@@ -114,6 +114,8 @@ struct BridgedProviderMetadata {
     #[serde(default)]
     has_save_config: bool,
     #[serde(default)]
+    is_available: bool,
+    #[serde(default)]
     schema: Vec<BridgedSchemaField>,
 }
 
@@ -2185,6 +2187,7 @@ const MEMORY_SETUP_METADATA_BOOTSTRAP: &str = concat!(
     "payload = {\n",
     "    'has_post_setup': hasattr(provider, 'post_setup'),\n",
     "    'has_save_config': hasattr(provider, 'save_config'),\n",
+    "    'is_available': bool(provider.is_available()) if hasattr(provider, 'is_available') else True,\n",
     "    'schema': provider.get_config_schema() if hasattr(provider, 'get_config_schema') else [],\n",
     "}\n",
     "print(json.dumps(payload, default=str))\n",
@@ -2267,7 +2270,45 @@ fn render_status(context: &HermesContext, loaded: &LoadedConfig) -> String {
                 "NOT installed ✗"
             }
         ));
-        if !found {
+        if found {
+            if let Ok(metadata) = load_bridged_provider_metadata(context, provider_name) {
+                lines.push(format!(
+                    "  Status:    {}",
+                    if metadata.is_available {
+                        "available ✓"
+                    } else {
+                        "not available ✗"
+                    }
+                ));
+                if !metadata.is_available {
+                    let required_fields = metadata
+                        .schema
+                        .iter()
+                        .filter(|field| field.env_var.is_some())
+                        .collect::<Vec<_>>();
+                    if !required_fields.is_empty() {
+                        lines.push(String::from("  Missing:"));
+                        for field in required_fields {
+                            let env_var = field.env_var.as_deref().unwrap_or_default();
+                            let is_set = std::env::var(env_var)
+                                .ok()
+                                .is_some_and(|value| !value.trim().is_empty());
+                            let mark = if is_set { "✓" } else { "✗" };
+                            let mut line = format!("    {mark} {env_var}");
+                            if !is_set
+                                && let Some(url) = field
+                                    .url
+                                    .as_deref()
+                                    .filter(|value| !value.trim().is_empty())
+                            {
+                                line.push_str(&format!("  → {url}"));
+                            }
+                            lines.push(line);
+                        }
+                    }
+                }
+            }
+        } else {
             lines.push(format!(
                 "  Install the '{provider_name}' memory plugin to {}/plugins/",
                 context.display_hermes_home()
@@ -3244,5 +3285,101 @@ exit 9\n",
         assert!(output.contains("Provider:  honcho"));
         assert!(output.contains("workspace: local"));
         assert!(output.contains("Installed plugins:"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn render_status_reports_unavailable_provider_requirements() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf '%s\\n' '{\"has_post_setup\": false, \"has_save_config\": false, \"is_available\": false, \"schema\": [{\"key\": \"api_key\", \"env_var\": \"CUSTOM_API_KEY\", \"url\": \"https://example.test\"}, {\"key\": \"endpoint\", \"env_var\": \"CUSTOM_ENDPOINT\"}]}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: honcho\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("honcho"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        set_env_var("CUSTOM_ENDPOINT", "https://api.test");
+        remove_env_var("CUSTOM_API_KEY");
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Plugin:    installed ✓"));
+        assert!(output.contains("Status:    not available ✗"));
+        assert!(output.contains("Missing:"));
+        assert!(output.contains("✗ CUSTOM_API_KEY  → https://example.test"));
+        assert!(output.contains("✓ CUSTOM_ENDPOINT"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+        remove_env_var("CUSTOM_ENDPOINT");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn render_status_reports_available_provider() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf '%s\\n' '{\"has_post_setup\": false, \"has_save_config\": false, \"is_available\": true, \"schema\": []}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: honcho\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("honcho"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Status:    available ✓"));
+        assert!(!output.contains("Missing:"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 }
