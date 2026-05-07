@@ -26,6 +26,7 @@ mod profile_cmd;
 mod python_bridge;
 mod setup_cmd;
 mod skills_cmd;
+mod skills_guard;
 mod slack_cmd;
 mod snapshot_cmd;
 mod uninstall_cmd;
