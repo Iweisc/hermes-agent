@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Args, Subcommand};
@@ -10,7 +11,7 @@ use hermes_core::HermesContext;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 const DEFAULT_INTERVAL_HOURS: i64 = 24 * 7;
 const DEFAULT_STALE_AFTER_DAYS: i64 = 30;
@@ -106,7 +107,7 @@ pub fn print_curator(
             Ok(())
         }
         Some(CuratorCommand::Status) => print_status(context),
-        Some(CuratorCommand::Run(args)) => bridge_run(args),
+        Some(CuratorCommand::Run(args)) => print_curator_run(args),
         Some(CuratorCommand::Pause) => {
             set_paused(context, true)?;
             println!("curator: paused");
@@ -122,8 +123,8 @@ pub fn print_curator(
         Some(CuratorCommand::Restore { skill }) => restore_command(context, &skill),
         Some(CuratorCommand::Archive { skill }) => archive_command(context, &skill),
         Some(CuratorCommand::Prune(args)) => prune_command(context, args),
-        Some(CuratorCommand::Backup(args)) => bridge_backup(args),
-        Some(CuratorCommand::Rollback(args)) => bridge_rollback(args),
+        Some(CuratorCommand::Backup(args)) => print_curator_backup(args),
+        Some(CuratorCommand::Rollback(args)) => print_curator_rollback(args),
     }
 }
 
@@ -142,53 +143,120 @@ fn print_help_summary() {
     println!("  rollback [...]         Restore from a curator snapshot");
 }
 
-fn bridge_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
-    let mut argv = vec![String::from("run")];
-    if args.synchronous {
-        argv.push(String::from("--sync"));
-    }
-    if args.dry_run {
-        argv.push(String::from("--dry-run"));
-    }
-    bridge_curator(&argv)
+fn print_curator_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
+    let mut envs = vec![
+        (
+            "HERMES_CURATOR_RUN_SYNCHRONOUS".to_string(),
+            if args.synchronous { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "HERMES_CURATOR_RUN_DRY".to_string(),
+            if args.dry_run { "1" } else { "0" }.to_string(),
+        ),
+    ];
+    run_curator_python(CURATOR_RUN_BOOTSTRAP, &mut envs)
 }
 
-fn bridge_backup(args: BackupArgs) -> Result<(), Box<dyn Error>> {
-    let mut argv = vec![String::from("backup")];
+fn print_curator_backup(args: BackupArgs) -> Result<(), Box<dyn Error>> {
+    let mut envs = Vec::new();
     if let Some(reason) = args
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        argv.push(String::from("--reason"));
-        argv.push(reason.to_string());
+        envs.push((
+            "HERMES_CURATOR_BACKUP_REASON".to_string(),
+            reason.to_string(),
+        ));
     }
-    bridge_curator(&argv)
+    run_curator_python(CURATOR_BACKUP_BOOTSTRAP, &mut envs)
 }
 
-fn bridge_rollback(args: RollbackArgs) -> Result<(), Box<dyn Error>> {
-    let mut argv = vec![String::from("rollback")];
-    if args.list {
-        argv.push(String::from("--list"));
-    }
+fn print_curator_rollback(args: RollbackArgs) -> Result<(), Box<dyn Error>> {
+    let mut envs = vec![
+        (
+            "HERMES_CURATOR_ROLLBACK_LIST".to_string(),
+            if args.list { "1" } else { "0" }.to_string(),
+        ),
+        (
+            "HERMES_CURATOR_ROLLBACK_YES".to_string(),
+            if args.yes { "1" } else { "0" }.to_string(),
+        ),
+    ];
     if let Some(backup_id) = args
         .backup_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        argv.push(String::from("--id"));
-        argv.push(backup_id.to_string());
+        envs.push((
+            "HERMES_CURATOR_ROLLBACK_ID".to_string(),
+            backup_id.to_string(),
+        ));
     }
-    if args.yes {
-        argv.push(String::from("--yes"));
-    }
-    bridge_curator(&argv)
+    run_curator_python(CURATOR_ROLLBACK_BOOTSTRAP, &mut envs)
 }
 
-fn bridge_curator(argv: &[String]) -> Result<(), Box<dyn Error>> {
-    launch_python_main_command("curator", argv, Some("HERMES_CURATOR_PYTHON"), &[])
+fn run_curator_python(
+    bootstrap: &str,
+    extra_env: &mut Vec<(String, String)>,
+) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CURATOR_PYTHON"))
+        .ok_or("could not find a Python interpreter for curator")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string());
+    for (key, value) in extra_env.drain(..) {
+        command.env(key, value);
+    }
+    command.arg("-c").arg(bootstrap);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("curator", status).into())
+}
+
+const CURATOR_RUN_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.curator import _cmd_run\n",
+    "raise SystemExit(_cmd_run(argparse.Namespace(\n",
+    "    synchronous=(os.environ.get('HERMES_CURATOR_RUN_SYNCHRONOUS') == '1'),\n",
+    "    dry_run=(os.environ.get('HERMES_CURATOR_RUN_DRY') == '1'),\n",
+    ")))\n",
+);
+
+const CURATOR_BACKUP_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.curator import _cmd_backup\n",
+    "raise SystemExit(_cmd_backup(argparse.Namespace(\n",
+    "    reason=(os.environ.get('HERMES_CURATOR_BACKUP_REASON') or None),\n",
+    ")))\n",
+);
+
+const CURATOR_ROLLBACK_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.curator import _cmd_rollback\n",
+    "raise SystemExit(_cmd_rollback(argparse.Namespace(\n",
+    "    list=(os.environ.get('HERMES_CURATOR_ROLLBACK_LIST') == '1'),\n",
+    "    backup_id=(os.environ.get('HERMES_CURATOR_ROLLBACK_ID') or None),\n",
+    "    yes=(os.environ.get('HERMES_CURATOR_ROLLBACK_YES') == '1'),\n",
+    ")))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn print_status(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -1314,7 +1382,33 @@ fn yaml_key(key: &str) -> YamlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1423,18 +1517,119 @@ mod tests {
     }
 
     #[test]
-    fn bridge_run_args_preserve_flags() {
-        let args = RunArgs {
+    #[cfg(unix)]
+    fn curator_run_uses_python_override_and_env_flags() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("curator-run");
+        fs::create_dir_all(&home).unwrap();
+        let fake_python = home.join("python3");
+        let log = home.join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'run sync=%s dry=%s\\n' \"$HERMES_CURATOR_RUN_SYNCHRONOUS\" \"$HERMES_CURATOR_RUN_DRY\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
+        print_curator_run(RunArgs {
             synchronous: true,
             dry_run: true,
-        };
-        let mut argv = vec![String::from("run")];
-        if args.synchronous {
-            argv.push(String::from("--sync"));
-        }
-        if args.dry_run {
-            argv.push(String::from("--dry-run"));
-        }
-        assert_eq!(argv, vec!["run", "--sync", "--dry-run"]);
+        })
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("run sync=1 dry=1"));
+
+        remove_env_var("HERMES_CURATOR_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn curator_backup_uses_python_override_and_reason() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("curator-backup");
+        fs::create_dir_all(&home).unwrap();
+        let fake_python = home.join("python3");
+        let log = home.join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'backup reason=%s\\n' \"$HERMES_CURATOR_BACKUP_REASON\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
+        print_curator_backup(BackupArgs {
+            reason: Some(String::from("manual-snapshot")),
+        })
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("backup reason=manual-snapshot"));
+
+        remove_env_var("HERMES_CURATOR_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn curator_rollback_uses_python_override_and_env_flags() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("curator-rollback");
+        fs::create_dir_all(&home).unwrap();
+        let fake_python = home.join("python3");
+        let log = home.join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'rollback list=%s id=%s yes=%s\\n' \"$HERMES_CURATOR_ROLLBACK_LIST\" \"$HERMES_CURATOR_ROLLBACK_ID\" \"$HERMES_CURATOR_ROLLBACK_YES\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
+        print_curator_rollback(RollbackArgs {
+            list: true,
+            backup_id: Some(String::from("snap-123")),
+            yes: true,
+        })
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("rollback list=1 id=snap-123 yes=1"));
+
+        remove_env_var("HERMES_CURATOR_PYTHON");
+        let _ = fs::remove_dir_all(home);
     }
 }
