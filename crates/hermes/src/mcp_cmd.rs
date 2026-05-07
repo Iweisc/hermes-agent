@@ -33,7 +33,7 @@ pub enum McpCommand {
     Test(TestArgs),
     #[command(alias = "config")]
     Configure(ConfigureArgs),
-    Login(CompatArgs),
+    Login(LoginArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -72,6 +72,11 @@ pub struct ConfigureArgs {
     pub name: String,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct LoginArgs {
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 struct McpServerEntry {
     config: Mapping,
@@ -93,7 +98,7 @@ pub fn print_mcp(
         Some(McpCommand::Serve(args)) => bridge_mcp("serve", &args.args),
         Some(McpCommand::Test(args)) => test_server(context, args),
         Some(McpCommand::Configure(args)) => configure_server(context, args),
-        Some(McpCommand::Login(args)) => bridge_mcp("login", &args.args),
+        Some(McpCommand::Login(args)) => login_server(context, args),
     }
 }
 
@@ -159,6 +164,47 @@ fn configure_server(context: &HermesContext, args: ConfigureArgs) -> Result<(), 
     let stdin = io::stdin();
     let stdout = io::stdout();
     configure_server_io(context, &args, stdin.lock(), stdout.lock())
+}
+
+fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn Error>> {
+    let name = normalize_server_lookup_name(&args.name)?;
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let servers = collect_mcp_servers(&root);
+    let Some(entry) = servers.get(name) else {
+        let suffix = if servers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Available servers: {}",
+                servers.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        return Err(format!("Server '{name}' not found in config.{suffix}").into());
+    };
+
+    if config_string(&entry.config, "url").is_none() {
+        return Err(format!("Server '{name}' has no URL — not an OAuth-capable server").into());
+    }
+    if !config_string(&entry.config, "auth")
+        .map(|value| value.eq_ignore_ascii_case("oauth"))
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Server '{name}' is not configured for OAuth (auth={})\nUse `hermes mcp remove` + `hermes mcp add` to reconfigure auth.",
+            config_string(&entry.config, "auth").unwrap_or_else(|| String::from("none"))
+        )
+        .into());
+    }
+
+    let cleared = cleanup_oauth_tokens(context, name)?;
+    println!();
+    if cleared {
+        println!("  Cleared cached OAuth tokens for '{name}'.");
+    } else {
+        println!("  No cached OAuth tokens found for '{name}'.");
+    }
+    println!("  Starting OAuth flow for '{name}'...");
+    bridge_mcp("test", &[name.to_string()])
 }
 
 fn configure_server_io<R: BufRead, W: Write>(
@@ -1812,6 +1858,15 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
     }
 
     #[test]
+    fn login_subcommand_parses_structured_args() {
+        let parsed = McpHarness::try_parse_from(["mcp", "login", "alpha"]).unwrap();
+        match parsed.command {
+            McpCommand::Login(args) => assert_eq!(args.name, "alpha"),
+            _ => panic!("expected login args"),
+        }
+    }
+
+    #[test]
     fn add_http_server_writes_native_config() {
         let home = temp_path("add-http");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2018,6 +2073,61 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
         assert!(rendered.contains("Currently 2/2 tools enabled"));
         assert!(rendered.contains("Updated config: 1/2 tools enabled"));
 
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_login_clears_tokens_and_bridges_oauth_probe() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("native-login");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        fs::write(
+            context.config_path(),
+            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
+        )
+        .unwrap();
+        fs::write(home.join("mcp-tokens").join("alpha.json"), "{}").unwrap();
+        fs::write(home.join("mcp-tokens").join("alpha.client.json"), "{}").unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Login(LoginArgs {
+                name: String::from("alpha"),
+            })),
+        )
+        .unwrap();
+
+        assert!(!home.join("mcp-tokens").join("alpha.json").exists());
+        assert!(!home.join("mcp-tokens").join("alpha.client.json").exists());
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("subcommand=test"));
+        assert!(output.contains("argv=alpha"));
+
+        remove_env_var("HERMES_MCP_PYTHON");
         let _ = fs::remove_dir_all(home);
     }
 
