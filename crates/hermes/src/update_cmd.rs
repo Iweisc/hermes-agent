@@ -1,11 +1,11 @@
 use std::error::Error;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use clap::Args;
 use hermes_core::HermesContext;
 
-use crate::python_bridge::{launch_python_main_command, project_root};
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateArgs {
@@ -31,28 +31,56 @@ pub fn print_update(context: &HermesContext, args: UpdateArgs) -> Result<(), Box
         return run_update_check();
     }
 
-    let argv = bridge_args(&args);
-    launch_python_main_command("update", &argv, Some("HERMES_UPDATE_PYTHON"), &[])
+    print_update_apply(args)
 }
 
-fn bridge_args(args: &UpdateArgs) -> Vec<String> {
-    let mut argv = Vec::new();
-    if args.gateway {
-        argv.push(String::from("--gateway"));
+fn print_update_apply(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_UPDATE_PYTHON"))
+        .ok_or("could not find a Python interpreter for update")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env(
+            "HERMES_UPDATE_GATEWAY",
+            if args.gateway { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_UPDATE_NO_BACKUP",
+            if args.no_backup { "1" } else { "0" },
+        )
+        .env("HERMES_UPDATE_BACKUP", if args.backup { "1" } else { "0" })
+        .env("HERMES_UPDATE_YES", if args.yes { "1" } else { "0" })
+        .arg("-c")
+        .arg(UPDATE_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
     }
-    if args.check {
-        argv.push(String::from("--check"));
+    Err(exit_status_message("update", status).into())
+}
+
+const UPDATE_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.main import cmd_update\n",
+    "cmd_update(argparse.Namespace(\n",
+    "    gateway=(os.environ.get('HERMES_UPDATE_GATEWAY') == '1'),\n",
+    "    check=False,\n",
+    "    no_backup=(os.environ.get('HERMES_UPDATE_NO_BACKUP') == '1'),\n",
+    "    backup=(os.environ.get('HERMES_UPDATE_BACKUP') == '1'),\n",
+    "    yes=(os.environ.get('HERMES_UPDATE_YES') == '1'),\n",
+    "))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
     }
-    if args.no_backup {
-        argv.push(String::from("--no-backup"));
-    }
-    if args.backup {
-        argv.push(String::from("--backup"));
-    }
-    if args.yes {
-        argv.push(String::from("--yes"));
-    }
-    argv
 }
 
 fn run_update_check() -> Result<(), Box<dyn Error>> {
@@ -225,9 +253,35 @@ struct GitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -238,22 +292,44 @@ mod tests {
     }
 
     #[test]
-    fn bridge_args_preserve_enabled_flags() {
-        let args = UpdateArgs {
+    #[cfg(unix)]
+    fn update_uses_python_override_and_env_flags() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'gateway=%s no_backup=%s backup=%s yes=%s\\n' \\\n\
+    \"$HERMES_UPDATE_GATEWAY\" \"$HERMES_UPDATE_NO_BACKUP\" \"$HERMES_UPDATE_BACKUP\" \"$HERMES_UPDATE_YES\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_UPDATE_PYTHON", &fake_python);
+        print_update_apply(UpdateArgs {
             gateway: true,
             check: false,
             no_backup: true,
-            backup: false,
+            backup: true,
             yes: true,
-        };
-        assert_eq!(
-            bridge_args(&args),
-            vec![
-                String::from("--gateway"),
-                String::from("--no-backup"),
-                String::from("--yes")
-            ]
-        );
+        })
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("gateway=1 no_backup=1 backup=1 yes=1"));
+
+        remove_env_var("HERMES_UPDATE_PYTHON");
     }
 
     #[test]
