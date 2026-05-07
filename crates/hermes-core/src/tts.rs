@@ -1,6 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use base64::Engine;
 use chrono::Local;
@@ -33,15 +38,31 @@ const DEFAULT_XAI_LANGUAGE: &str = "en";
 const DEFAULT_XAI_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_XAI_BIT_RATE: u32 = 128_000;
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+const DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_COMMAND_TTS_OUTPUT_FORMAT: &str = "mp3";
+const DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH: usize = 5_000;
 const EDGE_MAX_TEXT_LENGTH: usize = 5_000;
 const OPENAI_MAX_TEXT_LENGTH: usize = 4_096;
 const MINIMAX_MAX_TEXT_LENGTH: usize = 10_000;
 const GEMINI_MAX_TEXT_LENGTH: usize = 5_000;
 const MISTRAL_MAX_TEXT_LENGTH: usize = 4_000;
 const XAI_MAX_TEXT_LENGTH: usize = 15_000;
+const FALLBACK_MAX_TEXT_LENGTH: usize = 4_000;
 const GEMINI_TTS_SAMPLE_RATE: u32 = 24_000;
 const GEMINI_TTS_CHANNELS: u16 = 1;
 const GEMINI_TTS_SAMPLE_WIDTH: u16 = 2;
+
+#[derive(Debug, Clone)]
+struct CommandTtsProvider {
+    command: String,
+    timeout_seconds: f64,
+    output_format: String,
+    voice_compatible: bool,
+    voice: String,
+    model: String,
+    speed: String,
+    max_text_length: Option<usize>,
+}
 
 #[derive(Debug, Clone)]
 struct TtsSettings {
@@ -74,12 +95,13 @@ struct TtsSettings {
     xai_bit_rate: u32,
     xai_base_url: String,
     xai_api_key: String,
+    command_provider: Option<CommandTtsProvider>,
 }
 
 pub fn text_to_speech_schema() -> Value {
     json!({
         "name": "text_to_speech",
-        "description": "Convert text to speech audio. Returns a MEDIA path tag that compatible delivery surfaces can send as native audio.",
+        "description": "Convert text to speech audio. Supports built-in providers and configured tts.providers.<name> command backends. Returns a MEDIA path tag that compatible delivery surfaces can send as native audio.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -133,13 +155,15 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         text.to_string()
     };
 
-    let voice_compatible = matches!(provider, "openai" | "mistral" | "elevenlabs" | "gemini")
-        && output_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "ogg" | "opus"));
-
+    let mut effective_output_path = output_path.clone();
     let result = match provider {
+        other if settings.command_provider.is_some() && !is_builtin_tts_provider(other) => {
+            synthesize_command_provider(
+                settings.command_provider.as_ref().expect("checked is_some"),
+                &truncated,
+                &effective_output_path,
+            )
+        }
         "edge" => synthesize_edge(&settings, &truncated, &output_path),
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
         "openai" => synthesize_openai(&settings, &truncated, &output_path),
@@ -148,14 +172,30 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "mistral" => synthesize_mistral(&settings, &truncated, &output_path),
         "xai" => synthesize_xai(&settings, &truncated, &output_path),
         other => Err(format!(
-            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, minimax, gemini, mistral, xai."
+            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
         )),
     };
     if let Err(error) = result {
         return tool_error(error);
     }
 
-    let file_path = output_path.display().to_string();
+    let voice_compatible = if let Some(config) = settings.command_provider.as_ref() {
+        if config.voice_compatible {
+            if !path_is_voice_compatible(&effective_output_path)
+                && let Some(converted) = convert_audio_to_opus(&effective_output_path)
+            {
+                effective_output_path = converted;
+            }
+            path_is_voice_compatible(&effective_output_path)
+        } else {
+            false
+        }
+    } else {
+        matches!(provider, "openai" | "mistral" | "elevenlabs" | "gemini")
+            && path_is_voice_compatible(&effective_output_path)
+    };
+
+    let file_path = effective_output_path.display().to_string();
     let media_tag = if voice_compatible {
         format!("[[audio_as_voice]]\nMEDIA:{file_path}")
     } else {
@@ -262,6 +302,7 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let xai_api_key = yaml_mapping_value(root, &["xai", "api_key"])
         .or_else(|| std::env::var("XAI_API_KEY").ok())
         .unwrap_or_default();
+    let command_provider = load_command_provider(root, &provider);
 
     Ok(TtsSettings {
         provider,
@@ -293,6 +334,39 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
         xai_bit_rate,
         xai_base_url,
         xai_api_key,
+        command_provider,
+    })
+}
+
+fn load_command_provider(root: Option<&YamlValue>, provider: &str) -> Option<CommandTtsProvider> {
+    if provider.is_empty() || is_builtin_tts_provider(provider) {
+        return None;
+    }
+    let config = get_named_provider_config(root, provider)?;
+    if !is_command_provider_config(config) {
+        return None;
+    }
+    let output_format = get_command_tts_output_format(config, None);
+    let max_text_length = yaml_value_usize(mapping_get_case_insensitive(config, "max_text_length"))
+        .filter(|value| *value > 0);
+    Some(CommandTtsProvider {
+        command: mapping_get_case_insensitive(config, "command")
+            .and_then(yaml_value_string)
+            .expect("validated by is_command_provider_config"),
+        timeout_seconds: get_command_tts_timeout(config),
+        output_format,
+        voice_compatible: yaml_value_bool(mapping_get_case_insensitive(config, "voice_compatible")),
+        voice: mapping_get_case_insensitive(config, "voice")
+            .and_then(yaml_value_string)
+            .unwrap_or_default(),
+        model: mapping_get_case_insensitive(config, "model")
+            .and_then(yaml_value_string)
+            .unwrap_or_default(),
+        speed: mapping_get_case_insensitive(config, "speed")
+            .and_then(yaml_value_string)
+            .or_else(|| yaml_mapping_scalar_string(root, &["speed"]))
+            .unwrap_or_default(),
+        max_text_length,
     })
 }
 
@@ -691,12 +765,24 @@ fn resolve_output_path(
     explicit: Option<&str>,
 ) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
-        return runtime.resolve_path(path);
+        let resolved = runtime.resolve_path(path)?;
+        if let Some(config) = settings.command_provider.as_ref() {
+            return Ok(configured_command_tts_output_path(&resolved, config));
+        }
+        return Ok(resolved);
     }
     let platform = std::env::var("HERMES_SESSION_PLATFORM")
         .ok()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if let Some(config) = settings.command_provider.as_ref() {
+        return Ok(settings.output_dir.join(format!(
+            "tts_{}_{:x}.{}",
+            Local::now().format("%Y%m%d_%H%M%S"),
+            unix_ts_nanos(),
+            config.output_format
+        )));
+    }
     let extension = if matches!(
         settings.provider.as_str(),
         "openai" | "mistral" | "elevenlabs" | "gemini"
@@ -709,10 +795,7 @@ fn resolve_output_path(
     Ok(settings.output_dir.join(format!(
         "tts_{}_{:x}.{}",
         Local::now().format("%Y%m%d_%H%M%S"),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0),
+        unix_ts_nanos(),
         extension
     )))
 }
@@ -743,18 +826,190 @@ fn yaml_mapping_value(root: Option<&YamlValue>, path: &[&str]) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
+fn yaml_mapping_scalar_string(root: Option<&YamlValue>, path: &[&str]) -> Option<String> {
+    yaml_lookup(root, path).and_then(yaml_value_string)
+}
+
 fn yaml_mapping_u32(root: Option<&YamlValue>, path: &[&str]) -> Option<u32> {
+    match yaml_lookup(root, path)? {
+        YamlValue::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        YamlValue::String(value) => value.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn yaml_lookup<'a>(root: Option<&'a YamlValue>, path: &[&str]) -> Option<&'a YamlValue> {
     let mut current = root?;
     for key in path {
         current = current
             .as_mapping()?
             .get(YamlValue::String((*key).to_string()))?;
     }
-    match current {
-        YamlValue::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
-        YamlValue::String(value) => value.trim().parse::<u32>().ok(),
+    Some(current)
+}
+
+fn yaml_value_string(value: &YamlValue) -> Option<String> {
+    match value {
+        YamlValue::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        YamlValue::Number(value) => Some(value.to_string()),
+        YamlValue::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn yaml_value_bool(value: Option<&YamlValue>) -> bool {
+    match value {
+        Some(YamlValue::Bool(value)) => *value,
+        Some(YamlValue::String(value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Some(YamlValue::Number(value)) => value.as_i64().is_some_and(|value| value != 0),
+        _ => false,
+    }
+}
+
+fn yaml_value_usize(value: Option<&YamlValue>) -> Option<usize> {
+    match value? {
+        YamlValue::Number(value) => value.as_u64().and_then(|value| usize::try_from(value).ok()),
+        YamlValue::String(value) => value.trim().parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
+fn provider_root_mapping<'a>(root: Option<&'a YamlValue>) -> Option<&'a serde_yaml::Mapping> {
+    root?.as_mapping()
+}
+
+fn mapping_get_case_insensitive<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a YamlValue> {
+    mapping.iter().find_map(|(candidate, value)| {
+        candidate
+            .as_str()
+            .filter(|candidate| candidate.eq_ignore_ascii_case(key))
+            .map(|_| value)
+    })
+}
+
+fn get_named_provider_config<'a>(
+    root: Option<&'a YamlValue>,
+    provider: &str,
+) -> Option<&'a serde_yaml::Mapping> {
+    let root_mapping = provider_root_mapping(root)?;
+    if let Some(section) = mapping_get_case_insensitive(root_mapping, "providers")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|providers| mapping_get_case_insensitive(providers, provider))
+        .and_then(YamlValue::as_mapping)
+    {
+        return Some(section);
+    }
+    if is_builtin_tts_provider(provider) {
+        return None;
+    }
+    mapping_get_case_insensitive(root_mapping, provider).and_then(YamlValue::as_mapping)
+}
+
+fn is_command_provider_config(config: &serde_yaml::Mapping) -> bool {
+    if let Some(kind) = mapping_get_case_insensitive(config, "type")
+        .and_then(yaml_value_string)
+        .map(|value| value.to_ascii_lowercase())
+        && kind != "command"
+    {
+        return false;
+    }
+    mapping_get_case_insensitive(config, "command")
+        .and_then(yaml_value_string)
+        .is_some()
+}
+
+fn is_builtin_tts_provider(provider: &str) -> bool {
+    matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "edge" | "elevenlabs" | "openai" | "minimax" | "gemini" | "mistral" | "xai"
+    )
+}
+
+fn get_command_tts_timeout(config: &serde_yaml::Mapping) -> f64 {
+    let value = mapping_get_case_insensitive(config, "timeout")
+        .or_else(|| mapping_get_case_insensitive(config, "timeout_seconds"));
+    let Some(value) = value else {
+        return DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS as f64;
+    };
+    let parsed = match value {
+        YamlValue::Number(number) => number.as_f64(),
+        YamlValue::String(raw) => raw.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(value) if value.is_finite() && value > 0.0 => value,
+        _ => DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS as f64,
+    }
+}
+
+fn get_command_tts_output_format(
+    config: &serde_yaml::Mapping,
+    output_path: Option<&Path>,
+) -> String {
+    if let Some(path) = output_path
+        && let Some(extension) = path.extension().and_then(|value| value.to_str())
+    {
+        let normalized = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if is_command_tts_output_format(&normalized) {
+            return normalized;
+        }
+    }
+    let configured = mapping_get_case_insensitive(config, "format")
+        .or_else(|| mapping_get_case_insensitive(config, "output_format"))
+        .and_then(yaml_value_string)
+        .unwrap_or_else(|| DEFAULT_COMMAND_TTS_OUTPUT_FORMAT.to_string());
+    let normalized = configured
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if is_command_tts_output_format(&normalized) {
+        normalized
+    } else {
+        DEFAULT_COMMAND_TTS_OUTPUT_FORMAT.to_string()
+    }
+}
+
+fn is_command_tts_output_format(value: &str) -> bool {
+    matches!(value, "mp3" | "wav" | "ogg" | "flac")
+}
+
+fn configured_command_tts_output_path(path: &Path, config: &CommandTtsProvider) -> PathBuf {
+    let format = get_command_tts_output_format_from_provider(config, Some(path));
+    path.with_extension(format)
+}
+
+fn get_command_tts_output_format_from_provider(
+    config: &CommandTtsProvider,
+    output_path: Option<&Path>,
+) -> String {
+    if let Some(path) = output_path
+        && let Some(extension) = path.extension().and_then(|value| value.to_str())
+    {
+        let normalized = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if is_command_tts_output_format(&normalized) {
+            return normalized;
+        }
+    }
+    config.output_format.clone()
 }
 
 fn provider_max_text_length(settings: &TtsSettings) -> usize {
@@ -775,8 +1030,343 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
             "eleven_flash_v2_5" => 40_000,
             _ => 10_000,
         },
-        _ => EDGE_MAX_TEXT_LENGTH,
+        other if !is_builtin_tts_provider(other) => settings
+            .command_provider
+            .as_ref()
+            .and_then(|config| config.max_text_length)
+            .unwrap_or(DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH),
+        _ => FALLBACK_MAX_TEXT_LENGTH,
     }
+}
+
+fn synthesize_command_provider(
+    config: &CommandTtsProvider,
+    text: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    if config.command.trim().is_empty() {
+        return Err("TTS command provider command is not configured.".to_string());
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("creating {} failed: {error}", parent.display()))?;
+    }
+    if output_path.exists() {
+        let _ = fs::remove_file(output_path);
+    }
+    let temp_dir = std::env::temp_dir().join(format!("hermes_tts_{:x}", unix_ts_nanos()));
+    fs::create_dir_all(&temp_dir)
+        .map_err(|error| format!("creating {} failed: {error}", temp_dir.display()))?;
+    let input_path = temp_dir.join("input.txt");
+    fs::write(&input_path, text)
+        .map_err(|error| format!("writing {} failed: {error}", input_path.display()))?;
+
+    let placeholders = [
+        ("input_path", input_path.display().to_string()),
+        ("text_path", input_path.display().to_string()),
+        ("output_path", output_path.display().to_string()),
+        (
+            "format",
+            get_command_tts_output_format_from_provider(config, Some(output_path)),
+        ),
+        ("voice", config.voice.clone()),
+        ("model", config.model.clone()),
+        ("speed", config.speed.clone()),
+    ];
+    let command = render_command_tts_template(&config.command, &placeholders);
+    let result = run_command_tts(&command, Duration::from_secs_f64(config.timeout_seconds));
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    match result {
+        Ok(_) => ensure_audio_file(output_path),
+        Err(CommandTtsError::TimedOut) => Err(format!(
+            "TTS provider timed out after {}s",
+            trim_decimal(config.timeout_seconds)
+        )),
+        Err(CommandTtsError::Exited {
+            code,
+            stdout,
+            stderr,
+        }) => {
+            let mut detail_parts = Vec::new();
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                detail_parts.push(format!("stderr: {stderr}"));
+            }
+            let stdout = stdout.trim();
+            if !stdout.is_empty() {
+                detail_parts.push(format!("stdout: {stdout}"));
+            }
+            let detail = if detail_parts.is_empty() {
+                "no command output".to_string()
+            } else {
+                detail_parts.join("; ")
+            };
+            Err(format!(
+                "TTS provider exited with code {}: {}",
+                code.unwrap_or(-1),
+                detail
+            ))
+        }
+        Err(CommandTtsError::Spawn(error)) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+enum CommandTtsError {
+    TimedOut,
+    Exited {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    Spawn(String),
+}
+
+fn run_command_tts(command: &str, timeout: Duration) -> Result<(), CommandTtsError> {
+    let mut builder = if cfg!(windows) {
+        let mut builder = Command::new("cmd");
+        builder.arg("/C").arg(command);
+        builder
+    } else {
+        let mut builder = Command::new("sh");
+        builder.arg("-c").arg(command);
+        builder
+    };
+    builder
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // SAFETY: setsid is called in the child immediately before exec so the
+        // shell runs in its own process group and can be terminated as a unit.
+        unsafe {
+            builder.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = builder
+        .spawn()
+        .map_err(|error| CommandTtsError::Spawn(format!("spawning TTS command failed: {error}")))?;
+    let pid = child.id() as i32;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child.wait_with_output().map_err(|error| {
+                    CommandTtsError::Spawn(format!("collecting TTS command output failed: {error}"))
+                })?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                return Err(CommandTtsError::Exited {
+                    code: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                });
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                terminate_command_tts_process_group(pid, &mut child);
+                return Err(CommandTtsError::TimedOut);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                terminate_command_tts_process_group(pid, &mut child);
+                return Err(CommandTtsError::Spawn(format!(
+                    "waiting for TTS command failed: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn terminate_command_tts_process_group(pid: i32, child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = signal_process_group(pid, libc::SIGTERM);
+        thread::sleep(Duration::from_millis(250));
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = signal_process_group(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: i32, signal: i32) -> Result<(), String> {
+    let result = unsafe { libc::killpg(pid, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+fn render_command_tts_template(template: &str, placeholders: &[(&str, String)]) -> String {
+    let mut rendered = String::with_capacity(template.len() + 64);
+    let bytes = template.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'{' {
+            if bytes.get(index + 1) == Some(&b'{') {
+                rendered.push('{');
+                index += 2;
+                continue;
+            }
+            if let Some(end) = bytes[index + 1..].iter().position(|byte| *byte == b'}') {
+                let end = index + 1 + end;
+                let name = &template[index + 1..end];
+                if bytes.get(index.wrapping_sub(1)) != Some(&b'$')
+                    && let Some((_, value)) = placeholders
+                        .iter()
+                        .find(|(candidate, _)| *candidate == name)
+                {
+                    rendered.push_str(&quote_command_tts_placeholder(
+                        value,
+                        shell_quote_context(template, index),
+                    ));
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        if bytes[index] == b'}' && bytes.get(index + 1) == Some(&b'}') {
+            rendered.push('}');
+            index += 2;
+            continue;
+        }
+        rendered.push(bytes[index] as char);
+        index += 1;
+    }
+    rendered
+}
+
+fn shell_quote_context(command_template: &str, position: usize) -> Option<char> {
+    let bytes = command_template.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < position {
+        let byte = bytes[index];
+        match quote {
+            Some('\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quote = None;
+                }
+            }
+            _ => {
+                if byte == b'\'' {
+                    quote = Some('\'');
+                } else if byte == b'"' {
+                    quote = Some('"');
+                } else if byte == b'\\' {
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+    quote
+}
+
+fn quote_command_tts_placeholder(value: &str, quote_context: Option<char>) -> String {
+    match quote_context {
+        Some('\'') => value.replace('\'', r"'\''"),
+        Some('"') => value
+            .replace('\\', r"\\")
+            .replace('"', r#"\""#)
+            .replace('$', r"\$")
+            .replace('`', r"\`"),
+        _ => shell_quote(value),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if cfg!(windows) {
+        let escaped = value.replace('"', r#"\""#);
+        return format!(r#""{escaped}""#);
+    }
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
+
+fn convert_audio_to_opus(path: &Path) -> Option<PathBuf> {
+    if path_is_voice_compatible(path) {
+        return Some(path.to_path_buf());
+    }
+    let output_path = path.with_extension("ogg");
+    let status = Command::new("ffmpeg")
+        .arg("-i")
+        .arg(path)
+        .arg("-acodec")
+        .arg("libopus")
+        .arg("-ac")
+        .arg("1")
+        .arg("-b:a")
+        .arg("64k")
+        .arg("-vbr")
+        .arg("off")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg(&output_path)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    if ensure_audio_file(&output_path).is_ok() {
+        Some(output_path)
+    } else {
+        None
+    }
+}
+
+fn path_is_voice_compatible(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "ogg" | "opus"))
+}
+
+fn trim_decimal(value: f64) -> String {
+    let mut rendered = format!("{value}");
+    if rendered.contains('.') {
+        while rendered.ends_with('0') {
+            rendered.pop();
+        }
+        if rendered.ends_with('.') {
+            rendered.pop();
+        }
+    }
+    rendered
 }
 
 fn wrap_pcm_as_wav(
@@ -908,6 +1498,13 @@ fn tts_config_error(action: &'static str, error: HermesError) -> String {
     format!("TTS config {action} failed: {error}")
 }
 
+fn unix_ts_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1563,10 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn command_copy_command() -> &'static str {
+        "cp {input_path} {output_path}"
+    }
+
     #[test]
     fn openai_tts_writes_audio_file_and_media_tag() {
         let temp = TempDir::new().unwrap();
@@ -979,11 +1580,19 @@ mod tests {
         )
         .unwrap();
         let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
-        let result = handle_text_to_speech(&json!({"text":"hello world"}), &runtime);
+        let output_path = temp.path().join("openai.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello world",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["provider"], json!("openai"));
         let file_path = parsed["file_path"].as_str().unwrap();
+        assert_eq!(file_path, output_path.display().to_string());
         assert_eq!(fs::read(file_path).unwrap(), b"fake-audio");
         assert_eq!(parsed["media_tag"], json!(format!("MEDIA:{file_path}")));
     }
@@ -1736,5 +2345,131 @@ mod tests {
         assert_eq!(parsed["provider"], json!("edge"));
         let file_path = parsed["file_path"].as_str().unwrap();
         assert_eq!(fs::read(file_path).unwrap(), b"edge-audio");
+    }
+
+    #[test]
+    fn command_tts_provider_dispatches_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: py-copy\n  providers:\n    py-copy:\n      type: command\n      command: \"{}\"\n      output_format: mp3\n",
+                command_copy_command()
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("clip.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello command provider",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("py-copy"));
+        assert_eq!(parsed["voice_compatible"], json!(false));
+        assert_eq!(
+            fs::read_to_string(&output_path).unwrap(),
+            "hello command provider"
+        );
+    }
+
+    #[test]
+    fn command_tts_provider_legacy_block_resolves_and_truncates() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: legacy-copy\n  speed: 1.25\n  legacy-copy:\n    type: command\n    command: \"{}\"\n    output_format: wav\n    max_text_length: 2\n",
+                command_copy_command()
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("clip.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("legacy-copy"));
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "he");
+    }
+
+    #[test]
+    fn command_tts_provider_voice_opt_in_marks_ogg_as_voice_media() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: voice-copy\n  providers:\n    voice-copy:\n      type: command\n      command: \"{}\"\n      output_format: ogg\n      voice_compatible: true\n",
+                command_copy_command()
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("voice.ogg");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"voice me",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["voice_compatible"], json!(true));
+        let file_path = parsed["file_path"].as_str().unwrap();
+        assert!(file_path.ends_with(".ogg"));
+        assert_eq!(
+            parsed["media_tag"],
+            json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
+        );
+    }
+
+    #[test]
+    fn command_tts_provider_explicit_extension_overrides_config_format() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: ext-copy\n  providers:\n    ext-copy:\n      type: command\n      command: \"{}\"\n      output_format: mp3\n",
+                command_copy_command()
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let explicit = temp.path().join("clip.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello wav",
+                "output_path": explicit.display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["file_path"], json!(explicit.display().to_string()));
+        assert_eq!(fs::read_to_string(explicit).unwrap(), "hello wav");
+    }
+
+    #[test]
+    fn render_command_tts_template_quotes_spacey_paths() {
+        let rendered = render_command_tts_template(
+            "tts --in {input_path} --out {output_path}",
+            &[
+                ("input_path", "/tmp/Jane Doe/input.txt".to_string()),
+                ("output_path", "/tmp/out file.mp3".to_string()),
+            ],
+        );
+        assert!(rendered.contains("'/tmp/Jane Doe/input.txt'"));
+        assert!(rendered.contains("'/tmp/out file.mp3'"));
     }
 }

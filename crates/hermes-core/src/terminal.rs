@@ -721,23 +721,30 @@ mod tests {
         );
         let start_json: Value = serde_json::from_str(&start).unwrap();
         let session_id = start_json["session_id"].as_str().unwrap();
-
-        thread::sleep(Duration::from_millis(200));
-        let log = handle_process(
-            &json!({
-                "action": "log",
-                "session_id": session_id,
-                "limit": 10,
-            }),
-            &runtime,
-        );
-        let log_json: Value = serde_json::from_str(&log).unwrap();
-        assert!(
-            log_json["lines"]
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let log = handle_process(
+                &json!({
+                    "action": "log",
+                    "session_id": session_id,
+                    "limit": 10,
+                }),
+                &runtime,
+            );
+            let log_json: Value = serde_json::from_str(&log).unwrap();
+            if log_json["lines"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|line| line == "alpha")
-        );
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background process log did not contain expected output in time"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
