@@ -1,6 +1,7 @@
 mod acp_cmd;
 mod auth_cmd;
 mod backup;
+mod checkpoints_cmd;
 mod compat_cmd;
 mod completion;
 mod config_cmd;
@@ -83,6 +84,10 @@ enum Command {
     Dashboard(dashboard_cmd::DashboardArgs),
     Gateway(compat_cmd::CompatArgs),
     Skills(compat_cmd::CompatArgs),
+    Checkpoints {
+        #[command(subcommand)]
+        command: Option<checkpoints_cmd::CheckpointsCommand>,
+    },
     Snapshot {
         #[command(subcommand)]
         command: Option<snapshot_cmd::SnapshotCommand>,
@@ -301,6 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Gateway(args) => compat_cmd::print_gateway(args)?,
         Command::Skills(args) => compat_cmd::print_skills(args)?,
+        Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
         Command::Plugins(args) => compat_cmd::print_plugins(args)?,
         Command::Curator(args) => compat_cmd::print_curator(args)?,
