@@ -9,7 +9,7 @@ use hermes_core::HermesContext;
 use serde_yaml::{Mapping, Value};
 
 use crate::compat_cmd::CompatArgs;
-use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[cfg(test)]
@@ -22,7 +22,7 @@ pub enum McpCommand {
     #[command(alias = "rm")]
     Remove(RemoveArgs),
     Serve(CompatArgs),
-    Add(CompatArgs),
+    Add(AddArgs),
     Test(CompatArgs),
     #[command(alias = "config")]
     Configure(CompatArgs),
@@ -32,6 +32,25 @@ pub enum McpCommand {
 #[derive(Args, Debug, Clone)]
 pub struct RemoveArgs {
     pub name: String,
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AddArgs {
+    pub name: String,
+    #[arg(long, conflicts_with = "command")]
+    pub url: Option<String>,
+    #[arg(long, conflicts_with = "url")]
+    pub command: Option<String>,
+    #[arg(long = "args", num_args = 1..)]
+    pub command_args: Vec<String>,
+    #[arg(long, value_parser = ["oauth", "header"])]
+    pub auth: Option<String>,
+    #[arg(long)]
+    pub preset: Option<String>,
+    #[arg(long = "env", num_args = 1..)]
+    pub env: Vec<String>,
     #[arg(short = 'y', long)]
     pub yes: bool,
 }
@@ -53,8 +72,8 @@ pub fn print_mcp(
         }
         Some(McpCommand::List) => print_list(context),
         Some(McpCommand::Remove(args)) => remove_server(context, args),
+        Some(McpCommand::Add(args)) => add_server(context, args),
         Some(McpCommand::Serve(args)) => bridge_mcp("serve", &args.args),
-        Some(McpCommand::Add(args)) => bridge_mcp("add", &args.args),
         Some(McpCommand::Test(args)) => bridge_mcp("test", &args.args),
         Some(McpCommand::Configure(args)) => bridge_mcp("configure", &args.args),
         Some(McpCommand::Login(args)) => bridge_mcp("login", &args.args),
@@ -164,6 +183,118 @@ fn print_help_summary() {
     println!("  hermes mcp configure <name>                   Toggle tools");
     println!("  hermes mcp login <name>                       Re-authenticate OAuth");
     println!();
+}
+
+fn add_server(context: &HermesContext, args: AddArgs) -> Result<(), Box<dyn Error>> {
+    let name = validate_server_name(&args.name)?.to_string();
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let existing = collect_mcp_servers(&root);
+    if existing.contains_key(&name)
+        && !args.yes
+        && !confirm_prompt(&format!(
+            "Server '{name}' already exists. Overwrite? [y/N] "
+        ))?
+    {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let mut url = args.url.as_deref().map(validate_http_url).transpose()?;
+    let mut command = args
+        .command
+        .as_deref()
+        .map(validate_command_value)
+        .transpose()?;
+    let mut command_args = args.command_args.clone();
+    apply_mcp_preset(
+        args.preset.as_deref(),
+        &mut url,
+        &mut command,
+        &mut command_args,
+    )?;
+
+    if url.is_none() && command.is_none() {
+        return Err("Must specify --url <endpoint>, --command <cmd>, or --preset <name>".into());
+    }
+
+    let env_assignments = parse_env_assignments(&args.env)?;
+    if url.is_some() && !env_assignments.is_empty() {
+        return Err(
+            "--env is only supported for stdio MCP servers (--command or stdio presets)".into(),
+        );
+    }
+
+    let mut server = Mapping::new();
+    if let Some(url) = url {
+        server.insert(yaml_key("url"), yaml_string(url));
+    } else if let Some(command) = command {
+        server.insert(yaml_key("command"), yaml_string(command));
+        if !command_args.is_empty() {
+            server.insert(
+                yaml_key("args"),
+                Value::Sequence(command_args.into_iter().map(yaml_string).collect()),
+            );
+        }
+        if !env_assignments.is_empty() {
+            server.insert(yaml_key("env"), env_mapping(&env_assignments));
+        }
+    }
+
+    if let Some(auth) = args.auth.as_deref() {
+        match auth {
+            "oauth" => {
+                if !server.contains_key(yaml_key("url")) {
+                    return Err("--auth oauth is only supported for HTTP MCP servers".into());
+                }
+                server.insert(yaml_key("auth"), yaml_string("oauth"));
+            }
+            "header" => {
+                if !server.contains_key(yaml_key("url")) {
+                    return Err("--auth header is only supported for HTTP MCP servers".into());
+                }
+                let env_key = env_key_for_server(&name);
+                let api_key = match std::env::var(&env_key)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(value) => value,
+                    None => {
+                        let value = prompt_value("API key / Bearer token: ")?;
+                        if value.trim().is_empty() {
+                            return Err("API key / Bearer token cannot be empty".into());
+                        }
+                        save_env_value(context.hermes_home().join(".env"), &env_key, &value)?;
+                        println!(
+                            "Saved {} to {}",
+                            env_key,
+                            context.hermes_home().join(".env").display()
+                        );
+                        value
+                    }
+                };
+                let _ = api_key;
+                let mut headers = Mapping::new();
+                headers.insert(
+                    yaml_string("Authorization"),
+                    yaml_string(format!("Bearer ${{{env_key}}}")),
+                );
+                server.insert(yaml_key("headers"), Value::Mapping(headers));
+            }
+            _ => return Err(format!("unsupported auth type: {auth}").into()),
+        }
+    }
+
+    server.insert(yaml_key("enabled"), Value::Bool(true));
+    upsert_top_level_mcp_server(&mut root, &name, Value::Mapping(server));
+    write_yaml_mapping(&context.config_path(), &root)?;
+
+    println!("Saved '{name}' to {}", context.config_path().display());
+    println!("Use `hermes mcp test {name}` to verify the connection.");
+    println!(
+        "Use `hermes mcp configure {name}` after discovery if you want to narrow enabled tools."
+    );
+    Ok(())
 }
 
 fn remove_server(context: &HermesContext, args: RemoveArgs) -> Result<(), Box<dyn Error>> {
@@ -322,7 +453,100 @@ fn validate_server_name(raw: &str) -> Result<&str, Box<dyn Error>> {
     if name.is_empty() {
         return Err("server name cannot be empty".into());
     }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("server name may only contain letters, numbers, '.', '_' and '-'".into());
+    }
     Ok(name)
+}
+
+fn validate_http_url(raw: &str) -> Result<String, Box<dyn Error>> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err("URL cannot be empty".into());
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("URL must start with http:// or https://".into());
+    }
+    Ok(url.to_string())
+}
+
+fn validate_command_value(raw: &str) -> Result<String, Box<dyn Error>> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err("command cannot be empty".into());
+    }
+    Ok(command.to_string())
+}
+
+fn parse_env_assignments(raw_env: &[String]) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut parsed = BTreeMap::new();
+    for item in raw_env {
+        let text = item.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = text.split_once('=') else {
+            return Err(format!("Invalid --env value '{text}' (expected KEY=VALUE)").into());
+        };
+        let key = key.trim();
+        if !is_env_key(key) {
+            return Err(format!("Invalid --env variable name '{key}'").into());
+        }
+        parsed.insert(key.to_string(), value.to_string());
+    }
+    Ok(parsed)
+}
+
+fn is_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn env_mapping(assignments: &BTreeMap<String, String>) -> Value {
+    Value::Mapping(
+        assignments
+            .iter()
+            .map(|(key, value)| (yaml_string(key), yaml_string(value)))
+            .collect(),
+    )
+}
+
+fn env_key_for_server(name: &str) -> String {
+    format!(
+        "MCP_{}_API_KEY",
+        name.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+fn apply_mcp_preset(
+    preset_name: Option<&str>,
+    url: &mut Option<String>,
+    command: &mut Option<String>,
+    command_args: &mut Vec<String>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(preset_name) = preset_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if url.is_some() || command.is_some() {
+        return Ok(());
+    }
+    let _ = command_args;
+    Err(format!("Unknown MCP preset: {preset_name}").into())
+}
+
+fn prompt_value(prompt: &str) -> Result<String, Box<dyn Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
 }
 
 fn remove_mcp_server(root: &mut Mapping, name: &str) -> bool {
@@ -352,6 +576,16 @@ fn remove_mcp_server(root: &mut Mapping, name: &str) -> bool {
     }
 
     removed
+}
+
+fn upsert_top_level_mcp_server(root: &mut Mapping, name: &str, value: Value) {
+    let top_key = yaml_key("mcp_servers");
+    if !matches!(root.get(&top_key), Some(Value::Mapping(_))) {
+        root.insert(top_key.clone(), Value::Mapping(Mapping::new()));
+    }
+    if let Some(Value::Mapping(servers)) = root.get_mut(&top_key) {
+        servers.insert(yaml_key(name), value);
+    }
 }
 
 fn cleanup_oauth_tokens(
@@ -409,6 +643,10 @@ fn yaml_key(key: &str) -> Value {
     Value::String(key.to_string())
 }
 
+fn yaml_string(value: impl Into<String>) -> Value {
+    Value::String(value.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,33 +695,126 @@ mod tests {
     }
 
     #[test]
-    fn bridge_subcommand_preserves_remaining_args() {
+    fn add_subcommand_parses_structured_args() {
         let parsed = McpHarness::try_parse_from([
             "mcp",
             "add",
             "alpha",
             "--url",
             "https://example.com/mcp",
+            "--auth",
+            "oauth",
             "--env",
             "API_KEY=test",
+            "OTHER=value",
         ])
         .unwrap();
 
         match parsed.command {
             McpCommand::Add(args) => {
+                assert_eq!(args.name, "alpha");
+                assert_eq!(args.url.as_deref(), Some("https://example.com/mcp"));
+                assert_eq!(args.auth.as_deref(), Some("oauth"));
                 assert_eq!(
-                    args.args,
-                    vec![
-                        String::from("alpha"),
-                        String::from("--url"),
-                        String::from("https://example.com/mcp"),
-                        String::from("--env"),
-                        String::from("API_KEY=test"),
-                    ]
+                    args.env,
+                    vec![String::from("API_KEY=test"), String::from("OTHER=value")]
                 );
             }
             _ => panic!("expected add args"),
         }
+    }
+
+    #[test]
+    fn add_http_server_writes_native_config() {
+        let home = temp_path("add-http");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Add(AddArgs {
+                name: String::from("alpha"),
+                url: Some(String::from("https://example.com/mcp")),
+                command: None,
+                command_args: Vec::new(),
+                auth: None,
+                preset: None,
+                env: Vec::new(),
+                yes: true,
+            })),
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("mcp_servers:"));
+        assert!(saved.contains("alpha:"));
+        assert!(saved.contains("url: https://example.com/mcp"));
+        assert!(saved.contains("enabled: true"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn add_stdio_server_writes_native_config_with_env() {
+        let home = temp_path("add-stdio");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Add(AddArgs {
+                name: String::from("github"),
+                url: None,
+                command: Some(String::from("npx")),
+                command_args: vec![String::from("@modelcontextprotocol/server-github")],
+                auth: None,
+                preset: None,
+                env: vec![String::from("GITHUB_PERSONAL_ACCESS_TOKEN=test-token")],
+                yes: true,
+            })),
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("github:"));
+        assert!(saved.contains("command: npx"));
+        assert!(saved.contains("- '@modelcontextprotocol/server-github'"));
+        assert!(saved.contains("GITHUB_PERSONAL_ACCESS_TOKEN: test-token"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn add_http_header_auth_uses_existing_env_key() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("add-http-auth");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let env_key = env_key_for_server("remote-api");
+        let old = env::var_os(&env_key);
+        set_env_var(&env_key, "secret-token");
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Add(AddArgs {
+                name: String::from("remote-api"),
+                url: Some(String::from("https://example.com/mcp")),
+                command: None,
+                command_args: Vec::new(),
+                auth: Some(String::from("header")),
+                preset: None,
+                env: Vec::new(),
+                yes: true,
+            })),
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("remote-api:"));
+        assert!(saved.contains("Authorization: Bearer ${MCP_REMOTE_API_API_KEY}"));
+
+        match old {
+            Some(value) => set_env_var(&env_key, value),
+            None => remove_env_var(&env_key),
+        }
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -512,21 +843,11 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_MCP_PYTHON", &fake_python);
-        bridge_mcp(
-            "add",
-            &[
-                String::from("alpha"),
-                String::from("--url"),
-                String::from("https://example.com/mcp"),
-                String::from("--env"),
-                String::from("API_KEY=test"),
-            ],
-        )
-        .unwrap();
+        bridge_mcp("test", &[String::from("alpha")]).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("subcommand=add"));
-        assert!(output.contains("argv=alpha --url https://example.com/mcp --env API_KEY=test"));
+        assert!(output.contains("subcommand=test"));
+        assert!(output.contains("argv=alpha"));
 
         remove_env_var("HERMES_MCP_PYTHON");
     }
