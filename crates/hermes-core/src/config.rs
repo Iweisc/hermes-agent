@@ -9,6 +9,7 @@ use crate::{
     HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
+    resolve_provider_api_mode,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -436,6 +437,7 @@ impl HermesContext {
             action: "resolving model runtime",
             detail: format!("Provider '{provider}' is not recognized by the Rust runtime."),
         })?;
+        let model = normalize_model_for_provider(&raw_model, &provider);
 
         let base_url = explicit_base_url
             .or(config_base_url)
@@ -485,8 +487,15 @@ impl HermesContext {
             });
         }
 
+        let inferred_api_mode = infer_api_mode_from_base_url(&base_url).map(ToOwned::to_owned);
+        let provider_api_mode = resolve_provider_api_mode(&provider, &model).map(ToOwned::to_owned);
         let api_mode = requested_api_mode
-            .or_else(|| infer_api_mode_from_base_url(&base_url).map(ToOwned::to_owned))
+            .or_else(|| {
+                matches!(inferred_api_mode.as_deref(), Some("anthropic_messages"))
+                    .then(|| "anthropic_messages".to_string())
+            })
+            .or(provider_api_mode)
+            .or(inferred_api_mode)
             .unwrap_or_else(|| profile.api_mode.to_string())
             .to_ascii_lowercase();
         if !matches!(
@@ -498,7 +507,6 @@ impl HermesContext {
                 detail: format!("API mode '{api_mode}' is not ported in the Rust runtime yet."),
             });
         }
-        let model = normalize_model_for_provider(&raw_model, &provider);
 
         let mut default_headers = profile
             .default_headers
@@ -953,5 +961,83 @@ mod tests {
         assert_eq!(runtime.api_mode, "bedrock_converse");
         assert_eq!(runtime.auth_type, "aws_sdk");
         assert!(runtime.api_key.is_empty());
+    }
+
+    #[test]
+    fn resolve_model_runtime_applies_provider_specific_api_modes() {
+        let cases = [
+            (
+                "copilot",
+                "gpt-5.4",
+                "https://api.githubcopilot.com",
+                "gpt-5.4",
+                "codex_responses",
+            ),
+            (
+                "azure-foundry",
+                "gpt-5.4",
+                "https://example.openai.azure.com/v1",
+                "gpt-5.4",
+                "codex_responses",
+            ),
+            (
+                "opencode-zen",
+                "claude-sonnet-4.6",
+                "https://opencode.ai/zen/v1",
+                "claude-sonnet-4-6",
+                "anthropic_messages",
+            ),
+        ];
+
+        for (provider, model_name, base_url, expected_model, expected_api_mode) in cases {
+            let (_temp, ctx) = test_context();
+            ctx.ensure_hermes_home().expect("ensure home");
+            fs::write(
+                ctx.config_path(),
+                format!(
+                    "model:\n  default: {model_name}\n  provider: {provider}\n  base_url: {base_url}\n"
+                ),
+            )
+            .expect("write config");
+
+            let loaded = ctx.load_config_document().expect("load config");
+            let runtime = ctx
+                .resolve_model_runtime(
+                    &loaded,
+                    &ModelOverrides {
+                        api_key: Some("test-key".to_string()),
+                        ..ModelOverrides::default()
+                    },
+                )
+                .expect("resolve runtime");
+
+            assert_eq!(runtime.provider, provider);
+            assert_eq!(runtime.model, expected_model);
+            assert_eq!(runtime.api_mode, expected_api_mode);
+        }
+    }
+
+    #[test]
+    fn resolve_model_runtime_keeps_anthropic_url_inference_ahead_of_model_routing() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: gpt-5.4\n  provider: azure-foundry\n  base_url: https://example.azure.com/anthropic/v1\n",
+        )
+        .expect("write config");
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(
+                &loaded,
+                &ModelOverrides {
+                    api_key: Some("test-key".to_string()),
+                    ..ModelOverrides::default()
+                },
+            )
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.api_mode, "anthropic_messages");
     }
 }

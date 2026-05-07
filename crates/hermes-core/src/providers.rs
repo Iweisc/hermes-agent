@@ -38,6 +38,7 @@ impl ProviderProfile {
 const EMPTY_HEADERS: &[(&str, &str)] = &[];
 const AI_GATEWAY_HEADERS: &[(&str, &str)] = &[("x-source", "hermes-agent")];
 const KIMI_HEADERS: &[(&str, &str)] = &[("User-Agent", "hermes-agent/1.0")];
+const AZURE_FOUNDRY_RESPONSES_PREFIXES: &[&str] = &["codex", "gpt-5", "o1", "o3", "o4"];
 
 const PROVIDERS: &[ProviderProfile] = &[
     ProviderProfile {
@@ -502,6 +503,18 @@ pub fn infer_api_mode_from_base_url(base_url: &str) -> Option<&'static str> {
     None
 }
 
+pub fn resolve_provider_api_mode(provider: &str, model_input: &str) -> Option<&'static str> {
+    let normalized_provider = normalize_provider_alias(provider);
+    match normalized_provider.as_str() {
+        "copilot" => Some(copilot_model_api_mode(model_input)),
+        "azure-foundry" => azure_foundry_model_api_mode(model_input),
+        "opencode-zen" | "opencode-go" => {
+            Some(opencode_model_api_mode(&normalized_provider, model_input))
+        }
+        _ => None,
+    }
+}
+
 pub fn normalize_model_for_provider(model_input: &str, target_provider: &str) -> String {
     let name = model_input.trim();
     if name.is_empty() {
@@ -580,6 +593,72 @@ fn normalize_for_deepseek(model_name: &str) -> String {
         return "deepseek-reasoner".to_string();
     }
     "deepseek-chat".to_string()
+}
+
+fn copilot_model_api_mode(model_input: &str) -> &'static str {
+    if should_use_copilot_responses_api(model_input) {
+        "codex_responses"
+    } else {
+        "chat_completions"
+    }
+}
+
+fn should_use_copilot_responses_api(model_input: &str) -> bool {
+    let normalized = normalize_model_for_provider(model_input, "copilot").to_ascii_lowercase();
+    let Some(rest) = normalized.strip_prefix("gpt-") else {
+        return false;
+    };
+    let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return false;
+    }
+    let Ok(major) = rest[..digit_count].parse::<u32>() else {
+        return false;
+    };
+    major >= 5 && !normalized.starts_with("gpt-5-mini")
+}
+
+fn azure_foundry_model_api_mode(model_input: &str) -> Option<&'static str> {
+    let mut normalized = model_input.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some((_, tail)) = normalized.rsplit_once('/') {
+        normalized = tail.trim().to_string();
+    }
+    AZURE_FOUNDRY_RESPONSES_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        .then_some("codex_responses")
+}
+
+fn opencode_model_api_mode(provider: &str, model_input: &str) -> &'static str {
+    let normalized_provider = normalize_provider_alias(provider);
+    let normalized_model =
+        normalize_model_for_provider(model_input, &normalized_provider).to_ascii_lowercase();
+    if normalized_model.is_empty() {
+        return "chat_completions";
+    }
+
+    match normalized_provider.as_str() {
+        "opencode-go" => {
+            if normalized_model.starts_with("minimax-") {
+                "anthropic_messages"
+            } else {
+                "chat_completions"
+            }
+        }
+        "opencode-zen" => {
+            if normalized_model.starts_with("claude-") {
+                "anthropic_messages"
+            } else if normalized_model.starts_with("gpt-") {
+                "codex_responses"
+            } else {
+                "chat_completions"
+            }
+        }
+        _ => "chat_completions",
+    }
 }
 
 fn deepseek_v_series(model_name: &str) -> bool {
@@ -713,6 +792,39 @@ mod tests {
         );
         assert_eq!(
             infer_api_mode_from_base_url("https://api.deepseek.com/v1"),
+            Some("chat_completions")
+        );
+    }
+
+    #[test]
+    fn provider_specific_api_mode_routing_matches_python_rules() {
+        assert_eq!(
+            resolve_provider_api_mode("copilot", "openai/gpt-5.4"),
+            Some("codex_responses")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("copilot", "gpt-5-mini"),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("azure-foundry", "openai/gpt-5.4"),
+            Some("codex_responses")
+        );
+        assert_eq!(resolve_provider_api_mode("azure-foundry", "gpt-4o"), None);
+        assert_eq!(
+            resolve_provider_api_mode("opencode-zen", "opencode-zen/gpt-5.4"),
+            Some("codex_responses")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("opencode-zen", "claude-sonnet-4.6"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("opencode-go", "opencode-go/minimax-m2.5"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("opencode-go", "glm-5.1"),
             Some("chat_completions")
         );
     }
