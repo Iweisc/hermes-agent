@@ -193,6 +193,15 @@ struct WellKnownSkillSummary {
     identifier: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchCatalogSummary {
+    name: String,
+    description: String,
+    source: String,
+    trust: String,
+    identifier: String,
+}
+
 #[derive(Debug, Clone)]
 struct InstallArgsParsed {
     identifier: String,
@@ -691,6 +700,46 @@ fn search_skills_command(
     let Some((query, limit, source)) = parse_search_args(passthrough)? else {
         return bridge_prefixed("search", passthrough);
     };
+    if source == "all" {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return bridge_prefixed("search", passthrough);
+        }
+        let matches = search_all_catalog_summaries(context, needle, limit)?;
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                truncate(&skill.source, 12),
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source == "github" {
         let needle = query.trim().to_ascii_lowercase();
         if needle.is_empty() {
@@ -5273,6 +5322,145 @@ fn fetch_url_bundle_to_tempdir(
     )))
 }
 
+fn trust_rank(trust: &str) -> u8 {
+    match trust {
+        "builtin" => 3,
+        "trusted" => 2,
+        "community" => 1,
+        _ => 0,
+    }
+}
+
+fn catalog_matches_query(name: &str, description: &str, tags: &[String], needle: &str) -> bool {
+    let searchable = format!("{name} {description} {}", tags.join(" ")).to_ascii_lowercase();
+    searchable.contains(needle)
+}
+
+fn merge_catalog_search_result(
+    results: &mut Vec<SearchCatalogSummary>,
+    summary: SearchCatalogSummary,
+) {
+    if let Some(existing) = results.iter_mut().find(|entry| entry.name == summary.name) {
+        if trust_rank(&summary.trust) > trust_rank(&existing.trust) {
+            *existing = summary;
+        }
+        return;
+    }
+    results.push(summary);
+}
+
+fn search_all_catalog_summaries(
+    context: &HermesContext,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchCatalogSummary>, Box<dyn Error>> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.max(1);
+    let mut results = Vec::new();
+
+    for skill in collect_official_skill_summaries()?
+        .into_iter()
+        .filter(|skill| {
+            catalog_matches_query(&skill.name, &skill.description, &skill.tags, &needle)
+        })
+        .take(limit)
+    {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("official"),
+                trust: String::from("builtin"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in search_skills_sh_summaries(query, limit)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("skills-sh"),
+                trust: skill.trust,
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_well_known_skill_summaries(query, limit)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("well-known"),
+                trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_github_skill_summaries(context)?
+        .into_iter()
+        .filter(|skill| {
+            catalog_matches_query(&skill.name, &skill.description, &skill.tags, &needle)
+        })
+        .take(limit)
+    {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("github"),
+                trust: skill.trust,
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in search_clawhub_skill_summaries(query, limit)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("clawhub"),
+                trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_lobehub_skill_summaries()?
+        .into_iter()
+        .filter(|skill| {
+            catalog_matches_query(&skill.name, &skill.description, &skill.tags, &needle)
+        })
+        .take(limit)
+    {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("lobehub"),
+                trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    results.truncate(limit);
+    Ok(results)
+}
+
 fn resolve_single_catalog_skill_identifier(
     context: &HermesContext,
     raw: &str,
@@ -7449,13 +7637,13 @@ exit 9\n",
             &[
                 String::from("deploy"),
                 String::from("--source"),
-                String::from("all"),
+                String::from("claude-marketplace"),
             ],
         )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=search argv=deploy --source all"));
+        assert!(output.contains("action=search argv=deploy --source claude-marketplace"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -7644,6 +7832,102 @@ exit 9\n",
             Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
             None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
         }
+    }
+
+    #[test]
+    fn search_all_catalog_summaries_dedupes_supported_sources() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("search-all-home");
+        let optional = temp_path("search-all-optional");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let source_dir = optional.join("research").join("deploy-demo");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: deploy-demo\ndescription: Official deploy helper\ntags: [deploy, ops]\n---\nbody\n",
+        )
+        .unwrap();
+
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let clawhub_requests = Arc::new(Mutex::new(Vec::new()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let (github_base, github_handle) = spawn_github_empty_server(github_requests.clone());
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (clawhub_base, clawhub_handle) = spawn_clawhub_server(clawhub_requests.clone());
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+
+        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
+        let old_github_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        let old_skills_sh_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_clawhub_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        set_env_var("GITHUB_API_BASE_URL", &github_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &clawhub_base);
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+
+        let results = search_all_catalog_summaries(&context, "deploy", 5).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].name, "deploy-demo");
+        assert_eq!(results[0].source, "official");
+        assert_eq!(results[0].trust, "builtin");
+        let deploy_guide = results
+            .iter()
+            .find(|skill| skill.name == "deploy-guide")
+            .unwrap();
+        assert_eq!(deploy_guide.source, "skills-sh");
+        assert_eq!(deploy_guide.trust, "community");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|skill| skill.name == "deploy-guide")
+                .count(),
+            1
+        );
+        assert!(
+            results
+                .iter()
+                .any(|skill| skill.name == "shipit" && skill.source == "skills-sh")
+        );
+        assert!(results.iter().any(|skill| {
+            skill.identifier == "clawhub/deploy-agent" && skill.source == "clawhub"
+        }));
+
+        github_handle.join().unwrap();
+        skills_sh_handle.join().unwrap();
+        clawhub_handle.join().unwrap();
+        lobehub_handle.join().unwrap();
+
+        match old_optional {
+            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
+            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
+        }
+        match old_github_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        match old_skills_sh_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_clawhub_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
     }
 
     #[test]
@@ -8511,48 +8795,96 @@ exit 9\n",
         (format!("http://{addr}"), handle)
     }
 
+    fn spawn_github_empty_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request);
+                        let body = "{}";
+                        let response = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("github empty test server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     fn spawn_skills_sh_server(
         requests: Arc<Mutex<Vec<String>>>,
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let handle = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_http_request(&mut stream);
-                requests.lock().unwrap().push(request.clone());
-                let first_line = request.lines().next().unwrap_or_default();
-                let (status, body, content_type) = if first_line.starts_with("GET /api/search?") {
-                    (
-                        "HTTP/1.1 200 OK",
-                        r#"{"skills":[{"id":"openai/skills/shipit","name":"shipit","installs":42},{"source":"community/repo","skillId":"deploy-guide","name":"deploy-guide","installs":7}]}"#
-                            .to_string(),
-                        "application/json",
-                    )
-                } else if first_line.starts_with("GET / ") {
-                    (
-                        "HTTP/1.1 200 OK",
-                        r#"<html><body>
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /api/search?")
+                        {
+                            (
+                                    "HTTP/1.1 200 OK",
+                                    r#"{"skills":[{"id":"openai/skills/shipit","name":"shipit","installs":42},{"source":"community/repo","skillId":"deploy-guide","name":"deploy-guide","installs":7}]}"#
+                                        .to_string(),
+                                    "application/json",
+                                )
+                        } else if first_line.starts_with("GET / ") {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"<html><body>
 <a href="/openai/skills/shipit">Shipit</a>
 <a href="/community/repo/deploy-guide">Deploy</a>
 <a href="/openai/skills/shipit">Duplicate</a>
 </body></html>"#
-                            .to_string(),
-                        "text/html",
-                    )
-                } else {
-                    (
-                        "HTTP/1.1 404 Not Found",
-                        "{}".to_string(),
-                        "application/json",
-                    )
-                };
-                let response = format!(
-                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
+                                    .to_string(),
+                                "text/html",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("skills.sh test server accept failed: {error}"),
+                }
             }
         });
         (format!("http://{addr}"), handle)
