@@ -4,6 +4,8 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 pub mod agent;
 mod auth;
@@ -38,11 +40,12 @@ mod yuanbao;
 
 pub use agent::AgentTurnResult;
 pub use auth::{
-    CopilotAcpRuntimeCredentials, GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials,
-    NousRuntimeCredentials, QwenRuntimeCredentials, codex_cloudflare_headers,
-    resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
-    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
+    CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials, GoogleGeminiRuntimeCredentials,
+    MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials, QwenRuntimeCredentials,
+    codex_cloudflare_headers, resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
+    resolve_copilot_runtime_credentials, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
+    resolve_qwen_runtime_credentials,
 };
 pub use config::{
     AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,
@@ -174,6 +177,12 @@ impl Error for HermesError {
             _ => None,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

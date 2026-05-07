@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use chrono::Utc;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::HermesError;
 
@@ -14,6 +18,9 @@ const AUTH_STORE_VERSION: i64 = 1;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const COPILOT_TOKEN_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_EDITOR_VERSION: &str = "vscode/1.104.1";
+const COPILOT_EXCHANGE_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const DEFAULT_COPILOT_ACP_BASE_URL: &str = "acp://copilot";
 const DEFAULT_COPILOT_ACP_COMMAND: &str = "copilot";
 const DEFAULT_NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
@@ -33,6 +40,11 @@ const DEFAULT_QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
 const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_TOKEN_URL: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const COPILOT_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+const COPILOT_CLASSIC_PAT_PREFIX: &str = "ghp_";
+const COPILOT_TOKEN_REFRESH_MARGIN_SECONDS: f64 = 120.0;
+
+static COPILOT_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTokens {
@@ -50,6 +62,11 @@ pub struct MinimaxOAuthRuntimeCredentials {
 pub struct CopilotAcpRuntimeCredentials {
     pub base_url: String,
     pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotRuntimeCredentials {
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +143,13 @@ pub fn resolve_copilot_acp_runtime_credentials() -> Result<CopilotAcpRuntimeCred
         base_url: base_url.trim_end_matches('/').to_string(),
         command: resolved,
     })
+}
+
+pub fn resolve_copilot_runtime_credentials() -> Result<CopilotRuntimeCredentials, HermesError> {
+    resolve_copilot_runtime_credentials_with_client_and_exchange_url(
+        &Client::new(),
+        &copilot_exchange_url(),
+    )
 }
 
 pub fn resolve_nous_runtime_credentials(
@@ -273,6 +297,183 @@ fn resolve_minimax_oauth_runtime_credentials_with_client(
     })
 }
 
+fn resolve_copilot_runtime_credentials_with_client_and_exchange_url(
+    client: &Client,
+    exchange_url: &str,
+) -> Result<CopilotRuntimeCredentials, HermesError> {
+    let raw_token = resolve_copilot_raw_token()?;
+    let api_key = exchange_copilot_token(client, &raw_token, exchange_url).unwrap_or(raw_token);
+    Ok(CopilotRuntimeCredentials { api_key })
+}
+
+fn resolve_copilot_raw_token() -> Result<String, HermesError> {
+    for env_var in COPILOT_ENV_VARS {
+        if let Ok(value) = env::var(env_var)
+            && let Some(token) = non_empty_trimmed(&value)
+        {
+            if copilot_token_is_supported(&token) {
+                return Ok(token);
+            }
+        }
+    }
+
+    if let Some(token) = try_gh_cli_token()? {
+        if copilot_token_is_supported(&token) {
+            return Ok(token);
+        }
+        return Err(HermesError::State {
+            action: "resolving Copilot auth",
+            detail: "GitHub CLI returned a classic PAT (ghp_*), which is not supported by Copilot. Use copilot login, a fine-grained github_pat_* token, or COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN with a supported token."
+                .to_string(),
+        });
+    }
+
+    Err(HermesError::State {
+        action: "resolving Copilot auth",
+        detail: "No Copilot credentials found. Set COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN, or authenticate with `gh auth login`."
+            .to_string(),
+    })
+}
+
+fn copilot_token_is_supported(token: &str) -> bool {
+    let trimmed = token.trim();
+    !trimmed.is_empty() && !trimmed.starts_with(COPILOT_CLASSIC_PAT_PREFIX)
+}
+
+fn gh_cli_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(value) = env::var("HERMES_COPILOT_GH_PATH")
+        && let Some(path) = non_empty_trimmed(&value)
+    {
+        candidates.push(path);
+    }
+    if let Some(path) = resolve_command_path("gh") {
+        candidates.push(path);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let local = home.join(".local").join("bin").join("gh");
+        if local.is_file() {
+            candidates.push(local.to_string_lossy().to_string());
+        }
+    }
+    for candidate in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+        if Path::new(candidate).is_file() {
+            candidates.push(candidate.to_string());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn try_gh_cli_token() -> Result<Option<String>, HermesError> {
+    let hostname = env::var("COPILOT_GH_HOST")
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed);
+    for gh_path in gh_cli_candidates() {
+        let mut command = Command::new(&gh_path);
+        command.arg("auth").arg("token");
+        if let Some(hostname) = hostname.as_deref() {
+            command.arg("--hostname").arg(hostname);
+        }
+        command.env_remove("GITHUB_TOKEN").env_remove("GH_TOKEN");
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(token) = non_empty_trimmed(&stdout) {
+            return Ok(Some(token));
+        }
+    }
+    Ok(None)
+}
+
+fn exchange_copilot_token(
+    client: &Client,
+    raw_token: &str,
+    exchange_url: &str,
+) -> Result<String, HermesError> {
+    let fingerprint = copilot_token_fingerprint(raw_token);
+    if let Ok(cache) = copilot_token_cache().lock()
+        && let Some((token, expires_at)) = cache.get(&fingerprint)
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+        if now < *expires_at - COPILOT_TOKEN_REFRESH_MARGIN_SECONDS {
+            return Ok(token.clone());
+        }
+    }
+
+    let response = client
+        .get(exchange_url)
+        .header("Authorization", format!("token {raw_token}"))
+        .header("User-Agent", COPILOT_EXCHANGE_USER_AGENT)
+        .header("Accept", "application/json")
+        .header("Editor-Version", COPILOT_EDITOR_VERSION)
+        .send()
+        .map_err(|error| HermesError::State {
+            action: "exchanging Copilot token",
+            detail: error.to_string(),
+        })?;
+    let status = response.status();
+    let body = response.text().map_err(|error| HermesError::State {
+        action: "reading Copilot token exchange response",
+        detail: error.to_string(),
+    })?;
+    if !status.is_success() {
+        return Err(HermesError::State {
+            action: "exchanging Copilot token",
+            detail: format!(
+                "Copilot token exchange failed with status {}.",
+                status.as_u16()
+            ),
+        });
+    }
+    let payload = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Copilot token exchange response",
+        detail: format!("{error}: {body}"),
+    })?;
+    let api_token = payload
+        .get("token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| HermesError::State {
+            action: "exchanging Copilot token",
+            detail: "Copilot token exchange response was missing token.".to_string(),
+        })?;
+    let expires_at = value_to_f64(payload.get("expires_at").unwrap_or(&Value::Null))
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs_f64())
+                .unwrap_or(0.0)
+                + 1800.0
+        });
+    if let Ok(mut cache) = copilot_token_cache().lock() {
+        cache.insert(fingerprint, (api_token.clone(), expires_at));
+    }
+    Ok(api_token)
+}
+
+fn copilot_token_fingerprint(raw_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_token.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 fn load_auth_store(path: &Path) -> Result<Value, HermesError> {
     if !path.exists() {
         return Ok(json!({
@@ -316,6 +517,18 @@ fn resolve_command_path(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn copilot_exchange_url() -> String {
+    env::var("HERMES_COPILOT_TOKEN_EXCHANGE_URL")
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| COPILOT_TOKEN_EXCHANGE_URL.to_string())
+}
+
+fn copilot_token_cache() -> &'static Mutex<HashMap<String, (String, f64)>> {
+    COPILOT_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn google_oauth_path(hermes_home: &Path) -> std::path::PathBuf {
@@ -1768,6 +1981,18 @@ fn value_to_i64(value: &Value) -> Option<i64> {
         })
 }
 
+fn value_to_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|raw| raw as f64))
+        .or_else(|| value.as_u64().map(|raw| raw as f64))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        })
+}
+
 fn non_empty_trimmed(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -1832,10 +2057,7 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn jwt_with_claims(exp: i64, account_id: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2162,7 +2384,7 @@ mod tests {
 
     #[test]
     fn resolve_copilot_acp_runtime_credentials_reads_env_command_and_base_url() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
         let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
 
@@ -2195,6 +2417,174 @@ mod tests {
 
         assert_eq!(resolved.base_url, "acp://copilot");
         assert_eq!(resolved.command, fake.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_copilot_runtime_credentials_exchanges_env_token() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_copilot = env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = env::var_os("GH_TOKEN");
+        let previous_github = env::var_os("GITHUB_TOKEN");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("GET /copilot-token "));
+            assert!(
+                request_text
+                    .to_ascii_lowercase()
+                    .contains("authorization: token gho_envtoken")
+            );
+
+            let body = json!({
+                "token": "copilot-api-token",
+                "expires_at": 4102444800_u64
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        unsafe {
+            env::set_var("COPILOT_GITHUB_TOKEN", "gho_envtoken");
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+        }
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_copilot_runtime_credentials_with_client_and_exchange_url(
+            &client,
+            &format!("http://{addr}/copilot-token"),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
+            None => unsafe { env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("GITHUB_TOKEN") },
+        }
+
+        assert_eq!(resolved.api_key, "copilot-api-token");
+    }
+
+    #[test]
+    fn resolve_copilot_runtime_credentials_uses_gh_cli_fallback() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_copilot = env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = env::var_os("GH_TOKEN");
+        let previous_github = env::var_os("GITHUB_TOKEN");
+        let previous_gh_path = env::var_os("HERMES_COPILOT_GH_PATH");
+
+        let temp = TempDir::new().unwrap();
+        let gh = temp.path().join("gh");
+        fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ]; then\n  echo gho_from_gh\n  exit 0\nfi\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&gh).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&gh, permissions).unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text
+                    .to_ascii_lowercase()
+                    .contains("authorization: token gho_from_gh")
+            );
+
+            let body = json!({
+                "token": "copilot-api-token-gh",
+                "expires_at": 4102444800_u64
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        unsafe {
+            env::remove_var("COPILOT_GITHUB_TOKEN");
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+            env::set_var("HERMES_COPILOT_GH_PATH", &gh);
+        }
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_copilot_runtime_credentials_with_client_and_exchange_url(
+            &client,
+            &format!("http://{addr}/copilot-token"),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
+            None => unsafe { env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("GITHUB_TOKEN") },
+        }
+        match previous_gh_path {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_GH_PATH", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_GH_PATH") },
+        }
+
+        assert_eq!(resolved.api_key, "copilot-api-token-gh");
     }
 
     #[test]

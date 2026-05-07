@@ -2668,13 +2668,11 @@ mod tests {
 
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2915,7 +2913,7 @@ mod tests {
 
     #[test]
     fn google_gemini_cli_requests_code_assist_payload_and_persists_project() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_home = env::var_os("HERMES_HOME");
         let previous_base = env::var_os(GOOGLE_CODE_ASSIST_BASE_URL_ENV);
 
@@ -3113,7 +3111,7 @@ mod tests {
 
     #[test]
     fn copilot_acp_bridge_returns_text_response() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
         let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
 
@@ -3247,6 +3245,134 @@ for raw in sys.stdin:
             fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
             "hello from tool"
         );
+    }
+
+    #[test]
+    fn copilot_chat_completion_uses_exchanged_token_and_copilot_headers() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_copilot = env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = env::var_os("GH_TOKEN");
+        let previous_github = env::var_os("GITHUB_TOKEN");
+        let previous_exchange = env::var_os("HERMES_COPILOT_TOKEN_EXCHANGE_URL");
+
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let join = thread::spawn(move || {
+            for expected in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut content_length = 0usize;
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                        content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    }
+                    headers.push(trimmed);
+                }
+                let mut body = vec![0_u8; content_length];
+                let _ = reader.read_exact(&mut body);
+
+                let response = if expected == 0 {
+                    assert!(request_line.starts_with("GET /copilot-token "));
+                    let all_headers = headers.join("\n").to_ascii_lowercase();
+                    assert!(all_headers.contains("authorization: token gho_runtime_agent"));
+                    json!({
+                        "token": "copilot-api-token",
+                        "expires_at": 4102444800_u64
+                    })
+                    .to_string()
+                } else {
+                    assert!(request_line.starts_with("POST /v1/chat/completions "));
+                    let all_headers = headers.join("\n").to_ascii_lowercase();
+                    assert!(all_headers.contains("authorization: bearer copilot-api-token"));
+                    assert!(all_headers.contains("editor-version: vscode/1.104.1"));
+                    assert!(all_headers.contains("copilot-integration-id: vscode-chat"));
+                    assert!(all_headers.contains("openai-intent: conversation-edits"));
+                    assert!(all_headers.contains("x-initiator: agent"));
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Copilot Rust smoke passed."
+                            }
+                        }]
+                    })
+                    .to_string()
+                };
+
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(http.as_bytes());
+            }
+        });
+
+        unsafe {
+            env::set_var("COPILOT_GITHUB_TOKEN", "gho_runtime_agent");
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+            env::set_var(
+                "HERMES_COPILOT_TOKEN_EXCHANGE_URL",
+                format!("http://{addr}/copilot-token"),
+            );
+        }
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Hello from copilot",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("gpt-4.1".to_string()),
+                    provider: Some("copilot".to_string()),
+                    base_url: Some(format!("http://{addr}/v1")),
+                    api_mode: Some("chat_completions".to_string()),
+                    ..ModelOverrides::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        join.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
+            None => unsafe { env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("GITHUB_TOKEN") },
+        }
+        match previous_exchange {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL") },
+        }
+
+        assert_eq!(result.final_response, "Copilot Rust smoke passed.");
     }
 
     #[test]

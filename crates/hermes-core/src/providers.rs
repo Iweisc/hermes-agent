@@ -37,6 +37,13 @@ impl ProviderProfile {
 
 const EMPTY_HEADERS: &[(&str, &str)] = &[];
 const AI_GATEWAY_HEADERS: &[(&str, &str)] = &[("x-source", "hermes-agent")];
+const COPILOT_HEADERS: &[(&str, &str)] = &[
+    ("Editor-Version", "vscode/1.104.1"),
+    ("User-Agent", "HermesAgent/1.0"),
+    ("Copilot-Integration-Id", "vscode-chat"),
+    ("Openai-Intent", "conversation-edits"),
+    ("x-initiator", "agent"),
+];
 const KIMI_HEADERS: &[(&str, &str)] = &[("User-Agent", "hermes-agent/1.0")];
 const AZURE_FOUNDRY_RESPONSES_PREFIXES: &[&str] = &["codex", "gpt-5", "o1", "o3", "o4"];
 
@@ -162,7 +169,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         env_vars: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
         base_url: "https://api.githubcopilot.com",
         auth_type: "copilot",
-        default_headers: EMPTY_HEADERS,
+        default_headers: COPILOT_HEADERS,
     },
     ProviderProfile {
         name: "deepseek",

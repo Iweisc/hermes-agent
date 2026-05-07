@@ -9,9 +9,9 @@ use crate::{
     HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
-    resolve_copilot_acp_runtime_credentials, resolve_google_gemini_runtime_credentials,
-    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
-    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
+    resolve_copilot_acp_runtime_credentials, resolve_copilot_runtime_credentials,
+    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
+    resolve_nous_runtime_credentials, resolve_provider_api_mode, resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -464,6 +464,11 @@ impl HermesContext {
         } else {
             None
         };
+        let copilot_runtime = if provider == "copilot" && explicit_api_key.is_none() {
+            Some(resolve_copilot_runtime_credentials()?)
+        } else {
+            None
+        };
         let nous_runtime = if provider == "nous"
             && explicit_api_key.is_none()
             && env::var("NOUS_API_KEY")
@@ -514,6 +519,7 @@ impl HermesContext {
         let mut api_key = explicit_api_key
             .or(config_api_key)
             .or_else(|| (provider == "copilot-acp").then(|| "copilot-acp".to_string()))
+            .or_else(|| copilot_runtime.as_ref().map(|creds| creds.api_key.clone()))
             .or_else(|| {
                 minimax_oauth
                     .as_ref()
@@ -883,10 +889,9 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde_json::json;
-    use std::sync::Mutex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_context() -> (TempDir, HermesContext) {
         let temp = TempDir::new().expect("tempdir");
@@ -926,7 +931,7 @@ mod tests {
 
     #[test]
     fn load_config_document_deep_merges_and_expands_env_vars() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let (_temp, ctx) = test_context();
         ctx.ensure_hermes_home().expect("ensure home");
         let config_yaml = "logging:\n  level: DEBUG\ndisplay:\n  skin: ${HERMES_TEST_SKIN}\n";
@@ -1228,7 +1233,7 @@ mod tests {
 
     #[test]
     fn resolve_model_runtime_reads_copilot_acp_runtime_credentials() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
         let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
 
@@ -1275,8 +1280,97 @@ mod tests {
     }
 
     #[test]
+    fn resolve_model_runtime_reads_copilot_runtime_credentials() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_copilot = env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = env::var_os("GH_TOKEN");
+        let previous_github = env::var_os("GITHUB_TOKEN");
+        let previous_exchange = env::var_os("HERMES_COPILOT_TOKEN_EXCHANGE_URL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text
+                    .to_ascii_lowercase()
+                    .contains("authorization: token gho_runtime_config")
+            );
+            let body = json!({
+                "token": "copilot-runtime-token",
+                "expires_at": 4102444800_u64
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: gpt-4.1\n  provider: copilot\n",
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var("COPILOT_GITHUB_TOKEN", "gho_runtime_config");
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+            env::set_var(
+                "HERMES_COPILOT_TOKEN_EXCHANGE_URL",
+                format!("http://{addr}/copilot-token"),
+            );
+        }
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+        server.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { env::set_var("GH_TOKEN", value) },
+            None => unsafe { env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { env::remove_var("GITHUB_TOKEN") },
+        }
+        match previous_exchange {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL") },
+        }
+
+        assert_eq!(runtime.provider, "copilot");
+        assert_eq!(runtime.api_key, "copilot-runtime-token");
+        assert_eq!(runtime.base_url, "https://api.githubcopilot.com");
+    }
+
+    #[test]
     fn resolve_model_runtime_reads_qwen_oauth_credentials() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_home = env::var_os("HOME");
         let previous_qwen_base = env::var_os("HERMES_QWEN_BASE_URL");
 

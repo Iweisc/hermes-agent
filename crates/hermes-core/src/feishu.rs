@@ -895,6 +895,7 @@ mod tests {
 
     #[test]
     fn doc_read_returns_content() {
+        let _guard = acquire_test_lock();
         clear_token_cache_for_tests();
         let (base_url, join) = mock_server(2, |index, headers, body| match index {
             0 => {
@@ -942,6 +943,7 @@ mod tests {
 
     #[test]
     fn list_calls_reuse_cached_token() {
+        let _guard = acquire_test_lock();
         clear_token_cache_for_tests();
         let (base_url, join) = mock_server(3, |index, headers, _body| match index {
             0 => (
@@ -1004,6 +1006,7 @@ mod tests {
 
     #[test]
     fn reply_comment_posts_expected_body() {
+        let _guard = acquire_test_lock();
         clear_token_cache_for_tests();
         let (base_url, join) = mock_server(2, |index, headers, body| match index {
             0 => (
@@ -1050,6 +1053,7 @@ mod tests {
 
     #[test]
     fn add_comment_posts_expected_body() {
+        let _guard = acquire_test_lock();
         clear_token_cache_for_tests();
         let (base_url, join) = mock_server(2, |index, headers, body| match index {
             0 => (
