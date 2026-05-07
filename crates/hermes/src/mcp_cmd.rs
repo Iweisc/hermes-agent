@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use hermes_core::HermesContext;
@@ -139,16 +139,17 @@ fn test_server(context: &HermesContext, args: TestArgs) -> Result<(), Box<dyn Er
     }
     print_auth_info(&entry.config)?;
 
-    if config_string(&entry.config, "auth")
-        .map(|value| value.eq_ignore_ascii_case("oauth"))
-        .unwrap_or(false)
+    if is_oauth_configured(&entry.config)
+        && resolve_cached_oauth_access_token(context, name).is_none()
     {
-        println!("  OAuth-configured server detected; using compatibility probe.");
+        println!(
+            "  OAuth-configured server has no cached access token; using compatibility probe."
+        );
         return bridge_mcp("test", &[name.to_string()]);
     }
 
     let start = Instant::now();
-    let tools = probe_server_tools(name, &entry.config)?;
+    let tools = probe_server_tools(context, name, &entry.config)?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     println!("  Connected ({elapsed_ms:.0}ms)");
@@ -260,16 +261,15 @@ fn configure_server_io<R: BufRead, W: Write>(
         return Err(format!("Server '{name}' not found in config.{suffix}").into());
     };
 
-    if config_string(&entry.config, "auth")
-        .map(|value| value.eq_ignore_ascii_case("oauth"))
-        .unwrap_or(false)
+    if is_oauth_configured(&entry.config)
+        && resolve_cached_oauth_access_token(context, name).is_none()
     {
         return bridge_mcp("configure", &[name.to_string()]);
     }
 
     writeln!(output)?;
     writeln!(output, "  Connecting to '{name}' to discover tools...")?;
-    let all_tools = probe_server_tools(name, &entry.config)?;
+    let all_tools = probe_server_tools(context, name, &entry.config)?;
     if all_tools.is_empty() {
         writeln!(output, "  Server reports no tools.")?;
         return Ok(());
@@ -333,11 +333,12 @@ fn configure_server_io<R: BufRead, W: Write>(
 }
 
 fn probe_server_tools(
+    context: &HermesContext,
     name: &str,
     config: &Mapping,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     if config.contains_key(yaml_key("url")) {
-        return probe_http_server(name, config);
+        return probe_http_server(context, name, config);
     }
     if config.contains_key(yaml_key("command")) {
         return probe_stdio_server(name, config);
@@ -447,6 +448,7 @@ fn probe_stdio_server(
 }
 
 fn probe_http_server(
+    context: &HermesContext,
     name: &str,
     config: &Mapping,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
@@ -457,7 +459,17 @@ fn probe_http_server(
         .timeout(timeout)
         .build()?;
 
-    let default_headers = build_http_headers(config, None, Some(DEFAULT_MCP_PROTOCOL_VERSION))?;
+    let oauth_token = if is_oauth_configured(config) {
+        resolve_cached_oauth_access_token(context, name)
+    } else {
+        None
+    };
+    let default_headers = build_http_headers(
+        config,
+        None,
+        Some(DEFAULT_MCP_PROTOCOL_VERSION),
+        oauth_token.as_deref(),
+    )?;
     let init = send_http_jsonrpc(
         &client,
         &url,
@@ -480,8 +492,12 @@ fn probe_http_server(
     let protocol_version = extract_protocol_version(&init.body)
         .unwrap_or_else(|| DEFAULT_MCP_PROTOCOL_VERSION.to_string());
 
-    let initialized_headers =
-        build_http_headers(config, init.session_id.as_deref(), Some(&protocol_version))?;
+    let initialized_headers = build_http_headers(
+        config,
+        init.session_id.as_deref(),
+        Some(&protocol_version),
+        oauth_token.as_deref(),
+    )?;
     let _ = send_http_jsonrpc(
         &client,
         &url,
@@ -496,8 +512,12 @@ fn probe_http_server(
         true,
     )?;
 
-    let list_headers =
-        build_http_headers(config, init.session_id.as_deref(), Some(&protocol_version))?;
+    let list_headers = build_http_headers(
+        config,
+        init.session_id.as_deref(),
+        Some(&protocol_version),
+        oauth_token.as_deref(),
+    )?;
     let tools = send_http_jsonrpc(
         &client,
         &url,
@@ -574,6 +594,7 @@ fn build_http_headers(
     config: &Mapping,
     session_id: Option<&str>,
     protocol_version: Option<&str>,
+    oauth_bearer_token: Option<&str>,
 ) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
     let mut headers = BTreeMap::new();
     headers.insert(
@@ -616,7 +637,72 @@ fn build_http_headers(
             DEFAULT_MCP_PROTOCOL_VERSION.to_string(),
         );
     }
+    if is_oauth_configured(config)
+        && !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("authorization"))
+        && let Some(token) = oauth_bearer_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        headers.insert(String::from("authorization"), format!("Bearer {token}"));
+    }
     Ok(headers)
+}
+
+fn is_oauth_configured(config: &Mapping) -> bool {
+    config_string(config, "auth")
+        .map(|value| value.eq_ignore_ascii_case("oauth"))
+        .unwrap_or(false)
+}
+
+fn resolve_cached_oauth_access_token(context: &HermesContext, server_name: &str) -> Option<String> {
+    let safe_name = safe_oauth_server_filename(server_name);
+    let path = context
+        .hermes_home()
+        .join("mcp-tokens")
+        .join(format!("{safe_name}.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    let payload = serde_json::from_str::<JsonValue>(&raw).ok()?;
+    if let Some(expires_at) = payload.get("expires_at").and_then(JsonValue::as_f64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        if expires_at <= now + 30.0 {
+            return None;
+        }
+    }
+    payload
+        .get("access_token")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn safe_oauth_server_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    let limited = if trimmed.len() > 128 {
+        &trimmed[..128]
+    } else {
+        trimmed
+    };
+    if limited.is_empty() {
+        String::from("default")
+    } else {
+        limited.to_string()
+    }
 }
 
 fn print_auth_info(config: &Mapping) -> Result<(), Box<dyn Error>> {
@@ -2084,6 +2170,93 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
 
     #[test]
     #[cfg(unix)]
+    fn native_http_oauth_test_uses_cached_token() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("native-http-oauth-test");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, handle) = spawn_http_test_server(requests.clone());
+        fs::write(
+            context.config_path(),
+            format!("mcp_servers:\n  remote:\n    url: {url}\n    auth: oauth\n"),
+        )
+        .unwrap();
+        fs::write(
+            home.join("mcp-tokens").join("remote.json"),
+            r#"{"access_token":"secret-token","token_type":"Bearer","expires_at":4102444800}"#,
+        )
+        .unwrap();
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Test(TestArgs {
+                name: String::from("remote"),
+            })),
+        )
+        .unwrap();
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        assert!(logged[2].contains("authorization"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn oauth_http_test_bridges_without_cached_token() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("oauth-http-test-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            context.config_path(),
+            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
+        )
+        .unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+
+        print_mcp(
+            &context,
+            Some(McpCommand::Test(TestArgs {
+                name: String::from("alpha"),
+            })),
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("subcommand=test"));
+        assert!(output.contains("argv=alpha"));
+
+        remove_env_var("HERMES_MCP_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn native_configure_updates_tool_include_list() {
         let home = temp_path("native-configure");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2123,6 +2296,52 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Currently 2/2 tools enabled"));
         assert!(rendered.contains("Updated config: 1/2 tools enabled"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_oauth_configure_uses_cached_token() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("native-oauth-configure");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, handle) = spawn_http_test_server(requests.clone());
+        fs::write(
+            context.config_path(),
+            format!("mcp_servers:\n  alpha:\n    url: {url}\n    auth: oauth\n"),
+        )
+        .unwrap();
+        fs::write(
+            home.join("mcp-tokens").join("alpha.json"),
+            r#"{"access_token":"secret-token","token_type":"Bearer","expires_at":4102444800}"#,
+        )
+        .unwrap();
+
+        let input = std::io::Cursor::new("none\n");
+        let mut output = Vec::new();
+        configure_server_io(
+            &context,
+            &ConfigureArgs {
+                name: String::from("alpha"),
+            },
+            input,
+            &mut output,
+        )
+        .unwrap();
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("include: []"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Currently 1/1 tools enabled"));
+        assert!(rendered.contains("Updated config: 0/1 tools enabled"));
 
         let _ = fs::remove_dir_all(home);
     }
