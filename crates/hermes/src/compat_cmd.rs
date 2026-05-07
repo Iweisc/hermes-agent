@@ -30,10 +30,6 @@ pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("whatsapp", args)
 }
 
-pub fn print_update(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("update", args)
-}
-
 pub fn print_uninstall(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("uninstall", args)
 }

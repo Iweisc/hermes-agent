@@ -23,6 +23,7 @@ mod plugins_cmd;
 mod python_bridge;
 mod slack_cmd;
 mod snapshot_cmd;
+mod update_cmd;
 mod webhook;
 
 use std::error::Error;
@@ -170,7 +171,7 @@ enum Command {
         #[command(subcommand)]
         command: ToolsCommand,
     },
-    Update(compat_cmd::CompatArgs),
+    Update(update_cmd::UpdateArgs),
     Whatsapp(compat_cmd::CompatArgs),
     Status,
 }
@@ -368,7 +369,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
         Command::Tools { command } => print_tools(&context, &config, command)?,
-        Command::Update(args) => compat_cmd::print_update(args)?,
+        Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp(args) => compat_cmd::print_whatsapp(args)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
     }
