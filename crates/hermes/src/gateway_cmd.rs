@@ -1281,11 +1281,11 @@ fn generate_systemd_unit(
     let root = project_root();
     let python = resolve_repo_python(&root, None)
         .ok_or("could not find a Python interpreter for gateway service install")?;
-    let mut python_path = python;
+    let mut gateway_binary = resolve_gateway_service_binary(context, None)?;
     let mut working_dir = root;
     let mut hermes_home = context.hermes_home();
     let profile_arg = gateway_profile_arg(context);
-    let mut venv_dir = derive_venv_dir(&python_path).unwrap_or_else(|| working_dir.join(".venv"));
+    let mut venv_dir = derive_venv_dir(&python).unwrap_or_else(|| working_dir.join(".venv"));
     let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
     let mut path_entries = build_gateway_path_entries(&working_dir, &venv_bin);
     let mut wanted_by = "default.target";
@@ -1293,8 +1293,8 @@ fn generate_systemd_unit(
 
     if system {
         let resolved = system_service_identity(run_as_user)?;
-        python_path =
-            remap_path_for_target_user(&python_path, context.home_dir(), &resolved.home_dir);
+        gateway_binary =
+            remap_path_for_target_user(&gateway_binary, context.home_dir(), &resolved.home_dir);
         working_dir =
             remap_path_for_target_user(&working_dir, context.home_dir(), &resolved.home_dir);
         hermes_home = remap_hermes_home_for_target_user(context, &resolved.home_dir);
@@ -1318,14 +1318,11 @@ fn generate_systemd_unit(
     path_entries.dedup();
     let sane_path = path_entries.join(":");
     let exec_start = if profile_arg.is_empty() {
-        format!(
-            "{} -m hermes_cli.main gateway run --replace",
-            python_path.display()
-        )
+        format!("{} gateway run --replace", gateway_binary.display())
     } else {
         format!(
-            "{} -m hermes_cli.main {profile_arg} gateway run --replace",
-            python_path.display()
+            "{} {profile_arg} gateway run --replace",
+            gateway_binary.display()
         )
     };
 
@@ -1672,7 +1669,7 @@ fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Err
     let root = project_root();
     let python = resolve_repo_python(&root, None)
         .ok_or("could not find a Python interpreter for gateway service install")?;
-    let python_path = python.display().to_string();
+    let gateway_binary = resolve_gateway_service_binary(context, None)?;
     let working_dir = root.display().to_string();
     let hermes_home = context.hermes_home().display().to_string();
     let log_dir = context.hermes_home().join("logs");
@@ -1697,7 +1694,7 @@ fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Err
     path_entries.dedup();
     let sane_path = path_entries.join(":");
 
-    let mut program_args = vec![String::from("-m"), String::from("hermes_cli.main")];
+    let mut program_args = vec![gateway_binary.display().to_string()];
     if !profile_arg.is_empty() {
         program_args.extend(profile_arg.split_whitespace().map(str::to_string));
     }
@@ -1713,14 +1710,26 @@ fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Err
         .join("\n");
 
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{}</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>{}</string>\n{}\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>{working_dir}</string>\n\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{sane_path}</string>\n        <key>VIRTUAL_ENV</key>\n        <string>{}</string>\n        <key>HERMES_HOME</key>\n        <string>{hermes_home}</string>\n    </dict>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>\n\n    <key>StandardOutPath</key>\n    <string>{}/gateway.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>{}/gateway.error.log</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{}</string>\n\n    <key>ProgramArguments</key>\n    <array>\n{}\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>{working_dir}</string>\n\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{sane_path}</string>\n        <key>VIRTUAL_ENV</key>\n        <string>{}</string>\n        <key>HERMES_HOME</key>\n        <string>{hermes_home}</string>\n    </dict>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>\n\n    <key>StandardOutPath</key>\n    <string>{}/gateway.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>{}/gateway.error.log</string>\n</dict>\n</plist>\n",
         launchd_label(context),
-        xml_escape(&python_path),
         args_xml,
         venv_dir.display(),
         log_dir.display(),
         log_dir.display()
     ))
+}
+
+fn resolve_gateway_service_binary(
+    context: &HermesContext,
+    target_home: Option<&Path>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let mut binary = env::var_os("HERMES_GATEWAY_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_exe()?);
+    if let Some(home_dir) = target_home {
+        binary = remap_path_for_target_user(&binary, context.home_dir(), home_dir);
+    }
+    Ok(binary)
 }
 
 fn stop_manual_gateway(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
@@ -2538,7 +2547,10 @@ exit 9\n",
 
         let unit_path = systemd_unit_path(&ctx, false);
         let unit = fs::read_to_string(&unit_path).unwrap();
+        let current_exe = env::current_exe().unwrap();
         assert!(unit.contains("gateway run --replace"));
+        assert!(unit.contains(&current_exe.display().to_string()));
+        assert!(!unit.contains("hermes_cli.main"));
         assert!(unit.contains("HERMES_HOME="));
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(log.contains("--user daemon-reload"));
@@ -2589,7 +2601,10 @@ exit 9\n",
 
         let unit_path = systemd_unit_path(&ctx, true);
         let unit = fs::read_to_string(&unit_path).unwrap();
+        let current_exe = env::current_exe().unwrap();
         assert!(unit.contains("gateway run --replace"));
+        assert!(unit.contains(&current_exe.display().to_string()));
+        assert!(!unit.contains("hermes_cli.main"));
         assert!(unit.contains(&format!("User={run_as_user}")));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(unit.contains("Environment=\"HOME="));
@@ -2606,10 +2621,13 @@ exit 9\n",
     fn generate_launchd_plist_contains_gateway_command_and_home() {
         let (_temp, ctx) = test_context();
         let plist = generate_launchd_plist(&ctx).unwrap();
+        let current_exe = env::current_exe().unwrap();
         assert!(plist.contains("<key>ProgramArguments</key>"));
         assert!(plist.contains("gateway"));
         assert!(plist.contains("run"));
         assert!(plist.contains("--replace"));
+        assert!(plist.contains(&xml_escape(&current_exe.display().to_string())));
+        assert!(!plist.contains("hermes_cli.main"));
         assert!(plist.contains("HERMES_HOME"));
     }
 
