@@ -4,13 +4,16 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::HermesContext;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use md5::Context as Md5Context;
 use regex::Regex;
 use reqwest::StatusCode;
+use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 use sha2::Digest;
@@ -2007,18 +2010,68 @@ fn resolve_publish_skill_dir(
 }
 
 fn github_app_auth_configured() -> bool {
-    std::env::var("GITHUB_APP_ID")
+    read_nonempty_env_var("GITHUB_APP_ID").is_some()
+        && read_nonempty_env_var("GITHUB_APP_PRIVATE_KEY_PATH").is_some()
+        && read_nonempty_env_var("GITHUB_APP_INSTALLATION_ID").is_some()
+}
+
+fn read_nonempty_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-        && std::env::var("GITHUB_APP_PRIVATE_KEY_PATH")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
-        && std::env::var("GITHUB_APP_INSTALLATION_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_some()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Serialize)]
+struct GitHubAppClaims<'a> {
+    iat: u64,
+    exp: u64,
+    iss: &'a str,
+}
+
+fn resolve_github_app_installation_token() -> Option<String> {
+    let app_id = read_nonempty_env_var("GITHUB_APP_ID")?;
+    let key_path = read_nonempty_env_var("GITHUB_APP_PRIVATE_KEY_PATH")?;
+    let installation_id = read_nonempty_env_var("GITHUB_APP_INSTALLATION_ID")?;
+    let private_key = fs::read(key_path).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let claims = GitHubAppClaims {
+        iat: now.saturating_sub(60),
+        exp: now.saturating_add(10 * 60),
+        iss: &app_id,
+    };
+    let jwt = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(&private_key).ok()?,
+    )
+    .ok()?;
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()
+        .ok()?;
+    let response = client
+        .post(format!(
+            "{}/app/installations/{installation_id}/access_tokens",
+            github_api_base()
+        ))
+        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+        .send()
+        .ok()?;
+    if response.status() != StatusCode::CREATED {
+        return None;
+    }
+
+    response
+        .json::<JsonValue>()
+        .ok()?
+        .get("token")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn resolve_github_publish_token() -> Option<String> {
@@ -2031,12 +2084,18 @@ fn resolve_github_publish_token() -> Option<String> {
         return env_token;
     }
 
-    let output = Command::new("gh").arg("auth").arg("token").output().ok()?;
+    let output = match Command::new("gh").arg("auth").arg("token").output() {
+        Ok(output) => output,
+        Err(_) => return resolve_github_app_installation_token(),
+    };
     if !output.status.success() {
-        return None;
+        return resolve_github_app_installation_token();
     }
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!token.is_empty()).then_some(token)
+    if token.is_empty() {
+        return resolve_github_app_installation_token();
+    }
+    Some(token)
 }
 
 fn github_api_base() -> String {
@@ -9301,6 +9360,93 @@ exit 9\n",
         (format!("http://{addr}"), handle)
     }
 
+    const TEST_GITHUB_APP_PRIVATE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+MIIEogIBAAKCAQEAq5F3uXFJ3a+t93vXePuPzQkr/nfmM8oIUjcUy+6jwFg51vCw\n\
+oSm4B5HZpowjD2PfwECDTlxt40hcWqrTbcqd6YzU/B/lEXGKNwuKNf41Fm5pnY04\n\
+AtP23XbAKtBceujUkcfQRJDHEwL4CpTU6vJgU0cvODOs2zIbkVdvKbjUUZThBp8s\n\
+n38zC9ZYXkWZqvnEjVe8dCprMoOjWjotar4J6blJobilMS/MUT/ZVhkW/PXHEKcG\n\
+z+NbvFL91Czrv3coSNj+1SLSonEZhCH1yAGRQ/84hk0/tPZiJVSB/lmopYd+L1t/\n\
+KtJlrta9HjyQg4Z64a/pjWXsEzXINkYehfZx7QIDAQABAoIBAAiXMJD7ALFWdhYB\n\
+v/DBW9pu3qKPu1mVgKQpOOPbL5zWbhL6m0V+ksXiQi0qMCk5nX8BW/HFBAWQ3nr1\n\
+ub9yGUUT9agoKq6cakjGTaXVdDAK2EP4ybiuh1pgc0/Rfgfzd41THXUJcMZdbDEP\n\
+cbfP6g3RbyZXxAx3rlSxNZI3vH3XKu3XIgDafDzakRC0U3PwoTscBMoFouY+HGDF\n\
+HpVYSGLZ3Y9kfbsjrOfhmeXnL9c0iIExBSz5SMgb8CoeSeguwX3Q3zlUmSlMazmw\n\
+bZqnFDBT/U+BRXar98sV9kc6qTbBGv8PpMJxBo7BeE7GbXbwtNGBA8MFF86Y77U3\n\
+tXa7CfECgYEA6f0DqsBeR9T4k/eYdHMiZ826YPnVDBdFbFu/zlNEMoubKK6fdAVl\n\
+GVUutJiM0SyQTurgV/Md9+orjMp2DtiEx/xpjCoGP71sROMBXH2Mv+vK0ohFR2xA\n\
+Al0sutpadQgSm3NUkaVP/ULNNoEtQlaj1NjdgoafhOHEkkSWebf97OkCgYEAu7U7\n\
+QFd29cwy2MfFqxFf1TiX8X5vWyMfHgAJ2VdNFS6+fdfULgpU21oceP6GtvsAWRSw\n\
+da3jZ7DdRMzUJ6QTrJb8zfeKENrU97oUXeqkVxD2/cRpfRsUf+tHxhyNJqHq3GcF\n\
+V7DSzOuCKwvH8ZWGzpW6AKuqws3+29OyUjGD6mUCgYAD6qlKDWhGmYkDqQxTPq4f\n\
+wLDS+LuZNTaDRtHiGUC1++I//xRKM+DqWKOsgDUzNyS/PW0966LfyHqsI6NwQi2O\n\
+z2nQ38809+29BXO7YZqeh8rgVUmblXNI1tht1EPZW6Y8FeUffv3kxl57ABSK3Lpn\n\
+UK38hlZbOhA5Ro6iQPMuKQKBgC3Db6CuMliW4kar3etpHv4zAAhmlOuZUnrT85LD\n\
+kA18CgFQX3CiIDIidBKjq2BtLZaKTsNCE9Ex86BUd9z6SbmoThZBJa4aTBXhjhmf\n\
+nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
++kVpAoGAeNpBh2ugqMUHs6Ud+BRLK+XF5KozA4Q6IWjDaQje6cndc9w8U1bqXd9R\n\
+42PIQLqb2Kq9rXiy5asOXoLYhX9nTe/AWq0qVMUUu/byvfpot4sPt45vgBwwdr93\n\
+/u6gmK+VCKxm6licOKSQKk4UQXBEQcxGfcTKUTZkx7PBbRnBXVQ=\n\
+-----END RSA PRIVATE KEY-----\n";
+
+    fn spawn_github_app_publish_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                requests.lock().unwrap().push(request.clone());
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if first_line
+                    .starts_with("POST /app/installations/456/access_tokens ")
+                {
+                    (
+                        "HTTP/1.1 201 Created",
+                        r#"{"token":"app-install-token"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("POST /repos/owner/repo/forks ") {
+                    (
+                        "HTTP/1.1 202 Accepted",
+                        r#"{"full_name":"tester/repo-fork"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("GET /repos/owner/repo ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"default_branch":"main"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("GET /repos/tester/repo-fork/git/refs/heads/main ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"object":{"sha":"abc123"}}"#.to_string(),
+                    )
+                } else if first_line.starts_with("POST /repos/tester/repo-fork/git/refs ") {
+                    ("HTTP/1.1 201 Created", "{}".to_string())
+                } else if first_line
+                    .starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/")
+                {
+                    ("HTTP/1.1 201 Created", "{}".to_string())
+                } else if first_line.starts_with("POST /repos/owner/repo/pulls ") {
+                    (
+                        "HTTP/1.1 201 Created",
+                        r#"{"html_url":"https://example.test/pr/1"}"#.to_string(),
+                    )
+                } else {
+                    ("HTTP/1.1 404 Not Found", "{}".to_string())
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     fn spawn_github_inspect_server(
         requests: Arc<Mutex<Vec<String>>>,
     ) -> (String, thread::JoinHandle<()>) {
@@ -9910,31 +10056,18 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn publish_bridges_when_github_app_auth_is_configured() {
+    fn publish_native_github_app_flow_mints_installation_token() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
+        let key_path = temp.path().join("github-app.pem");
+        fs::write(&key_path, TEST_GITHUB_APP_PRIVATE_KEY).unwrap();
         let old_path = env::var_os("PATH");
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
         let old_github_token = env::var_os("GITHUB_TOKEN");
         let old_gh_token = env::var_os("GH_TOKEN");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        let old_github_app_id = env::var_os("GITHUB_APP_ID");
+        let old_github_app_key_path = env::var_os("GITHUB_APP_PRIVATE_KEY_PATH");
+        let old_github_app_installation_id = env::var_os("GITHUB_APP_INSTALLATION_ID");
 
         let home = temp_path("publish-bridge");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -9946,12 +10079,15 @@ exit 9\n",
         )
         .unwrap();
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_app_publish_server(requests.clone());
+
         set_env_var("PATH", temp.path());
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
         remove_env_var("GITHUB_TOKEN");
         remove_env_var("GH_TOKEN");
         set_env_var("GITHUB_APP_ID", "123");
-        set_env_var("GITHUB_APP_PRIVATE_KEY_PATH", "/tmp/key.pem");
+        set_env_var("GITHUB_APP_PRIVATE_KEY_PATH", &key_path);
         set_env_var("GITHUB_APP_INSTALLATION_ID", "456");
 
         publish_skill_command(
@@ -9964,13 +10100,49 @@ exit 9\n",
         )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=publish argv=demo --repo owner/repo"));
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 8);
+        let bearer_requests = logged
+            .iter()
+            .filter(|request| {
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer ")
+            })
+            .count();
+        assert_eq!(bearer_requests, 2);
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|request| {
+                    request.starts_with("POST /app/installations/456/access_tokens ")
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            logged
+                .iter()
+                .filter(|request| {
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: token app-install-token")
+                })
+                .count(),
+            6
+        );
+        assert!(logged.iter().any(|request| {
+            request.starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/SKILL.md ")
+        }));
 
-        remove_env_var("HERMES_SKILLS_PYTHON");
         match old_path {
             Some(value) => set_env_var("PATH", value),
             None => remove_env_var("PATH"),
+        }
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
         }
         match old_github_token {
             Some(value) => set_env_var("GITHUB_TOKEN", value),
@@ -9980,9 +10152,18 @@ exit 9\n",
             Some(value) => set_env_var("GH_TOKEN", value),
             None => remove_env_var("GH_TOKEN"),
         }
-        remove_env_var("GITHUB_APP_ID");
-        remove_env_var("GITHUB_APP_PRIVATE_KEY_PATH");
-        remove_env_var("GITHUB_APP_INSTALLATION_ID");
+        match old_github_app_id {
+            Some(value) => set_env_var("GITHUB_APP_ID", value),
+            None => remove_env_var("GITHUB_APP_ID"),
+        }
+        match old_github_app_key_path {
+            Some(value) => set_env_var("GITHUB_APP_PRIVATE_KEY_PATH", value),
+            None => remove_env_var("GITHUB_APP_PRIVATE_KEY_PATH"),
+        }
+        match old_github_app_installation_id {
+            Some(value) => set_env_var("GITHUB_APP_INSTALLATION_ID", value),
+            None => remove_env_var("GITHUB_APP_INSTALLATION_ID"),
+        }
         let _ = fs::remove_dir_all(home);
     }
 

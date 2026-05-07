@@ -14,6 +14,7 @@ dirs.workspace = true
 flate2.workspace = true
 hermes-core = { path = "../hermes-core" }
 hmac.workspace = true
+jsonwebtoken.workspace = true
 libc.workspace = true
 log.workspace = true
 md5.workspace = true
