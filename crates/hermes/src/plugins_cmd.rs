@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand};
 use hermes_core::HermesContext;
 use serde_yaml::{Mapping, Value};
+use tempfile::TempDir;
 
-use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Subcommand, Debug)]
@@ -51,45 +53,29 @@ struct PluginEntry {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct EnvSpec {
+    name: String,
+    description: String,
+    url: String,
+    secret: bool,
+}
+
+const SUPPORTED_MANIFEST_VERSION: i64 = 1;
+
 pub fn print_plugins(
     context: &HermesContext,
     command: Option<PluginsCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
         None => bridge_plugins(None, &[]),
-        Some(PluginsCommand::Install(args)) => bridge_install(args),
-        Some(PluginsCommand::Update { name }) => bridge_update(&name),
+        Some(PluginsCommand::Install(args)) => install_plugin(context, args),
+        Some(PluginsCommand::Update { name }) => update_plugin(context, &name),
         Some(PluginsCommand::List) => print_list(context),
         Some(PluginsCommand::Enable { name }) => enable_plugin(context, &name),
         Some(PluginsCommand::Disable { name }) => disable_plugin(context, &name),
         Some(PluginsCommand::Remove { name }) => remove_plugin(context, &name),
     }
-}
-
-fn bridge_install(args: InstallArgs) -> Result<(), Box<dyn Error>> {
-    let identifier = args.identifier.trim();
-    if identifier.is_empty() {
-        return Err("plugin identifier cannot be empty".into());
-    }
-    let mut argv = vec![identifier.to_string()];
-    if args.force {
-        argv.push(String::from("--force"));
-    }
-    if args.enable {
-        argv.push(String::from("--enable"));
-    }
-    if args.no_enable {
-        argv.push(String::from("--no-enable"));
-    }
-    bridge_plugins(Some("install"), &argv)
-}
-
-fn bridge_update(name: &str) -> Result<(), Box<dyn Error>> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("plugin name cannot be empty".into());
-    }
-    bridge_plugins(Some("update"), &[name.to_string()])
 }
 
 fn bridge_plugins(action: Option<&str>, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
@@ -139,6 +125,470 @@ fn exit_status_message(command: &str, status: ExitStatus) -> String {
         Some(code) => format!("{command} exited with status {code}"),
         None => format!("{command} terminated by signal"),
     }
+}
+
+fn install_plugin(context: &HermesContext, args: InstallArgs) -> Result<(), Box<dyn Error>> {
+    let identifier = args.identifier.trim();
+    if identifier.is_empty() {
+        return Err("plugin identifier cannot be empty".into());
+    }
+
+    let git_url = resolve_git_url(identifier)?;
+    if git_url.starts_with("http://") || git_url.starts_with("file://") {
+        println!("Warning: using insecure/local URL scheme: {git_url}");
+    }
+    println!("Cloning {git_url}...");
+
+    let (target, manifest, installed_name) = install_plugin_core(context, identifier, args.force)?;
+    copy_example_files(&target)?;
+    prompt_plugin_env_vars(context, &manifest)?;
+    display_after_install(&target, identifier)?;
+
+    let should_enable = resolve_install_enable_choice(&args, &installed_name)?;
+    if should_enable {
+        let mut enabled = load_plugin_set(context, "enabled")?;
+        let mut disabled = load_plugin_set(context, "disabled")?;
+        enabled.insert(installed_name.clone());
+        disabled.remove(&installed_name);
+        save_plugin_set(context, "enabled", &enabled)?;
+        save_plugin_set(context, "disabled", &disabled)?;
+        println!("Enabled plugin '{installed_name}'.");
+    } else {
+        println!("Plugin installed but not enabled.");
+        println!("Run `hermes plugins enable {installed_name}` to activate.");
+    }
+
+    println!("Restart the gateway for the plugin to take effect:");
+    println!("  hermes gateway restart");
+    Ok(())
+}
+
+fn update_plugin(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn Error>> {
+    let (name, target) = resolve_installed_plugin(context, raw_name)?.ok_or_else(|| {
+        format!(
+            "plugin '{}' not found in {}",
+            raw_name.trim(),
+            user_plugins_dir(context)
+                .ok()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| String::from("plugins"))
+        )
+    })?;
+    if !target.join(".git").exists() {
+        return Err(format!(
+            "plugin '{name}' was not installed from git (no .git directory). Cannot update."
+        )
+        .into());
+    }
+
+    println!("Updating {name}...");
+    let output = git_pull_plugin_dir(&target)?;
+    copy_example_files(&target)?;
+
+    if output.contains("Already up to date") {
+        println!("Plugin '{name}' is already up to date.");
+    } else {
+        println!("Plugin '{name}' updated.");
+        if !output.trim().is_empty() {
+            println!("{output}");
+        }
+    }
+    Ok(())
+}
+
+fn install_plugin_core(
+    context: &HermesContext,
+    identifier: &str,
+    force: bool,
+) -> Result<(PathBuf, Mapping, String), Box<dyn Error>> {
+    let git_url = resolve_git_url(identifier)?;
+    let plugins_dir = user_plugins_dir(context)?;
+    let temp = TempDir::new()?;
+    let temp_target = temp.path().join("plugin");
+
+    run_git_clone(&git_url, &temp_target)?;
+
+    let manifest = read_manifest_mapping(&temp_target)?;
+    let plugin_name = manifest
+        .get(Value::String(String::from("name")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| repo_name_from_url(&git_url));
+
+    validate_manifest_version(&manifest, &plugin_name)?;
+    let safe_name = validate_plugin_name(&plugin_name)?;
+    let target = plugins_dir.join(&safe_name);
+
+    if target.exists() {
+        if !force {
+            return Err(format!(
+                "plugin '{plugin_name}' already exists. Use --force or run `hermes plugins update {plugin_name}`."
+            )
+            .into());
+        }
+        fs::remove_dir_all(&target)?;
+    }
+
+    fs::rename(&temp_target, &target)?;
+
+    if manifest_path(&target).is_none() && !target.join("__init__.py").exists() {
+        println!(
+            "Warning: {} has no plugin.yaml / __init__.py; it may not be a valid Hermes plugin.",
+            plugin_name
+        );
+    }
+
+    let installed_manifest = read_manifest_mapping(&target)?;
+    let installed_name = installed_manifest
+        .get(Value::String(String::from("name")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&safe_name)
+        .to_string();
+
+    Ok((target, installed_manifest, installed_name))
+}
+
+fn resolve_git_url(identifier: &str) -> Result<String, Box<dyn Error>> {
+    let trimmed = identifier.trim();
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("git@")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("file://")
+    {
+        return Ok(trimmed.to_string());
+    }
+
+    let parts = trimmed.trim_matches('/').split('/').collect::<Vec<_>>();
+    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+        return Ok(format!(
+            "https://github.com/{}/{}.git",
+            parts[0].trim(),
+            parts[1].trim()
+        ));
+    }
+
+    Err(
+        format!("invalid plugin identifier: '{trimmed}'. Use a Git URL or owner/repo shorthand.")
+            .into(),
+    )
+}
+
+fn repo_name_from_url(url: &str) -> String {
+    let mut trimmed = url.trim().trim_end_matches('/').to_string();
+    if trimmed.ends_with(".git") {
+        trimmed.truncate(trimmed.len() - 4);
+    }
+    let last = trimmed
+        .rsplit('/')
+        .next()
+        .unwrap_or(trimmed.as_str())
+        .to_string();
+    last.rsplit(':').next().unwrap_or(last.as_str()).to_string()
+}
+
+fn run_git_clone(git_url: &str, target: &Path) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", git_url])
+        .arg(target)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("git is not installed or not in PATH.".into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(format!(
+        "Git clone failed:\n{}",
+        if !stderr.is_empty() { stderr } else { stdout }
+    )
+    .into())
+}
+
+fn git_pull_plugin_dir(target: &Path) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("git")
+        .current_dir(target)
+        .args(["pull", "--ff-only"])
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("git is not installed or not in PATH.".into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(if !stderr.is_empty() { stderr } else { stdout }.into())
+}
+
+fn read_manifest_mapping(path: &Path) -> Result<Mapping, Box<dyn Error>> {
+    let Some(manifest_path) = manifest_path(path) else {
+        return Ok(Mapping::new());
+    };
+    let text = fs::read_to_string(manifest_path)?;
+    let parsed = serde_yaml::from_str::<Value>(&text)?;
+    match parsed {
+        Value::Mapping(mapping) => Ok(mapping),
+        Value::Null => Ok(Mapping::new()),
+        _ => Err(format!("{} must contain a YAML mapping", path.display()).into()),
+    }
+}
+
+fn validate_manifest_version(manifest: &Mapping, plugin_name: &str) -> Result<(), Box<dyn Error>> {
+    let Some(value) = manifest.get(Value::String(String::from("manifest_version"))) else {
+        return Ok(());
+    };
+    let version = match value {
+        Value::Number(number) => number.as_i64().ok_or_else(|| {
+            format!("Plugin '{plugin_name}' has invalid manifest_version '{number}'.")
+        })?,
+        Value::String(text) => text.trim().parse::<i64>().map_err(|_| {
+            format!(
+                "Plugin '{plugin_name}' has invalid manifest_version '{}'.",
+                text.trim()
+            )
+        })?,
+        _ => {
+            return Err(format!(
+                "Plugin '{plugin_name}' has invalid manifest_version; expected an integer."
+            )
+            .into());
+        }
+    };
+    if version > SUPPORTED_MANIFEST_VERSION {
+        return Err(format!(
+            "Plugin '{plugin_name}' requires manifest_version {version}, but this installer only supports up to {SUPPORTED_MANIFEST_VERSION}. Run `hermes update` to update Hermes."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn copy_example_files(plugin_dir: &Path) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(plugin_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(real_name) = file_name.strip_suffix(".example") else {
+            continue;
+        };
+        let target = plugin_dir.join(real_name);
+        if target.exists() {
+            continue;
+        }
+        fs::copy(&path, &target)?;
+        println!("  Created {real_name} from {file_name}");
+    }
+    Ok(())
+}
+
+fn prompt_plugin_env_vars(
+    context: &HermesContext,
+    manifest: &Mapping,
+) -> Result<(), Box<dyn Error>> {
+    let specs = parse_manifest_env_specs(manifest);
+    if specs.is_empty() {
+        return Ok(());
+    }
+
+    let missing = specs
+        .into_iter()
+        .filter(|spec| {
+            std::env::var(&spec.name)
+                .ok()
+                .is_none_or(|value| value.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let plugin_name = manifest
+        .get(Value::String(String::from("name")))
+        .and_then(Value::as_str)
+        .unwrap_or("this plugin");
+    println!("\n{plugin_name} requires the following environment variables:\n");
+
+    for spec in missing {
+        if !spec.description.trim().is_empty() {
+            println!("  {} — {}", spec.name, spec.description);
+        } else {
+            println!("  {}", spec.name);
+        }
+        if !spec.url.trim().is_empty() {
+            println!("  Get yours at: {}", spec.url);
+        }
+
+        let prompt = format!("  {}: ", spec.name);
+        let value = if spec.secret {
+            read_prompt(prompt.as_str(), true)?
+        } else {
+            read_prompt(prompt.as_str(), false)?
+        };
+        let Some(value) = value else {
+            println!(
+                "\n  Skipped (you can set these later in {}/.env)\n",
+                context.display_hermes_home()
+            );
+            return Ok(());
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            println!(
+                "  Skipped (set {} in {}/.env later)",
+                spec.name,
+                context.display_hermes_home()
+            );
+            continue;
+        }
+
+        save_env_value(context.env_path(), &spec.name, trimmed)?;
+        unsafe {
+            std::env::set_var(&spec.name, trimmed);
+        }
+        println!("  Saved to {}/.env", context.display_hermes_home());
+    }
+    println!();
+    Ok(())
+}
+
+fn parse_manifest_env_specs(manifest: &Mapping) -> Vec<EnvSpec> {
+    let Some(value) = manifest.get(Value::String(String::from("requires_env"))) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_sequence() else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::String(name) => {
+                let trimmed = name.trim();
+                (!trimmed.is_empty()).then(|| EnvSpec {
+                    name: trimmed.to_string(),
+                    description: String::new(),
+                    url: String::new(),
+                    secret: false,
+                })
+            }
+            Value::Mapping(mapping) => {
+                let name = mapping
+                    .get(Value::String(String::from("name")))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                Some(EnvSpec {
+                    name: name.to_string(),
+                    description: mapping
+                        .get(Value::String(String::from("description")))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    url: mapping
+                        .get(Value::String(String::from("url")))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    secret: mapping
+                        .get(Value::String(String::from("secret")))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn display_after_install(plugin_dir: &Path, identifier: &str) -> Result<(), Box<dyn Error>> {
+    let after_install = plugin_dir.join("after-install.md");
+    if after_install.exists() {
+        println!();
+        println!("{}", fs::read_to_string(after_install)?);
+        println!();
+    } else {
+        println!();
+        println!("Plugin installed: {identifier}");
+        println!("Location: {}", plugin_dir.display());
+        println!();
+    }
+    Ok(())
+}
+
+fn resolve_install_enable_choice(
+    args: &InstallArgs,
+    installed_name: &str,
+) -> Result<bool, Box<dyn Error>> {
+    if args.enable {
+        return Ok(true);
+    }
+    if args.no_enable {
+        return Ok(false);
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(false);
+    }
+
+    let prompt = format!("  Enable '{installed_name}' now? [y/N]: ");
+    let Some(answer) = read_prompt(&prompt, false)? else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn read_prompt(prompt: &str, secret: bool) -> Result<Option<String>, Box<dyn Error>> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(prompt.as_bytes())?;
+    stdout.flush()?;
+
+    let echo_disabled = if secret && cfg!(unix) && io::stdin().is_terminal() {
+        Command::new("stty")
+            .arg("-echo")
+            .status()
+            .ok()
+            .is_some_and(|status| status.success())
+    } else {
+        false
+    };
+
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+
+    if echo_disabled {
+        let _ = Command::new("stty").arg("echo").status();
+        println!();
+    }
+
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
 }
 
 fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -480,6 +930,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Command;
     #[cfg(test)]
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
@@ -502,6 +954,27 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Hermes")
+            .env("GIT_AUTHOR_EMAIL", "hermes@example.com")
+            .env("GIT_COMMITTER_NAME", "Hermes")
+            .env("GIT_COMMITTER_EMAIL", "hermes@example.com")
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn init_plugin_repo(repo: &Path, manifest: &str) {
+        fs::create_dir_all(repo).unwrap();
+        run_git(repo, &["init"]);
+        fs::write(repo.join("plugin.yaml"), manifest).unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-m", "init"]);
     }
 
     #[test]
@@ -607,8 +1080,82 @@ mod tests {
     }
 
     #[test]
+    fn install_plugin_clones_repo_and_enables_when_requested() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("demo-plugin");
+        init_plugin_repo(
+            &repo,
+            "name: demo\nversion: 1.0.0\ndescription: demo plugin\n",
+        );
+        fs::write(repo.join("config.yaml.example"), "demo: true\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "add example"]);
+
+        let home = temp.path().join(".hermes");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+
+        install_plugin(
+            &context,
+            InstallArgs {
+                identifier: format!("file://{}", repo.display()),
+                force: false,
+                enable: true,
+                no_enable: false,
+            },
+        )
+        .unwrap();
+
+        let plugin_dir = home.join("plugins").join("demo");
+        assert!(plugin_dir.join("plugin.yaml").exists());
+        assert!(plugin_dir.join("config.yaml").exists());
+
+        let config = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config.contains("enabled:"));
+        assert!(config.contains("- demo"));
+    }
+
+    #[test]
+    fn update_plugin_pulls_latest_changes() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("demo-plugin");
+        init_plugin_repo(
+            &repo,
+            "name: demo\nversion: 1.0.0\ndescription: demo plugin\n",
+        );
+
+        let home = temp.path().join(".hermes");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        install_plugin(
+            &context,
+            InstallArgs {
+                identifier: format!("file://{}", repo.display()),
+                force: false,
+                enable: false,
+                no_enable: true,
+            },
+        )
+        .unwrap();
+
+        fs::write(
+            repo.join("plugin.yaml"),
+            "name: demo\nversion: 2.0.0\ndescription: updated plugin\n",
+        )
+        .unwrap();
+        fs::write(repo.join("new.env.example"), "DEMO=1\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "update plugin"]);
+
+        update_plugin(&context, "demo").unwrap();
+
+        let plugin_dir = home.join("plugins").join("demo");
+        let manifest = fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
+        assert!(manifest.contains("version: 2.0.0"));
+        assert!(plugin_dir.join("new.env").exists());
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn bridge_plugins_uses_python_override_and_passes_action_and_args() {
+    fn bridge_plugins_uses_python_override_for_bare_command() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -632,17 +1179,9 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_PLUGINS_PYTHON", &fake_python);
-        bridge_install(InstallArgs {
-            identifier: String::from("owner/repo"),
-            force: true,
-            enable: false,
-            no_enable: true,
-        })
-        .unwrap();
         bridge_plugins(None, &[]).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=owner/repo --force --no-enable"));
         assert!(output.contains("action= argv="));
 
         remove_env_var("HERMES_PLUGINS_PYTHON");
