@@ -7,6 +7,7 @@ mod doctor;
 mod dump;
 mod hooks;
 mod logs;
+mod webhook;
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -49,6 +50,10 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         command: Option<hooks::HooksCommand>,
+    },
+    Webhook {
+        #[command(subcommand)]
+        command: Option<webhook::WebhookCommand>,
     },
     Completion(completion::CompletionArgs),
     Logout(auth_cmd::LogoutArgs),
@@ -240,6 +245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
+        Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
