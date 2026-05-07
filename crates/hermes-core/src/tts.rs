@@ -24,6 +24,7 @@ const DEFAULT_ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE: &str = "alloy";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_PIPER_VOICE: &str = "en_US-lessac-medium";
 const DEFAULT_MINIMAX_MODEL: &str = "speech-01";
 const DEFAULT_MINIMAX_VOICE_ID: &str = "female-shaonv";
 const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.chat/v1/text_to_speech";
@@ -81,6 +82,15 @@ struct TtsSettings {
     minimax_voice_id: String,
     minimax_base_url: String,
     minimax_api_key: String,
+    piper_voice: String,
+    piper_voices_dir: PathBuf,
+    piper_use_cuda: bool,
+    piper_pythonpath: Option<String>,
+    piper_length_scale: Option<f64>,
+    piper_noise_scale: Option<f64>,
+    piper_noise_w_scale: Option<f64>,
+    piper_volume: Option<f64>,
+    piper_normalize_audio: Option<bool>,
     gemini_model: String,
     gemini_voice: String,
     gemini_base_url: String,
@@ -167,12 +177,13 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "edge" => synthesize_edge(&settings, &truncated, &output_path),
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
         "openai" => synthesize_openai(&settings, &truncated, &output_path),
+        "piper" => synthesize_piper(&settings, &truncated, &output_path),
         "minimax" => synthesize_minimax(&settings, &truncated, &output_path),
         "gemini" => synthesize_gemini(&settings, &truncated, &output_path),
         "mistral" => synthesize_mistral(&settings, &truncated, &output_path),
         "xai" => synthesize_xai(&settings, &truncated, &output_path),
         other => Err(format!(
-            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
+            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, piper, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
         )),
     };
     if let Err(error) = result {
@@ -263,6 +274,18 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let minimax_api_key = yaml_mapping_value(root, &["minimax", "api_key"])
         .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
         .unwrap_or_default();
+    let piper_voice = yaml_mapping_value(root, &["piper", "voice"])
+        .unwrap_or_else(|| DEFAULT_PIPER_VOICE.to_string());
+    let piper_voices_dir = yaml_mapping_value(root, &["piper", "voices_dir"])
+        .map(|value| expand_user_path(&value))
+        .unwrap_or_else(|| hermes_home.join("cache/piper-voices"));
+    let piper_use_cuda = yaml_mapping_bool(root, &["piper", "use_cuda"]).unwrap_or(false);
+    let piper_pythonpath = yaml_mapping_value(root, &["piper", "pythonpath"]);
+    let piper_length_scale = yaml_mapping_f64(root, &["piper", "length_scale"]);
+    let piper_noise_scale = yaml_mapping_f64(root, &["piper", "noise_scale"]);
+    let piper_noise_w_scale = yaml_mapping_f64(root, &["piper", "noise_w_scale"]);
+    let piper_volume = yaml_mapping_f64(root, &["piper", "volume"]);
+    let piper_normalize_audio = yaml_mapping_bool(root, &["piper", "normalize_audio"]);
     let gemini_model = yaml_mapping_value(root, &["gemini", "model"])
         .unwrap_or_else(|| DEFAULT_GEMINI_TTS_MODEL.to_string());
     let gemini_voice = yaml_mapping_value(root, &["gemini", "voice"])
@@ -320,6 +343,15 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
         minimax_voice_id,
         minimax_base_url,
         minimax_api_key,
+        piper_voice,
+        piper_voices_dir,
+        piper_use_cuda,
+        piper_pythonpath,
+        piper_length_scale,
+        piper_noise_scale,
+        piper_noise_w_scale,
+        piper_volume,
+        piper_normalize_audio,
         gemini_model,
         gemini_voice,
         gemini_base_url,
@@ -548,6 +580,86 @@ fn synthesize_xai(settings: &TtsSettings, text: &str, output_path: &Path) -> Res
     fs::write(output_path, &bytes)
         .map_err(|error| format!("writing {} failed: {error}", output_path.display()))?;
     ensure_audio_file(output_path)
+}
+
+fn synthesize_piper(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
+    let model_path = resolve_piper_voice_path(settings)?;
+    let wav_path = if output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    {
+        output_path.to_path_buf()
+    } else {
+        output_path.with_extension("wav")
+    };
+    let synth_code = r#"
+import json
+import sys
+import wave
+from piper import PiperVoice
+
+text, model_path, wav_path, use_cuda_raw, knobs_raw = sys.argv[1:6]
+use_cuda = use_cuda_raw == "1"
+voice = PiperVoice.load(model_path, use_cuda=use_cuda)
+knobs = json.loads(knobs_raw)
+syn_config = None
+if knobs:
+    try:
+        from piper import SynthesisConfig
+        syn_config = SynthesisConfig(**knobs)
+    except Exception:
+        syn_config = None
+with wave.open(wav_path, "wb") as wav_file:
+    if syn_config is not None:
+        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+    else:
+        voice.synthesize_wav(text, wav_file)
+"#;
+    let knobs = piper_synthesis_knobs(settings);
+    let interpreter = resolve_python_interpreter();
+    let mut command = Command::new(&interpreter);
+    command
+        .arg("-c")
+        .arg(synth_code)
+        .arg(text)
+        .arg(&model_path)
+        .arg(&wav_path)
+        .arg(if settings.piper_use_cuda { "1" } else { "0" })
+        .arg(serde_json::to_string(&knobs).unwrap_or_else(|_| "{}".to_string()));
+    apply_pythonpath_override(&mut command, settings.piper_pythonpath.as_deref());
+    let output = command.output().map_err(|error| {
+        format!(
+            "starting Piper synthesis with {} failed: {error}",
+            interpreter.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No module named 'piper'")
+            || stderr.contains("No module named \"piper\"")
+        {
+            return Err(
+                "Piper provider selected but 'piper-tts' is not installed. Install it with: pip install piper-tts"
+                    .to_string(),
+            );
+        }
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!(
+                "Piper synthesis exited with code {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            format!(
+                "Piper synthesis exited with code {}: {}",
+                output.status.code().unwrap_or(-1),
+                detail
+            )
+        });
+    }
+    ensure_audio_file(&wav_path)?;
+    finalize_wav_output(&wav_path, output_path)
 }
 
 fn synthesize_minimax(
@@ -838,6 +950,18 @@ fn yaml_mapping_u32(root: Option<&YamlValue>, path: &[&str]) -> Option<u32> {
     }
 }
 
+fn yaml_mapping_f64(root: Option<&YamlValue>, path: &[&str]) -> Option<f64> {
+    match yaml_lookup(root, path)? {
+        YamlValue::Number(value) => value.as_f64(),
+        YamlValue::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn yaml_mapping_bool(root: Option<&YamlValue>, path: &[&str]) -> Option<bool> {
+    yaml_lookup(root, path).map(|value| yaml_value_bool(Some(value)))
+}
+
 fn yaml_lookup<'a>(root: Option<&'a YamlValue>, path: &[&str]) -> Option<&'a YamlValue> {
     let mut current = root?;
     for key in path {
@@ -934,7 +1058,7 @@ fn is_command_provider_config(config: &serde_yaml::Mapping) -> bool {
 fn is_builtin_tts_provider(provider: &str) -> bool {
     matches!(
         provider.to_ascii_lowercase().as_str(),
-        "edge" | "elevenlabs" | "openai" | "minimax" | "gemini" | "mistral" | "xai"
+        "edge" | "elevenlabs" | "openai" | "piper" | "minimax" | "gemini" | "mistral" | "xai"
     )
 }
 
@@ -1016,6 +1140,7 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
     match settings.provider.as_str() {
         "edge" => EDGE_MAX_TEXT_LENGTH,
         "openai" => OPENAI_MAX_TEXT_LENGTH,
+        "piper" => DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH,
         "minimax" => MINIMAX_MAX_TEXT_LENGTH,
         "gemini" => GEMINI_MAX_TEXT_LENGTH,
         "mistral" => MISTRAL_MAX_TEXT_LENGTH,
@@ -1350,6 +1475,195 @@ fn convert_audio_to_opus(path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn finalize_wav_output(wav_path: &Path, output_path: &Path) -> Result<(), String> {
+    if wav_path == output_path {
+        return ensure_audio_file(output_path);
+    }
+    if ffmpeg_available() {
+        let status = Command::new("ffmpeg")
+            .arg("-i")
+            .arg(wav_path)
+            .arg("-y")
+            .arg("-loglevel")
+            .arg("error")
+            .arg(output_path)
+            .status()
+            .map_err(|error| format!("ffmpeg conversion failed: {error}"))?;
+        let _ = fs::remove_file(wav_path);
+        if !status.success() {
+            return Err(format!(
+                "ffmpeg conversion failed with code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        return ensure_audio_file(output_path);
+    }
+    fs::rename(wav_path, output_path).map_err(|error| {
+        format!(
+            "moving {} to {} failed: {error}",
+            wav_path.display(),
+            output_path.display()
+        )
+    })?;
+    ensure_audio_file(output_path)
+}
+
+fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn resolve_python_interpreter() -> PathBuf {
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        let candidate = PathBuf::from(venv).join(if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        });
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(if python_command_available("python3") {
+        "python3"
+    } else {
+        "python"
+    })
+}
+
+fn python_command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn resolve_piper_voice_path(settings: &TtsSettings) -> Result<PathBuf, String> {
+    let voice = settings.piper_voice.trim();
+    let voice = if voice.is_empty() {
+        DEFAULT_PIPER_VOICE
+    } else {
+        voice
+    };
+    let direct = expand_user_path(voice);
+    if direct
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+        && direct.exists()
+    {
+        return Ok(direct);
+    }
+
+    let download_dir = &settings.piper_voices_dir;
+    fs::create_dir_all(download_dir)
+        .map_err(|error| format!("creating {} failed: {error}", download_dir.display()))?;
+    let cached = download_dir.join(format!("{voice}.onnx"));
+    let cached_meta = download_dir.join(format!("{voice}.onnx.json"));
+    if cached.exists() && cached_meta.exists() {
+        return Ok(cached);
+    }
+
+    let interpreter = resolve_python_interpreter();
+    let mut command = Command::new(&interpreter);
+    command
+        .arg("-m")
+        .arg("piper.download_voices")
+        .arg(voice)
+        .arg("--download-dir")
+        .arg(download_dir);
+    apply_pythonpath_override(&mut command, settings.piper_pythonpath.as_deref());
+    let output = command.output().map_err(|error| {
+        format!(
+            "starting Piper voice download with {} failed: {error}",
+            interpreter.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No module named 'piper'")
+            || stderr.contains("No module named \"piper\"")
+        {
+            return Err(
+                "Piper provider selected but 'piper-tts' is not installed. Install it with: pip install piper-tts"
+                    .to_string(),
+            );
+        }
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("Piper voice download failed for '{voice}'")
+        } else {
+            format!("Piper voice download failed for '{voice}': {detail}")
+        });
+    }
+    if !cached.exists() {
+        return Err(format!(
+            "Piper voice download completed but {} is missing",
+            cached.display()
+        ));
+    }
+    Ok(cached)
+}
+
+fn piper_synthesis_knobs(settings: &TtsSettings) -> serde_json::Map<String, Value> {
+    let mut knobs = serde_json::Map::new();
+    if let Some(value) = settings.piper_length_scale {
+        knobs.insert("length_scale".to_string(), json!(value));
+    }
+    if let Some(value) = settings.piper_noise_scale {
+        knobs.insert("noise_scale".to_string(), json!(value));
+    }
+    if let Some(value) = settings.piper_noise_w_scale {
+        knobs.insert("noise_w_scale".to_string(), json!(value));
+    }
+    if let Some(value) = settings.piper_volume {
+        knobs.insert("volume".to_string(), json!(value));
+    }
+    if let Some(value) = settings.piper_normalize_audio {
+        knobs.insert("normalize_audio".to_string(), json!(value));
+    }
+    knobs
+}
+
+fn expand_user_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(rest);
+    }
+    PathBuf::from(raw)
+}
+
+fn apply_pythonpath_override(command: &mut Command, override_value: Option<&str>) {
+    let Some(override_value) = override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let merged = if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        format!(
+            "{}{}{}",
+            override_value,
+            separator,
+            existing.to_string_lossy()
+        )
+    } else {
+        override_value.to_string()
+    };
+    command.env("PYTHONPATH", merged);
+}
+
 fn path_is_voice_compatible(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -1565,6 +1879,59 @@ mod tests {
 
     fn command_copy_command() -> &'static str {
         "cp {input_path} {output_path}"
+    }
+
+    fn install_fake_piper_package(root: &Path, broken: bool) {
+        let package = root.join("piper");
+        fs::create_dir_all(&package).unwrap();
+        if broken {
+            fs::write(
+                package.join("__init__.py"),
+                "raise ModuleNotFoundError(\"No module named 'piper'\")\n",
+            )
+            .unwrap();
+            return;
+        }
+        fs::write(
+            package.join("__init__.py"),
+            r#"
+class SynthesisConfig:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+class PiperVoice:
+    @classmethod
+    def load(cls, model_path, use_cuda=False):
+        instance = cls()
+        instance.model_path = model_path
+        instance.use_cuda = use_cuda
+        return instance
+
+    def synthesize_wav(self, text, wav_file, syn_config=None):
+        payload = text.encode("utf-8")
+        if len(payload) % 2:
+            payload += b" "
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(22050)
+        wav_file.writeframes(payload)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            package.join("download_voices.py"),
+            r#"
+import pathlib
+import sys
+
+voice = sys.argv[1]
+download_dir = pathlib.Path(sys.argv[sys.argv.index("--download-dir") + 1])
+download_dir.mkdir(parents=True, exist_ok=True)
+(download_dir / f"{voice}.onnx").write_bytes(b"model")
+(download_dir / f"{voice}.onnx.json").write_text("{}")
+"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2471,5 +2838,65 @@ mod tests {
         );
         assert!(rendered.contains("'/tmp/Jane Doe/input.txt'"));
         assert!(rendered.contains("'/tmp/out file.mp3'"));
+    }
+
+    #[test]
+    fn piper_tts_downloads_voice_and_writes_audio_file() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        install_fake_piper_package(&pyroot, false);
+        let voices_dir = temp.path().join("voices");
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: piper\n  piper:\n    voice: en_US-lessac-medium\n    voices_dir: {}\n    pythonpath: {}\n",
+                voices_dir.display(),
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("piper.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello piper",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("piper"));
+        let wav = fs::read(&output_path).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert!(
+            wav.windows(b"hello piper".len())
+                .any(|chunk| chunk == b"hello piper")
+        );
+        assert!(voices_dir.join("en_US-lessac-medium.onnx").exists());
+        assert!(voices_dir.join("en_US-lessac-medium.onnx.json").exists());
+    }
+
+    #[test]
+    fn piper_tts_missing_package_returns_helpful_error() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        install_fake_piper_package(&pyroot, true);
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: piper\n  piper:\n    pythonpath: {}\n",
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(&json!({"text":"hello piper"}), &runtime);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("piper-tts"));
     }
 }
