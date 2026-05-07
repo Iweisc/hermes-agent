@@ -10,6 +10,7 @@ use hermes_core::HermesContext;
 use md5::Context as Md5Context;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
+use sha2::Digest;
 
 use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
@@ -131,6 +132,19 @@ struct NativeInspectSkill {
 }
 
 #[derive(Debug, Clone)]
+struct OfficialSkillCandidate {
+    name: String,
+    source: String,
+    trust_level: String,
+    scan_verdict: String,
+    install_path: String,
+    source_dir: PathBuf,
+    current_hash: String,
+    latest_hash: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct HubInstalledEntry {
     source: String,
     trust_level: String,
@@ -156,8 +170,8 @@ pub fn print_skills(
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
-        Some(SkillsCommand::Check(args)) => bridge_prefixed("check", &args.args),
-        Some(SkillsCommand::Update(args)) => bridge_prefixed("update", &args.args),
+        Some(SkillsCommand::Check(args)) => check_skills_command(context, &args.args),
+        Some(SkillsCommand::Update(args)) => update_skills_command(context, &args.args),
         Some(SkillsCommand::Audit(args)) => bridge_prefixed("audit", &args.args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
         Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
@@ -346,6 +360,337 @@ fn inspect_skill_command(
         return Ok(());
     }
     bridge_prefixed("inspect", &[identifier.to_string()])
+}
+
+fn check_skills_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(name) = parse_single_name_passthrough(passthrough) else {
+        return bridge_prefixed("check", passthrough);
+    };
+
+    let installed = load_hub_lock(context)?;
+    let targets = if let Some(name) = name {
+        let Some(entry) = installed.get(name) else {
+            println!("No hub-installed skills to check.");
+            println!();
+            return Ok(());
+        };
+        vec![(name.to_string(), entry.source.clone())]
+    } else {
+        installed
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.source.clone()))
+            .collect()
+    };
+
+    if targets.is_empty() {
+        println!("No hub-installed skills to check.");
+        println!();
+        return Ok(());
+    }
+
+    if targets.iter().any(|(_, source)| source != "official") {
+        return bridge_prefixed("check", passthrough);
+    }
+
+    let target_names = targets
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let candidates = collect_official_skill_candidates(&installed, &target_names)?;
+    print_official_check_results(&targets, &candidates);
+    Ok(())
+}
+
+fn update_skills_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(name) = parse_single_name_passthrough(passthrough) else {
+        return bridge_prefixed("update", passthrough);
+    };
+
+    let mut installed = load_hub_lock(context)?;
+    let target_names = if let Some(name) = name {
+        let Some(entry) = installed.get(name) else {
+            println!("No updates available.");
+            println!();
+            return Ok(());
+        };
+        if entry.source != "official" {
+            return bridge_prefixed("update", passthrough);
+        }
+        vec![name.to_string()]
+    } else {
+        if installed.is_empty() {
+            println!("No updates available.");
+            println!();
+            return Ok(());
+        }
+        if installed.values().any(|entry| entry.source != "official") {
+            return bridge_prefixed("update", passthrough);
+        }
+        let mut names = installed.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+
+    let candidates = collect_official_skill_candidates(&installed, &target_names)?;
+    let updates = candidates
+        .into_values()
+        .filter(|candidate| candidate.current_hash != candidate.latest_hash)
+        .collect::<Vec<_>>();
+
+    if updates.is_empty() {
+        println!("No updates available.");
+        println!();
+        return Ok(());
+    }
+
+    apply_official_updates(context, &mut installed, &updates)?;
+    save_hub_lock(context, &installed)?;
+    println!("Updated {} skill(s).", updates.len());
+    println!();
+    Ok(())
+}
+
+fn parse_single_name_passthrough<'a>(passthrough: &'a [String]) -> Option<Option<&'a str>> {
+    if passthrough.len() > 1 {
+        return None;
+    }
+    let name = passthrough.first().map(String::as_str).map(str::trim);
+    let Some(name) = name else {
+        return Some(None);
+    };
+    if name.is_empty() || name.starts_with('-') {
+        return None;
+    }
+    Some(Some(name))
+}
+
+fn print_official_check_results(
+    targets: &[(String, String)],
+    candidates: &HashMap<String, OfficialSkillCandidate>,
+) {
+    println!("{:<24} {:<12} Status", "Name", "Source");
+    println!(
+        "{:<24} {:<12} ------",
+        "------------------------", "------------"
+    );
+
+    let mut updates = 0_usize;
+    for (name, source) in targets {
+        let status = match candidates.get(name) {
+            Some(candidate) if candidate.current_hash == candidate.latest_hash => "up_to_date",
+            Some(_) => {
+                updates += 1;
+                "update_available"
+            }
+            None => "unavailable",
+        };
+        println!(
+            "{:<24} {:<12} {}",
+            truncate(name, 24),
+            truncate(source, 12),
+            status
+        );
+    }
+
+    println!();
+    println!(
+        "{} update(s) available across {} checked skill(s)",
+        updates,
+        targets.len()
+    );
+    println!();
+}
+
+fn collect_official_skill_candidates(
+    installed: &HashMap<String, HubInstalledEntry>,
+    target_names: &[String],
+) -> Result<HashMap<String, OfficialSkillCandidate>, Box<dyn Error>> {
+    let optional = discover_optional_skill_records()?;
+    let mut records_by_identifier = HashMap::new();
+    let mut records_by_name = HashMap::new();
+    for record in &optional {
+        let Some(skill_dir) = record.skill_md.parent() else {
+            continue;
+        };
+        let rel = match skill_dir.strip_prefix(optional_skills_dir()) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        records_by_identifier.insert(format!("official/{rel}"), record);
+        records_by_name.insert(record.entry.name.clone(), record);
+    }
+
+    let mut result = HashMap::new();
+    for name in target_names {
+        let Some(entry) = installed.get(name) else {
+            continue;
+        };
+        let identifier = entry
+            .raw
+            .get("identifier")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let record = identifier
+            .and_then(|value| records_by_identifier.get(value).copied())
+            .or_else(|| records_by_name.get(name).copied());
+        let Some(record) = record else {
+            continue;
+        };
+        let Some(source_dir) = record.skill_md.parent().map(Path::to_path_buf) else {
+            continue;
+        };
+        let files = collect_bundle_file_paths(&source_dir)?;
+        let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
+        let current_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        result.insert(
+            name.clone(),
+            OfficialSkillCandidate {
+                name: name.clone(),
+                source: entry.source.clone(),
+                trust_level: entry.trust_level.clone(),
+                scan_verdict: entry
+                    .raw
+                    .get("scan_verdict")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("n/a")
+                    .to_string(),
+                install_path: entry.install_path.clone(),
+                source_dir,
+                current_hash,
+                latest_hash,
+                files,
+            },
+        );
+    }
+
+    Ok(result)
+}
+
+fn apply_official_updates(
+    context: &HermesContext,
+    installed: &mut HashMap<String, HubInstalledEntry>,
+    updates: &[OfficialSkillCandidate],
+) -> Result<(), Box<dyn Error>> {
+    let skills_root = context.hermes_home().join("skills");
+    for update in updates {
+        println!("Updating: {}", update.name);
+        let install_path = validated_install_path(&skills_root, &update.install_path)?;
+        install_official_bundle(&update.source_dir, &install_path)?;
+
+        let Some(entry) = installed.get_mut(&update.name) else {
+            return Err(format!("missing hub lock entry for {}", update.name).into());
+        };
+        entry.raw.insert(
+            "content_hash".to_string(),
+            JsonValue::String(update.latest_hash.clone()),
+        );
+        entry.raw.insert(
+            "files".to_string(),
+            JsonValue::Array(
+                update
+                    .files
+                    .iter()
+                    .cloned()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
+        );
+        entry
+            .raw
+            .insert("updated_at".to_string(), JsonValue::String(iso8601_now()));
+        append_audit_log(
+            context,
+            "UPDATE",
+            &update.name,
+            &update.source,
+            &update.trust_level,
+            &update.scan_verdict,
+            &update.latest_hash,
+        )?;
+    }
+    Ok(())
+}
+
+fn install_official_bundle(source_dir: &Path, install_dir: &Path) -> Result<(), Box<dyn Error>> {
+    if install_dir.exists() {
+        fs::remove_dir_all(install_dir)?;
+    }
+    fs::create_dir_all(install_dir)?;
+    for rel in collect_bundle_file_paths(source_dir)? {
+        let source_path = source_dir.join(&rel);
+        let dest_path = install_dir.join(&rel);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source_path, dest_path)?;
+    }
+    Ok(())
+}
+
+fn bundle_content_hash_from_dir(skill_dir: &Path) -> Result<String, Box<dyn Error>> {
+    let mut hasher = sha2::Sha256::new();
+    for rel in collect_bundle_file_paths(skill_dir)? {
+        hasher.update(fs::read(skill_dir.join(rel))?);
+    }
+    let digest = sha2::Digest::finalize(hasher);
+    Ok(format!("sha256:{:x}", digest)[..23].to_string())
+}
+
+fn collect_bundle_file_paths(skill_dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut output = Vec::new();
+    collect_bundle_file_paths_inner(skill_dir, skill_dir, &mut output)?;
+    output.sort();
+    Ok(output)
+}
+
+fn collect_bundle_file_paths_inner(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<String>,
+) -> Result<(), Box<dyn Error>> {
+    if !current.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if name.starts_with('.') || name == "__pycache__" {
+                continue;
+            }
+            collect_bundle_file_paths_inner(root, &path, output)?;
+            continue;
+        }
+        if !path.is_file()
+            || name.starts_with('.')
+            || path.extension().is_some_and(|ext| ext == "pyc")
+        {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.split('/').any(|part| part == "__pycache__") {
+            continue;
+        }
+        output.push(rel);
+    }
+    Ok(())
 }
 
 fn print_native_inspect(skill: &NativeInspectSkill) {
@@ -2770,6 +3115,198 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("action=inspect argv=owner/repo/remote-skill"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn collect_official_candidates_detects_updates() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("official-check-home");
+        let optional = temp_path("official-check-src");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("research").join("demo");
+        let source_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"demo":{"source":"official","identifier":"official/research/demo","trust_level":"builtin","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"research/demo","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        let installed = load_hub_lock(&context).unwrap();
+        let candidates =
+            collect_official_skill_candidates(&installed, &[String::from("demo")]).unwrap();
+        let candidate = candidates.get("demo").unwrap();
+        assert_eq!(candidate.name, "demo");
+        assert_eq!(candidate.source, "official");
+        assert_eq!(candidate.install_path, "research/demo");
+        assert_eq!(candidate.current_hash, "sha256:stale");
+        assert_ne!(candidate.latest_hash, candidate.current_hash);
+        assert_eq!(candidate.files, vec![String::from("SKILL.md")]);
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    fn update_native_official_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("official-update-home");
+        let optional = temp_path("official-update-src");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("research").join("demo");
+        let source_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(source_dir.join("extra.txt"), "fresh\n").unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"demo":{"source":"official","identifier":"official/research/demo","trust_level":"builtin","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"research/demo","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("demo").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_eq!(
+            saved_hash,
+            bundle_content_hash_from_dir(&source_dir).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            fs::read_to_string(source_dir.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("extra.txt")).unwrap(),
+            "fresh\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_bridges_when_non_official_sources_are_present() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("check-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"demo":{"source":"github","identifier":"owner/repo/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        check_skills_command(&context, &[]).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=check argv="));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_bridges_when_non_official_sources_are_present() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("update-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"demo":{"source":"github","identifier":"owner/repo/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        update_skills_command(&context, &[]).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=update argv="));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
