@@ -11,7 +11,8 @@ use serde_yaml::Value as YamlValue;
 
 use crate::backup::{create_pre_update_backup, create_quick_snapshot, format_size};
 use crate::config_cmd::{migrate_config, read_raw_yaml_mapping};
-use crate::dashboard_cmd::ensure_dashboard_web_ui;
+use crate::dashboard_cmd::{ensure_dashboard_web_ui, stop_stale_dashboard_processes};
+use crate::gateway_cmd::restart_gateways_after_update;
 use crate::memory_cmd::sync_honcho_profiles;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::skills_cmd::sync_bundled_skills;
@@ -201,9 +202,12 @@ fn print_update_apply_native(
     println!("→ Checking configuration for new options...");
     migrate_config(context)?;
 
+    restart_gateways_after_update_native(context)?;
+    stop_stale_dashboards_after_update()?;
+
     println!();
     println!("✓ Update complete!");
-    println!("  Remaining Python-only update behavior: gateway restart flow.");
+    println!("  Remaining Python-only update behavior: gateway-mode watcher handoff.");
     println!("  Restart running gateways or dashboards manually if needed.");
     println!("    hermes gateway restart");
     println!("    hermes dashboard --port <port>");
@@ -381,6 +385,44 @@ fn sync_honcho_profiles_after_update(context: &HermesContext) -> Result<(), Box<
         println!("→ Syncing Honcho profiles...");
         println!("  ✓ Synced {synced} profile(s)");
     }
+    Ok(())
+}
+
+fn restart_gateways_after_update_native(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let summary = restart_gateways_after_update(context)?;
+    if summary.restarted_services.is_empty()
+        && summary.restarted_profiles.is_empty()
+        && summary.stopped_manual == 0
+    {
+        return Ok(());
+    }
+
+    println!();
+    println!("→ Restarting gateways...");
+    for service in summary.restarted_services {
+        println!("  ✓ Restarted {service}");
+    }
+    if !summary.restarted_profiles.is_empty() {
+        println!(
+            "  ✓ Restarting manual gateway profile(s): {}",
+            summary.restarted_profiles.join(", ")
+        );
+    }
+    if summary.stopped_manual > 0 {
+        println!(
+            "  → Stopped {} manual gateway process(es)",
+            summary.stopped_manual
+        );
+        println!("    Restart manually: hermes gateway run");
+        if summary.stopped_manual > 1 {
+            println!("    (or: hermes -p <profile> gateway run  for each profile)");
+        }
+    }
+    Ok(())
+}
+
+fn stop_stale_dashboards_after_update() -> Result<(), Box<dyn Error>> {
+    let _ = stop_stale_dashboard_processes("code updated")?;
     Ok(())
 }
 
@@ -1359,6 +1401,212 @@ exit 0\n",
             Some(true)
         );
 
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_update_restarts_gateway_services() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        let fake_systemctl = bin.join("systemctl");
+        let log = home.join("systemctl.log");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &fake_systemctl,
+            format!(
+                "#!/bin/sh\n\
+printf '%s\\n' \"$*\" >> '{}'\n\
+if [ \"$1\" = \"--user\" ] && [ \"$2\" = \"list-units\" ]; then\n\
+  printf 'hermes-gateway.service loaded active running Hermes\\n'\n\
+  printf 'hermes-gateway-coder.service loaded active running Hermes\\n'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"list-units\" ]; then\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"--user\" ] && [ \"$2\" = \"show\" ]; then\n\
+  printf '0\\n'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"show\" ]; then\n\
+  printf '0\\n'\n\
+  exit 0\n\
+fi\n\
+exit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        for path in [&fake_git, &fake_uv, &fake_systemctl] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", bin.display(), original_path));
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+
+        print_update(
+            &context,
+            UpdateArgs {
+                gateway: false,
+                check: false,
+                no_backup: false,
+                backup: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("--user restart hermes-gateway"));
+        assert!(logged.contains("--user restart hermes-gateway-coder"));
+
+        set_env_var("PATH", original_path);
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_update_restarts_manual_gateways_and_stops_dashboards() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        let fake_gateway = bin.join("hermes");
+        let log = home.join("gateway-restart.log");
+        let profile_home = home.join("profiles").join("coder");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&profile_home).unwrap();
+
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &fake_gateway,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        for path in [&fake_git, &fake_uv, &fake_gateway] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let mut gateway = Command::new("bash")
+            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .spawn()
+            .unwrap();
+        fs::write(
+            profile_home.join("gateway.pid"),
+            format!("{{\"pid\":{}}}\n", gateway.id()),
+        )
+        .unwrap();
+
+        let mut dashboard = Command::new("bash")
+            .args(["-lc", "exec -a 'hermes dashboard' sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+        set_env_var("HERMES_GATEWAY_BINARY", &fake_gateway);
+
+        print_update(
+            &context,
+            UpdateArgs {
+                gateway: false,
+                check: false,
+                no_backup: false,
+                backup: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        let gateway_status = gateway.wait().unwrap();
+        let dashboard_status = dashboard.wait().unwrap();
+        assert!(!gateway_status.success());
+        assert!(!dashboard_status.success());
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("--profile coder gateway run --replace"));
+
+        remove_env_var("HERMES_GATEWAY_BINARY");
         remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
         remove_env_var("HERMES_UPDATE_GIT");
         remove_env_var("HERMES_UPDATE_UV");

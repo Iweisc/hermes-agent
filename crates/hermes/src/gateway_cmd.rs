@@ -3,6 +3,8 @@ use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(test)]
@@ -132,6 +134,13 @@ struct GatewayProcess {
     command: String,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayUpdateRestartSummary {
+    pub restarted_services: Vec<String>,
+    pub restarted_profiles: Vec<String>,
+    pub stopped_manual: usize,
+}
+
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
@@ -160,6 +169,101 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
         Some(GatewayCommand::Setup) => print_gateway_setup(args.accept_hooks),
         Some(GatewayCommand::MigrateLegacy(args2)) => print_gateway_migrate_legacy(context, args2),
     }
+}
+
+pub(crate) fn restart_gateways_after_update(
+    context: &HermesContext,
+) -> Result<GatewayUpdateRestartSummary, Box<dyn Error>> {
+    let mut summary = GatewayUpdateRestartSummary::default();
+    let mut service_pids = collect_running_service_gateway_pids(context)?;
+
+    for system in [false, true] {
+        for service in list_active_systemd_gateway_services(system)? {
+            match restart_named_systemd_service(system, &service) {
+                Ok(()) => summary.restarted_services.push(service),
+                Err(error) => {
+                    eprintln!("  ⚠ Failed to restart {service}: {error}");
+                }
+            }
+        }
+    }
+
+    let profile_homes = collect_profile_homes(context)?;
+    if is_macos() {
+        for (name, home) in &profile_homes {
+            let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
+            if launchd_plist_path(&profile_context).exists()
+                && launchd_service_active(&profile_context)
+            {
+                match restart_launchd_service(&profile_context) {
+                    Ok(()) => summary.restarted_services.push(if name == "default" {
+                        launchd_label(&profile_context)
+                    } else {
+                        format!("{} ({name})", launchd_label(&profile_context))
+                    }),
+                    Err(error) => {
+                        eprintln!(
+                            "  ⚠ Failed to restart {}: {}",
+                            launchd_label(&profile_context),
+                            error
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    service_pids.extend(collect_running_service_gateway_pids(context)?);
+
+    let processes = find_all_gateway_processes()?;
+    let mut manual_processes = Vec::new();
+    for process in &processes {
+        if !service_pids.contains(&process.pid) {
+            manual_processes.push(process.clone());
+        }
+    }
+    if manual_processes.is_empty() {
+        return Ok(summary);
+    }
+
+    let mut mapped_profiles = Vec::new();
+    for (name, home) in profile_homes {
+        let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
+        if has_any_systemd_unit(&profile_context)
+            || (is_macos() && launchd_plist_path(&profile_context).exists())
+        {
+            continue;
+        }
+        let Some(pid) = gateway_pids_for_profile(&home)
+            .into_iter()
+            .find(|pid| manual_processes.iter().any(|process| process.pid == *pid))
+        else {
+            continue;
+        };
+        mapped_profiles.push((name, pid));
+    }
+
+    let killed = kill_gateway_processes(&manual_processes, false);
+    if killed > 0 {
+        let manual_pids = manual_processes
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        let _ = wait_for_processes_exit(
+            &manual_pids,
+            Duration::from_secs(10),
+            Some(Duration::from_secs(5)),
+        );
+    }
+
+    for (profile, _) in &mapped_profiles {
+        if launch_detached_profile_gateway_after_update(context, profile).is_ok() {
+            summary.restarted_profiles.push(profile.clone());
+        }
+    }
+    summary.stopped_manual = manual_processes.len().saturating_sub(mapped_profiles.len());
+
+    Ok(summary)
 }
 
 fn print_gateway_start(
@@ -921,6 +1025,35 @@ fn find_all_gateway_processes() -> Result<Vec<GatewayProcess>, Box<dyn Error>> {
     }
 }
 
+fn collect_profile_homes(
+    context: &HermesContext,
+) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
+    let mut homes = Vec::new();
+    let default_home = context.default_hermes_root();
+    if default_home.is_dir() {
+        homes.push((String::from("default"), default_home));
+    }
+    let profiles_root = context.profiles_root();
+    if profiles_root.is_dir() {
+        let mut entries = fs::read_dir(&profiles_root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !is_valid_profile_id(&name) {
+                continue;
+            }
+            homes.push((name, path));
+        }
+    }
+    Ok(homes)
+}
+
 #[cfg(not(windows))]
 fn parse_gateway_ps_processes(output: &str, exclude_pids: &[i64]) -> Vec<GatewayProcess> {
     output
@@ -1037,6 +1170,96 @@ fn stop_gateway_service_if_available(context: &HermesContext, system: bool) -> b
         return stop_launchd_service(context).is_ok();
     }
     false
+}
+
+fn list_active_systemd_gateway_services(system: bool) -> Result<Vec<String>, Box<dyn Error>> {
+    if which_on_path("systemctl").is_none() {
+        return Ok(Vec::new());
+    }
+    let output = build_systemctl_command(
+        system,
+        &[
+            "list-units",
+            "hermes-gateway*",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+        ],
+    )
+    .output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut services = Vec::new();
+    for line in stdout.lines() {
+        let Some(unit) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !unit.ends_with(".service") {
+            continue;
+        }
+        let service = unit.trim_end_matches(".service").to_string();
+        if !services.iter().any(|value| value == &service) {
+            services.push(service);
+        }
+    }
+    Ok(services)
+}
+
+fn restart_named_systemd_service(system: bool, service: &str) -> Result<(), Box<dyn Error>> {
+    let output = build_systemctl_command(system, &["restart", service]).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(command_failure_message("systemctl", &output).into())
+}
+
+fn systemd_main_pid(system: bool, service: &str) -> Option<i64> {
+    let output =
+        build_systemctl_command(system, &["show", service, "--property=MainPID", "--value"])
+            .output()
+            .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+fn collect_running_service_gateway_pids(
+    context: &HermesContext,
+) -> Result<Vec<i64>, Box<dyn Error>> {
+    let mut pids = Vec::new();
+    for system in [false, true] {
+        for service in list_active_systemd_gateway_services(system)? {
+            if let Some(pid) = systemd_main_pid(system, &service)
+                && !pids.contains(&pid)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+    if is_macos() {
+        for (_, home) in collect_profile_homes(context)? {
+            let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
+            if !(launchd_plist_path(&profile_context).exists()
+                && launchd_service_active(&profile_context))
+            {
+                continue;
+            }
+            for pid in gateway_pids_for_profile(&home) {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    Ok(pids)
 }
 
 fn systemd_service_active(context: &HermesContext, system: bool) -> bool {
@@ -1734,6 +1957,35 @@ fn resolve_gateway_service_binary(
         binary = remap_path_for_target_user(&binary, context.home_dir(), home_dir);
     }
     Ok(binary)
+}
+
+fn launch_detached_profile_gateway_after_update(
+    context: &HermesContext,
+    profile: &str,
+) -> Result<(), Box<dyn Error>> {
+    let gateway_binary = resolve_gateway_service_binary(context, None)?;
+    let mut command = Command::new(gateway_binary);
+    if profile != "default" {
+        command.arg("--profile").arg(profile);
+    }
+    command
+        .arg("gateway")
+        .arg("run")
+        .arg("--replace")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _child = command.spawn()?;
+    Ok(())
 }
 
 fn stop_manual_gateway(context: &HermesContext) -> Result<bool, Box<dyn Error>> {

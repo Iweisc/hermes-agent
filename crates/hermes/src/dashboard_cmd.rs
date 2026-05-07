@@ -60,6 +60,11 @@ pub fn print_dashboard(args: DashboardArgs) -> Result<(), Box<dyn Error>> {
     launch_dashboard(args)
 }
 
+pub(crate) fn stop_stale_dashboard_processes(reason: &str) -> Result<usize, Box<dyn Error>> {
+    let result = kill_dashboard_processes(reason)?;
+    Ok(result.killed.len())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DashboardProcess {
     pid: i32,
