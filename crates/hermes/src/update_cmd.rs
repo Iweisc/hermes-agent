@@ -3,7 +3,8 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use hermes_core::HermesContext;
@@ -51,8 +52,8 @@ fn print_update_apply(context: &HermesContext, args: UpdateArgs) -> Result<(), B
     print_update_apply_native(context, args)
 }
 
-fn should_use_python_update_bridge(args: &UpdateArgs) -> bool {
-    args.gateway
+fn should_use_python_update_bridge(_args: &UpdateArgs) -> bool {
+    false
 }
 
 fn print_update_apply_python(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
@@ -131,8 +132,7 @@ fn print_update_apply_native(
 
     let prompt_for_restore = auto_stash_ref.is_some()
         && !args.yes
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal();
+        && (args.gateway || (io::stdin().is_terminal() && io::stdout().is_terminal()));
 
     let rev = run_git(
         &root,
@@ -147,7 +147,14 @@ fn print_update_apply_native(
     if behind == 0 {
         invalidate_update_cache(context);
         if let Some(stash_ref) = auto_stash_ref.as_deref() {
-            let _ = restore_stashed_changes(&root, &git_base, stash_ref, prompt_for_restore)?;
+            let _ = restore_stashed_changes(
+                context,
+                &root,
+                &git_base,
+                stash_ref,
+                prompt_for_restore,
+                args.gateway,
+            )?;
         }
         if !matches!(current_branch.as_str(), "main" | "HEAD") {
             let _ = run_git(&root, &git_base, &["checkout", current_branch.as_str()])?;
@@ -174,7 +181,14 @@ fn print_update_apply_native(
     }
 
     if let Some(stash_ref) = auto_stash_ref.as_deref() {
-        let _ = restore_stashed_changes(&root, &git_base, stash_ref, prompt_for_restore)?;
+        let _ = restore_stashed_changes(
+            context,
+            &root,
+            &git_base,
+            stash_ref,
+            prompt_for_restore,
+            args.gateway,
+        )?;
     }
 
     invalidate_update_cache(context);
@@ -201,6 +215,10 @@ fn print_update_apply_native(
     println!();
     println!("→ Checking configuration for new options...");
     migrate_config(context)?;
+
+    if args.gateway {
+        let _ = fs::write(context.hermes_home().join(".update_exit_code"), "0");
+    }
 
     restart_gateways_after_update_native(context)?;
     stop_stale_dashboards_after_update()?;
@@ -602,10 +620,12 @@ fn stash_local_changes_if_needed(
 }
 
 fn restore_stashed_changes(
+    context: &HermesContext,
     repo_dir: &Path,
     git_base: &[String],
     stash_ref: &str,
     prompt_user: bool,
+    gateway_mode: bool,
 ) -> Result<bool, Box<dyn Error>> {
     if prompt_user {
         println!();
@@ -614,8 +634,13 @@ fn restore_stashed_changes(
         println!("  Review the result afterward if Hermes behaves unexpectedly.");
         print!("Restore local changes now? [Y/n]: ");
         io::stdout().flush()?;
-        let mut response = String::new();
-        io::stdin().read_line(&mut response)?;
+        let response = if gateway_mode {
+            gateway_prompt(context, "Restore local changes now? [Y/n]", "y", 300)
+        } else {
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            response.trim().to_string()
+        };
         let response = response.trim().to_ascii_lowercase();
         if !matches!(response.as_str(), "" | "y" | "yes") {
             println!("Skipped restoring local changes.");
@@ -677,6 +702,58 @@ fn restore_stashed_changes(
     println!("⚠ Local changes were restored on top of the updated codebase.");
     println!("  Review `git diff` / `git status` if Hermes behaves unexpectedly.");
     Ok(true)
+}
+
+fn gateway_prompt(
+    context: &HermesContext,
+    prompt_text: &str,
+    default: &str,
+    timeout_secs: u64,
+) -> String {
+    let prompt_path = context.hermes_home().join(".update_prompt.json");
+    let response_path = context.hermes_home().join(".update_response");
+    let _ = fs::remove_file(&response_path);
+    let payload = serde_json::json!({
+        "prompt": prompt_text,
+        "default": default,
+        "id": format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ),
+    });
+    if let Ok(text) = serde_json::to_string(&payload) {
+        let _ = atomic_write_json(&prompt_path, &text);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    while std::time::Instant::now() < deadline {
+        if let Ok(answer) = fs::read_to_string(&response_path) {
+            let _ = fs::remove_file(&response_path);
+            let _ = fs::remove_file(&prompt_path);
+            let trimmed = answer.trim();
+            return if trimmed.is_empty() {
+                default.to_string()
+            } else {
+                trimmed.to_string()
+            };
+        }
+        sleep(Duration::from_millis(500));
+    }
+
+    let _ = fs::remove_file(&prompt_path);
+    let _ = fs::remove_file(&response_path);
+    println!("  (no response after {timeout_secs}s, using default: {default:?})");
+    default.to_string()
+}
+
+fn atomic_write_json(path: &Path, content: &str) -> Result<(), Box<dyn Error>> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn resolve_stash_selector(
@@ -974,48 +1051,97 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn gateway_update_uses_python_override_and_env_flags() {
+    fn gateway_update_uses_prompt_files_and_writes_exit_code_marker() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        let context =
-            HermesContext::new("/tmp").with_hermes_home_env(Some(temp.path().join(".hermes")));
+        let root = temp.path().join("repo");
+        let home = temp.path().join(".hermes");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        let log = temp.path().join("git.log");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin).unwrap();
         fs::write(
-            &fake_python,
+            &fake_git,
             format!(
                 "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'gateway=%s no_backup=%s backup=%s yes=%s\\n' \\\n\
-    \"$HERMES_UPDATE_GATEWAY\" \"$HERMES_UPDATE_NO_BACKUP\" \"$HERMES_UPDATE_BACKUP\" \"$HERMES_UPDATE_YES\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
+printf 'git %s\\n' \"$*\" >> '{}'\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) printf ' M local.txt\\n'; exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
                 log.display()
             ),
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&fake_git, &fake_uv] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
 
-        set_env_var("HERMES_UPDATE_PYTHON", &fake_python);
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+
+        let prompt_home = home.clone();
+        let responder = std::thread::spawn(move || {
+            let prompt_path = prompt_home.join(".update_prompt.json");
+            let response_path = prompt_home.join(".update_response");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if prompt_path.exists() {
+                    fs::write(response_path, "n\n").unwrap();
+                    return;
+                }
+                sleep(Duration::from_millis(100));
+            }
+            panic!("timed out waiting for update prompt");
+        });
+
         print_update(
             &context,
             UpdateArgs {
                 gateway: true,
                 check: false,
-                no_backup: true,
-                backup: true,
-                yes: true,
+                no_backup: false,
+                backup: false,
+                yes: false,
             },
         )
         .unwrap();
+        responder.join().unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("gateway=1 no_backup=1 backup=1 yes=1"));
+        assert!(output.contains("git stash push --include-untracked"));
+        assert!(!output.contains("git stash apply"));
+        assert_eq!(
+            fs::read_to_string(home.join(".update_exit_code")).unwrap(),
+            "0"
+        );
 
-        remove_env_var("HERMES_UPDATE_PYTHON");
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
     }
 
     #[test]
