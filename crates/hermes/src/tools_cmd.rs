@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
-use std::io::{self, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
@@ -284,10 +284,16 @@ const PLATFORMS: &[PlatformDef] = &[
     },
 ];
 
-const TOOLS_INTERACTIVE_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "from hermes_cli.tools_config import tools_command\n",
-    "tools_command(argparse.Namespace(summary=False), first_install=False)\n",
+const TOOLS_RECONFIGURE_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.config import load_config\n",
+    "from hermes_cli.tools_config import _reconfigure_tool\n",
+    "_reconfigure_tool(load_config())\n",
+);
+
+const TOOLS_MCP_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.config import load_config\n",
+    "from hermes_cli.tools_config import _configure_mcp_tools_interactive\n",
+    "_configure_mcp_tools_interactive(load_config())\n",
 );
 
 pub fn print_tools(
@@ -311,7 +317,7 @@ pub fn print_tools(
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return Err("'hermes tools' requires an interactive terminal".into());
             }
-            print_python_tools_interactive()
+            run_native_tools_interactive(context)
         }
         Some(ToolsCommand::List { platform, toolset }) => {
             if let Some(toolset_name) = toolset.as_deref() {
@@ -405,7 +411,342 @@ fn run_tool(
     Ok(())
 }
 
-fn print_python_tools_interactive() -> Result<(), Box<dyn Error>> {
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum InteractiveToolsChoice {
+    Platform(usize),
+    AllPlatforms,
+    Reconfigure,
+    ConfigureMcp,
+    Done,
+}
+
+fn run_native_tools_interactive(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    run_native_tools_interactive_with_io(context, &mut input, &mut output)
+}
+
+fn run_native_tools_interactive_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "Hermes Tool Configuration")?;
+    writeln!(output, "  Enable or disable built-in tools per platform.")?;
+    writeln!(
+        output,
+        "  Provider/API-key reconfiguration and MCP discovery stay on the narrowed compatibility path."
+    )?;
+    writeln!(output)?;
+
+    loop {
+        let root = read_raw_yaml_mapping(&context.config_path())?;
+        let platforms = enabled_platforms();
+        let options = build_interactive_tools_options(&root, &platforms);
+        let choice = prompt_menu_choice(
+            input,
+            output,
+            "Select an option",
+            &options
+                .iter()
+                .map(|(_, label)| label.as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        match options[choice].0 {
+            InteractiveToolsChoice::Platform(index) => {
+                let platform = platforms
+                    .get(index)
+                    .ok_or("selected platform is no longer available")?;
+                let current = enabled_builtin_toolsets(&root, platform.name);
+                let selected = prompt_toolset_selection(
+                    input,
+                    output,
+                    platform.label,
+                    platform.name,
+                    &current,
+                )?;
+                if let Some(enabled) = selected {
+                    apply_platform_selection(output, context, platform.name, &current, &enabled)?;
+                } else {
+                    writeln!(output, "No changes.")?;
+                }
+                writeln!(output)?;
+            }
+            InteractiveToolsChoice::AllPlatforms => {
+                let mut union = BTreeSet::new();
+                for platform in &platforms {
+                    union.extend(enabled_builtin_toolsets(&root, platform.name));
+                }
+                let selected =
+                    prompt_toolset_selection(input, output, "All platforms", "cli", &union)?;
+                if let Some(enabled) = selected {
+                    apply_global_selection(output, context, &platforms, &root, &enabled)?;
+                } else {
+                    writeln!(output, "No changes.")?;
+                }
+                writeln!(output)?;
+            }
+            InteractiveToolsChoice::Reconfigure => {
+                run_python_tools_bootstrap("tools reconfigure", TOOLS_RECONFIGURE_BOOTSTRAP)?;
+                writeln!(output)?;
+            }
+            InteractiveToolsChoice::ConfigureMcp => {
+                run_python_tools_bootstrap("tools mcp", TOOLS_MCP_BOOTSTRAP)?;
+                writeln!(output)?;
+            }
+            InteractiveToolsChoice::Done => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn build_interactive_tools_options(
+    root: &Mapping,
+    platforms: &[&'static PlatformDef],
+) -> Vec<(InteractiveToolsChoice, String)> {
+    let mut options = Vec::new();
+    let total = CONFIGURABLE_TOOLSETS.len();
+    for (index, platform) in platforms.iter().enumerate() {
+        let enabled = enabled_builtin_toolsets(root, platform.name);
+        options.push((
+            InteractiveToolsChoice::Platform(index),
+            format!("Configure {} ({}/{})", platform.label, enabled.len(), total),
+        ));
+    }
+    if platforms.len() > 1 {
+        options.push((
+            InteractiveToolsChoice::AllPlatforms,
+            String::from("Configure all platforms (global)"),
+        ));
+    }
+    options.push((
+        InteractiveToolsChoice::Reconfigure,
+        String::from("Reconfigure an existing tool's provider or API key"),
+    ));
+    if !collect_mcp_server_filters(root).is_empty() {
+        options.push((
+            InteractiveToolsChoice::ConfigureMcp,
+            String::from("Configure MCP server tools"),
+        ));
+    }
+    options.push((InteractiveToolsChoice::Done, String::from("Done")));
+    options
+}
+
+fn prompt_menu_choice(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    title: &str,
+    choices: &[&str],
+) -> Result<usize, Box<dyn Error>> {
+    loop {
+        writeln!(output, "{title}:")?;
+        for (index, choice) in choices.iter().enumerate() {
+            writeln!(output, "  {}. {}", index + 1, choice)?;
+        }
+        let response = prompt_line(input, output, "Enter a number")?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            writeln!(output, "Please enter a selection.")?;
+            continue;
+        }
+        let Ok(index) = trimmed.parse::<usize>() else {
+            writeln!(output, "Invalid selection: '{trimmed}'.")?;
+            continue;
+        };
+        if !(1..=choices.len()).contains(&index) {
+            writeln!(output, "Selection must be between 1 and {}.", choices.len())?;
+            continue;
+        }
+        return Ok(index - 1);
+    }
+}
+
+fn prompt_toolset_selection(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    label: &str,
+    platform: &str,
+    current: &BTreeSet<String>,
+) -> Result<Option<BTreeSet<String>>, Box<dyn Error>> {
+    let available = CONFIGURABLE_TOOLSETS
+        .iter()
+        .filter(|toolset| toolset_allowed_for_platform(toolset.name, platform))
+        .collect::<Vec<_>>();
+    loop {
+        writeln!(output, "Tools for {label}:")?;
+        for (index, toolset) in available.iter().enumerate() {
+            let status = if current.contains(toolset.name) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            writeln!(output, "  {}. {} {}", index + 1, status, toolset.label)?;
+        }
+        writeln!(
+            output,
+            "Enter enabled tool numbers as comma-separated values or ranges."
+        )?;
+        writeln!(output, "Use 'all', 'none', or press Enter to keep current.")?;
+        let response = prompt_line(input, output, "Selection")?;
+        match parse_toolset_selection(&response, available.len()) {
+            Ok(parsed) => {
+                return Ok(parsed.map(|indexes| {
+                    indexes
+                        .into_iter()
+                        .map(|index| available[index].name.to_string())
+                        .collect()
+                }));
+            }
+            Err(error) => {
+                writeln!(output, "{error}")?;
+            }
+        }
+    }
+}
+
+fn parse_toolset_selection(
+    raw: &str,
+    total: usize,
+) -> Result<Option<BTreeSet<usize>>, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Some((0..total).collect()));
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Some(BTreeSet::new()));
+    }
+
+    let mut selected = BTreeSet::new();
+    for part in trimmed.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            return Err("selection contains an empty item".into());
+        }
+        if let Some((start_raw, end_raw)) = token.split_once('-') {
+            let start = parse_selection_index(start_raw.trim(), total)?;
+            let end = parse_selection_index(end_raw.trim(), total)?;
+            if start > end {
+                return Err(format!("invalid range '{token}'").into());
+            }
+            selected.extend(start..=end);
+            continue;
+        }
+        selected.insert(parse_selection_index(token, total)?);
+    }
+    Ok(Some(selected))
+}
+
+fn parse_selection_index(raw: &str, total: usize) -> Result<usize, Box<dyn Error>> {
+    let number = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid selection '{raw}'"))?;
+    if !(1..=total).contains(&number) {
+        return Err(format!("selection '{raw}' is out of range").into());
+    }
+    Ok(number - 1)
+}
+
+fn prompt_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{prompt}: ")?;
+    output.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Err("interactive input closed".into());
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn apply_platform_selection(
+    output: &mut dyn Write,
+    context: &HermesContext,
+    platform: &str,
+    current: &BTreeSet<String>,
+    enabled: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    save_platform_toolsets(&mut root, platform, enabled)?;
+    write_yaml_mapping(&context.config_path(), &root)?;
+    print_toolset_delta(
+        output,
+        platform_definition(platform).map_or(platform, |value| value.label),
+        current,
+        enabled,
+    )?;
+    Ok(())
+}
+
+fn apply_global_selection(
+    output: &mut dyn Write,
+    context: &HermesContext,
+    platforms: &[&'static PlatformDef],
+    root: &Mapping,
+    enabled: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut updated_root = root.clone();
+    let mut changed = false;
+    for platform in platforms {
+        let previous = enabled_builtin_toolsets(root, platform.name);
+        let next = enabled
+            .iter()
+            .filter(|name| toolset_allowed_for_platform(name, platform.name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if previous != next {
+            save_platform_toolsets(&mut updated_root, platform.name, &next)?;
+            print_toolset_delta(output, platform.label, &previous, &next)?;
+            changed = true;
+        }
+    }
+    if changed {
+        write_yaml_mapping(&context.config_path(), &updated_root)?;
+    } else {
+        writeln!(output, "No changes.")?;
+    }
+    Ok(())
+}
+
+fn print_toolset_delta(
+    output: &mut dyn Write,
+    label: &str,
+    previous: &BTreeSet<String>,
+    next: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output, "{label}:")?;
+    let added = next
+        .difference(previous)
+        .filter_map(|name| configurable_toolset(name))
+        .collect::<Vec<_>>();
+    let removed = previous
+        .difference(next)
+        .filter_map(|name| configurable_toolset(name))
+        .collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() {
+        writeln!(output, "  No changes.")?;
+        return Ok(());
+    }
+    for toolset in added {
+        writeln!(output, "  + {}", toolset.label)?;
+    }
+    for toolset in removed {
+        writeln!(output, "  - {}", toolset.label)?;
+    }
+    writeln!(output, "  Saved.")?;
+    Ok(())
+}
+
+fn run_python_tools_bootstrap(command_name: &str, bootstrap: &str) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_TOOLS_PYTHON"))
         .ok_or("could not find a Python interpreter for tools")?;
@@ -413,12 +754,12 @@ fn print_python_tools_interactive() -> Result<(), Box<dyn Error>> {
         .current_dir(&root)
         .env("PYTHONPATH", root.display().to_string())
         .arg("-c")
-        .arg(TOOLS_INTERACTIVE_BOOTSTRAP)
+        .arg(bootstrap)
         .status()?;
     if status.success() {
         return Ok(());
     }
-    Err(exit_status_message("tools", status).into())
+    Err(exit_status_message(command_name, status).into())
 }
 
 fn render_tools_summary(root: &Mapping) -> String {
@@ -921,6 +1262,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::fs;
+    use std::io::Cursor;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1042,7 +1384,50 @@ mod tests {
     }
 
     #[test]
-    fn interactive_tools_bridge_uses_python_override() {
+    fn parse_toolset_selection_supports_ranges_and_keywords() {
+        assert_eq!(parse_toolset_selection("", 4).unwrap(), None);
+        assert_eq!(
+            parse_toolset_selection("all", 3).unwrap(),
+            Some(BTreeSet::from([0, 1, 2]))
+        );
+        assert_eq!(
+            parse_toolset_selection("none", 3).unwrap(),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            parse_toolset_selection("1,3-4", 4).unwrap(),
+            Some(BTreeSet::from([0, 2, 3]))
+        );
+        assert!(parse_toolset_selection("0", 4).is_err());
+        assert!(parse_toolset_selection("4-2", 4).is_err());
+    }
+
+    #[test]
+    fn interactive_tools_menu_updates_cli_toolsets_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("interactive");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - file\n",
+        );
+        let mut input = Cursor::new(b"1\n1,4\n3\n".to_vec());
+        let mut output = Vec::new();
+
+        run_native_tools_interactive_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("- web"));
+        assert!(saved.contains("- file"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Hermes Tool Configuration"));
+        assert!(rendered.contains("Configure CLI"));
+        assert!(rendered.contains("CLI:"));
+        assert!(rendered.contains("+ Web Search & Scraping"));
+    }
+
+    #[test]
+    fn tools_reconfigure_bootstrap_uses_python_override() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let root = project_root();
         let temp = temp_path("bridge");
@@ -1066,12 +1451,13 @@ mod tests {
         }
 
         unsafe { std::env::set_var("HERMES_TOOLS_PYTHON", &python) };
-        let result = print_python_tools_interactive();
+        let result = run_python_tools_bootstrap("tools reconfigure", TOOLS_RECONFIGURE_BOOTSTRAP);
         unsafe { std::env::remove_var("HERMES_TOOLS_PYTHON") };
 
         result.unwrap();
         let logged = fs::read_to_string(log_path).unwrap();
         assert!(logged.contains("-c"));
+        assert!(logged.contains("_reconfigure_tool"));
         assert!(root.exists());
     }
 }
