@@ -10,6 +10,7 @@ use crate::{
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
     resolve_minimax_oauth_runtime_credentials, resolve_provider_api_mode,
+    resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -445,10 +446,16 @@ impl HermesContext {
         } else {
             None
         };
+        let qwen_oauth = if provider == "qwen-oauth" {
+            Some(resolve_qwen_runtime_credentials()?)
+        } else {
+            None
+        };
 
         let base_url = explicit_base_url
             .or(config_base_url)
             .or_else(|| minimax_oauth.as_ref().map(|creds| creds.base_url.clone()))
+            .or_else(|| qwen_oauth.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| {
                 profile
                     .base_url_env_var()
@@ -470,6 +477,7 @@ impl HermesContext {
                     .as_ref()
                     .map(|creds| creds.access_token.clone())
             })
+            .or_else(|| qwen_oauth.as_ref().map(|creds| creds.access_token.clone()))
             .or_else(|| {
                 profile
                     .api_key_env_vars()
@@ -1091,5 +1099,57 @@ mod tests {
         assert_eq!(runtime.api_mode, "anthropic_messages");
         assert_eq!(runtime.api_key, "mini-runtime-token");
         assert_eq!(runtime.base_url, "https://api.minimaxi.com/anthropic");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_qwen_oauth_credentials() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_home = env::var_os("HOME");
+        let previous_qwen_base = env::var_os("HERMES_QWEN_BASE_URL");
+
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        let external_home = ctx.hermes_home().join("external-home");
+        let qwen_dir = external_home.join(".qwen");
+        fs::create_dir_all(&qwen_dir).expect("qwen dir");
+        fs::write(
+            qwen_dir.join("oauth_creds.json"),
+            json!({
+                "access_token": "qwen-runtime-token",
+                "refresh_token": "qwen-refresh-token",
+                "token_type": "Bearer",
+                "resource_url": "portal.qwen.ai",
+                "expiry_date": i64::MAX / 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: qwen3.5-plus\n  provider: qwen-oauth\n",
+        )
+        .unwrap();
+
+        unsafe { env::set_var("HOME", &external_home) };
+        unsafe { env::set_var("HERMES_QWEN_BASE_URL", "https://portal.qwen.ai/v1") };
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        match previous_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        match previous_qwen_base {
+            Some(value) => unsafe { env::set_var("HERMES_QWEN_BASE_URL", value) },
+            None => unsafe { env::remove_var("HERMES_QWEN_BASE_URL") },
+        }
+
+        assert_eq!(runtime.provider, "qwen-oauth");
+        assert_eq!(runtime.api_mode, "chat_completions");
+        assert_eq!(runtime.api_key, "qwen-runtime-token");
+        assert_eq!(runtime.base_url, "https://portal.qwen.ai/v1");
     }
 }

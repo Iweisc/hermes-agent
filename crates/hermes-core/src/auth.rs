@@ -14,6 +14,10 @@ const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
 const MINIMAX_OAUTH_REFRESH_SKEW_SECONDS: i64 = 60;
+const DEFAULT_QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
+const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
+const QWEN_OAUTH_TOKEN_URL: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
+const QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTokens {
@@ -23,6 +27,12 @@ struct CodexTokens {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinimaxOAuthRuntimeCredentials {
+    pub access_token: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QwenRuntimeCredentials {
     pub access_token: String,
     pub base_url: String,
 }
@@ -49,6 +59,15 @@ pub fn resolve_minimax_oauth_runtime_credentials(
     hermes_home: &Path,
 ) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
     resolve_minimax_oauth_runtime_credentials_with_client(hermes_home, &Client::new())
+}
+
+pub fn resolve_qwen_runtime_credentials() -> Result<QwenRuntimeCredentials, HermesError> {
+    let auth_path = qwen_cli_auth_path()?;
+    let base_url_override = std::env::var("HERMES_QWEN_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    resolve_qwen_runtime_credentials_from_path(&auth_path, &Client::new(), base_url_override)
 }
 
 fn resolve_codex_access_token_with_refresh_url(
@@ -182,6 +201,14 @@ fn load_auth_store(path: &Path) -> Result<Value, HermesError> {
     })
 }
 
+fn qwen_cli_auth_path() -> Result<std::path::PathBuf, HermesError> {
+    let home = dirs::home_dir().ok_or_else(|| HermesError::State {
+        action: "resolving Qwen OAuth auth",
+        detail: "Could not determine the home directory for ~/.qwen/oauth_creds.json.".to_string(),
+    })?;
+    Ok(home.join(".qwen").join("oauth_creds.json"))
+}
+
 fn persist_codex_tokens(
     auth_path: &Path,
     auth_store: &mut Value,
@@ -300,6 +327,25 @@ fn persist_minimax_oauth_state(
         action: "serializing auth store",
         detail: error.to_string(),
     })?;
+    fs::write(auth_path, format!("{payload}\n")).map_err(|source| HermesError::Io {
+        action: "writing",
+        path: auth_path.to_path_buf(),
+        source,
+    })
+}
+
+fn persist_qwen_tokens(auth_path: &Path, tokens: &Value) -> Result<(), HermesError> {
+    let payload = serde_json::to_string_pretty(tokens).map_err(|error| HermesError::State {
+        action: "serializing Qwen OAuth credentials",
+        detail: error.to_string(),
+    })?;
+    if let Some(parent) = auth_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| HermesError::Io {
+            action: "creating",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
     fs::write(auth_path, format!("{payload}\n")).map_err(|source| HermesError::Io {
         action: "writing",
         path: auth_path.to_path_buf(),
@@ -519,6 +565,195 @@ fn refresh_minimax_oauth_state(
     })
 }
 
+fn resolve_qwen_runtime_credentials_from_path(
+    auth_path: &Path,
+    client: &Client,
+    base_url_override: Option<String>,
+) -> Result<QwenRuntimeCredentials, HermesError> {
+    resolve_qwen_runtime_credentials_from_path_with_refresh_url(
+        auth_path,
+        client,
+        base_url_override,
+        QWEN_OAUTH_TOKEN_URL,
+    )
+}
+
+fn resolve_qwen_runtime_credentials_from_path_with_refresh_url(
+    auth_path: &Path,
+    client: &Client,
+    base_url_override: Option<String>,
+    refresh_url: &str,
+) -> Result<QwenRuntimeCredentials, HermesError> {
+    let mut tokens = load_qwen_tokens(auth_path)?;
+    let should_refresh = qwen_access_token_needs_refresh(tokens.get("expiry_date"));
+    if should_refresh {
+        tokens = refresh_qwen_tokens(client, auth_path, &tokens, refresh_url)?;
+    }
+    let access_token = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Qwen OAuth auth",
+            detail: "Qwen OAuth access_token missing. Re-authenticate with the Python runtime."
+                .to_string(),
+        })?;
+    let base_url = base_url_override.unwrap_or_else(|| DEFAULT_QWEN_BASE_URL.to_string());
+    Ok(QwenRuntimeCredentials {
+        access_token,
+        base_url: base_url.trim_end_matches('/').to_string(),
+    })
+}
+
+fn load_qwen_tokens(auth_path: &Path) -> Result<Value, HermesError> {
+    if !auth_path.exists() {
+        return Err(HermesError::State {
+            action: "resolving Qwen OAuth auth",
+            detail: format!(
+                "Qwen CLI credentials not found at {}. Run the Python runtime's Qwen auth flow first.",
+                auth_path.display()
+            ),
+        });
+    }
+    let raw = fs::read_to_string(auth_path).map_err(|source| HermesError::Io {
+        action: "reading",
+        path: auth_path.to_path_buf(),
+        source,
+    })?;
+    let parsed = serde_json::from_str::<Value>(&raw).map_err(|error| HermesError::State {
+        action: "parsing Qwen OAuth credentials",
+        detail: format!("{}: {error}", auth_path.display()),
+    })?;
+    if !parsed.is_object() {
+        return Err(HermesError::State {
+            action: "parsing Qwen OAuth credentials",
+            detail: format!("{} does not contain a JSON object.", auth_path.display()),
+        });
+    }
+    Ok(parsed)
+}
+
+fn qwen_access_token_needs_refresh(expiry_date_ms: Option<&Value>) -> bool {
+    let expiry_ms = expiry_date_ms
+        .and_then(value_to_i64)
+        .filter(|value| *value > 0);
+    let Some(expiry_ms) = expiry_ms else {
+        return true;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    now_ms >= expiry_ms - (QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS * 1000)
+}
+
+fn refresh_qwen_tokens(
+    client: &Client,
+    auth_path: &Path,
+    tokens: &Value,
+    refresh_url: &str,
+) -> Result<Value, HermesError> {
+    let object = tokens.as_object().ok_or_else(|| HermesError::State {
+        action: "refreshing Qwen OAuth auth",
+        detail: "Qwen OAuth credentials are not a JSON object.".to_string(),
+    })?;
+    let refresh_token = object
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HermesError::State {
+            action: "refreshing Qwen OAuth auth",
+            detail: "Qwen OAuth refresh_token missing. Re-authenticate with the Python runtime."
+                .to_string(),
+        })?;
+
+    let response = client
+        .post(refresh_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", QWEN_OAUTH_CLIENT_ID),
+        ])
+        .send()
+        .map_err(|error| HermesError::State {
+            action: "refreshing Qwen OAuth auth",
+            detail: error.to_string(),
+        })?;
+    let status = response.status();
+    let body = response.text().map_err(|error| HermesError::State {
+        action: "reading Qwen OAuth refresh response",
+        detail: error.to_string(),
+    })?;
+    if !status.is_success() {
+        let detail = body.trim();
+        return Err(HermesError::State {
+            action: "refreshing Qwen OAuth auth",
+            detail: if detail.is_empty() {
+                "Qwen OAuth refresh failed. Re-authenticate with the Python runtime.".to_string()
+            } else {
+                format!(
+                    "Qwen OAuth refresh failed. Re-authenticate with the Python runtime. Response: {detail}"
+                )
+            },
+        });
+    }
+    let payload = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Qwen OAuth refresh response",
+        detail: format!("{error}: {body}"),
+    })?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HermesError::State {
+            action: "refreshing Qwen OAuth auth",
+            detail: "Qwen OAuth refresh response missing access_token.".to_string(),
+        })?;
+    let expires_in_seconds = payload
+        .get("expires_in")
+        .and_then(value_to_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or(6 * 60 * 60);
+    let expiry_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+        + expires_in_seconds * 1000;
+
+    let refreshed = json!({
+        "access_token": access_token,
+        "refresh_token": payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(refresh_token),
+        "token_type": payload
+            .get("token_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| object.get("token_type").and_then(Value::as_str))
+            .unwrap_or("Bearer"),
+        "resource_url": payload
+            .get("resource_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| object.get("resource_url").and_then(Value::as_str))
+            .unwrap_or("portal.qwen.ai"),
+        "expiry_date": expiry_date,
+    });
+    persist_qwen_tokens(auth_path, &refreshed)?;
+    Ok(refreshed)
+}
+
 fn token_needs_refresh(access_token: &str) -> bool {
     let Some(exp) = token_expiry(access_token) else {
         return false;
@@ -539,6 +774,17 @@ fn minimax_token_needs_refresh(expires_at: Option<i64>) -> bool {
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
     now >= expires_at - MINIMAX_OAUTH_REFRESH_SKEW_SECONDS
+}
+
+fn value_to_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|raw| raw as i64))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<i64>().ok())
+        })
 }
 
 fn token_expiry(access_token: &str) -> Option<i64> {
@@ -835,5 +1081,103 @@ mod tests {
             persisted["providers"]["minimax-oauth"]["access_token"],
             "mini-new"
         );
+    }
+
+    #[test]
+    fn resolve_qwen_runtime_credentials_reads_fresh_state() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("oauth_creds.json");
+        fs::write(
+            &auth_path,
+            json!({
+                "access_token": "qwen-fresh",
+                "refresh_token": "qwen-refresh",
+                "token_type": "Bearer",
+                "resource_url": "portal.qwen.ai",
+                "expiry_date": i64::MAX / 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = resolve_qwen_runtime_credentials_from_path(
+            &auth_path,
+            &Client::new(),
+            Some("https://portal.qwen.ai/v1".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.access_token, "qwen-fresh");
+        assert_eq!(resolved.base_url, "https://portal.qwen.ai/v1");
+    }
+
+    #[test]
+    fn resolve_qwen_runtime_credentials_refreshes_expired_state() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("oauth_creds.json");
+        fs::write(
+            &auth_path,
+            json!({
+                "access_token": "qwen-old",
+                "refresh_token": "qwen-refresh-old",
+                "token_type": "Bearer",
+                "resource_url": "portal.qwen.ai",
+                "expiry_date": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /oauth2/token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=qwen-refresh-old"));
+            assert!(request_text.contains(&format!("client_id={QWEN_OAUTH_CLIENT_ID}")));
+
+            let body = json!({
+                "access_token": "qwen-new",
+                "refresh_token": "qwen-refresh-new",
+                "expires_in": 7200,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_qwen_runtime_credentials_from_path_with_refresh_url(
+            &auth_path,
+            &client,
+            Some("http://127.0.0.1:18000/v1".to_string()),
+            &format!("http://{addr}/oauth2/token"),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.access_token, "qwen-new");
+        let persisted =
+            serde_json::from_str::<Value>(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(persisted["access_token"], "qwen-new");
+        assert_eq!(persisted["refresh_token"], "qwen-refresh-new");
     }
 }

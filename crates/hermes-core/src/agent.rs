@@ -17,6 +17,7 @@ use crate::{
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
 const MAX_HTTP_ERROR_BODY_CHARS: usize = 4000;
 const KANBAN_GUIDANCE: &str = "# Kanban task execution protocol\nUse kanban_show first to orient on the assigned task. Work inside HERMES_KANBAN_WORKSPACE unless the task explicitly requires otherwise. Heartbeat during long-running work, block when you need human input you cannot infer, and finish with kanban_complete(summary=..., metadata=...) or kanban_block(reason=...). Use kanban_create for real follow-up work instead of silently scope-creeping into it.";
+const QWEN_CODE_VERSION: &str = "0.14.1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnResult {
@@ -206,7 +207,13 @@ impl HermesContext {
 
         for _ in 0..loaded.config.agent.max_turns {
             api_calls += 1;
-            let response = send_model_request(&client, &runtime_model, &messages, &tools)?;
+            let response = send_model_request(
+                &client,
+                &runtime_model,
+                &messages,
+                &tools,
+                session_id.as_deref(),
+            )?;
             let NormalizedAssistantResponse {
                 content: assistant_content,
                 tool_calls: pending_tool_calls,
@@ -439,9 +446,12 @@ fn send_model_request(
     runtime_model: &crate::ModelRuntimeConfig,
     messages: &[Value],
     tools: &[crate::ToolDefinition],
+    session_id: Option<&str>,
 ) -> Result<NormalizedAssistantResponse, HermesError> {
     match runtime_model.api_mode.as_str() {
-        "chat_completions" => send_chat_completion(client, runtime_model, messages, tools),
+        "chat_completions" => {
+            send_chat_completion(client, runtime_model, messages, tools, session_id)
+        }
         "anthropic_messages" => send_anthropic_message(client, runtime_model, messages, tools),
         "codex_responses" => send_codex_response(client, runtime_model, messages, tools),
         "bedrock_converse" => send_bedrock_converse(client, runtime_model, messages, tools),
@@ -457,7 +467,7 @@ pub(crate) fn request_model_text(
     runtime_model: &crate::ModelRuntimeConfig,
     messages: &[Value],
 ) -> Result<Option<String>, HermesError> {
-    let response = send_model_request(client, runtime_model, messages, &[])?;
+    let response = send_model_request(client, runtime_model, messages, &[], None)?;
     Ok(response.content.and_then(|text| {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -473,11 +483,25 @@ fn send_chat_completion(
     runtime_model: &crate::ModelRuntimeConfig,
     messages: &[Value],
     tools: &[crate::ToolDefinition],
+    session_id: Option<&str>,
 ) -> Result<NormalizedAssistantResponse, HermesError> {
+    let qwen_messages = prepare_qwen_messages(messages);
+    let request_messages = if is_qwen_portal_runtime(runtime_model) {
+        &qwen_messages
+    } else {
+        messages
+    };
     let mut payload = json!({
         "model": runtime_model.model,
-        "messages": messages,
+        "messages": request_messages,
     });
+    if is_qwen_portal_runtime(runtime_model) {
+        payload["vl_high_resolution_images"] = Value::Bool(true);
+        payload["metadata"] = json!({
+            "sessionId": session_id.unwrap_or("hermes"),
+            "promptId": unix_ts_nanos().to_string(),
+        });
+    }
     if !tools.is_empty() {
         payload["tools"] = Value::Array(tools.iter().map(|tool| tool.openai_schema()).collect());
         payload["tool_choice"] = Value::String("auto".to_string());
@@ -778,6 +802,19 @@ fn apply_chat_auth_headers(
     if !runtime_model.api_key.is_empty() {
         request = request.bearer_auth(&runtime_model.api_key);
     }
+    if is_qwen_portal_runtime(runtime_model) {
+        let user_agent = format!(
+            "QwenCode/{} ({}; {})",
+            QWEN_CODE_VERSION,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        request = request
+            .header("User-Agent", &user_agent)
+            .header("X-DashScope-CacheControl", "enable")
+            .header("X-DashScope-UserAgent", &user_agent)
+            .header("X-DashScope-AuthType", "qwen-oauth");
+    }
     for (name, value) in &runtime_model.default_headers {
         request = request.header(name, value);
     }
@@ -892,6 +929,77 @@ fn parse_bedrock_region(base_url: &str) -> Option<String> {
         return non_empty_trimmed(region);
     }
     None
+}
+
+fn is_qwen_portal_runtime(runtime_model: &crate::ModelRuntimeConfig) -> bool {
+    runtime_model.provider == "qwen-oauth"
+        || reqwest::Url::parse(&runtime_model.base_url)
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case("portal.qwen.ai"))
+            })
+            .unwrap_or(false)
+}
+
+fn prepare_qwen_messages(messages: &[Value]) -> Vec<Value> {
+    let mut prepared = messages.to_vec();
+    for message in &mut prepared {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        let Some(content) = object.get_mut("content") else {
+            continue;
+        };
+        normalize_qwen_content(content);
+    }
+
+    for message in &mut prepared {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) else {
+            break;
+        };
+        let Some(last) = content.last_mut().and_then(Value::as_object_mut) else {
+            break;
+        };
+        last.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+        break;
+    }
+
+    prepared
+}
+
+fn normalize_qwen_content(content: &mut Value) {
+    match content {
+        Value::String(text) => {
+            *content = Value::Array(vec![json!({
+                "type": "text",
+                "text": text.clone(),
+            })]);
+        }
+        Value::Array(parts) => {
+            let mut normalized = Vec::new();
+            for part in parts.iter() {
+                match part {
+                    Value::String(text) => normalized.push(json!({
+                        "type": "text",
+                        "text": text,
+                    })),
+                    Value::Object(_) => normalized.push(part.clone()),
+                    _ => {}
+                }
+            }
+            if !normalized.is_empty() {
+                *content = Value::Array(normalized);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn repo_root() -> PathBuf {
@@ -1750,6 +1858,123 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("MINIMAX_API_KEY");
         }
+    }
+
+    #[test]
+    fn qwen_oauth_chat_requests_include_portal_headers_and_payload_shape() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert!(request_line.starts_with("POST /v1/chat/completions "));
+
+            let mut content_length = 0usize;
+            let mut auth = String::new();
+            let mut user_agent = String::new();
+            let mut dashscope_cache = String::new();
+            let mut dashscope_user_agent = String::new();
+            let mut dashscope_auth_type = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                } else if lower.starts_with("authorization:") {
+                    auth = trimmed
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_default();
+                } else if lower.starts_with("user-agent:") {
+                    user_agent = trimmed
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_default();
+                } else if lower.starts_with("x-dashscope-cachecontrol:") {
+                    dashscope_cache = trimmed
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_default();
+                } else if lower.starts_with("x-dashscope-useragent:") {
+                    dashscope_user_agent = trimmed
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_default();
+                } else if lower.starts_with("x-dashscope-authtype:") {
+                    dashscope_auth_type = trimmed
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string())
+                        .unwrap_or_default();
+                }
+            }
+            assert_eq!(auth, "Bearer qwen-token");
+            assert_eq!(dashscope_cache, "enable");
+            assert_eq!(dashscope_auth_type, "qwen-oauth");
+            assert_eq!(dashscope_user_agent, user_agent);
+            assert!(user_agent.starts_with("QwenCode/0.14.1 ("));
+
+            let mut body = vec![0_u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let payload = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!(payload["vl_high_resolution_images"], Value::Bool(true));
+            assert_eq!(payload["metadata"]["sessionId"], json!("hermes"));
+            assert!(
+                payload["metadata"]["promptId"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+            );
+            let messages = payload["messages"].as_array().unwrap();
+            assert!(messages[0]["content"].is_array());
+            assert_eq!(messages[0]["content"][0]["text"], json!("Be helpful"));
+            assert_eq!(
+                messages[0]["content"][0]["cache_control"],
+                json!({"type": "ephemeral"})
+            );
+            assert!(messages[1]["content"].is_array());
+            assert_eq!(messages[1]["content"][0]["text"], json!("hello"));
+
+            let body = json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Qwen portal smoke passed."},
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = build_http_client().unwrap();
+        let runtime = crate::ModelRuntimeConfig {
+            model: "qwen3.5-plus".to_string(),
+            provider: "qwen-oauth".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "qwen-token".to_string(),
+            api_mode: "chat_completions".to_string(),
+            auth_type: "oauth_external".to_string(),
+            default_headers: Vec::new(),
+        };
+        let messages = vec![
+            json!({"role": "system", "content": "Be helpful"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+
+        let result = request_model_text(&client, &runtime, &messages).unwrap();
+        server.join().unwrap();
+        assert_eq!(result.as_deref(), Some("Qwen portal smoke passed."));
     }
 
     #[test]
