@@ -15,6 +15,7 @@ mod hooks;
 mod insights_cmd;
 mod login_cmd;
 mod logs;
+mod mcp_cmd;
 mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
@@ -104,7 +105,10 @@ enum Command {
         #[command(subcommand)]
         command: Option<memory_cmd::MemoryCommand>,
     },
-    Mcp(compat_cmd::CompatArgs),
+    Mcp {
+        #[command(subcommand)]
+        command: Option<mcp_cmd::McpCommand>,
+    },
     Insights(insights_cmd::InsightsArgs),
     Claw {
         #[command(subcommand)]
@@ -321,7 +325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Plugins { command } => plugins_cmd::print_plugins(&context, command)?,
         Command::Curator(args) => compat_cmd::print_curator(args)?,
         Command::Memory { command } => memory_cmd::print_memory(&context, &config, command)?,
-        Command::Mcp(args) => compat_cmd::print_mcp(args)?,
+        Command::Mcp { command } => mcp_cmd::print_mcp(&context, command)?,
         Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
         Command::Claw { command } => claw_cmd::print_claw(command)?,
         Command::Acp(args) => acp_cmd::print_acp(args)?,

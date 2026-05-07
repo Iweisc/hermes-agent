@@ -26,10 +26,6 @@ pub fn print_curator(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("curator", args)
 }
 
-pub fn print_mcp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("mcp", args)
-}
-
 pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("whatsapp", args)
 }
