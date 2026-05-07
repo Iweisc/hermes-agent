@@ -94,7 +94,7 @@ pub fn print_dump(
     Ok(())
 }
 
-fn render_dump(
+pub(crate) fn render_dump(
     context: &HermesContext,
     config: &LoadedConfig,
     show_keys: bool,
