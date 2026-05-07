@@ -1176,9 +1176,6 @@ fn install_skill_command(
     if !args.identifier.starts_with("official/") {
         return install_github_skill_command(context, passthrough, &args);
     }
-    if !args.name_override.trim().is_empty() {
-        return bridge_prefixed("install", passthrough);
-    }
 
     let summary = collect_official_skill_summaries()?
         .into_iter()
@@ -1298,6 +1295,7 @@ fn install_github_skill_command(
     passthrough: &[String],
     args: &InstallArgsParsed,
 ) -> Result<(), Box<dyn Error>> {
+    let name_override = resolve_optional_install_name_override(&args.name_override)?;
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_lobehub_bundle_to_tempdir(&args.identifier)?
     {
@@ -1315,13 +1313,7 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_clawhub_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| {
-            if args.name_override.trim().is_empty() {
-                None
-            } else {
-                Some(args.name_override.trim().to_string())
-            }
-        }) else {
+        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
             return bridge_prefixed("install", passthrough);
         };
         return install_remote_skill_bundle(
@@ -1338,13 +1330,7 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_skills_sh_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| {
-            if args.name_override.trim().is_empty() {
-                None
-            } else {
-                Some(args.name_override.trim().to_string())
-            }
-        }) else {
+        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
             return bridge_prefixed("install", passthrough);
         };
         return install_remote_skill_bundle(
@@ -1361,13 +1347,7 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_well_known_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| {
-            if args.name_override.trim().is_empty() {
-                None
-            } else {
-                Some(args.name_override.trim().to_string())
-            }
-        }) else {
+        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
             return bridge_prefixed("install", passthrough);
         };
         return install_remote_skill_bundle(
@@ -1384,13 +1364,7 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_url_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| {
-            if args.name_override.trim().is_empty() {
-                None
-            } else {
-                Some(args.name_override.trim().to_string())
-            }
-        }) else {
+        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
             return bridge_prefixed("install", passthrough);
         };
         return install_remote_skill_bundle(
@@ -1403,10 +1377,6 @@ fn install_github_skill_command(
             "url",
             "URL",
         );
-    }
-
-    if !args.name_override.trim().is_empty() {
-        return bridge_prefixed("install", passthrough);
     }
     if github_app_auth_configured() && resolve_github_publish_token().is_none() {
         return bridge_prefixed("install", passthrough);
@@ -6796,6 +6766,37 @@ fn validate_skill_name(raw: &str) -> Result<&str, Box<dyn Error>> {
     Ok(name)
 }
 
+fn resolve_optional_install_name_override(raw: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "skill" | "readme" | "index" | "unnamed-skill"
+    ) {
+        return Err(
+            "invalid --name: use a lowercase identifier, not a placeholder like 'skill' or 'readme'"
+                .into(),
+        );
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return Err("invalid --name: skill name cannot be empty".into());
+    };
+    if !first.is_ascii_lowercase()
+        || !chars
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+    {
+        return Err(
+            "invalid --name: must start with a lowercase letter and contain only lowercase letters, digits, '_' or '-'"
+                .into(),
+        );
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 fn validate_category_name(raw: &str) -> Result<&str, Box<dyn Error>> {
     let category = raw.trim();
     if category.is_empty() {
@@ -7897,6 +7898,110 @@ exit 9\n",
             None => remove_env_var("GITHUB_TOKEN"),
         }
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_native_official_skill_ignores_name_override_without_bridging() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-official-name-home");
+        let optional = temp_path("optional-name-src");
+        let fake_python = temp_path("skills-install-name-python");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        let skill_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("notes.txt"), "hello\n").unwrap();
+        fs::write(&fake_python, "#!/bin/sh\nexit 99\n").unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+
+        install_skill_command(
+            &context,
+            &[
+                String::from("official/research/demo"),
+                String::from("--name"),
+                String::from("renamed"),
+                String::from("--yes"),
+            ],
+        )
+        .unwrap();
+
+        assert!(home.join("skills").join("research").join("demo").exists());
+        assert!(
+            !home
+                .join("skills")
+                .join("research")
+                .join("renamed")
+                .exists()
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        assert!(installed.contains_key("demo"));
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+        let _ = fs::remove_file(fake_python);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_native_github_skill_ignores_name_override_without_bridging() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-github-name-home");
+        let fake_python = temp_path("skills-github-name-python");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests);
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        fs::write(&fake_python, "#!/bin/sh\nexit 99\n").unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+
+        install_skill_command(
+            &context,
+            &[
+                String::from("openai/skills/shipit"),
+                String::from("--name"),
+                String::from("renamed"),
+                String::from("--yes"),
+            ],
+        )
+        .unwrap();
+
+        assert!(home.join("skills").join("shipit").exists());
+        assert!(!home.join("skills").join("renamed").exists());
+        let installed = load_hub_lock(&context).unwrap();
+        assert!(installed.contains_key("shipit"));
+
+        handle.join().unwrap();
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_file(fake_python);
     }
 
     #[test]
