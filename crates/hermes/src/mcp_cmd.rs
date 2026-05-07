@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
+use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand};
 use hermes_core::HermesContext;
@@ -9,7 +10,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[cfg(test)]
 use clap::Parser;
@@ -61,10 +62,61 @@ pub fn print_mcp(
 }
 
 fn bridge_mcp(subcommand: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut argv = Vec::with_capacity(1 + passthrough.len());
-    argv.push(subcommand.to_string());
-    argv.extend(passthrough.iter().cloned());
-    launch_python_main_command("mcp", &argv, Some("HERMES_MCP_PYTHON"), &[])
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_MCP_PYTHON"))
+        .ok_or("could not find a Python interpreter for mcp")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_MCP_SUBCOMMAND", subcommand)
+        .arg("-c")
+        .arg(MCP_BOOTSTRAP)
+        .args(passthrough);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("mcp", status).into())
+}
+
+const MCP_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "import sys\n",
+    "from hermes_cli.mcp_config import mcp_command\n",
+    "subcommand = (os.environ.get('HERMES_MCP_SUBCOMMAND') or '').strip()\n",
+    "parser = argparse.ArgumentParser(prog=f'hermes mcp {subcommand}')\n",
+    "parser.set_defaults(mcp_action=subcommand)\n",
+    "if subcommand == 'serve':\n",
+    "    parser.add_argument('-v', '--verbose', action='store_true')\n",
+    "    parser.add_argument('--accept-hooks', action='store_true', default=False)\n",
+    "elif subcommand == 'add':\n",
+    "    parser.add_argument('name')\n",
+    "    parser.add_argument('--url')\n",
+    "    parser.add_argument('--command')\n",
+    "    parser.add_argument('--args', nargs='*', default=[])\n",
+    "    parser.add_argument('--auth', choices=['oauth', 'header'])\n",
+    "    parser.add_argument('--preset')\n",
+    "    parser.add_argument('--env', nargs='*', default=[])\n",
+    "elif subcommand == 'test':\n",
+    "    parser.add_argument('name')\n",
+    "elif subcommand == 'configure':\n",
+    "    parser.add_argument('name')\n",
+    "elif subcommand == 'login':\n",
+    "    parser.add_argument('name')\n",
+    "else:\n",
+    "    raise SystemExit(f'unsupported mcp subcommand: {subcommand}')\n",
+    "mcp_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -360,8 +412,15 @@ fn yaml_key(key: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -369,6 +428,26 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("hermes-rs-mcp-{label}-{unique}"))
+    }
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
     }
 
     #[derive(Parser, Debug)]
@@ -405,6 +484,51 @@ mod tests {
             }
             _ => panic!("expected add args"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_uses_python_override_and_passes_subcommand_and_args() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+        bridge_mcp(
+            "add",
+            &[
+                String::from("alpha"),
+                String::from("--url"),
+                String::from("https://example.com/mcp"),
+                String::from("--env"),
+                String::from("API_KEY=test"),
+            ],
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("subcommand=add"));
+        assert!(output.contains("argv=alpha --url https://example.com/mcp --env API_KEY=test"));
+
+        remove_env_var("HERMES_MCP_PYTHON");
     }
 
     #[test]
