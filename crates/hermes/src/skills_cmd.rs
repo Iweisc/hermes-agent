@@ -1051,6 +1051,29 @@ fn install_github_skill_command(
         );
     }
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_skills_sh_bundle_to_tempdir(&args.identifier)?
+    {
+        let Some(skill_name) = skill_name.or_else(|| {
+            if args.name_override.trim().is_empty() {
+                None
+            } else {
+                Some(args.name_override.trim().to_string())
+            }
+        }) else {
+            return bridge_prefixed("install", passthrough);
+        };
+        return install_remote_skill_bundle(
+            context,
+            args,
+            bundle_dir,
+            skill_name,
+            trust_level,
+            identifier,
+            "skills-sh",
+            "skills.sh",
+        );
+    }
+    if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_well_known_bundle_to_tempdir(&args.identifier)?
     {
         let Some(skill_name) = skill_name.or_else(|| {
@@ -1464,6 +1487,7 @@ fn check_skills_command(
             && source != "github"
             && source != "lobehub"
             && source != "clawhub"
+            && source != "skills-sh"
             && source != "well-known"
             && source != "url"
     }) {
@@ -1473,6 +1497,17 @@ fn check_skills_command(
         && github_app_auth_configured()
         && resolve_github_publish_token().is_none()
     {
+        return bridge_prefixed("check", passthrough);
+    }
+    if targets.iter().any(|(name, source)| {
+        if source != "skills-sh" {
+            return false;
+        }
+        installed
+            .get(name)
+            .map(entry_identifier)
+            .is_some_and(|identifier| parse_skills_sh_identifier(&identifier).is_none())
+    }) {
         return bridge_prefixed("check", passthrough);
     }
 
@@ -1504,6 +1539,7 @@ fn update_skills_command(
             && entry.source != "github"
             && entry.source != "lobehub"
             && entry.source != "clawhub"
+            && entry.source != "skills-sh"
             && entry.source != "well-known"
             && entry.source != "url"
         {
@@ -1512,6 +1548,11 @@ fn update_skills_command(
         if entry.source == "github"
             && github_app_auth_configured()
             && resolve_github_publish_token().is_none()
+        {
+            return bridge_prefixed("update", passthrough);
+        }
+        if entry.source == "skills-sh"
+            && parse_skills_sh_identifier(&entry_identifier(entry)).is_none()
         {
             return bridge_prefixed("update", passthrough);
         }
@@ -1527,6 +1568,7 @@ fn update_skills_command(
                 && entry.source != "github"
                 && entry.source != "lobehub"
                 && entry.source != "clawhub"
+                && entry.source != "skills-sh"
                 && entry.source != "well-known"
                 && entry.source != "url"
         }) {
@@ -1536,6 +1578,12 @@ fn update_skills_command(
             && github_app_auth_configured()
             && resolve_github_publish_token().is_none()
         {
+            return bridge_prefixed("update", passthrough);
+        }
+        if installed.values().any(|entry| {
+            entry.source == "skills-sh"
+                && parse_skills_sh_identifier(&entry_identifier(entry)).is_none()
+        }) {
             return bridge_prefixed("update", passthrough);
         }
         let mut names = installed.keys().cloned().collect::<Vec<_>>();
@@ -1985,6 +2033,17 @@ fn parse_single_name_passthrough<'a>(passthrough: &'a [String]) -> Option<Option
     Some(Some(name))
 }
 
+fn entry_identifier(entry: &HubInstalledEntry) -> String {
+    entry
+        .raw
+        .get("identifier")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(entry.source.as_str())
+        .to_string()
+}
+
 fn print_official_check_results(
     targets: &[(String, String)],
     candidates: &HashMap<String, OfficialSkillCandidate>,
@@ -2046,17 +2105,11 @@ fn collect_official_skill_candidates(
         let Some(entry) = installed.get(name) else {
             continue;
         };
-        let identifier = entry
-            .raw
-            .get("identifier")
-            .and_then(JsonValue::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(entry.source.as_str())
-            .to_string();
+        let identifier = entry_identifier(entry);
         let (source_dir, files, latest_hash, trust_level, temp_dir) = if entry.source == "github"
             || entry.source == "lobehub"
             || entry.source == "clawhub"
+            || entry.source == "skills-sh"
             || entry.source == "well-known"
             || entry.source == "url"
         {
@@ -2074,6 +2127,8 @@ fn collect_official_skill_candidates(
                 )
             } else if entry.source == "clawhub" {
                 fetch_clawhub_bundle_to_tempdir(&identifier)?
+            } else if entry.source == "skills-sh" {
+                fetch_skills_sh_bundle_to_tempdir(&identifier)?
             } else if entry.source == "well-known" {
                 fetch_well_known_bundle_to_tempdir(&identifier)?
             } else {
@@ -2164,6 +2219,7 @@ fn apply_official_updates(
         let scan_verdict = if update.source == "github"
             || update.source == "lobehub"
             || update.source == "clawhub"
+            || update.source == "skills-sh"
             || update.source == "well-known"
             || update.source == "url"
         {
@@ -2342,6 +2398,9 @@ fn resolve_native_inspect_skill(
         return Ok(Some(skill));
     }
     if let Some(skill) = fetch_remote_clawhub_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
+    if let Some(skill) = fetch_remote_skills_sh_inspect_skill(identifier)? {
         return Ok(Some(skill));
     }
     if let Some(skill) = fetch_remote_well_known_inspect_skill(identifier)? {
@@ -2721,6 +2780,9 @@ fn parse_github_inspect_identifier(identifier: &str) -> Option<(String, String, 
         .strip_prefix("github/")
         .or_else(|| trimmed.strip_prefix("github:"))
         .unwrap_or(trimmed);
+    if trimmed.starts_with("skills-sh/") || trimmed.starts_with("skills-sh:") {
+        return None;
+    }
     if trimmed.starts_with("official/") {
         return None;
     }
@@ -4656,6 +4718,93 @@ fn fetch_remote_clawhub_inspect_skill(
     }))
 }
 
+fn parse_skills_sh_identifier(identifier: &str) -> Option<String> {
+    let trimmed = identifier.trim();
+    let raw = trimmed
+        .strip_prefix("skills-sh/")
+        .or_else(|| trimmed.strip_prefix("skills-sh:"))?;
+    let normalized = raw.trim().trim_matches('/').to_string();
+    let parts = normalized.split('/').collect::<Vec<_>>();
+    if parts.len() < 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('\\'))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn fetch_skills_sh_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, Option<String>, String, String)>, Box<dyn Error>> {
+    let Some(canonical) = parse_skills_sh_identifier(identifier) else {
+        return Ok(None);
+    };
+    let Some((bundle_dir, bundle_name, trust, resolved_identifier)) =
+        fetch_github_bundle_to_tempdir(&canonical)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        bundle_dir,
+        Some(bundle_name),
+        trust,
+        format!("skills-sh/{resolved_identifier}"),
+    )))
+}
+
+fn fetch_remote_skills_sh_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let Some(canonical) = parse_skills_sh_identifier(identifier) else {
+        return Ok(None);
+    };
+    let Some((repo, skill_path, skill_md_path, normalized_identifier)) =
+        parse_github_inspect_identifier(&canonical)
+    else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let token = resolve_github_publish_token();
+    let response = client
+        .get(format!(
+            "{}/repos/{repo}/contents/{skill_md_path}",
+            github_api_base()
+        ))
+        .headers(github_raw_headers(
+            token.as_deref(),
+            "application/vnd.github.v3.raw",
+        )?)
+        .send()?;
+    if response.status() != StatusCode::OK {
+        return Ok(None);
+    }
+
+    let content = response.text()?;
+    let (frontmatter, _body) = parse_frontmatter(&content);
+    let fallback_name = skill_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("skill");
+
+    Ok(Some(NativeInspectSkill {
+        name: frontmatter_string(&frontmatter, "name").unwrap_or_else(|| fallback_name.to_string()),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("skills.sh"),
+        trust: resolve_trust_level(&normalized_identifier).to_string(),
+        identifier: format!("skills-sh/{normalized_identifier}"),
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: PathBuf::from(format!("skills-sh/{repo}/{skill_md_path}")),
+    }))
+}
+
 fn collect_well_known_skill_summaries(
     query: &str,
     limit: usize,
@@ -6332,6 +6481,48 @@ exit 9\n",
     }
 
     #[test]
+    fn inspect_resolves_explicit_skills_sh_skill_natively() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("inspect-skills-sh-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_inspect_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let inspected = resolve_native_inspect_skill(&context, "skills-sh/openai/skills/shipit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.name, "shipit");
+        assert_eq!(inspected.description, "Remote demo");
+        assert_eq!(inspected.source, "skills.sh");
+        assert_eq!(inspected.trust, "trusted");
+        assert_eq!(inspected.identifier, "skills-sh/openai/skills/shipit");
+        assert_eq!(
+            inspected.tags,
+            vec![String::from("deploy"), String::from("ops")]
+        );
+        assert!(inspected.preview.contains("remote-body"));
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md "));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn collect_official_summaries_reads_optional_tree() {
         let _guard = test_env_lock().lock().unwrap();
         let optional = temp_path("official-summaries");
@@ -6707,6 +6898,60 @@ exit 9\n",
         assert_eq!(
             entry.raw.get("identifier").and_then(JsonValue::as_str),
             Some("openai/skills/shipit")
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        assert!(logged[0].starts_with("GET /repos/openai/skills/contents/shipit "));
+        assert!(logged[1].starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md "));
+        assert!(logged[2].starts_with("GET /repos/openai/skills/contents/shipit/notes.txt "));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn install_native_skills_sh_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-skills-sh-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        install_skill_command(
+            &context,
+            &[
+                String::from("skills-sh/openai/skills/shipit"),
+                String::from("--yes"),
+            ],
+        )
+        .unwrap();
+
+        let install_dir = home.join("skills").join("shipit");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        assert_eq!(entry.source, "skills-sh");
+        assert_eq!(entry.trust_level, "trusted");
+        assert_eq!(entry.install_path, "shipit");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("skills-sh/openai/skills/shipit")
         );
 
         handle.join().unwrap();
@@ -7286,6 +7531,65 @@ exit 9\n",
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
             r#"{"version":1,"installed":{"shipit":{"source":"github","identifier":"openai/skills/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests);
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn update_native_skills_sh_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("skills-sh-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("shipit");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: shipit\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"shipit":{"source":"skills-sh","identifier":"skills-sh/openai/skills/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
 
