@@ -420,7 +420,7 @@ enum InteractiveToolsChoice {
     Done,
 }
 
-fn run_native_tools_interactive(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run_native_tools_interactive(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -428,7 +428,7 @@ fn run_native_tools_interactive(context: &HermesContext) -> Result<(), Box<dyn E
     run_native_tools_interactive_with_io(context, &mut input, &mut output)
 }
 
-fn run_native_tools_interactive_with_io(
+pub(crate) fn run_native_tools_interactive_with_io(
     context: &HermesContext,
     input: &mut dyn BufRead,
     output: &mut dyn Write,

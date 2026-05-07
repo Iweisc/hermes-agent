@@ -12,6 +12,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::tools_cmd;
 
 #[derive(Args, Debug, Clone)]
 pub struct SetupArgs {
@@ -65,6 +66,12 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         let mut ui = TerminalUi;
         return run_native_terminal_setup(context, &mut ui);
     }
+    if should_use_native_tools_setup(&args)
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        return run_native_tools_setup(context);
+    }
     if let Some(section) = direct_python_setup_section(&args) {
         return print_direct_setup_python(section);
     }
@@ -110,8 +117,7 @@ fn print_direct_setup_python(section: SetupSection) -> Result<(), Box<dyn Error>
     let bootstrap = match section {
         SetupSection::Model => SETUP_MODEL_BOOTSTRAP,
         SetupSection::Gateway => SETUP_GATEWAY_BOOTSTRAP,
-        SetupSection::Tools => SETUP_TOOLS_BOOTSTRAP,
-        SetupSection::Tts | SetupSection::Terminal | SetupSection::Agent => {
+        SetupSection::Tools | SetupSection::Tts | SetupSection::Terminal | SetupSection::Agent => {
             return Err(format!("unsupported direct setup section: {}", section.as_str()).into());
         }
     };
@@ -152,12 +158,20 @@ fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
+fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
+    matches!(args.section, Some(SetupSection::Tools))
+        && !args.non_interactive
+        && !args.reset
+        && !args.reconfigure
+        && !args.quick
+}
+
 fn direct_python_setup_section(args: &SetupArgs) -> Option<SetupSection> {
     if args.non_interactive || args.reset || args.reconfigure || args.quick {
         return None;
     }
     match args.section {
-        Some(SetupSection::Model | SetupSection::Gateway | SetupSection::Tools) => args.section,
+        Some(SetupSection::Model | SetupSection::Gateway) => args.section,
         _ => None,
     }
 }
@@ -221,27 +235,87 @@ const SETUP_GATEWAY_BOOTSTRAP: &str = concat!(
     "        save_config(config)\n",
 );
 
-const SETUP_TOOLS_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
-    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
-    "if is_managed():\n",
-    "    managed_error('run setup wizard')\n",
-    "else:\n",
-    "    ensure_hermes_home()\n",
-    "    if not is_interactive_stdin():\n",
-    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
-    "    else:\n",
-    "        config = load_config()\n",
-    "        from hermes_cli.setup import setup_tools\n",
-    "        setup_tools(config, first_install=False)\n",
-    "        save_config(config)\n",
-);
-
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("{command} exited with status {code}"),
         None => format!("{command} terminated by signal"),
     }
+}
+
+fn run_native_tools_setup(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        eprintln!(
+            "{}",
+            format_setup_managed_message(&system, "run setup wizard")
+        );
+        return Ok(());
+    }
+    tools_cmd::run_native_tools_interactive(context)
+}
+
+fn run_native_tools_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn io::BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        writeln!(
+            output,
+            "{}",
+            format_setup_managed_message(&system, "run setup wizard")
+        )?;
+        return Ok(());
+    }
+    tools_cmd::run_native_tools_interactive_with_io(context, input, output)
+}
+
+fn setup_managed_system(context: &HermesContext) -> Option<String> {
+    if let Ok(raw) = std::env::var("HERMES_MANAGED") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let normalized = trimmed.to_ascii_lowercase();
+            return Some(match normalized.as_str() {
+                "true" | "1" | "yes" | "nix" | "nixos" => String::from("NixOS"),
+                "brew" | "homebrew" => String::from("Homebrew"),
+                _ => trimmed.to_string(),
+            });
+        }
+    }
+    context
+        .hermes_home()
+        .join(".managed")
+        .exists()
+        .then_some(String::from("NixOS"))
+}
+
+fn format_setup_managed_message(system: &str, action: &str) -> String {
+    let raw = std::env::var("HERMES_MANAGED").unwrap_or_default();
+    let normalized = raw.trim().to_ascii_lowercase();
+    if system == "NixOS" {
+        let env_hint = if matches!(normalized.as_str(), "true" | "1" | "yes") {
+            "true"
+        } else if raw.trim().is_empty() {
+            "true"
+        } else {
+            raw.trim()
+        };
+        return format!(
+            "Cannot {action}: this Hermes installation is managed by NixOS (HERMES_MANAGED={env_hint}).\nEdit services.hermes-agent.settings in your configuration.nix and run:\n  sudo nixos-rebuild switch"
+        );
+    }
+    if system == "Homebrew" {
+        let env_hint = if raw.trim().is_empty() {
+            "homebrew"
+        } else {
+            raw.trim()
+        };
+        return format!(
+            "Cannot {action}: this Hermes installation is managed by Homebrew (HERMES_MANAGED={env_hint}).\nUse:\n  brew upgrade hermes-agent"
+        );
+    }
+    format!(
+        "Cannot {action}: this Hermes installation is managed by {system}.\nUse your package manager to upgrade or reinstall Hermes."
+    )
 }
 
 trait SetupUi {
@@ -1538,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_python_setup_section_only_allows_plain_model_gateway_tools() {
+    fn direct_python_setup_section_only_allows_plain_model_and_gateway() {
         assert_eq!(
             direct_python_setup_section(&SetupArgs {
                 section: Some(SetupSection::Model),
@@ -1567,7 +1641,7 @@ mod tests {
                 reconfigure: false,
                 quick: false,
             }),
-            Some(SetupSection::Tools)
+            None
         );
         assert_eq!(
             direct_python_setup_section(&SetupArgs {
@@ -1589,6 +1663,31 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn native_tools_setup_only_allows_plain_tools() {
+        assert!(should_use_native_tools_setup(&SetupArgs {
+            section: Some(SetupSection::Tools),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+        assert!(!should_use_native_tools_setup(&SetupArgs {
+            section: Some(SetupSection::Tools),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: false,
+        }));
+        assert!(!should_use_native_tools_setup(&SetupArgs {
+            section: Some(SetupSection::Gateway),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
     }
 
     #[test]
@@ -1744,51 +1843,46 @@ exit 9\n",
     }
 
     #[test]
-    #[cfg(unix)]
-    fn setup_tools_section_uses_direct_python_bootstrap() {
+    fn setup_tools_section_runs_native_tools_flow() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  case \"$2\" in\n\
-    *\"setup_tools(config, first_install=False)\"*) echo tools >> '{}';;\n\
-    *\"run_setup_wizard\"*) echo wizard >> '{}';;\n\
-  esac\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display(),
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
         let context = HermesContext::new(temp.path());
-        print_setup(
-            &context,
-            SetupArgs {
-                section: Some(SetupSection::Tools),
-                non_interactive: false,
-                reset: false,
-                reconfigure: false,
-                quick: false,
-            },
+        if let Some(parent) = context.config_path().parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            context.config_path(),
+            "platform_toolsets:\n  cli:\n    - file\n",
         )
         .unwrap();
+        let mut input = io::Cursor::new(b"1\n1,4\n3\n".to_vec());
+        let mut output = Vec::new();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("tools"));
-        assert!(!output.contains("wizard"));
-        remove_env_var("HERMES_SETUP_PYTHON");
+        run_native_tools_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("- web"));
+        assert!(saved.contains("- file"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Hermes Tool Configuration"));
+        assert!(rendered.contains("Configure CLI"));
+    }
+
+    #[test]
+    fn setup_tools_managed_install_reports_error() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        set_env_var("HERMES_MANAGED", "homebrew");
+        run_native_tools_setup_with_io(&context, &mut input, &mut output).unwrap();
+        remove_env_var("HERMES_MANAGED");
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Cannot run setup wizard"));
+        assert!(rendered.contains("Homebrew"));
     }
 
     #[test]
