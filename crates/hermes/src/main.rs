@@ -14,6 +14,7 @@ mod insights_cmd;
 mod login_cmd;
 mod logs;
 mod model_cmd;
+mod pairing_cmd;
 mod python_bridge;
 mod slack_cmd;
 mod snapshot_cmd;
@@ -104,6 +105,10 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: Option<config_cmd::ConfigCommand>,
+    },
+    Pairing {
+        #[command(subcommand)]
+        command: Option<pairing_cmd::PairingCommand>,
     },
     Uninstall(compat_cmd::CompatArgs),
     Backup(backup::BackupArgs),
@@ -313,6 +318,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
         Command::Setup(args) => compat_cmd::print_setup(args)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
+        Command::Pairing { command } => pairing_cmd::print_pairing(&context, command)?,
         Command::Uninstall(args) => compat_cmd::print_uninstall(args)?,
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
