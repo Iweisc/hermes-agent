@@ -12,6 +12,7 @@ use hermes_core::{
 };
 use serde_yaml::{Mapping, Value};
 
+use crate::auth_cmd;
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
@@ -322,6 +323,7 @@ const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "tts",
     "image_gen",
     "rl",
+    "spotify",
 ];
 
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
@@ -612,6 +614,7 @@ fn run_native_tool_reconfigure_with_io(
         "tts" => reconfigure_tts_with_io(context, input, output),
         "image_gen" => reconfigure_image_gen_with_io(context, input, output),
         "rl" => reconfigure_rl_with_io(context, input, output),
+        "spotify" => reconfigure_spotify_with_io(output),
         other => run_python_tools_reconfigure_toolset(other),
     }
 }
@@ -1007,6 +1010,14 @@ fn reconfigure_rl_with_io(
     prompt_secret_env_update(context, input, output, "WANDB_API_KEY", "WandB API key")?;
     writeln!(output, "RL training settings updated.")?;
     Ok(())
+}
+
+fn reconfigure_spotify_with_io(output: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "Spotify")?;
+    writeln!(output, "Starting Spotify login...")?;
+    output.flush()?;
+    auth_cmd::run_default_spotify_login()
 }
 
 fn reconfigure_simple_env_tool_with_io(
@@ -2417,6 +2428,53 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         assert!(logged.contains("-c"));
         assert!(logged.contains("_configure_tool_category_for_reconfig"));
         assert!(root.exists());
+    }
+
+    #[test]
+    fn tools_reconfigure_spotify_uses_auth_launcher() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = temp_path("spotify-auth");
+        let log_path = temp.join("spotify-auth.log");
+        let python = temp.join("python3");
+        let home = temp_path("reconfigure-spotify");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - spotify\nauth:\n  type: spotify\n",
+        );
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf 'no_browser=%s\\ntimeout=%s\\n' \"$HERMES_AUTH_SPOTIFY_NO_BROWSER\" \"$HERMES_AUTH_SPOTIFY_TIMEOUT\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        let result = run_tools_reconfigure_with_io(&context, &mut input, &mut output);
+        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+
+        result.unwrap();
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("no_browser=0"));
+        assert!(logged.contains("timeout="));
+        assert!(logged.contains("-c"));
+        assert!(logged.contains("login_spotify_command"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Spotify"));
+        assert!(rendered.contains("Starting Spotify login..."));
     }
 
     #[test]
