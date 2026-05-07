@@ -1,33 +1,4 @@
-use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-
-pub fn launch_python_main_command(
-    command_name: &str,
-    args: &[String],
-    override_env_var: Option<&str>,
-    extra_env: &[(String, String)],
-) -> Result<(), Box<dyn Error>> {
-    let project_root = project_root();
-    let python = resolve_repo_python(&project_root, override_env_var)
-        .ok_or("could not find a Python interpreter for compatibility launch")?;
-    let mut command = Command::new(python);
-    command
-        .current_dir(&project_root)
-        .env("PYTHONPATH", project_root.display().to_string())
-        .arg("-m")
-        .arg("hermes_cli.main")
-        .arg(command_name);
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    command.args(args);
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message(command_name, status).into())
-}
 
 pub fn resolve_repo_python(project_root: &Path, override_env_var: Option<&str>) -> Option<PathBuf> {
     if let Some(env_var) = override_env_var {
@@ -94,13 +65,6 @@ fn python_bin_name() -> &'static str {
     #[cfg(not(windows))]
     {
         "bin/python"
-    }
-}
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
     }
 }
 

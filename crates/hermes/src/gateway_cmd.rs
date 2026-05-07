@@ -14,7 +14,7 @@ use hermes_core::{HermesContext, is_container, is_wsl};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::python_bridge::{launch_python_main_command, project_root, resolve_repo_python};
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
 const LEGACY_SERVICE_NAMES: &[&str] = &["hermes.service"];
@@ -363,8 +363,19 @@ fn print_gateway_install(
     accept_hooks: bool,
     args: GatewayInstallArgs,
 ) -> Result<(), Box<dyn Error>> {
+    if args
+        .run_as_user
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value.is_empty())
+    {
+        return Err("run-as-user cannot be empty".into());
+    }
+    if args.run_as_user.is_some() && !args.system {
+        return Err("--run-as-user requires --system".into());
+    }
     if args.system || args.run_as_user.is_some() {
-        return bridge_gateway(accept_hooks, &bridge_install_args(args));
+        return print_gateway_install_bridge(accept_hooks, args);
     }
 
     if is_termux(context) {
@@ -563,13 +574,44 @@ fn print_gateway_status(
     Ok(())
 }
 
-fn bridge_gateway(accept_hooks: bool, argv: &[String]) -> Result<(), Box<dyn Error>> {
-    let extra_env = if accept_hooks {
-        vec![("HERMES_ACCEPT_HOOKS".to_string(), "1".to_string())]
-    } else {
-        Vec::new()
-    };
-    launch_python_main_command("gateway", argv, Some("HERMES_GATEWAY_PYTHON"), &extra_env)
+fn print_gateway_install_bridge(
+    accept_hooks: bool,
+    args: GatewayInstallArgs,
+) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
+        .ok_or("could not find a Python interpreter for gateway install")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env(
+            "HERMES_GATEWAY_INSTALL_FORCE",
+            if args.force { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_GATEWAY_INSTALL_SYSTEM",
+            if args.system { "1" } else { "0" },
+        );
+    if let Some(user) = args
+        .run_as_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("HERMES_GATEWAY_INSTALL_RUN_AS_USER", user);
+    }
+    if accept_hooks {
+        command.env("HERMES_ACCEPT_HOOKS", "1");
+    }
+    command.arg("-c").arg(GATEWAY_INSTALL_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("gateway", status).into())
 }
 
 fn print_gateway_run(accept_hooks: bool, args: GatewayRunArgs) -> Result<(), Box<dyn Error>> {
@@ -609,6 +651,18 @@ const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     ")\n",
 );
 
+const GATEWAY_INSTALL_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.gateway import gateway_command\n",
+    "gateway_command(argparse.Namespace(\n",
+    "    gateway_command='install',\n",
+    "    force=(os.environ.get('HERMES_GATEWAY_INSTALL_FORCE') == '1'),\n",
+    "    system=(os.environ.get('HERMES_GATEWAY_INSTALL_SYSTEM') == '1'),\n",
+    "    run_as_user=(os.environ.get('HERMES_GATEWAY_INSTALL_RUN_AS_USER') or None),\n",
+    "))\n",
+);
+
 fn print_gateway_setup(accept_hooks: bool) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
@@ -634,26 +688,6 @@ const GATEWAY_SETUP_BOOTSTRAP: &str = concat!(
     "from hermes_cli.gateway import gateway_setup\n",
     "gateway_setup()\n",
 );
-
-fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
-    let mut argv = vec!["install".to_string()];
-    if args.force {
-        argv.push("--force".to_string());
-    }
-    if args.system {
-        argv.push("--system".to_string());
-    }
-    if let Some(user) = args
-        .run_as_user
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        argv.push("--run-as-user".to_string());
-        argv.push(user.to_string());
-    }
-    argv
-}
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
@@ -2042,6 +2076,68 @@ exit 9\n",
         assert!(output.contains("setup accept=1"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_install_bridge_uses_python_override_and_env_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'accept=%s force=%s system=%s run_as_user=%s\\n' \\\n\
+    \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_INSTALL_FORCE\" \\\n\
+    \"$HERMES_GATEWAY_INSTALL_SYSTEM\" \"$HERMES_GATEWAY_INSTALL_RUN_AS_USER\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        print_gateway_install_bridge(
+            true,
+            GatewayInstallArgs {
+                force: true,
+                system: true,
+                run_as_user: Some(String::from("alice")),
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("accept=1 force=1 system=1 run_as_user=alice"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    fn gateway_install_rejects_run_as_user_without_system() {
+        let (_temp, ctx) = test_context();
+        let error = print_gateway_install(
+            &ctx,
+            false,
+            GatewayInstallArgs {
+                force: false,
+                system: false,
+                run_as_user: Some(String::from("alice")),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--run-as-user requires --system"));
     }
 
     #[test]
