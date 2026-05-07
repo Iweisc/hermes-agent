@@ -4,6 +4,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -56,6 +59,11 @@ const FALLBACK_MAX_TEXT_LENGTH: usize = 4_000;
 const GEMINI_TTS_SAMPLE_RATE: u32 = 24_000;
 const GEMINI_TTS_CHANNELS: u16 = 1;
 const GEMINI_TTS_SAMPLE_WIDTH: u16 = 2;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FFMPEG_BINARY: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 struct CommandTtsProvider {
@@ -217,9 +225,15 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         } else {
             false
         }
+    } else if auto_voice_media_provider(provider) {
+        if !path_is_voice_compatible(&effective_output_path)
+            && let Some(converted) = convert_audio_to_opus(&effective_output_path)
+        {
+            effective_output_path = converted;
+        }
+        path_is_voice_compatible(&effective_output_path)
     } else {
-        matches!(provider, "openai" | "mistral" | "elevenlabs" | "gemini")
-            && path_is_voice_compatible(&effective_output_path)
+        native_voice_media_provider(provider) && path_is_voice_compatible(&effective_output_path)
     };
 
     let file_path = effective_output_path.display().to_string();
@@ -1277,6 +1291,17 @@ fn is_builtin_tts_provider(provider: &str) -> bool {
     )
 }
 
+fn auto_voice_media_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "edge" | "neutts" | "minimax" | "xai" | "kittentts" | "piper"
+    )
+}
+
+fn native_voice_media_provider(provider: &str) -> bool {
+    matches!(provider, "openai" | "mistral" | "elevenlabs" | "gemini")
+}
+
 fn get_command_tts_timeout(config: &serde_yaml::Mapping) -> f64 {
     let value = mapping_get_case_insensitive(config, "timeout")
         .or_else(|| mapping_get_case_insensitive(config, "timeout_seconds"));
@@ -1663,7 +1688,8 @@ fn convert_audio_to_opus(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
     let output_path = path.with_extension("ogg");
-    let status = Command::new("ffmpeg")
+    let ffmpeg = ffmpeg_binary();
+    let status = Command::new(&ffmpeg)
         .arg("-i")
         .arg(path)
         .arg("-acodec")
@@ -1695,7 +1721,8 @@ fn finalize_wav_output(wav_path: &Path, output_path: &Path) -> Result<(), String
         return ensure_audio_file(output_path);
     }
     if ffmpeg_available() {
-        let status = Command::new("ffmpeg")
+        let ffmpeg = ffmpeg_binary();
+        let status = Command::new(&ffmpeg)
             .arg("-i")
             .arg(wav_path)
             .arg("-y")
@@ -1724,7 +1751,8 @@ fn finalize_wav_output(wav_path: &Path, output_path: &Path) -> Result<(), String
 }
 
 fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
+    let ffmpeg = ffmpeg_binary();
+    Command::new(&ffmpeg)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1969,9 +1997,10 @@ fn write_wav_or_transcode(wav_bytes: &[u8], output_path: &Path) -> Result<(), St
     fs::write(&temp_wav, wav_bytes)
         .map_err(|error| format!("writing {} failed: {error}", temp_wav.display()))?;
 
-    let ffmpeg = Command::new("ffmpeg").arg("-version").output();
+    let ffmpeg_path = ffmpeg_binary();
+    let ffmpeg = Command::new(&ffmpeg_path).arg("-version").output();
     if ffmpeg.is_ok() {
-        let mut command = Command::new("ffmpeg");
+        let mut command = Command::new(&ffmpeg_path);
         command.arg("-i").arg(&temp_wav);
         if extension == "ogg" {
             command
@@ -2070,6 +2099,21 @@ fn create_tts_temp_dir() -> Result<PathBuf, String> {
         }
     }
     Err("creating temporary TTS directory failed after repeated collisions".to_string())
+}
+
+fn ffmpeg_binary() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_FFMPEG_BINARY.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+    PathBuf::from("ffmpeg")
+}
+
+#[cfg(test)]
+fn set_test_ffmpeg_binary(path: Option<PathBuf>) {
+    TEST_FFMPEG_BINARY.with(|slot| {
+        *slot.borrow_mut() = path;
+    });
 }
 
 fn unix_ts_nanos() -> u128 {
@@ -2286,6 +2330,23 @@ def write(path, audio, samplerate):
 "#,
         )
         .unwrap();
+    }
+
+    fn install_ffmpeg_copy_script(root: &Path) -> PathBuf {
+        let script = root.join("ffmpeg");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\nin=''\nout=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -i)\n      shift\n      in=\"$1\"\n      ;;\n    -acodec|-ac|-b:a|-vbr|-loglevel)\n      shift\n      ;;\n    -y)\n      ;;\n    *)\n      if [ \"${1#-}\" = \"$1\" ]; then out=\"$1\"; fi\n      ;;\n  esac\n  shift\ndone\ncp \"$in\" \"$out\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        script
     }
 
     #[test]
@@ -2913,31 +2974,17 @@ def write(path, audio, samplerate):
         .unwrap();
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        let script = bin_dir.join("ffmpeg");
-        fs::write(
-            &script,
-            "#!/usr/bin/env bash\nin=''\nout=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -i)\n      shift\n      in=\"$1\"\n      ;;\n    -acodec|-ac|-b:a|-vbr|-loglevel)\n      shift\n      ;;\n    -y)\n      ;;\n    *)\n      if [ \"${1#-}\" = \"$1\" ]; then out=\"$1\"; fi\n      ;;\n  esac\n  shift\ndone\ncp \"$in\" \"$out\"\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script, perms).unwrap();
-        }
-
-        let original_path = env::var("PATH").unwrap_or_default();
+        let ffmpeg = install_ffmpeg_copy_script(&bin_dir);
+        set_test_ffmpeg_binary(Some(ffmpeg));
         unsafe {
-            env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
             env::set_var("HERMES_SESSION_PLATFORM", "telegram");
         }
         let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
         let result = handle_text_to_speech(&json!({"text":"voice me gemini"}), &runtime);
         unsafe {
-            env::set_var("PATH", original_path);
             env::remove_var("HERMES_SESSION_PLATFORM");
         }
+        set_test_ffmpeg_binary(None);
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["provider"], json!("gemini"));
@@ -3065,6 +3112,63 @@ def write(path, audio, samplerate):
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["provider"], json!("edge"));
         let file_path = parsed["file_path"].as_str().unwrap();
+        assert_eq!(fs::read(file_path).unwrap(), b"edge-audio");
+    }
+
+    #[test]
+    fn edge_tts_auto_converts_to_voice_media_when_ffmpeg_is_available() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "tts:\n  provider: edge\n  edge:\n    voice: custom-voice\n",
+        )
+        .unwrap();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let edge_script = bin_dir.join("edge-tts");
+        fs::write(
+            &edge_script,
+            "#!/usr/bin/env bash\nout=''\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--write-media\" ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\nprintf 'edge-audio' > \"$out\"\n",
+        )
+        .unwrap();
+        let ffmpeg = install_ffmpeg_copy_script(&bin_dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&edge_script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&edge_script, perms).unwrap();
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        unsafe {
+            env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
+        }
+        set_test_ffmpeg_binary(Some(ffmpeg));
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("edge.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello edge voice",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        unsafe {
+            env::set_var("PATH", original_path);
+        }
+        set_test_ffmpeg_binary(None);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("edge"));
+        assert_eq!(parsed["voice_compatible"], json!(true));
+        let file_path = parsed["file_path"].as_str().unwrap();
+        assert!(file_path.ends_with(".ogg"));
+        assert_eq!(
+            parsed["media_tag"],
+            json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
+        );
         assert_eq!(fs::read(file_path).unwrap(), b"edge-audio");
     }
 
@@ -3390,5 +3494,58 @@ def write(path, audio, samplerate):
                 .to_ascii_lowercase()
                 .contains("neutts")
         );
+    }
+
+    #[test]
+    fn neutts_auto_converts_to_voice_media_when_ffmpeg_is_available() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&pyroot).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        install_fake_neutts_package(&pyroot, false);
+        let ffmpeg = install_ffmpeg_copy_script(&bin_dir);
+
+        let ref_audio = temp.path().join("voice.wav");
+        let ref_text = temp.path().join("voice.txt");
+        fs::write(&ref_audio, b"fake-reference").unwrap();
+        fs::write(&ref_text, "reference transcript").unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: neutts\n  neutts:\n    ref_audio: {}\n    ref_text: {}\n    pythonpath: {}\n",
+                ref_audio.display(),
+                ref_text.display(),
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        set_test_ffmpeg_binary(Some(ffmpeg));
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("neutts.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello neutts voice",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        set_test_ffmpeg_binary(None);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("neutts"));
+        assert_eq!(parsed["voice_compatible"], json!(true));
+        let file_path = parsed["file_path"].as_str().unwrap();
+        assert!(file_path.ends_with(".ogg"));
+        assert_eq!(
+            parsed["media_tag"],
+            json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
+        );
+        let audio = fs::read(file_path).unwrap();
+        assert_eq!(&audio[..4], b"RIFF");
+        let rendered = String::from_utf8_lossy(&audio);
+        assert!(rendered.contains("hello neutts voice"));
     }
 }
