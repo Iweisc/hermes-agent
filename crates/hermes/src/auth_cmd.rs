@@ -1,18 +1,28 @@
 use std::error::Error;
 use std::fs;
+use std::io::{self, BufRead, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Args, Subcommand, ValueEnum};
+use getrandom::fill as fill_random;
 use hermes_core::{
     AuthStatusSummary, HermesContext, LoadedConfig, OPENROUTER_BASE_URL, clear_provider_auth_state,
     get_active_auth_provider, get_auth_status_summary, get_provider_profile,
     normalize_provider_alias,
 };
-use serde_json::Value as JsonValue;
+use reqwest::Url;
+use reqwest::blocking::Client;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value;
+use sha2::{Digest, Sha256};
 
+use crate::config_cmd::save_env_value;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const CONFIG_FALLBACK_LOGOUT_PROVIDERS: &[&str] = &[
@@ -24,20 +34,13 @@ const CONFIG_FALLBACK_LOGOUT_PROVIDERS: &[&str] = &[
     "spotify",
 ];
 
-const SPOTIFY_AUTH_LOGIN_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from types import SimpleNamespace\n",
-    "from hermes_cli.auth import login_spotify_command\n",
-    "raw_timeout = os.environ.get('HERMES_AUTH_SPOTIFY_TIMEOUT', '').strip()\n",
-    "args = SimpleNamespace(\n",
-    "    client_id=(os.environ.get('HERMES_AUTH_SPOTIFY_CLIENT_ID', '').strip() or None),\n",
-    "    redirect_uri=(os.environ.get('HERMES_AUTH_SPOTIFY_REDIRECT_URI', '').strip() or None),\n",
-    "    scope=(os.environ.get('HERMES_AUTH_SPOTIFY_SCOPE', '').strip() or None),\n",
-    "    no_browser=(os.environ.get('HERMES_AUTH_SPOTIFY_NO_BROWSER', '0') == '1'),\n",
-    "    timeout=(float(raw_timeout) if raw_timeout else None),\n",
-    ")\n",
-    "login_spotify_command(args)\n",
-);
+const DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL: &str = "https://accounts.spotify.com";
+const DEFAULT_SPOTIFY_API_BASE_URL: &str = "https://api.spotify.com/v1";
+const DEFAULT_SPOTIFY_REDIRECT_URI: &str = "http://127.0.0.1:43827/spotify/callback";
+const DEFAULT_SPOTIFY_SCOPE: &str = "user-modify-playback-state user-read-playback-state user-read-currently-playing user-read-recently-played playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-library-read user-library-modify";
+const SPOTIFY_DOCS_URL: &str =
+    "https://hermes-agent.nousresearch.com/docs/user-guide/features/spotify";
+const SPOTIFY_DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
 
 const AUTH_ADD_BOOTSTRAP: &str = concat!(
     "import os\n",
@@ -316,7 +319,7 @@ fn print_auth_spotify(
     args: SpotifyAuthArgs,
 ) -> Result<(), Box<dyn Error>> {
     match args.spotify_action {
-        SpotifyAuthAction::Login => run_python_spotify_login(&args),
+        SpotifyAuthAction::Login => run_native_spotify_login(context, &args),
         SpotifyAuthAction::Status => {
             let status = get_auth_status_summary(context.hermes_home().as_path(), "spotify")?;
             println!(
@@ -329,8 +332,20 @@ fn print_auth_spotify(
     }
 }
 
-pub(crate) fn run_default_spotify_login() -> Result<(), Box<dyn Error>> {
-    run_python_spotify_login(&SpotifyAuthArgs::default())
+pub(crate) fn run_default_spotify_login(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    run_native_spotify_login_with_io(context, &SpotifyAuthArgs::default(), input, output)
+}
+
+#[derive(Default)]
+struct SpotifyCallbackResult {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
@@ -526,43 +541,122 @@ fn run_python_auth_remove(provider: &str, target: &str) -> Result<(), Box<dyn Er
     Err(exit_status_message("auth remove", status).into())
 }
 
-fn run_python_spotify_login(args: &SpotifyAuthArgs) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_AUTH_PYTHON"))
-        .ok_or("could not find a Python interpreter for auth")?;
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env(
-            "HERMES_AUTH_SPOTIFY_CLIENT_ID",
-            args.client_id.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_SPOTIFY_REDIRECT_URI",
-            args.redirect_uri.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_SPOTIFY_SCOPE",
-            args.scope.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_SPOTIFY_NO_BROWSER",
-            if args.no_browser { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_AUTH_SPOTIFY_TIMEOUT",
-            args.timeout
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        )
-        .arg("-c")
-        .arg(SPOTIFY_AUTH_LOGIN_BOOTSTRAP);
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
+fn run_native_spotify_login(
+    context: &HermesContext,
+    args: &SpotifyAuthArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    run_native_spotify_login_with_io(context, args, &mut input, &mut output)
+}
+
+pub(crate) fn run_native_spotify_login_with_io(
+    context: &HermesContext,
+    args: &SpotifyAuthArgs,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let existing_state =
+        spotify_provider_state(&load_auth_store_json(context.hermes_home().as_path())?);
+    let redirect_uri = spotify_redirect_uri(args.redirect_uri.as_deref(), existing_state.as_ref());
+    let client_id = match spotify_client_id(args.client_id.as_deref(), existing_state.as_ref()) {
+        Ok(value) => value,
+        Err(error) if error == "spotify_client_id_missing" => {
+            spotify_interactive_setup_with_io(context, input, output, &redirect_uri)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let scope = spotify_scope_string(args.scope.as_deref().or_else(|| {
+        existing_state
+            .as_ref()
+            .and_then(|state| json_string(state, "scope"))
+    }));
+    let accounts_base_url = spotify_accounts_base_url(existing_state.as_ref());
+    let api_base_url = spotify_api_base_url(existing_state.as_ref());
+    let timeout_seconds = args.timeout.unwrap_or(180.0).max(5.0);
+    let code_verifier = spotify_code_verifier()?;
+    let code_challenge = spotify_code_challenge(&code_verifier);
+    let state_nonce = spotify_random_token(16)?;
+    let authorize_url = spotify_build_authorize_url(
+        &client_id,
+        &redirect_uri,
+        &scope,
+        &state_nonce,
+        &code_challenge,
+        &accounts_base_url,
+    )?;
+
+    writeln!(output, "Starting Spotify PKCE login...")?;
+    writeln!(output, "Client ID: {client_id}")?;
+    writeln!(output, "Redirect URI: {redirect_uri}")?;
+    writeln!(
+        output,
+        "Make sure this redirect URI is allow-listed in your Spotify app settings."
+    )?;
+    writeln!(output)?;
+    writeln!(output, "Open this URL to authorize Hermes:")?;
+    writeln!(output, "{authorize_url}")?;
+    writeln!(output)?;
+    writeln!(output, "Full setup guide: {SPOTIFY_DOCS_URL}")?;
+    writeln!(output)?;
+    output.flush()?;
+
+    if !args.no_browser && !is_remote_session() {
+        if try_open_browser(&authorize_url)? {
+            writeln!(output, "Browser opened for Spotify authorization.")?;
+        } else {
+            writeln!(
+                output,
+                "Could not open the browser automatically; use the URL above."
+            )?;
+        }
+        output.flush()?;
     }
-    Err(exit_status_message("auth spotify", status).into())
+
+    let callback = spotify_wait_for_callback(&redirect_uri, timeout_seconds)?;
+    if let Some(error) = callback.error {
+        let detail = callback.error_description.unwrap_or(error);
+        return Err(format!("Spotify authorization failed: {detail}").into());
+    }
+    if callback.state.as_deref() != Some(state_nonce.as_str()) {
+        return Err("Spotify authorization failed: state mismatch.".into());
+    }
+    let code = callback
+        .code
+        .ok_or("Spotify authorization failed: missing authorization code.")?;
+    let token_payload = spotify_exchange_code_for_tokens(
+        &client_id,
+        &code,
+        &redirect_uri,
+        &code_verifier,
+        &accounts_base_url,
+        args.timeout.unwrap_or(20.0).max(1.0),
+    )?;
+    let spotify_state = spotify_token_payload_to_state(
+        &token_payload,
+        &client_id,
+        &redirect_uri,
+        &scope,
+        &accounts_base_url,
+        &api_base_url,
+        existing_state.as_ref(),
+    );
+    let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+    store_provider_state(&mut auth_store, "spotify", spotify_state)?;
+    save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
+
+    writeln!(output, "Spotify login successful!")?;
+    writeln!(
+        output,
+        "  Auth state: {}",
+        context.hermes_home().join("auth.json").display()
+    )?;
+    writeln!(output, "  Provider state saved under providers.spotify")?;
+    writeln!(output, "  Docs: {SPOTIFY_DOCS_URL}")?;
+    output.flush()?;
+    Ok(())
 }
 
 fn render_status(status: AuthStatusSummary, active: Option<String>) -> String {
@@ -695,6 +789,527 @@ fn exit_status_message(command: &str, status: ExitStatus) -> String {
         Some(code) => format!("{command} exited with status code {code}"),
         None => format!("{command} terminated by signal"),
     }
+}
+
+fn spotify_provider_state(auth_store: &JsonValue) -> Option<JsonMap<String, JsonValue>> {
+    auth_store
+        .get("providers")
+        .and_then(JsonValue::as_object)
+        .and_then(|providers| providers.get("spotify"))
+        .and_then(JsonValue::as_object)
+        .cloned()
+}
+
+fn store_provider_state(
+    auth_store: &mut JsonValue,
+    provider_id: &str,
+    state: JsonMap<String, JsonValue>,
+) -> Result<(), Box<dyn Error>> {
+    let root = auth_store
+        .as_object_mut()
+        .ok_or("auth store is not a JSON object")?;
+    let providers = root
+        .entry("providers".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let providers = providers
+        .as_object_mut()
+        .ok_or("providers is not a JSON object")?;
+    providers.insert(provider_id.to_string(), JsonValue::Object(state));
+    Ok(())
+}
+
+fn json_string<'a>(mapping: &'a JsonMap<String, JsonValue>, key: &str) -> Option<&'a str> {
+    mapping
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn env_trimmed(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn spotify_scope_string(raw_scope: Option<&str>) -> String {
+    let scope_text = raw_scope.unwrap_or(DEFAULT_SPOTIFY_SCOPE).trim();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut scopes = Vec::new();
+    for scope in scope_text.split_whitespace() {
+        if seen.insert(scope.to_string()) {
+            scopes.push(scope.to_string());
+        }
+    }
+    if scopes.is_empty() {
+        DEFAULT_SPOTIFY_SCOPE.to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+fn spotify_client_id(
+    explicit: Option<&str>,
+    state: Option<&JsonMap<String, JsonValue>>,
+) -> Result<String, &'static str> {
+    for candidate in [
+        explicit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        env_trimmed("HERMES_SPOTIFY_CLIENT_ID"),
+        env_trimmed("SPOTIFY_CLIENT_ID"),
+        state
+            .and_then(|state| json_string(state, "client_id"))
+            .map(ToOwned::to_owned),
+    ] {
+        if let Some(value) = candidate {
+            return Ok(value);
+        }
+    }
+    Err("spotify_client_id_missing")
+}
+
+fn spotify_redirect_uri(
+    explicit: Option<&str>,
+    state: Option<&JsonMap<String, JsonValue>>,
+) -> String {
+    for candidate in [
+        explicit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        env_trimmed("HERMES_SPOTIFY_REDIRECT_URI"),
+        env_trimmed("SPOTIFY_REDIRECT_URI"),
+        state
+            .and_then(|state| json_string(state, "redirect_uri"))
+            .map(ToOwned::to_owned),
+        Some(DEFAULT_SPOTIFY_REDIRECT_URI.to_string()),
+    ] {
+        if let Some(value) = candidate {
+            return value;
+        }
+    }
+    DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
+}
+
+fn spotify_api_base_url(state: Option<&JsonMap<String, JsonValue>>) -> String {
+    for candidate in [
+        env_trimmed("HERMES_SPOTIFY_API_BASE_URL"),
+        state
+            .and_then(|state| json_string(state, "api_base_url"))
+            .map(ToOwned::to_owned),
+        Some(DEFAULT_SPOTIFY_API_BASE_URL.to_string()),
+    ] {
+        if let Some(value) = candidate {
+            let trimmed = value.trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    DEFAULT_SPOTIFY_API_BASE_URL.to_string()
+}
+
+fn spotify_accounts_base_url(state: Option<&JsonMap<String, JsonValue>>) -> String {
+    for candidate in [
+        env_trimmed("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
+        state
+            .and_then(|state| json_string(state, "accounts_base_url"))
+            .map(ToOwned::to_owned),
+        Some(DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL.to_string()),
+    ] {
+        if let Some(value) = candidate {
+            let trimmed = value.trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL.to_string()
+}
+
+fn spotify_random_token(byte_len: usize) -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_SPOTIFY_TEST_STATE") {
+        return Ok(override_value);
+    }
+    let mut bytes = vec![0u8; byte_len];
+    fill_random(&mut bytes).map_err(|error| format!("failed to generate random bytes: {error}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn spotify_code_verifier() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_SPOTIFY_TEST_VERIFIER") {
+        return Ok(override_value);
+    }
+    spotify_random_token(64).map(|value| value.chars().take(128).collect())
+}
+
+fn spotify_code_challenge(code_verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn spotify_build_authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    state: &str,
+    code_challenge: &str,
+    accounts_base_url: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut url = Url::parse(&format!(
+        "{}/authorize",
+        accounts_base_url.trim_end_matches('/')
+    ))?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("client_id", client_id);
+        query.append_pair("response_type", "code");
+        query.append_pair("redirect_uri", redirect_uri);
+        query.append_pair("scope", scope);
+        query.append_pair("state", state);
+        query.append_pair("code_challenge_method", "S256");
+        query.append_pair("code_challenge", code_challenge);
+    }
+    Ok(url.to_string())
+}
+
+fn spotify_validate_redirect_uri(
+    redirect_uri: &str,
+) -> Result<(String, u16, String), Box<dyn Error>> {
+    let parsed = Url::parse(redirect_uri)?;
+    if parsed.scheme() != "http" {
+        return Err(
+            "Spotify PKCE redirect_uri must use http://localhost or http://127.0.0.1.".into(),
+        );
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err("Spotify PKCE redirect_uri must point to localhost or 127.0.0.1.".into());
+    }
+    let port = parsed
+        .port()
+        .ok_or("Spotify PKCE redirect_uri must include an explicit localhost port.")?;
+    let path = if parsed.path().is_empty() {
+        "/".to_string()
+    } else {
+        parsed.path().to_string()
+    };
+    Ok((host.to_string(), port, path))
+}
+
+fn spotify_wait_for_callback(
+    redirect_uri: &str,
+    timeout_seconds: f64,
+) -> Result<SpotifyCallbackResult, Box<dyn Error>> {
+    let (host, port, expected_path) = spotify_validate_redirect_uri(redirect_uri)?;
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
+        format!("Could not bind Spotify callback server on {host}:{port}: {error}")
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure Spotify callback server: {error}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds.max(5.0));
+    let mut buffer = [0u8; 8192];
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let size = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let mut result = SpotifyCallbackResult::default();
+                let first_line = request.lines().next().unwrap_or_default();
+                if let Some(target) = first_line
+                    .strip_prefix("GET ")
+                    .and_then(|value| value.split_whitespace().next())
+                {
+                    let parsed = Url::parse(&format!("http://localhost{target}"))?;
+                    if parsed.path() == expected_path {
+                        let mut response_body =
+                            "Spotify authorization received. You can close this tab.".to_string();
+                        for (key, value) in parsed.query_pairs() {
+                            match key.as_ref() {
+                                "code" => result.code = Some(value.into_owned()),
+                                "state" => result.state = Some(value.into_owned()),
+                                "error" => result.error = Some(value.into_owned()),
+                                "error_description" => {
+                                    result.error_description = Some(value.into_owned())
+                                }
+                                _ => {}
+                            }
+                        }
+                        if result.error.is_some() {
+                            response_body =
+                                "Spotify authorization failed. You can close this tab.".to_string();
+                        }
+                        let html = format!("<html><body><h1>{}</h1></body></html>", response_body);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n<html><body><h1>{}</h1></body></html>",
+                            html.len(),
+                            response_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        return Ok(result);
+                    }
+                }
+                let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 10\r\n\r\nNot found.";
+                let _ = stream.write_all(response);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("Spotify callback server failed: {error}").into()),
+        }
+    }
+    Err("Spotify authorization timed out waiting for the local callback.".into())
+}
+
+fn spotify_exchange_code_for_tokens(
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    accounts_base_url: &str,
+    timeout_seconds: f64,
+) -> Result<JsonMap<String, JsonValue>, Box<dyn Error>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .build()?;
+    let response = client
+        .post(format!(
+            "{}/api/token",
+            accounts_base_url.trim_end_matches('/')
+        ))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("client_id", client_id),
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier),
+        ])
+        .send()
+        .map_err(|error| format!("Spotify token exchange failed: {error}"))?;
+    if response.status().as_u16() >= 400 {
+        let detail = response.text().unwrap_or_default();
+        let suffix = if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" Response: {}", detail.trim())
+        };
+        return Err(format!("Spotify token exchange failed.{suffix}").into());
+    }
+    let payload: JsonValue = response.json()?;
+    let payload = payload
+        .as_object()
+        .cloned()
+        .ok_or("Spotify token response was not a JSON object.")?;
+    if json_string(&payload, "access_token").is_none() {
+        return Err("Spotify token response did not include an access_token.".into());
+    }
+    Ok(payload)
+}
+
+fn spotify_token_payload_to_state(
+    token_payload: &JsonMap<String, JsonValue>,
+    client_id: &str,
+    redirect_uri: &str,
+    requested_scope: &str,
+    accounts_base_url: &str,
+    api_base_url: &str,
+    previous_state: Option<&JsonMap<String, JsonValue>>,
+) -> JsonMap<String, JsonValue> {
+    let now = Utc::now();
+    let expires_in = token_payload
+        .get("expires_in")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let expires_at = now + ChronoDuration::seconds(expires_in);
+    let mut state = previous_state.cloned().unwrap_or_default();
+    state.insert(
+        "client_id".to_string(),
+        JsonValue::String(client_id.to_string()),
+    );
+    state.insert(
+        "redirect_uri".to_string(),
+        JsonValue::String(redirect_uri.to_string()),
+    );
+    state.insert(
+        "accounts_base_url".to_string(),
+        JsonValue::String(accounts_base_url.to_string()),
+    );
+    state.insert(
+        "api_base_url".to_string(),
+        JsonValue::String(api_base_url.to_string()),
+    );
+    state.insert(
+        "scope".to_string(),
+        JsonValue::String(requested_scope.to_string()),
+    );
+    state.insert(
+        "granted_scope".to_string(),
+        JsonValue::String(
+            json_string(token_payload, "scope")
+                .unwrap_or(requested_scope)
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "token_type".to_string(),
+        JsonValue::String(
+            json_string(token_payload, "token_type")
+                .unwrap_or("Bearer")
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "access_token".to_string(),
+        JsonValue::String(
+            json_string(token_payload, "access_token")
+                .unwrap_or("")
+                .to_string(),
+        ),
+    );
+    let refresh_token = json_string(token_payload, "refresh_token")
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            previous_state
+                .and_then(|state| json_string(state, "refresh_token"))
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default();
+    state.insert(
+        "refresh_token".to_string(),
+        JsonValue::String(refresh_token),
+    );
+    state.insert(
+        "obtained_at".to_string(),
+        JsonValue::String(now.to_rfc3339()),
+    );
+    state.insert(
+        "expires_at".to_string(),
+        JsonValue::String(expires_at.to_rfc3339()),
+    );
+    state.insert("expires_in".to_string(), JsonValue::from(expires_in));
+    state.insert(
+        "auth_type".to_string(),
+        JsonValue::String("oauth_pkce".to_string()),
+    );
+    state
+}
+
+fn spotify_interactive_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    redirect_uri_hint: &str,
+) -> Result<String, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "{}", "=".repeat(70))?;
+    writeln!(output, "Spotify first-time setup")?;
+    writeln!(output, "{}", "=".repeat(70))?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Spotify requires every user to register their own lightweight"
+    )?;
+    writeln!(
+        output,
+        "developer app. This takes about two minutes and only has to be"
+    )?;
+    writeln!(output, "done once per machine.")?;
+    writeln!(output)?;
+    writeln!(output, "Full guide: {SPOTIFY_DOCS_URL}")?;
+    writeln!(output)?;
+    writeln!(output, "Steps:")?;
+    writeln!(
+        output,
+        "  1. Opening {SPOTIFY_DASHBOARD_URL} in your browser..."
+    )?;
+    writeln!(output, "  2. Click 'Create app' and fill in:")?;
+    writeln!(output, "       App name:     anything (e.g. hermes-agent)")?;
+    writeln!(output, "       Description:  anything")?;
+    writeln!(output, "       Redirect URI: {redirect_uri_hint}")?;
+    writeln!(output, "       API/SDK:      Web API")?;
+    writeln!(output, "  3. Agree to the terms, click Save.")?;
+    writeln!(
+        output,
+        "  4. Open the app's Settings page and copy the Client ID."
+    )?;
+    writeln!(output, "  5. Paste it below.")?;
+    writeln!(output)?;
+    output.flush()?;
+    if !is_remote_session() {
+        let _ = try_open_browser(SPOTIFY_DASHBOARD_URL)?;
+    }
+
+    let raw = prompt_line(input, output, "Spotify Client ID")?;
+    let client_id = raw.trim();
+    if client_id.is_empty() {
+        return Err("Spotify setup cancelled: empty Client ID.".into());
+    }
+    save_env_value(context.env_path(), "HERMES_SPOTIFY_CLIENT_ID", client_id)?;
+    if redirect_uri_hint != DEFAULT_SPOTIFY_REDIRECT_URI {
+        save_env_value(
+            context.env_path(),
+            "HERMES_SPOTIFY_REDIRECT_URI",
+            redirect_uri_hint,
+        )?;
+    }
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Saved HERMES_SPOTIFY_CLIENT_ID to {}",
+        context.env_path().display()
+    )?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(client_id.to_string())
+}
+
+fn prompt_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{prompt}: ")?;
+    output.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Err("interactive input closed".into());
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn is_remote_session() -> bool {
+    std::env::var_os("SSH_CLIENT").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+fn try_open_browser(url: &str) -> Result<bool, Box<dyn Error>> {
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("open", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("cmd", &["/C", "start", ""])]
+    } else {
+        &[("xdg-open", &[])]
+    };
+    for (program, args) in commands {
+        let mut command = Command::new(program);
+        command.args(*args).arg(url);
+        match command.status() {
+            Ok(status) if status.success() => return Ok(true),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to open browser: {error}").into()),
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone)]
@@ -1139,7 +1754,10 @@ mod tests {
     use super::*;
     use hermes_core::HermesContext;
     use serde_json::json;
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1147,6 +1765,35 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("hermes-rs-auth-{label}-{unique}"))
+    }
+
+    fn spawn_spotify_token_server(
+        response: JsonValue,
+    ) -> (String, Arc<Mutex<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let request_body_clone = Arc::clone(&request_body);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 8192];
+            let size = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+            let body = request
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            *request_body_clone.lock().unwrap() = body;
+            let payload = serde_json::to_string(&response).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (base_url, request_body, handle)
     }
 
     #[test]
@@ -1190,50 +1837,121 @@ mod tests {
     }
 
     #[test]
-    fn spotify_login_uses_direct_python_launcher() {
+    fn spotify_login_persists_native_provider_state() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let temp = temp_path("spotify-login");
-        let log_path = temp.join("spotify-auth.log");
-        let python = temp.join("python3");
-        fs::create_dir_all(&temp).unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'client_id=%s\\nredirect_uri=%s\\nscope=%s\\nno_browser=%s\\ntimeout=%s\\n' \"$HERMES_AUTH_SPOTIFY_CLIENT_ID\" \"$HERMES_AUTH_SPOTIFY_REDIRECT_URI\" \"$HERMES_AUTH_SPOTIFY_SCOPE\" \"$HERMES_AUTH_SPOTIFY_NO_BROWSER\" \"$HERMES_AUTH_SPOTIFY_TIMEOUT\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
+        let home = temp_path("spotify-login");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (accounts_base_url, request_body, server) = spawn_spotify_token_server(json!({
+            "access_token": "spotify-access",
+            "refresh_token": "spotify-refresh",
+            "token_type": "Bearer",
+            "scope": "user-read-playback-state",
+            "expires_in": 3600
+        }));
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_uri = format!(
+            "http://127.0.0.1:{}/spotify/callback",
+            probe.local_addr().unwrap().port()
+        );
+        drop(probe);
+        let callback_url = format!("{}?code=test-code&state=test-state", redirect_uri);
+        let callback_thread = thread::spawn(move || {
+            for _ in 0..30 {
+                if reqwest::blocking::get(&callback_url).is_ok() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        unsafe {
+            std::env::set_var("HERMES_AUTH_SPOTIFY_TEST_STATE", "test-state");
+            std::env::set_var("HERMES_AUTH_SPOTIFY_TEST_VERIFIER", "fixed-verifier");
+            std::env::set_var("HERMES_SPOTIFY_ACCOUNTS_BASE_URL", &accounts_base_url);
+            std::env::set_var("HERMES_SPOTIFY_API_BASE_URL", "https://api.spotify.test/v1");
+        }
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let result = run_native_spotify_login_with_io(
+            &context,
+            &SpotifyAuthArgs {
+                spotify_action: SpotifyAuthAction::Login,
+                client_id: Some("client-123".to_string()),
+                redirect_uri: Some(redirect_uri.clone()),
+                scope: Some("user-read-playback-state".to_string()),
+                no_browser: true,
+                timeout: Some(5.0),
+            },
+            &mut input,
+            &mut output,
+        );
+        unsafe {
+            std::env::remove_var("HERMES_AUTH_SPOTIFY_TEST_STATE");
+            std::env::remove_var("HERMES_AUTH_SPOTIFY_TEST_VERIFIER");
+            std::env::remove_var("HERMES_SPOTIFY_ACCOUNTS_BASE_URL");
+            std::env::remove_var("HERMES_SPOTIFY_API_BASE_URL");
         }
 
-        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
-        let result = run_python_spotify_login(&SpotifyAuthArgs {
-            spotify_action: SpotifyAuthAction::Login,
-            client_id: Some("client-123".to_string()),
-            redirect_uri: Some("http://127.0.0.1:43827/spotify/callback".to_string()),
-            scope: Some("user-read-playback-state".to_string()),
-            no_browser: true,
-            timeout: Some(9.5),
-        });
-        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
-
         result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("client_id=client-123"));
-        assert!(logged.contains("redirect_uri=http://127.0.0.1:43827/spotify/callback"));
-        assert!(logged.contains("scope=user-read-playback-state"));
-        assert!(logged.contains("no_browser=1"));
-        assert!(logged.contains("timeout=9.5"));
-        assert!(logged.contains("-c"));
-        assert!(logged.contains("login_spotify_command"));
-        let _ = fs::remove_dir_all(temp);
+        callback_thread.join().unwrap();
+        server.join().unwrap();
+        let body = request_body.lock().unwrap().clone();
+        assert!(body.contains("client_id=client-123"));
+        assert!(body.contains("grant_type=authorization_code"));
+        assert!(body.contains("code=test-code"));
+        assert!(body.contains("code_verifier=fixed-verifier"));
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let state = &persisted["providers"]["spotify"];
+        assert_eq!(state["client_id"], "client-123");
+        assert_eq!(state["redirect_uri"], redirect_uri);
+        assert_eq!(state["access_token"], "spotify-access");
+        assert_eq!(state["refresh_token"], "spotify-refresh");
+        assert_eq!(state["api_base_url"], "https://api.spotify.test/v1");
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Starting Spotify PKCE login..."));
+        assert!(rendered.contains("Spotify login successful!"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn spotify_interactive_setup_saves_client_id() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("spotify-setup");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        unsafe { std::env::set_var("SSH_TTY", "1") };
+        let mut input = Cursor::new(b"client-xyz\n".to_vec());
+        let mut output = Vec::new();
+
+        let client_id = spotify_interactive_setup_with_io(
+            &context,
+            &mut input,
+            &mut output,
+            "http://127.0.0.1:44991/spotify/callback",
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("SSH_TTY") };
+        assert_eq!(client_id, "client-xyz");
+        let env_text = fs::read_to_string(home.join(".env")).unwrap();
+        assert!(env_text.contains("HERMES_SPOTIFY_CLIENT_ID=client-xyz"));
+        assert!(
+            env_text
+                .contains("HERMES_SPOTIFY_REDIRECT_URI=http://127.0.0.1:44991/spotify/callback")
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Spotify first-time setup"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn spotify_redirect_validation_rejects_invalid_scheme() {
+        let error = spotify_validate_redirect_uri("https://example.com/callback")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("redirect_uri must use http://localhost or http://127.0.0.1"));
     }
 
     #[test]

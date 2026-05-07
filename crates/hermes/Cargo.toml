@@ -12,6 +12,7 @@ clap.workspace = true
 ctrlc.workspace = true
 dirs.workspace = true
 flate2.workspace = true
+getrandom.workspace = true
 hermes-core = { path = "../hermes-core" }
 hmac.workspace = true
 jsonwebtoken.workspace = true

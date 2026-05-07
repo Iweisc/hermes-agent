@@ -614,7 +614,7 @@ fn run_native_tool_reconfigure_with_io(
         "tts" => reconfigure_tts_with_io(context, input, output),
         "image_gen" => reconfigure_image_gen_with_io(context, input, output),
         "rl" => reconfigure_rl_with_io(context, input, output),
-        "spotify" => reconfigure_spotify_with_io(output),
+        "spotify" => reconfigure_spotify_with_io(context, input, output),
         other => run_python_tools_reconfigure_toolset(other),
     }
 }
@@ -1012,12 +1012,16 @@ fn reconfigure_rl_with_io(
     Ok(())
 }
 
-fn reconfigure_spotify_with_io(output: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+fn reconfigure_spotify_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     writeln!(output)?;
     writeln!(output, "Spotify")?;
     writeln!(output, "Starting Spotify login...")?;
     output.flush()?;
-    auth_cmd::run_default_spotify_login()
+    auth_cmd::run_default_spotify_login(context, input, output)
 }
 
 fn reconfigure_simple_env_tool_with_io(
@@ -2089,8 +2093,12 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Parser, Debug)]
@@ -2110,6 +2118,35 @@ mod tests {
     fn write_config(path: &Path, body: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
+    }
+
+    fn spawn_spotify_token_server(
+        response: serde_json::Value,
+    ) -> (String, Arc<Mutex<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let request_body_clone = Arc::clone(&request_body);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 8192];
+            let size = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+            let body = request
+                .split("\r\n\r\n")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            *request_body_clone.lock().unwrap() = body;
+            let payload = serde_json::to_string(&response).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (base_url, request_body, handle)
     }
 
     #[cfg(unix)]
@@ -2433,48 +2470,71 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     #[test]
     fn tools_reconfigure_spotify_uses_auth_launcher() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let temp = temp_path("spotify-auth");
-        let log_path = temp.join("spotify-auth.log");
-        let python = temp.join("python3");
         let home = temp_path("reconfigure-spotify");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         write_config(
             &context.config_path(),
             "platform_toolsets:\n  cli:\n    - spotify\nauth:\n  type: spotify\n",
         );
-        fs::create_dir_all(&temp).unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'no_browser=%s\\ntimeout=%s\\n' \"$HERMES_AUTH_SPOTIFY_NO_BROWSER\" \"$HERMES_AUTH_SPOTIFY_TIMEOUT\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
+        let (accounts_base_url, request_body, server) =
+            spawn_spotify_token_server(serde_json::json!({
+                "access_token": "spotify-access",
+                "refresh_token": "spotify-refresh",
+                "token_type": "Bearer",
+                "scope": "user-read-playback-state",
+                "expires_in": 3600
+            }));
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_uri = format!(
+            "http://127.0.0.1:{}/spotify/callback",
+            probe.local_addr().unwrap().port()
+        );
+        drop(probe);
+        let callback_url = format!("{redirect_uri}?code=test-code&state=test-state");
+        let callback_thread = thread::spawn(move || {
+            for _ in 0..30 {
+                if reqwest::blocking::get(&callback_url).is_ok() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
 
-        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        unsafe {
+            std::env::set_var("HERMES_SPOTIFY_CLIENT_ID", "spotify-client");
+            std::env::set_var("HERMES_SPOTIFY_REDIRECT_URI", &redirect_uri);
+            std::env::set_var("HERMES_SPOTIFY_ACCOUNTS_BASE_URL", &accounts_base_url);
+            std::env::set_var("HERMES_SPOTIFY_API_BASE_URL", "https://api.spotify.test/v1");
+            std::env::set_var("HERMES_AUTH_SPOTIFY_TEST_STATE", "test-state");
+            std::env::set_var("HERMES_AUTH_SPOTIFY_TEST_VERIFIER", "fixed-verifier");
+            std::env::set_var("SSH_TTY", "1");
+        }
         let mut input = Cursor::new(b"1\n".to_vec());
         let mut output = Vec::new();
         let result = run_tools_reconfigure_with_io(&context, &mut input, &mut output);
-        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+        unsafe {
+            std::env::remove_var("HERMES_SPOTIFY_CLIENT_ID");
+            std::env::remove_var("HERMES_SPOTIFY_REDIRECT_URI");
+            std::env::remove_var("HERMES_SPOTIFY_ACCOUNTS_BASE_URL");
+            std::env::remove_var("HERMES_SPOTIFY_API_BASE_URL");
+            std::env::remove_var("HERMES_AUTH_SPOTIFY_TEST_STATE");
+            std::env::remove_var("HERMES_AUTH_SPOTIFY_TEST_VERIFIER");
+            std::env::remove_var("SSH_TTY");
+        }
 
         result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("no_browser=0"));
-        assert!(logged.contains("timeout="));
-        assert!(logged.contains("-c"));
-        assert!(logged.contains("login_spotify_command"));
+        callback_thread.join().unwrap();
+        server.join().unwrap();
+        let body = request_body.lock().unwrap().clone();
+        assert!(body.contains("client_id=spotify-client"));
+        assert!(body.contains("code_verifier=fixed-verifier"));
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(auth_text.contains("\"spotify\""));
+        assert!(auth_text.contains("spotify-access"));
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Spotify"));
         assert!(rendered.contains("Starting Spotify login..."));
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

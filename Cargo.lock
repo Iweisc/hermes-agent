@@ -1241,6 +1241,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "flate2",
+ "getrandom 0.3.4",
  "hermes-core",
  "hmac 0.12.1",
  "jsonwebtoken",
