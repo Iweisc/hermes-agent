@@ -169,6 +169,13 @@ struct LobeHubSkillSummary {
 }
 
 #[derive(Debug, Clone)]
+struct WellKnownSkillSummary {
+    name: String,
+    description: String,
+    identifier: String,
+}
+
+#[derive(Debug, Clone)]
 struct InstallArgsParsed {
     identifier: String,
     category: String,
@@ -691,6 +698,42 @@ fn search_skills_command(
         println!();
         return Ok(());
     }
+    if source == "well-known" {
+        let matches = collect_well_known_skill_summaries(&query, limit)?;
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "well-known",
+                "community",
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("search", passthrough);
     }
@@ -901,6 +944,52 @@ fn install_github_skill_command(
             identifier,
             "lobehub",
             "LobeHub",
+        );
+    }
+    if let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_well_known_bundle_to_tempdir(&args.identifier)?
+    {
+        let Some(skill_name) = skill_name.or_else(|| {
+            if args.name_override.trim().is_empty() {
+                None
+            } else {
+                Some(args.name_override.trim().to_string())
+            }
+        }) else {
+            return bridge_prefixed("install", passthrough);
+        };
+        return install_remote_skill_bundle(
+            context,
+            args,
+            bundle_dir,
+            skill_name,
+            trust_level,
+            identifier,
+            "well-known",
+            "well-known source",
+        );
+    }
+    if let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_url_bundle_to_tempdir(&args.identifier)?
+    {
+        let Some(skill_name) = skill_name.or_else(|| {
+            if args.name_override.trim().is_empty() {
+                None
+            } else {
+                Some(args.name_override.trim().to_string())
+            }
+        }) else {
+            return bridge_prefixed("install", passthrough);
+        };
+        return install_remote_skill_bundle(
+            context,
+            args,
+            bundle_dir,
+            skill_name,
+            trust_level,
+            identifier,
+            "url",
+            "URL",
         );
     }
 
@@ -1266,10 +1355,13 @@ fn check_skills_command(
         return Ok(());
     }
 
-    if targets
-        .iter()
-        .any(|(_, source)| source != "official" && source != "github" && source != "lobehub")
-    {
+    if targets.iter().any(|(_, source)| {
+        source != "official"
+            && source != "github"
+            && source != "lobehub"
+            && source != "well-known"
+            && source != "url"
+    }) {
         return bridge_prefixed("check", passthrough);
     }
     if targets.iter().any(|(_, source)| source == "github")
@@ -1303,7 +1395,12 @@ fn update_skills_command(
             println!();
             return Ok(());
         };
-        if entry.source != "official" && entry.source != "github" && entry.source != "lobehub" {
+        if entry.source != "official"
+            && entry.source != "github"
+            && entry.source != "lobehub"
+            && entry.source != "well-known"
+            && entry.source != "url"
+        {
             return bridge_prefixed("update", passthrough);
         }
         if entry.source == "github"
@@ -1320,7 +1417,11 @@ fn update_skills_command(
             return Ok(());
         }
         if installed.values().any(|entry| {
-            entry.source != "official" && entry.source != "github" && entry.source != "lobehub"
+            entry.source != "official"
+                && entry.source != "github"
+                && entry.source != "lobehub"
+                && entry.source != "well-known"
+                && entry.source != "url"
         }) {
             return bridge_prefixed("update", passthrough);
         }
@@ -1846,29 +1947,30 @@ fn collect_official_skill_candidates(
             .filter(|value| !value.is_empty())
             .unwrap_or(entry.source.as_str())
             .to_string();
-        let (source_dir, files, latest_hash, trust_level, temp_dir) = if entry.source == "github" {
-            let Some((bundle_dir, _bundle_name, resolved_trust, _resolved_identifier)) =
-                fetch_github_bundle_to_tempdir(&identifier)?
-            else {
-                continue;
+        let (source_dir, files, latest_hash, trust_level, temp_dir) = if entry.source == "github"
+            || entry.source == "lobehub"
+            || entry.source == "well-known"
+            || entry.source == "url"
+        {
+            let remote_bundle = if entry.source == "github" {
+                fetch_github_bundle_to_tempdir(&identifier)?.map(
+                    |(bundle_dir, bundle_name, trust, resolved_identifier)| {
+                        (bundle_dir, Some(bundle_name), trust, resolved_identifier)
+                    },
+                )
+            } else if entry.source == "lobehub" {
+                fetch_lobehub_bundle_to_tempdir(&identifier)?.map(
+                    |(bundle_dir, bundle_name, trust, resolved_identifier)| {
+                        (bundle_dir, Some(bundle_name), trust, resolved_identifier)
+                    },
+                )
+            } else if entry.source == "well-known" {
+                fetch_well_known_bundle_to_tempdir(&identifier)?
+            } else {
+                fetch_url_bundle_to_tempdir(&identifier)?
             };
-            let source_dir = bundle_dir.path().to_path_buf();
-            let files = collect_bundle_file_paths(&source_dir)?;
-            let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
-            (
-                source_dir,
-                files,
-                latest_hash,
-                if entry.trust_level.trim().is_empty() {
-                    resolved_trust
-                } else {
-                    entry.trust_level.clone()
-                },
-                Some(bundle_dir),
-            )
-        } else if entry.source == "lobehub" {
             let Some((bundle_dir, _bundle_name, resolved_trust, _resolved_identifier)) =
-                fetch_lobehub_bundle_to_tempdir(&identifier)?
+                remote_bundle
             else {
                 continue;
             };
@@ -1949,7 +2051,11 @@ fn apply_official_updates(
     for update in updates {
         println!("Updating: {}", update.name);
         let install_path = validated_install_path(&skills_root, &update.install_path)?;
-        let scan_verdict = if update.source == "github" || update.source == "lobehub" {
+        let scan_verdict = if update.source == "github"
+            || update.source == "lobehub"
+            || update.source == "well-known"
+            || update.source == "url"
+        {
             scan_skill(&update.source_dir, &update.identifier)
                 .verdict
                 .to_string()
@@ -2124,6 +2230,12 @@ fn resolve_native_inspect_skill(
     if let Some(skill) = fetch_remote_lobehub_inspect_skill(identifier)? {
         return Ok(Some(skill));
     }
+    if let Some(skill) = fetch_remote_well_known_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
+    if let Some(skill) = fetch_remote_url_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
 
     Ok(None)
 }
@@ -2209,6 +2321,67 @@ fn fetch_remote_lobehub_inspect_skill(
     }))
 }
 
+fn fetch_remote_well_known_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let Some(parsed) = parse_well_known_identifier(identifier)? else {
+        return Ok(None);
+    };
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(entry) = fetch_well_known_index_entry(&client, &parsed.index_url, &parsed.skill_name)?
+    else {
+        return Ok(None);
+    };
+    let skill_md = fetch_text(&client, &format!("{}/SKILL.md", parsed.skill_url))?
+        .ok_or("well-known skill is missing SKILL.md")?;
+    let (frontmatter, _body) = parse_frontmatter(&skill_md);
+    Ok(Some(NativeInspectSkill {
+        name: frontmatter_string(&frontmatter, "name").unwrap_or_else(|| parsed.skill_name.clone()),
+        description: frontmatter_string(&frontmatter, "description")
+            .or_else(|| {
+                entry
+                    .get("description")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("well-known"),
+        trust: String::from("community"),
+        identifier: format!("well-known:{}", parsed.skill_url),
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&skill_md, 50),
+        path: PathBuf::from(format!("well-known/{}", parsed.skill_name)),
+    }))
+}
+
+fn fetch_remote_url_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let Some(url) = parse_url_source_identifier(identifier)? else {
+        return Ok(None);
+    };
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(content) = fetch_text(&client, &url)? else {
+        return Ok(None);
+    };
+    let (frontmatter, _body) = parse_frontmatter(&content);
+    Ok(Some(NativeInspectSkill {
+        name: resolve_url_skill_name(&frontmatter, &url).unwrap_or_default(),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("url"),
+        trust: String::from("community"),
+        identifier: url.clone(),
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: PathBuf::from(url),
+    }))
+}
+
 fn parse_lobehub_identifier(identifier: &str) -> Option<String> {
     let trimmed = identifier.trim();
     let trimmed = trimmed
@@ -2223,6 +2396,98 @@ fn parse_lobehub_identifier(identifier: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct WellKnownIdentifier {
+    index_url: String,
+    skill_name: String,
+    skill_url: String,
+}
+
+fn parse_well_known_identifier(
+    identifier: &str,
+) -> Result<Option<WellKnownIdentifier>, Box<dyn Error>> {
+    let raw = identifier
+        .trim()
+        .strip_prefix("well-known:")
+        .unwrap_or(identifier.trim());
+    if !raw.starts_with("http://") && !raw.starts_with("https://") {
+        return Ok(None);
+    }
+    let mut parsed = reqwest::Url::parse(raw)?;
+    let fragment = parsed.fragment().map(str::to_string);
+    parsed.set_fragment(None);
+    let clean = parsed.to_string().trim_end_matches('/').to_string();
+    if clean.ends_with("/index.json") {
+        let Some(skill_name) = fragment.filter(|value| !value.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let base_url = clean.trim_end_matches("/index.json").to_string();
+        let skill_url = format!("{base_url}/{skill_name}");
+        return Ok(Some(WellKnownIdentifier {
+            index_url: clean,
+            skill_name,
+            skill_url,
+        }));
+    }
+
+    let skill_url = if clean.ends_with("/SKILL.md") {
+        clean.trim_end_matches("/SKILL.md").to_string()
+    } else {
+        clean
+    };
+    if !skill_url.contains("/.well-known/skills/") {
+        return Ok(None);
+    }
+    let Some((base_url, skill_name)) = skill_url.rsplit_once('/') else {
+        return Ok(None);
+    };
+    if skill_name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(WellKnownIdentifier {
+        index_url: format!("{base_url}/index.json"),
+        skill_name: skill_name.to_string(),
+        skill_url,
+    }))
+}
+
+fn parse_well_known_query_to_index_url(query: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let trimmed = query.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Ok(None);
+    }
+    let parsed = reqwest::Url::parse(trimmed)?;
+    let clean = parsed
+        .as_str()
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string();
+    if clean.ends_with("/index.json") {
+        return Ok(Some(clean));
+    }
+    if let Some((prefix, _)) = clean.split_once("/.well-known/skills/") {
+        return Ok(Some(format!("{prefix}/.well-known/skills/index.json")));
+    }
+    Ok(Some(format!("{clean}/.well-known/skills/index.json")))
+}
+
+fn parse_url_source_identifier(identifier: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let trimmed = identifier.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Ok(None);
+    }
+    if trimmed.contains("/.well-known/skills/") || trimmed.ends_with("/index.json") {
+        return Ok(None);
+    }
+    let parsed = reqwest::Url::parse(trimmed)?;
+    if !parsed.path().to_ascii_lowercase().ends_with(".md") {
+        return Ok(None);
+    }
+    Ok(Some(parsed.to_string()))
 }
 
 fn lobehub_base_url() -> String {
@@ -3821,6 +4086,239 @@ fn collect_lobehub_skill_summaries() -> Result<Vec<LobeHubSkillSummary>, Box<dyn
     }
     summaries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(summaries)
+}
+
+fn collect_well_known_skill_summaries(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<WellKnownSkillSummary>, Box<dyn Error>> {
+    let Some(index_url) = parse_well_known_query_to_index_url(query)? else {
+        return Ok(Vec::new());
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(index) = fetch_well_known_index(&client, &index_url)? else {
+        return Ok(Vec::new());
+    };
+    let Some(skills) = index.get("skills").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+    let base_url = index_url
+        .trim_end_matches("/index.json")
+        .trim_end_matches('/')
+        .to_string();
+
+    let mut summaries = Vec::new();
+    for entry in skills.iter().take(limit) {
+        let Some(skill_name) = entry
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        summaries.push(WellKnownSkillSummary {
+            name: skill_name.to_string(),
+            description: entry
+                .get("description")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string(),
+            identifier: format!("well-known:{base_url}/{skill_name}"),
+        });
+    }
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(summaries)
+}
+
+fn fetch_text(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let response = client.get(url).send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() != StatusCode::OK {
+        return Err(format!("Failed to fetch '{}': {}", url, response.status()).into());
+    }
+    Ok(Some(response.text()?))
+}
+
+fn fetch_well_known_index(
+    client: &reqwest::blocking::Client,
+    index_url: &str,
+) -> Result<Option<JsonValue>, Box<dyn Error>> {
+    let response = client.get(index_url).send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() != StatusCode::OK {
+        return Err(format!("Failed to fetch '{}': {}", index_url, response.status()).into());
+    }
+    Ok(Some(response.json::<JsonValue>()?))
+}
+
+fn fetch_well_known_index_entry(
+    client: &reqwest::blocking::Client,
+    index_url: &str,
+    skill_name: &str,
+) -> Result<Option<JsonValue>, Box<dyn Error>> {
+    let Some(index) = fetch_well_known_index(client, index_url)? else {
+        return Ok(None);
+    };
+    let Some(skills) = index.get("skills").and_then(JsonValue::as_array) else {
+        return Ok(None);
+    };
+    for entry in skills {
+        if entry.get("name").and_then(JsonValue::as_str).map(str::trim) == Some(skill_name) {
+            return Ok(Some(entry.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn fetch_well_known_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, Option<String>, String, String)>, Box<dyn Error>> {
+    let Some(parsed) = parse_well_known_identifier(identifier)? else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(entry) = fetch_well_known_index_entry(&client, &parsed.index_url, &parsed.skill_name)?
+    else {
+        return Ok(None);
+    };
+    let files = entry
+        .get("files")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![String::from("SKILL.md")]);
+
+    let bundle_dir = tempfile::TempDir::new()?;
+    for rel_path in files {
+        let safe_rel_path = match normalize_bundle_relative_path(&rel_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let Some(text) = fetch_text(
+            &client,
+            &format!(
+                "{}/{}",
+                parsed.skill_url,
+                safe_rel_path.to_string_lossy().replace('\\', "/")
+            ),
+        )?
+        else {
+            return Ok(None);
+        };
+        let dest_path = bundle_dir.path().join(&safe_rel_path);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest_path, text)?;
+    }
+    if !bundle_dir.path().join("SKILL.md").is_file() {
+        return Ok(None);
+    }
+    Ok(Some((
+        bundle_dir,
+        Some(parsed.skill_name.clone()),
+        String::from("community"),
+        format!("well-known:{}", parsed.skill_url),
+    )))
+}
+
+fn is_valid_url_skill_name(name: &str) -> bool {
+    let candidate = name.trim().to_ascii_lowercase();
+    if candidate.is_empty()
+        || matches!(
+            candidate.as_str(),
+            "skill" | "readme" | "index" | "unnamed-skill"
+        )
+    {
+        return false;
+    }
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+}
+
+fn resolve_url_skill_name(frontmatter: &serde_yaml::Mapping, url: &str) -> Option<String> {
+    if let Some(name) = frontmatter_string(frontmatter, "name")
+        && is_valid_url_skill_name(&name)
+    {
+        return Some(name.trim().to_string());
+    }
+
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let parts = parsed
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() >= 2
+        && parts
+            .last()
+            .is_some_and(|part| part.eq_ignore_ascii_case("SKILL.md"))
+    {
+        let candidate = parts[parts.len() - 2];
+        if is_valid_url_skill_name(candidate) {
+            return Some(candidate.trim().to_string());
+        }
+    }
+    if let Some(candidate) = parts.last() {
+        let trimmed = candidate.trim_end_matches(".md");
+        if is_valid_url_skill_name(trimmed) {
+            return Some(trimmed.trim().to_string());
+        }
+    }
+    None
+}
+
+fn fetch_url_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, Option<String>, String, String)>, Box<dyn Error>> {
+    let Some(url) = parse_url_source_identifier(identifier)? else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(skill_md) = fetch_text(&client, &url)? else {
+        return Ok(None);
+    };
+    let (frontmatter, _body) = parse_frontmatter(&skill_md);
+    let bundle_dir = tempfile::TempDir::new()?;
+    fs::write(bundle_dir.path().join("SKILL.md"), skill_md)?;
+    Ok(Some((
+        bundle_dir,
+        resolve_url_skill_name(&frontmatter, &url),
+        String::from("community"),
+        url,
+    )))
 }
 
 fn resolve_single_catalog_skill_identifier(
@@ -5705,6 +6203,79 @@ exit 9\n",
     }
 
     #[test]
+    fn install_native_well_known_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-well-known-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_well_known_server(requests.clone());
+        let identifier = format!("well-known:{base_url}/.well-known/skills/deploy-demo");
+
+        install_skill_command(&context, &[identifier.clone(), String::from("--yes")]).unwrap();
+
+        let install_dir = home.join("skills").join("deploy-demo");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: deploy-demo"));
+        assert!(skill_md.contains("Well known deploy helper"));
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "check the cluster before deploy\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-demo").unwrap();
+        assert_eq!(entry.source, "well-known");
+        assert_eq!(entry.trust_level, "community");
+        assert_eq!(entry.install_path, "deploy-demo");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some(identifier.as_str())
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        assert!(logged[0].starts_with("GET /.well-known/skills/index.json "));
+        assert!(logged[1].starts_with("GET /.well-known/skills/deploy-demo/SKILL.md "));
+        assert!(logged[2].starts_with("GET /.well-known/skills/deploy-demo/notes.txt "));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn install_native_url_skill_copies_file_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-url-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_url_skill_server(requests.clone());
+        let identifier = format!("{base_url}/skills/shipit.md");
+
+        install_skill_command(&context, &[identifier.clone(), String::from("--yes")]).unwrap();
+
+        let install_dir = home.join("skills").join("shipit");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Direct URL demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n---\nbody\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        assert_eq!(entry.source, "url");
+        assert_eq!(entry.trust_level, "community");
+        assert_eq!(entry.install_path, "shipit");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some(identifier.as_str())
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /skills/shipit.md "));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn install_bridges_for_non_official_identifier() {
         let _guard = test_env_lock().lock().unwrap();
@@ -5959,6 +6530,30 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_well_known_skill_summaries_reads_index() {
+        let _guard = test_env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_well_known_server(requests.clone());
+
+        let summaries = collect_well_known_skill_summaries(&base_url, 10).unwrap();
+        assert_eq!(summaries.len(), 2);
+        let deploy = summaries
+            .iter()
+            .find(|skill| skill.name == "deploy-demo")
+            .unwrap();
+        assert_eq!(
+            deploy.identifier,
+            format!("well-known:{base_url}/.well-known/skills/deploy-demo")
+        );
+        assert_eq!(deploy.description, "Well known deploy helper");
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /.well-known/skills/index.json "));
+    }
+
+    #[test]
     fn update_native_official_skill_restores_files_and_lock_hash() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("official-update-home");
@@ -6121,6 +6716,110 @@ exit 9\n",
             Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
             None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
         }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn update_native_well_known_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("well-known-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("deploy-demo");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: deploy-demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_well_known_server(requests.clone());
+        let identifier = format!("well-known:{base_url}/.well-known/skills/deploy-demo");
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            format!(
+                r#"{{"version":1,"installed":{{"deploy-demo":{{"source":"well-known","identifier":"{identifier}","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"deploy-demo","files":["SKILL.md"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-demo").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("Well known deploy helper"));
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "check the cluster before deploy\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        assert!(logged[0].starts_with("GET /.well-known/skills/index.json "));
+        assert!(logged[1].starts_with("GET /.well-known/skills/deploy-demo/SKILL.md "));
+        assert!(logged[2].starts_with("GET /.well-known/skills/deploy-demo/notes.txt "));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn update_native_url_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("url-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("shipit");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: shipit\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_url_skill_server(requests.clone());
+        let identifier = format!("{base_url}/skills/shipit.md");
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            format!(
+                r#"{{"version":1,"installed":{{"shipit":{{"source":"url","identifier":"{identifier}","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Direct URL demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n---\nbody\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /skills/shipit.md "));
+
         let _ = fs::remove_dir_all(home);
     }
 
@@ -6560,6 +7259,128 @@ exit 9\n",
                         thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(error) => panic!("lobehub test server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_well_known_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /.well-known/skills/index.json ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"skills":[{"name":"deploy-demo","description":"Well known deploy helper","files":["SKILL.md","notes.txt"]},{"name":"research-demo","description":"Research helper","files":["SKILL.md"]}]}"#.to_string(),
+                                "application/json",
+                            )
+                        } else if first_line
+                            .starts_with("GET /.well-known/skills/deploy-demo/SKILL.md ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: deploy-demo\ndescription: Well known deploy helper\n---\nbody\n".to_string(),
+                                "text/plain",
+                            )
+                        } else if first_line
+                            .starts_with("GET /.well-known/skills/deploy-demo/notes.txt ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "check the cluster before deploy\n".to_string(),
+                                "text/plain",
+                            )
+                        } else if first_line
+                            .starts_with("GET /.well-known/skills/research-demo/SKILL.md ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: research-demo\ndescription: Research helper\n---\nbody\n".to_string(),
+                                "text/plain",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("well-known test server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_url_skill_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /skills/shipit.md ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: shipit\ndescription: Direct URL demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n---\nbody\n".to_string(),
+                                "text/plain",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("url test server accept failed: {error}"),
                 }
             }
         });
