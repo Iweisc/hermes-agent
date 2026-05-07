@@ -132,6 +132,15 @@ struct NativeInspectSkill {
 }
 
 #[derive(Debug, Clone)]
+struct OfficialSkillSummary {
+    name: String,
+    category: Option<String>,
+    description: String,
+    identifier: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct OfficialSkillCandidate {
     name: String,
     source: String,
@@ -164,8 +173,8 @@ pub fn print_skills(
 ) -> Result<(), Box<dyn Error>> {
     match command {
         None => bridge_skills(None, &[]),
-        Some(SkillsCommand::Browse(args)) => bridge_prefixed("browse", &args.args),
-        Some(SkillsCommand::Search(args)) => bridge_prefixed("search", &args.args),
+        Some(SkillsCommand::Browse(args)) => browse_skills_command(&args.args),
+        Some(SkillsCommand::Search(args)) => search_skills_command(&args.args),
         Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
@@ -360,6 +369,203 @@ fn inspect_skill_command(
         return Ok(());
     }
     bridge_prefixed("inspect", &[identifier.to_string()])
+}
+
+fn browse_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some((page, page_size, source)) = parse_browse_args(passthrough)? else {
+        return bridge_prefixed("browse", passthrough);
+    };
+    if source != "official" {
+        return bridge_prefixed("browse", passthrough);
+    }
+
+    let skills = collect_official_skill_summaries()?;
+    if skills.is_empty() {
+        println!("No skills found in the Skills Hub.");
+        println!();
+        return Ok(());
+    }
+
+    let total = skills.len();
+    let total_pages = ((total + page_size - 1) / page_size).max(1);
+    let page = page.clamp(1, total_pages);
+    let start = (page - 1) * page_size;
+    let end = (start + page_size).min(total);
+
+    println!(
+        "{:<24} {:<16} {:<12} {:<10} Description",
+        "Name", "Category", "Source", "Trust"
+    );
+    println!(
+        "{:<24} {:<16} {:<12} {:<10} -----------",
+        "------------------------", "----------------", "------------", "----------"
+    );
+    for skill in &skills[start..end] {
+        println!(
+            "{:<24} {:<16} {:<12} {:<10} {}",
+            truncate(&skill.name, 24),
+            truncate(skill.category.as_deref().unwrap_or(""), 16),
+            "official",
+            "official",
+            truncate(&skill.description, 60),
+        );
+    }
+    println!();
+    println!("Page {page}/{total_pages} — {total} official skill(s)");
+    println!(
+        "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+    );
+    println!();
+    Ok(())
+}
+
+fn search_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+    let Some((query, limit, source)) = parse_search_args(passthrough)? else {
+        return bridge_prefixed("search", passthrough);
+    };
+    if source != "official" {
+        return bridge_prefixed("search", passthrough);
+    }
+
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return bridge_prefixed("search", passthrough);
+    }
+
+    let skills = collect_official_skill_summaries()?;
+    let matches = skills
+        .into_iter()
+        .filter(|skill| {
+            let searchable = format!(
+                "{} {} {}",
+                skill.name,
+                skill.description,
+                skill.tags.join(" ")
+            )
+            .to_ascii_lowercase();
+            searchable.contains(&needle)
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        println!("No skills found matching your query.");
+        println!();
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<12} {:<10} {:<30} Description",
+        "Name", "Source", "Trust", "Identifier"
+    );
+    println!(
+        "{:<24} {:<12} {:<10} {:<30} -----------",
+        "------------------------", "------------", "----------", "------------------------------"
+    );
+    for skill in &matches {
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} {}",
+            truncate(&skill.name, 24),
+            "official",
+            "official",
+            truncate(&skill.identifier, 30),
+            truncate(&skill.description, 60),
+        );
+    }
+    println!();
+    println!(
+        "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+    );
+    println!();
+    Ok(())
+}
+
+fn parse_browse_args(
+    passthrough: &[String],
+) -> Result<Option<(usize, usize, String)>, Box<dyn Error>> {
+    let mut page = 1_usize;
+    let mut page_size = 20_usize;
+    let mut source = String::from("all");
+
+    let mut index = 0_usize;
+    while index < passthrough.len() {
+        match passthrough[index].as_str() {
+            "--page" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --page".into());
+                };
+                page = parse_positive_usize(value, "--page")?;
+                index += 2;
+            }
+            "--size" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --size".into());
+                };
+                page_size = parse_positive_usize(value, "--size")?.min(100);
+                index += 2;
+            }
+            "--source" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --source".into());
+                };
+                source = value.trim().to_ascii_lowercase();
+                index += 2;
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some((page, page_size.max(1), source)))
+}
+
+fn parse_search_args(
+    passthrough: &[String],
+) -> Result<Option<(String, usize, String)>, Box<dyn Error>> {
+    let mut query = None::<String>;
+    let mut limit = 10_usize;
+    let mut source = String::from("all");
+
+    let mut index = 0_usize;
+    while index < passthrough.len() {
+        let current = passthrough[index].as_str();
+        match current {
+            "--source" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --source".into());
+                };
+                source = value.trim().to_ascii_lowercase();
+                index += 2;
+            }
+            "--limit" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --limit".into());
+                };
+                limit = parse_positive_usize(value, "--limit")?.min(100);
+                index += 2;
+            }
+            _ if current.starts_with('-') => return Ok(None),
+            _ => {
+                if query.is_some() {
+                    return Ok(None);
+                }
+                query = Some(current.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(query.map(|query| (query, limit.max(1), source)))
+}
+
+fn parse_positive_usize(raw: &str, flag: &str) -> Result<usize, Box<dyn Error>> {
+    let parsed = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be a positive integer").into());
+    }
+    Ok(parsed)
 }
 
 fn check_skills_command(
@@ -1870,6 +2076,46 @@ fn discover_optional_skill_records() -> Result<Vec<SkillRecord>, Box<dyn Error>>
     Ok(skills)
 }
 
+fn collect_official_skill_summaries() -> Result<Vec<OfficialSkillSummary>, Box<dyn Error>> {
+    let records = discover_optional_skill_records()?;
+    let mut skills = Vec::new();
+    for record in records {
+        let content = match fs::read_to_string(&record.skill_md) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let (frontmatter, _body) = parse_frontmatter(&content);
+        let Some(skill_dir) = record.skill_md.parent() else {
+            continue;
+        };
+        let rel = match skill_dir.strip_prefix(optional_skills_dir()) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        skills.push(OfficialSkillSummary {
+            name: record.entry.name,
+            category: record.entry.category,
+            description: frontmatter_string(&frontmatter, "description")
+                .unwrap_or_else(|| String::from("(no description)")),
+            identifier: format!("official/{rel}"),
+            tags: extract_tags(&frontmatter),
+        });
+    }
+
+    skills.sort_by(|left, right| {
+        let left_key = (
+            left.category.as_deref().unwrap_or_default(),
+            left.name.as_str(),
+        );
+        let right_key = (
+            right.category.as_deref().unwrap_or_default(),
+            right.name.as_str(),
+        );
+        left_key.cmp(&right_key)
+    });
+    Ok(skills)
+}
+
 fn frontmatter_string(frontmatter: &YamlMapping, key: &str) -> Option<String> {
     frontmatter
         .get(&yaml_key(key))
@@ -3083,6 +3329,75 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_official_summaries_reads_optional_tree() {
+        let _guard = test_env_lock().lock().unwrap();
+        let optional = temp_path("official-summaries");
+        let shipit = optional.join("devops").join("shipit");
+        let demo = optional.join("research").join("demo");
+        fs::create_dir_all(&shipit).unwrap();
+        fs::create_dir_all(&demo).unwrap();
+        fs::write(
+            shipit.join("SKILL.md"),
+            "---\nname: shipit\ndescription: Deploy helper\ntags: [deploy, ops]\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            demo.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo helper\nmetadata:\n  hermes:\n    tags:\n      - optional\n      - research\n---\nbody\n",
+        )
+        .unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        let summaries = collect_official_skill_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].identifier, "official/devops/shipit");
+        assert_eq!(summaries[1].identifier, "official/research/demo");
+        assert_eq!(
+            summaries[0].tags,
+            vec![String::from("deploy"), String::from("ops")]
+        );
+        assert_eq!(
+            summaries[1].tags,
+            vec![String::from("optional"), String::from("research")]
+        );
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    fn parse_browse_args_accepts_official_source() {
+        let parsed = parse_browse_args(&[
+            String::from("--source"),
+            String::from("official"),
+            String::from("--page"),
+            String::from("2"),
+            String::from("--size"),
+            String::from("7"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed, (2, 7, String::from("official")));
+    }
+
+    #[test]
+    fn parse_search_args_accepts_official_source() {
+        let parsed = parse_search_args(&[
+            String::from("deploy"),
+            String::from("--source"),
+            String::from("official"),
+            String::from("--limit"),
+            String::from("4"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            parsed,
+            (String::from("deploy"), 4, String::from("official"))
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn inspect_bridges_when_native_resolution_misses() {
         let _guard = test_env_lock().lock().unwrap();
@@ -3118,6 +3433,85 @@ exit 9\n",
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn browse_bridges_when_source_is_not_official() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        browse_skills_command(&[
+            String::from("--source"),
+            String::from("all"),
+            String::from("--page"),
+            String::from("1"),
+        ])
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=browse argv=--source all --page 1"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_bridges_when_source_is_not_official() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        search_skills_command(&[
+            String::from("deploy"),
+            String::from("--source"),
+            String::from("all"),
+        ])
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=search argv=deploy --source all"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
     }
 
     #[test]
