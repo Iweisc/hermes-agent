@@ -349,7 +349,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
-        Command::Setup(args) => setup_cmd::print_setup(args)?,
+        Command::Setup(args) => setup_cmd::print_setup(&context, args)?,
         Command::Config { command } => {
             config_cmd::print_config(&context, &env_report, &config, command)?
         }
