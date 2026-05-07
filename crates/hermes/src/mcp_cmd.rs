@@ -174,6 +174,22 @@ fn configure_server(context: &HermesContext, args: ConfigureArgs) -> Result<(), 
     configure_server_io(context, &args, stdin.lock(), stdout.lock())
 }
 
+pub(crate) fn configure_server_name_with_io<R: BufRead, W: Write>(
+    context: &HermesContext,
+    name: &str,
+    input: R,
+    output: W,
+) -> Result<(), Box<dyn Error>> {
+    configure_server_io(
+        context,
+        &ConfigureArgs {
+            name: name.to_string(),
+        },
+        input,
+        output,
+    )
+}
+
 fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn Error>> {
     let name = normalize_server_lookup_name(&args.name)?;
     let root = read_raw_yaml_mapping(&context.config_path())?;

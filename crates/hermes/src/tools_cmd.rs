@@ -12,6 +12,7 @@ use hermes_core::{
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::mcp_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::{disabled_memory_toolsets, run_clarify_prompt};
 
@@ -290,12 +291,6 @@ const TOOLS_RECONFIGURE_BOOTSTRAP: &str = concat!(
     "_reconfigure_tool(load_config())\n",
 );
 
-const TOOLS_MCP_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.config import load_config\n",
-    "from hermes_cli.tools_config import _configure_mcp_tools_interactive\n",
-    "_configure_mcp_tools_interactive(load_config())\n",
-);
-
 pub fn print_tools(
     context: &HermesContext,
     config: &LoadedConfig,
@@ -494,7 +489,7 @@ pub(crate) fn run_native_tools_interactive_with_io(
                 writeln!(output)?;
             }
             InteractiveToolsChoice::ConfigureMcp => {
-                run_python_tools_bootstrap("tools mcp", TOOLS_MCP_BOOTSTRAP)?;
+                configure_mcp_tools_interactive_with_io(context, input, output)?;
                 writeln!(output)?;
             }
             InteractiveToolsChoice::Done => break,
@@ -502,6 +497,43 @@ pub(crate) fn run_native_tools_interactive_with_io(
     }
 
     Ok(())
+}
+
+fn configure_mcp_tools_interactive_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let servers = configured_mcp_server_names(&root);
+    if servers.is_empty() {
+        writeln!(output, "No enabled MCP servers configured.")?;
+        return Ok(());
+    }
+
+    loop {
+        let mut labels = servers
+            .iter()
+            .map(|name| format!("Configure MCP server: {name}"))
+            .collect::<Vec<_>>();
+        labels.push(String::from("Done"));
+        let choice = prompt_menu_choice(
+            &mut *input,
+            &mut *output,
+            "Select an MCP server",
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        if choice == servers.len() {
+            return Ok(());
+        }
+        mcp_cmd::configure_server_name_with_io(
+            context,
+            &servers[choice],
+            &mut *input,
+            &mut *output,
+        )?;
+        writeln!(output)?;
+    }
 }
 
 fn build_interactive_tools_options(
@@ -1030,6 +1062,39 @@ fn collect_mcp_server_filters(root: &Mapping) -> BTreeMap<String, McpToolFilter>
     result
 }
 
+fn configured_mcp_server_names(root: &Mapping) -> Vec<String> {
+    let Some(servers) = root
+        .get(yaml_key("mcp_servers"))
+        .and_then(Value::as_mapping)
+    else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter_map(|(name, config)| {
+            let server_name = name.as_str()?.trim();
+            if server_name.is_empty() {
+                return None;
+            }
+            let mapping = config.as_mapping()?;
+            mcp_server_enabled(mapping).then_some(server_name.to_string())
+        })
+        .collect()
+}
+
+fn mcp_server_enabled(config: &Mapping) -> bool {
+    match config.get(yaml_key("enabled")) {
+        None => true,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => !matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(1) != 0,
+        _ => true,
+    }
+}
+
 fn enabled_builtin_toolsets(root: &Mapping, platform: &str) -> BTreeSet<String> {
     let Some(platform_def) = platform_definition(platform) else {
         return BTreeSet::new();
@@ -1285,6 +1350,23 @@ mod tests {
         fs::write(path, body).unwrap();
     }
 
+    #[cfg(unix)]
+    fn write_stdio_test_server(path: &Path) {
+        fs::write(
+            path,
+            "#!/bin/sh\n\
+printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\"}}\\n'\n\
+read line\n\
+read line\n\
+printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\",\"description\":\"first\"},{\"name\":\"beta\",\"description\":\"second\"}]}}\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
     #[test]
     fn list_subcommand_parses_platform_and_toolset() {
         let parsed = ToolsHarness::try_parse_from([
@@ -1459,5 +1541,41 @@ mod tests {
         assert!(logged.contains("-c"));
         assert!(logged.contains("_reconfigure_tool"));
         assert!(root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interactive_tools_menu_configures_mcp_servers_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("interactive-mcp");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(&home).unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("server.sh");
+        write_stdio_test_server(&script);
+        write_config(
+            &context.config_path(),
+            &format!(
+                "mcp_servers:\n  alpha:\n    command: {}\n",
+                serde_yaml::to_string(&script.display().to_string())
+                    .unwrap()
+                    .trim()
+            ),
+        );
+
+        let mut input = Cursor::new(b"3\n1\n2\n2\n4\n".to_vec());
+        let mut output = Vec::new();
+        run_native_tools_interactive_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("include:"));
+        assert!(saved.contains("- beta"));
+        assert!(!saved.contains("- alpha"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Select an MCP server"));
+        assert!(rendered.contains("Connecting to 'alpha'"));
+        assert!(rendered.contains("Updated config: 1/2 tools enabled"));
+
+        let _ = fs::remove_dir_all(home);
     }
 }
