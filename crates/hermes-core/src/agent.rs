@@ -1,4 +1,8 @@
+use std::env;
 use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
@@ -382,6 +386,7 @@ fn send_model_request(
         "chat_completions" => send_chat_completion(client, runtime_model, messages, tools),
         "anthropic_messages" => send_anthropic_message(client, runtime_model, messages, tools),
         "codex_responses" => send_codex_response(client, runtime_model, messages, tools),
+        "bedrock_converse" => send_bedrock_converse(client, runtime_model, messages, tools),
         other => Err(HermesError::State {
             action: "running agent turn",
             detail: format!("Unsupported runtime api_mode '{other}'."),
@@ -569,6 +574,144 @@ fn send_codex_response(
     normalize_codex_response(&parsed)
 }
 
+fn send_bedrock_converse(
+    _client: &Client,
+    runtime_model: &crate::ModelRuntimeConfig,
+    messages: &[Value],
+    tools: &[crate::ToolDefinition],
+) -> Result<NormalizedAssistantResponse, HermesError> {
+    let python = resolve_python_interpreter();
+    let region = parse_bedrock_region(&runtime_model.base_url)
+        .or_else(|| {
+            env::var("AWS_REGION")
+                .ok()
+                .as_deref()
+                .and_then(non_empty_trimmed)
+        })
+        .or_else(|| {
+            env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .as_deref()
+                .and_then(non_empty_trimmed)
+        })
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let payload = json!({
+        "region": region,
+        "model": runtime_model.model,
+        "messages": messages,
+        "tools": tools.iter().map(|tool| tool.openai_schema()).collect::<Vec<_>>(),
+        "max_tokens": 4096,
+    });
+    let script = r#"
+import json
+import sys
+
+from agent.bedrock_adapter import call_converse
+
+payload = json.load(sys.stdin)
+response = call_converse(
+    region=payload["region"],
+    model=payload["model"],
+    messages=payload.get("messages") or [],
+    tools=payload.get("tools") or [],
+    max_tokens=int(payload.get("max_tokens") or 4096),
+)
+choice = response.choices[0] if getattr(response, "choices", None) else None
+message = getattr(choice, "message", None)
+tool_calls = []
+for tool_call in (getattr(message, "tool_calls", None) or []):
+    function = getattr(tool_call, "function", None)
+    tool_calls.append({
+        "id": getattr(tool_call, "id", ""),
+        "name": getattr(function, "name", ""),
+        "arguments": getattr(function, "arguments", "{}"),
+    })
+usage = getattr(response, "usage", None)
+print(json.dumps({
+    "content": getattr(message, "content", None),
+    "tool_calls": tool_calls,
+    "finish_reason": getattr(choice, "finish_reason", None),
+    "usage": {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+    },
+}))
+"#;
+
+    let mut command = Command::new(&python);
+    command
+        .arg("-c")
+        .arg(script)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut pythonpath_entries = vec![repo_root()];
+    if let Some(existing) = env::var_os("PYTHONPATH") {
+        pythonpath_entries.extend(env::split_paths(&existing));
+    }
+    if let Ok(joined) = env::join_paths(pythonpath_entries) {
+        command.env("PYTHONPATH", joined);
+    }
+
+    let mut child = command.spawn().map_err(|error| HermesError::State {
+        action: "starting bedrock converse bridge",
+        detail: format!("{} failed: {error}", python.display()),
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = serde_json::to_vec(&payload).map_err(|error| HermesError::State {
+            action: "encoding bedrock converse payload",
+            detail: error.to_string(),
+        })?;
+        stdin
+            .write_all(&bytes)
+            .map_err(|error| HermesError::State {
+                action: "writing bedrock converse payload",
+                detail: error.to_string(),
+            })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| HermesError::State {
+            action: "waiting for bedrock converse bridge",
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!(
+                "bridge exited with code {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            stderr
+        };
+        return Err(HermesError::State {
+            action: "calling bedrock converse",
+            detail,
+        });
+    }
+
+    let parsed =
+        serde_json::from_slice::<Value>(&output.stdout).map_err(|error| HermesError::State {
+            action: "decoding bedrock converse response",
+            detail: format!("{}: {}", error, String::from_utf8_lossy(&output.stdout)),
+        })?;
+    Ok(NormalizedAssistantResponse {
+        content: extract_message_text(parsed.get("content")),
+        tool_calls: parse_bedrock_tool_calls(parsed.get("tool_calls"))?,
+        finish_reason: parsed
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        reasoning: None,
+        reasoning_details: None,
+        codex_reasoning_items: None,
+        codex_message_items: None,
+    })
+}
+
 fn apply_chat_auth_headers(
     request: reqwest::blocking::RequestBuilder,
     runtime_model: &crate::ModelRuntimeConfig,
@@ -624,6 +767,44 @@ fn read_json_response(
     Ok(body)
 }
 
+fn parse_bedrock_tool_calls(value: Option<&Value>) -> Result<Vec<PendingToolCall>, HermesError> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut parsed = Vec::new();
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let arguments_raw = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}")
+            .to_string();
+        let json = serde_json::from_str(&arguments_raw).unwrap_or_else(|_| json!({}));
+        if id.trim().is_empty() || name.trim().is_empty() {
+            return Err(HermesError::State {
+                action: "parsing bedrock response",
+                detail: format!("Invalid tool call payload: {item}"),
+            });
+        }
+        parsed.push(PendingToolCall {
+            id,
+            name,
+            arguments_raw,
+            json,
+        });
+    }
+    Ok(parsed)
+}
+
 fn extract_choice(response: &Value) -> Result<&Value, HermesError> {
     response
         .get("choices")
@@ -639,6 +820,59 @@ fn requires_bearer_anthropic_auth(base_url: &str) -> bool {
     let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
     normalized.starts_with("https://api.minimax.io/anthropic")
         || normalized.starts_with("https://api.minimaxi.com/anthropic")
+}
+
+fn parse_bedrock_region(base_url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(base_url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    let prefix = "bedrock-runtime.";
+    let suffix = ".amazonaws.com";
+    if host.starts_with(prefix) && host.ends_with(suffix) {
+        let region = &host[prefix.len()..host.len() - suffix.len()];
+        return non_empty_trimmed(region);
+    }
+    None
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+        })
+}
+
+fn resolve_python_interpreter() -> PathBuf {
+    if let Some(venv) = env::var_os("VIRTUAL_ENV") {
+        let candidate = PathBuf::from(venv).join(if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        });
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(if python_command_available("python3") {
+        "python3"
+    } else {
+        "python"
+    })
+}
+
+fn python_command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn responses_tools(tools: &[crate::ToolDefinition]) -> Value {
@@ -1799,6 +2033,114 @@ mod tests {
         assert_eq!(second.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(second.final_response, "Second codex turn.");
         assert_eq!(session_store.get_messages(&session_id).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn bedrock_turn_executes_tools_and_returns_final_text() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        fs::write(
+            pyroot.join("boto3.py"),
+            r#"
+class _Client:
+    def converse(self, **kwargs):
+        messages = kwargs.get("messages") or []
+        saw_tool_result = False
+        for message in messages:
+            for block in message.get("content", []):
+                if "toolResult" in block:
+                    saw_tool_result = True
+                    break
+            if saw_tool_result:
+                break
+        if not saw_tool_result:
+            tool_config = kwargs.get("toolConfig", {})
+            tools = tool_config.get("tools", [])
+            assert any(
+                tool.get("toolSpec", {}).get("name") == "write_file"
+                for tool in tools
+            ), kwargs
+            return {
+                "modelId": kwargs.get("modelId", ""),
+                "output": {
+                    "message": {
+                        "content": [{
+                            "toolUse": {
+                                "toolUseId": "bedrock-call-1",
+                                "name": "write_file",
+                                "input": {
+                                    "path": "bedrock.txt",
+                                    "content": "hello from bedrock tool"
+                                }
+                            }
+                        }]
+                    }
+                },
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 11, "outputTokens": 7},
+            }
+        return {
+            "modelId": kwargs.get("modelId", ""),
+            "output": {
+                "message": {
+                    "content": [{
+                        "text": "Bedrock flow complete."
+                    }]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 13, "outputTokens": 5},
+        }
+
+def client(service_name, region_name=None):
+    assert service_name == "bedrock-runtime", service_name
+    assert region_name == "us-west-2", region_name
+    return _Client()
+"#,
+        )
+        .unwrap();
+
+        let previous_pythonpath = std::env::var_os("PYTHONPATH");
+        unsafe {
+            std::env::set_var("PYTHONPATH", &pyroot);
+        }
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Create a file through bedrock mode",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("anthropic.claude-sonnet-4-6-20250514-v1:0".to_string()),
+                    provider: Some("bedrock".to_string()),
+                    base_url: Some("https://bedrock-runtime.us-west-2.amazonaws.com".to_string()),
+                    api_key: None,
+                    api_mode: Some("bedrock_converse".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        match previous_pythonpath {
+            Some(value) => unsafe { std::env::set_var("PYTHONPATH", value) },
+            None => unsafe { std::env::remove_var("PYTHONPATH") },
+        }
+
+        assert_eq!(result.provider, "bedrock");
+        assert_eq!(result.model, "anthropic.claude-sonnet-4-6-20250514-v1:0");
+        assert_eq!(result.final_response, "Bedrock flow complete.");
+        assert_eq!(result.api_calls, 2);
+        assert_eq!(result.tool_calls, 1);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("bedrock.txt")).unwrap(),
+            "hello from bedrock tool"
+        );
     }
 
     #[test]

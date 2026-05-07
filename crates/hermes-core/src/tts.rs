@@ -2132,9 +2132,16 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
 
     use tempfile::TempDir;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn serve_audio_once(body: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2856,6 +2863,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn mistral_tts_telegram_defaults_to_ogg_voice_media() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2930,6 +2938,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn gemini_tts_telegram_defaults_to_ogg_voice_media() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3002,6 +3011,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn elevenlabs_tts_telegram_defaults_to_ogg_voice_media() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3077,6 +3087,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn edge_tts_invokes_cli_when_configured() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("config.yaml"),
@@ -3117,6 +3128,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn edge_tts_auto_converts_to_voice_media_when_ffmpeg_is_available() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("config.yaml"),

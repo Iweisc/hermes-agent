@@ -464,7 +464,7 @@ impl HermesContext {
         if api_key.is_empty() && provider == "openai-codex" {
             api_key = resolve_codex_access_token(&self.hermes_home())?;
         }
-        if api_key.is_empty() && provider != "custom" {
+        if api_key.is_empty() && provider != "custom" && profile.auth_type != "aws_sdk" {
             let env_hint = profile.api_key_env_vars().collect::<Vec<_>>().join(", ");
             let detail = if provider == "openai-codex" {
                 "No Codex OAuth token resolved. Run `hermes auth codex`, or pass --api-key."
@@ -491,7 +491,7 @@ impl HermesContext {
             .to_ascii_lowercase();
         if !matches!(
             api_mode.as_str(),
-            "chat_completions" | "anthropic_messages" | "codex_responses"
+            "chat_completions" | "anthropic_messages" | "codex_responses" | "bedrock_converse"
         ) {
             return Err(HermesError::State {
                 action: "resolving model runtime",
@@ -932,5 +932,26 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "ChatGPT-Account-ID" && value == "acct-codex")
         );
+    }
+
+    #[test]
+    fn resolve_model_runtime_allows_bedrock_without_api_key() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: anthropic.claude-sonnet-4-6-20250514-v1:0\n  provider: bedrock\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.provider, "bedrock");
+        assert_eq!(runtime.api_mode, "bedrock_converse");
+        assert_eq!(runtime.auth_type, "aws_sdk");
+        assert!(runtime.api_key.is_empty());
     }
 }
