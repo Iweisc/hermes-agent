@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use hermes_core::HermesContext;
+use serde_yaml::Value as YamlValue;
 
-use crate::backup::create_quick_snapshot;
-use crate::config_cmd::migrate_config;
+use crate::backup::{create_pre_update_backup, create_quick_snapshot, format_size};
+use crate::config_cmd::{migrate_config, read_raw_yaml_mapping};
 use crate::dashboard_cmd::ensure_dashboard_web_ui;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
@@ -48,7 +49,7 @@ fn print_update_apply(context: &HermesContext, args: UpdateArgs) -> Result<(), B
 }
 
 fn should_use_python_update_bridge(args: &UpdateArgs) -> bool {
-    args.gateway || args.backup || args.no_backup
+    args.gateway
 }
 
 fn print_update_apply_python(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
@@ -93,6 +94,7 @@ fn print_update_apply_native(
 
     println!("⚕ Updating Hermes Agent...");
     println!();
+    maybe_run_pre_update_backup(context, &args)?;
     println!("→ Fetching updates...");
     let fetch = run_git(&root, &git_base, &["fetch", "origin"])?;
     if !fetch.status.success() {
@@ -197,7 +199,7 @@ fn print_update_apply_native(
     println!();
     println!("✓ Update complete!");
     println!(
-        "  Remaining Python-only update behavior: gateway restart flow, full pre-update backup flags, and bundled skill/profile sync."
+        "  Remaining Python-only update behavior: gateway restart flow and bundled skill/profile sync."
     );
     println!("  Restart running gateways or dashboards manually if needed.");
     println!("    hermes gateway restart");
@@ -276,6 +278,62 @@ fn run_update_check() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn maybe_run_pre_update_backup(
+    context: &HermesContext,
+    args: &UpdateArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.no_backup {
+        println!("◆ Pre-update backup: skipped (--no-backup)");
+        println!();
+        return Ok(());
+    }
+
+    let (enabled, keep) = read_update_backup_settings(context)?;
+    if !enabled && !args.backup {
+        return Ok(());
+    }
+
+    println!("◆ Creating pre-update backup...");
+    match create_pre_update_backup(context, keep) {
+        Ok(Some(path)) => {
+            let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            println!("  Saved:    {} ({})", path.display(), format_size(size));
+            println!("  Restore:  hermes import {}", path.display());
+            println!("  Disable:  omit --backup (backups are off by default)");
+            println!("            set updates.pre_update_backup: false in config.yaml");
+            println!();
+        }
+        Ok(None) => {
+            println!("  ⚠ Backup skipped (no files found or write failed); continuing update.");
+            println!();
+        }
+        Err(error) => {
+            println!("  ⚠ Backup failed: {error}");
+            println!("  Continuing with update.");
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn read_update_backup_settings(context: &HermesContext) -> Result<(bool, usize), Box<dyn Error>> {
+    let mapping = read_raw_yaml_mapping(&context.config_path())?;
+    let updates = mapping
+        .get(&YamlValue::String(String::from("updates")))
+        .and_then(YamlValue::as_mapping);
+    let enabled = updates
+        .and_then(|value| value.get(&YamlValue::String(String::from("pre_update_backup"))))
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(false);
+    let keep = updates
+        .and_then(|value| value.get(&YamlValue::String(String::from("backup_keep"))))
+        .and_then(YamlValue::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(5)
+        .max(1);
+    Ok((enabled, keep))
 }
 
 fn run_git(
@@ -908,6 +966,84 @@ exit 0\n",
         assert!(output.contains("uv pip install -e .[all]"));
         assert!(context.config_path().exists());
         assert!(context.env_path().exists());
+
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_update_backup_flag_writes_pre_update_zip() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(home.join("config.yaml"), "display:\n  skin: slate\n").unwrap();
+
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&fake_git, &fake_uv] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+
+        print_update(
+            &context,
+            UpdateArgs {
+                gateway: false,
+                check: false,
+                no_backup: false,
+                backup: true,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        let backups = home.join("backups");
+        let entries = fs::read_dir(&backups)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let backup_name = entries[0].file_name().to_string_lossy().to_string();
+        assert!(backup_name.starts_with("pre-update-"));
+        assert!(backup_name.ends_with(".zip"));
 
         remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
         remove_env_var("HERMES_UPDATE_GIT");

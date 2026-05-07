@@ -42,6 +42,8 @@ const QUICK_STATE_FILES: &[&str] = &[
 ];
 const QUICK_SNAPSHOTS_DIR: &str = "state-snapshots";
 pub(crate) const QUICK_DEFAULT_KEEP: usize = 20;
+const PRE_UPDATE_BACKUPS_DIR: &str = "backups";
+const PRE_UPDATE_PREFIX: &str = "pre-update-";
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
@@ -84,96 +86,56 @@ pub fn print_backup(context: &HermesContext, args: BackupArgs) -> Result<(), Box
     }
 
     println!("Scanning {} ...", display_path(context, &root));
-    let mut files = Vec::new();
-    let mut skipped_dirs = Vec::new();
-    collect_backup_files(&root, &root, &out_path, &mut files, &mut skipped_dirs)?;
-
-    if files.is_empty() {
+    let Some(result) = write_full_zip_backup(&root, &out_path, true)? else {
         println!("No files to back up.");
         return Ok(());
-    }
-
-    files.sort_by(|left, right| left.1.cmp(&right.1));
-    skipped_dirs.sort();
-    skipped_dirs.dedup();
-
-    println!("Backing up {} files ...", files.len());
-    let file = File::create(&out_path)?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let mut total_bytes = 0_u64;
-    let mut warnings = Vec::new();
-
-    for (index, (source, relative)) in files.iter().enumerate() {
-        let member = zip_member_name(relative)?;
-        if source
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("db"))
-        {
-            let tmp_db = unique_temp_path("backup-db", "db");
-            match safe_copy_db(source, &tmp_db) {
-                Ok(()) => {
-                    let size = fs::metadata(&tmp_db).map(|meta| meta.len()).unwrap_or(0);
-                    let mut reader = File::open(&tmp_db)?;
-                    zip.start_file(member, options)?;
-                    io::copy(&mut reader, &mut zip)?;
-                    total_bytes += size;
-                    let _ = fs::remove_file(&tmp_db);
-                }
-                Err(error) => {
-                    warnings.push(format!("  {}: {}", relative.display(), error));
-                    let _ = fs::remove_file(&tmp_db);
-                    continue;
-                }
-            }
-        } else {
-            let mut reader = match File::open(source) {
-                Ok(file) => file,
-                Err(error) => {
-                    warnings.push(format!("  {}: {}", relative.display(), error));
-                    continue;
-                }
-            };
-            zip.start_file(member, options)?;
-            io::copy(&mut reader, &mut zip)?;
-            total_bytes += fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
-        }
-
-        let processed = index + 1;
-        if processed % 500 == 0 {
-            println!("  {processed}/{} files ...", files.len());
-        }
-    }
-
-    zip.finish()?;
-    let zip_size = fs::metadata(&out_path)?.len();
+    };
 
     println!();
     println!("Backup complete: {}", out_path.display());
-    println!("  Files:       {}", files.len());
-    println!("  Original:    {}", format_size(total_bytes));
-    println!("  Compressed:  {}", format_size(zip_size));
+    println!("  Files:       {}", result.file_count);
+    println!("  Original:    {}", format_size(result.total_bytes));
+    println!("  Compressed:  {}", format_size(result.zip_size));
 
-    if !skipped_dirs.is_empty() {
+    if !result.skipped_dirs.is_empty() {
         println!("\n  Excluded directories:");
-        for dir in skipped_dirs {
+        for dir in result.skipped_dirs {
             println!("    {dir}/");
         }
     }
 
-    if !warnings.is_empty() {
-        println!("\n  Warnings ({} files skipped):", warnings.len());
-        for warning in warnings.iter().take(10) {
+    if !result.warnings.is_empty() {
+        println!("\n  Warnings ({} files skipped):", result.warnings.len());
+        for warning in result.warnings.iter().take(10) {
             println!("{warning}");
         }
-        if warnings.len() > 10 {
-            println!("  ... and {} more", warnings.len() - 10);
+        if result.warnings.len() > 10 {
+            println!("  ... and {} more", result.warnings.len() - 10);
         }
     }
 
     println!("\nRestore with: hermes import {}", out_path.display());
     Ok(())
+}
+
+pub(crate) fn create_pre_update_backup(
+    context: &HermesContext,
+    keep: usize,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let root = context.default_hermes_root();
+    if !root.is_dir() {
+        return Ok(None);
+    }
+
+    let backup_dir = root.join(PRE_UPDATE_BACKUPS_DIR);
+    fs::create_dir_all(&backup_dir)?;
+    let stamp = Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    let out_path = backup_dir.join(format!("{PRE_UPDATE_PREFIX}{stamp}.zip"));
+    if write_full_zip_backup(&root, &out_path, false)?.is_none() {
+        return Ok(None);
+    }
+    let _ = prune_pre_update_backups(&backup_dir, keep.max(1));
+    Ok(Some(out_path))
 }
 
 pub fn print_quick_backup(
@@ -472,6 +434,122 @@ pub fn prune_quick_snapshots(
         deleted += 1;
     }
     Ok(deleted)
+}
+
+fn prune_pre_update_backups(backup_dir: &Path, keep: usize) -> Result<usize, Box<dyn Error>> {
+    if !backup_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut entries = fs::read_dir(backup_dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            let path = entry.path();
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(PRE_UPDATE_PREFIX)
+                            && path
+                                .extension()
+                                .and_then(|value| value.to_str())
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+                    })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.reverse();
+
+    let mut deleted = 0_usize;
+    for entry in entries.into_iter().skip(keep.max(1)) {
+        fs::remove_file(entry.path())?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+fn write_full_zip_backup(
+    root: &Path,
+    out_path: &Path,
+    show_progress: bool,
+) -> Result<Option<FullBackupResult>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    let mut skipped_dirs = Vec::new();
+    collect_backup_files(root, root, out_path, &mut files, &mut skipped_dirs)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    skipped_dirs.sort();
+    skipped_dirs.dedup();
+
+    let file = File::create(out_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut total_bytes = 0_u64;
+    let mut warnings = Vec::new();
+
+    for (index, (source, relative)) in files.iter().enumerate() {
+        let member = zip_member_name(relative)?;
+        if source
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("db"))
+        {
+            let tmp_db = unique_temp_path("backup-db", "db");
+            match safe_copy_db(source, &tmp_db) {
+                Ok(()) => {
+                    let size = fs::metadata(&tmp_db).map(|meta| meta.len()).unwrap_or(0);
+                    let mut reader = File::open(&tmp_db)?;
+                    zip.start_file(member, options)?;
+                    io::copy(&mut reader, &mut zip)?;
+                    total_bytes += size;
+                    let _ = fs::remove_file(&tmp_db);
+                }
+                Err(error) => {
+                    warnings.push(format!("  {}: {}", relative.display(), error));
+                    let _ = fs::remove_file(&tmp_db);
+                    continue;
+                }
+            }
+        } else {
+            let mut reader = match File::open(source) {
+                Ok(file) => file,
+                Err(error) => {
+                    warnings.push(format!("  {}: {}", relative.display(), error));
+                    continue;
+                }
+            };
+            zip.start_file(member, options)?;
+            io::copy(&mut reader, &mut zip)?;
+            total_bytes += fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
+        }
+
+        let processed = index + 1;
+        if show_progress && processed % 500 == 0 {
+            println!("  {processed}/{} files ...", files.len());
+        }
+    }
+
+    zip.finish()?;
+    let zip_size = fs::metadata(out_path)?.len();
+    Ok(Some(FullBackupResult {
+        file_count: files.len(),
+        total_bytes,
+        zip_size,
+        warnings,
+        skipped_dirs,
+    }))
+}
+
+struct FullBackupResult {
+    file_count: usize,
+    total_bytes: u64,
+    zip_size: u64,
+    warnings: Vec<String>,
+    skipped_dirs: Vec<String>,
 }
 
 fn collect_backup_files(
@@ -1006,20 +1084,16 @@ mod tests {
         .unwrap();
 
         assert!(!target_home.path().join("evil.txt").exists());
-        assert!(
-            !target_home
-                .path()
-                .join(".hermes")
-                .join("..")
-                .join("evil.txt")
-                .exists()
-        );
-        assert!(
-            target_home
-                .path()
-                .join(".hermes")
-                .join("config.yaml")
-                .exists()
-        );
+        assert!(!target_home
+            .path()
+            .join(".hermes")
+            .join("..")
+            .join("evil.txt")
+            .exists());
+        assert!(target_home
+            .path()
+            .join(".hermes")
+            .join("config.yaml")
+            .exists());
     }
 }
