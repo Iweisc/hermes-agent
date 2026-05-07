@@ -3763,7 +3763,7 @@ fn import_skill_snapshot(
         }
 
         println!("--- {display_name} ---");
-        bridge_prefixed("install", &passthrough)?;
+        install_skill_command(context, &passthrough)?;
     }
 
     println!("Snapshot import complete.");
@@ -7158,32 +7158,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn import_snapshot_restores_taps_and_bridges_installs() {
+    fn import_snapshot_restores_taps_and_uses_native_installs() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let home = temp_path("snapshot-import");
+        let optional = temp.path().join("optional-skills");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         let input = home.join("snapshot.json");
+        let alpha_dir = optional.join("dev").join("alpha");
+        let beta_dir = optional.join("beta");
+        fs::create_dir_all(&alpha_dir).unwrap();
+        fs::create_dir_all(&beta_dir).unwrap();
+        fs::write(
+            alpha_dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha demo\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(alpha_dir.join("notes.txt"), "alpha\n").unwrap();
+        fs::write(
+            beta_dir.join("SKILL.md"),
+            "---\nname: beta\ndescription: Beta demo\n---\nbody\n",
+        )
+        .unwrap();
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             &input,
@@ -7199,19 +7195,22 @@ exit 9\n",
         )
         .unwrap();
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
         import_skill_snapshot(&context, input.to_str().unwrap(), true).unwrap();
 
         let taps = load_taps(&context).unwrap();
         assert_eq!(taps.len(), 1);
         assert_eq!(taps[0].repo, "owner/repo");
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=official/dev/alpha --category dev --force"));
-        assert!(output.contains("action=install argv=official/beta --force"));
+        assert!(home.join("skills").join("dev").join("alpha").exists());
+        assert!(home.join("skills").join("beta").exists());
+        let installed = load_hub_lock(&context).unwrap();
+        assert!(installed.contains_key("alpha"));
+        assert!(installed.contains_key("beta"));
 
-        remove_env_var("HERMES_SKILLS_PYTHON");
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
         let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
     }
 
     #[test]
