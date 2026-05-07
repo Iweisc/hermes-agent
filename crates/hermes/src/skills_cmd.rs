@@ -482,6 +482,54 @@ fn browse_skills_command(
     let Some((page, page_size, source)) = parse_browse_args(passthrough)? else {
         return bridge_prefixed("browse", passthrough);
     };
+    if source == "all" {
+        let skills = collect_all_browse_catalog_summaries(context)?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        let total = skills.len();
+        let total_pages = ((total + page_size - 1) / page_size).max(1);
+        let page = page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        let end = (start + page_size).min(total);
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills[start..end] {
+            let trust = if skill.source == "official" {
+                "official"
+            } else {
+                skill.trust.as_str()
+            };
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                truncate(&skill.source, 12),
+                truncate(trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page}/{total_pages} — {total} skill(s) across supported sources");
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source == "github" {
         let skills = collect_github_skill_summaries(context)?;
         if skills.is_empty() {
@@ -5349,6 +5397,89 @@ fn merge_catalog_search_result(
     results.push(summary);
 }
 
+fn collect_all_browse_catalog_summaries(
+    context: &HermesContext,
+) -> Result<Vec<SearchCatalogSummary>, Box<dyn Error>> {
+    let mut results = Vec::new();
+
+    for skill in collect_official_skill_summaries()? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("official"),
+                trust: String::from("builtin"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_skills_sh_featured_summaries(200)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("skills-sh"),
+                trust: skill.trust,
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_github_skill_summaries(context)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("github"),
+                trust: skill.trust,
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in browse_clawhub_skill_summaries(1, 500)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("clawhub"),
+                trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_lobehub_skill_summaries()? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("lobehub"),
+                trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    results.sort_by(|left, right| {
+        trust_rank(&right.trust)
+            .cmp(&trust_rank(&left.trust))
+            .then_with(|| (left.source != "official").cmp(&(right.source != "official")))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+    Ok(results)
+}
+
 fn search_all_catalog_summaries(
     context: &HermesContext,
     query: &str,
@@ -7152,8 +7283,99 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_all_browse_catalog_summaries_dedupes_supported_sources() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("browse-all-home");
+        let optional = temp_path("browse-all-optional");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let source_dir = optional.join("research").join("deploy-demo");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: deploy-demo\ndescription: Official deploy helper\ntags: [deploy, ops]\n---\nbody\n",
+        )
+        .unwrap();
+
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let clawhub_requests = Arc::new(Mutex::new(Vec::new()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let (github_base, github_handle) = spawn_github_empty_server(github_requests.clone());
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (clawhub_base, clawhub_handle) = spawn_clawhub_server(clawhub_requests.clone());
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+
+        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
+        let old_github_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        let old_skills_sh_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_clawhub_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        set_env_var("GITHUB_API_BASE_URL", &github_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &clawhub_base);
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+
+        let results = collect_all_browse_catalog_summaries(&context).unwrap();
+        assert_eq!(results.len(), 6);
+        assert_eq!(results[0].name, "deploy-demo");
+        assert_eq!(results[0].source, "official");
+        assert_eq!(results[0].trust, "builtin");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|skill| skill.name == "deploy-guide")
+                .count(),
+            1
+        );
+        let deploy_guide = results
+            .iter()
+            .find(|skill| skill.name == "deploy-guide")
+            .unwrap();
+        assert_eq!(deploy_guide.source, "skills-sh");
+        assert_eq!(deploy_guide.trust, "community");
+        assert!(results.iter().any(|skill| {
+            skill.identifier == "clawhub/deploy-agent" && skill.source == "clawhub"
+        }));
+
+        github_handle.join().unwrap();
+        skills_sh_handle.join().unwrap();
+        clawhub_handle.join().unwrap();
+        lobehub_handle.join().unwrap();
+
+        match old_optional {
+            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
+            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
+        }
+        match old_github_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        match old_skills_sh_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_clawhub_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn browse_bridges_when_source_is_not_official() {
+    fn browse_bridges_when_source_is_unsupported() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -7182,7 +7404,7 @@ exit 9\n",
             &context,
             &[
                 String::from("--source"),
-                String::from("all"),
+                String::from("claude-marketplace"),
                 String::from("--page"),
                 String::from("1"),
             ],
@@ -7190,7 +7412,7 @@ exit 9\n",
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=browse argv=--source all --page 1"));
+        assert!(output.contains("action=browse argv=--source claude-marketplace --page 1"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -8994,7 +9216,9 @@ exit 9\n",
                                 r#"{"items":[{"slug":"deploy-agent","displayName":"Deploy Agent","summary":"ClawHub deploy helper","tags":["ops","deploy"],"latestVersion":{"version":"1.2.3"}}]}"#.to_string(),
                                 "application/json",
                             )
-                        } else if first_line.starts_with("GET /api/v1/skills?limit=5 ") {
+                        } else if first_line.starts_with("GET /api/v1/skills?limit=5 ")
+                            || first_line.starts_with("GET /api/v1/skills?limit=500 ")
+                        {
                             (
                                 "HTTP/1.1 200 OK",
                                 r#"{"items":[{"slug":"deploy-agent","displayName":"Deploy Agent","summary":"ClawHub deploy helper","tags":["ops","deploy"],"latestVersion":{"version":"1.2.3"}},{"slug":"research-agent","displayName":"Research Agent","summary":"ClawHub research helper","tags":["research"],"latestVersion":{"version":"2.0.0"}}]}"#.to_string(),
