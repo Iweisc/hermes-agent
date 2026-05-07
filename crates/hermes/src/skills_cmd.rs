@@ -5992,7 +5992,7 @@ fn resolve_single_catalog_skill_identifier(
 
     let exact_official_matches = collect_official_skill_summaries()?
         .into_iter()
-        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
         .map(|skill| skill.identifier)
         .collect::<Vec<_>>();
 
@@ -6005,7 +6005,7 @@ fn resolve_single_catalog_skill_identifier(
 
     let mut exact_lobehub_matches = collect_lobehub_skill_summaries()?
         .into_iter()
-        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
         .map(|skill| skill.identifier)
         .collect::<Vec<_>>();
     exact_lobehub_matches.sort();
@@ -6014,9 +6014,42 @@ fn resolve_single_catalog_skill_identifier(
         return Ok(exact_lobehub_matches.into_iter().next());
     }
 
+    let mut exact_skills_sh_matches = search_skills_sh_summaries(needle, 20)?
+        .into_iter()
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+    exact_skills_sh_matches.sort();
+    exact_skills_sh_matches.dedup();
+    if exact_skills_sh_matches.len() == 1 {
+        return Ok(exact_skills_sh_matches.into_iter().next());
+    }
+
+    let mut exact_clawhub_matches = search_clawhub_skill_summaries(needle, 20)?
+        .into_iter()
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+    exact_clawhub_matches.sort();
+    exact_clawhub_matches.dedup();
+    if exact_clawhub_matches.len() == 1 {
+        return Ok(exact_clawhub_matches.into_iter().next());
+    }
+
+    let mut exact_claude_marketplace_matches = collect_claude_marketplace_skill_summaries(100)?
+        .into_iter()
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+    exact_claude_marketplace_matches.sort();
+    exact_claude_marketplace_matches.dedup();
+    if exact_claude_marketplace_matches.len() == 1 {
+        return Ok(exact_claude_marketplace_matches.into_iter().next());
+    }
+
     let mut exact_github_matches = collect_github_skill_summaries(context)?
         .into_iter()
-        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .filter(|skill| catalog_identifier_matches_needle(&skill.name, &skill.identifier, needle))
         .map(|skill| skill.identifier)
         .collect::<Vec<_>>();
     exact_github_matches.sort();
@@ -6026,6 +6059,15 @@ fn resolve_single_catalog_skill_identifier(
         return Ok(exact_github_matches.into_iter().next());
     }
     Ok(None)
+}
+
+fn catalog_identifier_matches_needle(name: &str, identifier: &str, needle: &str) -> bool {
+    name.eq_ignore_ascii_case(needle)
+        || identifier
+            .rsplit('/')
+            .next()
+            .map(|segment| segment.eq_ignore_ascii_case(needle))
+            .unwrap_or(false)
 }
 
 fn github_skill_taps(context: &HermesContext) -> Result<Vec<(String, String)>, Box<dyn Error>> {
@@ -7644,18 +7686,36 @@ exit 9\n",
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("short-github-resolve-home");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let (api_base, handle) = spawn_github_browse_server(requests.clone());
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let clawhub_requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, github_handle) = spawn_github_browse_server(github_requests.clone());
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (clawhub_base, clawhub_handle) = spawn_clawhub_server(clawhub_requests.clone());
         let old_api_base = env::var_os("GITHUB_API_BASE_URL");
         let old_github_token = env::var_os("GITHUB_TOKEN");
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        let old_skills_sh_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_clawhub_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &clawhub_base);
 
-        let resolved = resolve_single_catalog_skill_identifier(&context, "shipit").unwrap();
-        assert_eq!(resolved.as_deref(), Some("openai/skills/skills/shipit"));
+        let resolved = resolve_single_catalog_skill_identifier(&context, "github-only").unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("openai/skills/skills/github-only")
+        );
 
-        handle.join().unwrap();
-        let logged = requests.lock().unwrap().clone();
+        github_handle.join().unwrap();
+        lobehub_handle.join().unwrap();
+        skills_sh_handle.join().unwrap();
+        clawhub_handle.join().unwrap();
+        let logged = github_requests.lock().unwrap().clone();
         assert!(
             logged
                 .iter()
@@ -7669,6 +7729,18 @@ exit 9\n",
         match old_github_token {
             Some(value) => set_env_var("GITHUB_TOKEN", value),
             None => remove_env_var("GITHUB_TOKEN"),
+        }
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        match old_skills_sh_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_clawhub_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
         }
         let _ = fs::remove_dir_all(home);
     }
@@ -7697,6 +7769,170 @@ exit 9\n",
         match old_base {
             Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
             None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resolve_single_catalog_skill_identifier_resolves_unique_skills_sh_match() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("short-skills-sh-resolve-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+        let (base_url, handle) = spawn_skills_sh_server(requests.clone());
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        let old_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &base_url);
+
+        let resolved = resolve_single_catalog_skill_identifier(&context, "shipit").unwrap();
+        assert_eq!(resolved.as_deref(), Some("skills-sh/openai/skills/shipit"));
+
+        lobehub_handle.join().unwrap();
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/search?"))
+        );
+
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        match old_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resolve_single_catalog_skill_identifier_resolves_unique_clawhub_match() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("short-clawhub-resolve-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (base_url, handle) = spawn_clawhub_server(requests.clone());
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        let old_skills_sh_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
+
+        let resolved = resolve_single_catalog_skill_identifier(&context, "deploy-agent").unwrap();
+        assert_eq!(resolved.as_deref(), Some("clawhub/deploy-agent"));
+
+        lobehub_handle.join().unwrap();
+        skills_sh_handle.join().unwrap();
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(logged.iter().any(|request| {
+            request.starts_with("GET /api/v1/skills?limit=20&search=deploy-agent ")
+        }));
+
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        match old_skills_sh_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resolve_single_catalog_skill_identifier_resolves_unique_claude_marketplace_match() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("short-claude-marketplace-resolve-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let marketplace_requests = Arc::new(Mutex::new(Vec::new()));
+        let lobehub_requests = Arc::new(Mutex::new(Vec::new()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let clawhub_requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, marketplace_handle) =
+            spawn_claude_marketplace_server(marketplace_requests.clone());
+        let (lobehub_base, lobehub_handle) = spawn_lobehub_server(lobehub_requests.clone());
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (clawhub_base, clawhub_handle) = spawn_clawhub_server(clawhub_requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        let old_lobehub_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        let old_skills_sh_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_clawhub_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &lobehub_base);
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &clawhub_base);
+
+        let resolved =
+            resolve_single_catalog_skill_identifier(&context, "research-market").unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("aiskillstore/marketplace/research-market")
+        );
+
+        marketplace_handle.join().unwrap();
+        lobehub_handle.join().unwrap();
+        skills_sh_handle.join().unwrap();
+        clawhub_handle.join().unwrap();
+        let logged = marketplace_requests.lock().unwrap().clone();
+        assert!(logged.iter().any(|request| {
+            request.starts_with(
+                "GET /repos/aiskillstore/marketplace/contents/.claude-plugin/marketplace.json ",
+            )
+        }));
+        assert!(
+            lobehub_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.starts_with("GET /index.json "))
+        );
+        assert!(
+            skills_sh_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| { request.starts_with("GET /api/search?") })
+        );
+        assert!(clawhub_requests.lock().unwrap().iter().any(|request| {
+            request.starts_with("GET /api/v1/skills?limit=20&search=research-market ")
+        }));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        match old_lobehub_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        match old_skills_sh_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_clawhub_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
         }
         let _ = fs::remove_dir_all(home);
     }
@@ -9725,41 +9961,63 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let handle = thread::spawn(move || {
-            for _ in 0..6 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_http_request(&mut stream);
-                requests.lock().unwrap().push(request.clone());
-                let first_line = request.lines().next().unwrap_or_default();
-                let (status, body, content_type) = if first_line
-                    .starts_with("GET /repos/openai/skills/contents/skills ")
-                {
-                    (
-                        "HTTP/1.1 200 OK",
-                        r#"[{"type":"dir","name":"shipit","path":"skills/shipit"}]"#.to_string(),
-                        "application/json",
-                    )
-                } else if first_line
-                    .starts_with("GET /repos/openai/skills/contents/skills/shipit/SKILL.md ")
-                {
-                    (
-                        "HTTP/1.1 200 OK",
-                        "---\nname: shipit\ndescription: Remote demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n      - ops\n---\nbody\n".to_string(),
-                        "text/plain",
-                    )
-                } else {
-                    (
-                        "HTTP/1.1 404 Not Found",
-                        "{}".to_string(),
-                        "application/json",
-                    )
-                };
-                let response = format!(
-                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /repos/openai/skills/contents/skills ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"[{"type":"dir","name":"shipit","path":"skills/shipit"},{"type":"dir","name":"github-only","path":"skills/github-only"}]"#
+                                    .to_string(),
+                                "application/json",
+                            )
+                        } else if first_line.starts_with(
+                            "GET /repos/openai/skills/contents/skills/shipit/SKILL.md ",
+                        ) {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: shipit\ndescription: Remote demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n      - ops\n---\nbody\n".to_string(),
+                                "text/plain",
+                            )
+                        } else if first_line.starts_with(
+                            "GET /repos/openai/skills/contents/skills/github-only/SKILL.md ",
+                        ) {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: github-only\ndescription: GitHub-only demo\n---\nbody\n"
+                                    .to_string(),
+                                "text/plain",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("github browse test server accept failed: {error}"),
+                }
             }
         });
         (format!("http://{addr}"), handle)
@@ -9787,7 +10045,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                         stream.write_all(response.as_bytes()).unwrap();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                        if started.elapsed() > std::time::Duration::from_secs(5) {
                             break;
                         }
                         thread::sleep(std::time::Duration::from_millis(10));
@@ -10014,7 +10272,8 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                             continue;
                         }
                         let (status, body, content_type) = if first_line
-                            .starts_with("GET /api/v1/skills?limit=5&search=deploy ")
+                            .starts_with("GET /api/v1/skills?")
+                            && first_line.contains("search=deploy")
                         {
                             (
                                 "HTTP/1.1 200 OK",
