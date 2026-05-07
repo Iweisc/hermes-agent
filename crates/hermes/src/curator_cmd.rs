@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Args, Subcommand};
@@ -112,7 +115,7 @@ pub fn print_curator(
             Ok(())
         }
         Some(CuratorCommand::Status) => print_status(context),
-        Some(CuratorCommand::Run(args)) => print_curator_run(args),
+        Some(CuratorCommand::Run(args)) => print_curator_run(context, args),
         Some(CuratorCommand::Pause) => {
             set_paused(context, true)?;
             println!("curator: paused");
@@ -148,18 +151,66 @@ fn print_help_summary() {
     println!("  rollback [...]         Restore from a curator snapshot");
 }
 
-fn print_curator_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
-    let mut envs = vec![
-        (
-            "HERMES_CURATOR_RUN_SYNCHRONOUS".to_string(),
-            if args.synchronous { "1" } else { "0" }.to_string(),
-        ),
-        (
-            "HERMES_CURATOR_RUN_DRY".to_string(),
-            if args.dry_run { "1" } else { "0" }.to_string(),
-        ),
-    ];
-    run_curator_python(CURATOR_RUN_BOOTSTRAP, &mut envs)
+fn print_curator_run(context: &HermesContext, args: RunArgs) -> Result<(), Box<dyn Error>> {
+    if !curator_enabled(context)? {
+        println!("curator: disabled via config; enable with `curator.enabled: true`");
+        return Err("curator disabled".into());
+    }
+
+    if args.dry_run {
+        println!("curator: running DRY-RUN (report only, no mutations)...");
+    } else {
+        println!("curator: running review pass...");
+    }
+
+    if !args.synchronous {
+        launch_detached_curator_run(context, args.dry_run)?;
+        println!("llm pass running in background — check `hermes curator status` later");
+        if args.dry_run {
+            println!(
+                "dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply."
+            );
+        }
+        return Ok(());
+    }
+
+    let mut envs = vec![(
+        "HERMES_CURATOR_RUN_DRY".to_string(),
+        if args.dry_run { "1" } else { "0" }.to_string(),
+    )];
+    run_curator_python(CURATOR_RUN_SYNC_BOOTSTRAP, &mut envs)
+}
+
+fn launch_detached_curator_run(
+    context: &HermesContext,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let binary = env::var_os("HERMES_CURATOR_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_exe()?);
+    let mut command = Command::new(binary);
+    command
+        .arg("curator")
+        .arg("run")
+        .arg("--sync")
+        .env("HERMES_HOME", context.hermes_home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _child = command.spawn()?;
+    Ok(())
 }
 
 fn print_curator_backup(context: &HermesContext, args: BackupArgs) -> Result<(), Box<dyn Error>> {
@@ -289,14 +340,20 @@ fn run_curator_python(
     Err(exit_status_message("curator", status).into())
 }
 
-const CURATOR_RUN_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
+const CURATOR_RUN_SYNC_BOOTSTRAP: &str = concat!(
     "import os\n",
-    "from hermes_cli.curator import _cmd_run\n",
-    "raise SystemExit(_cmd_run(argparse.Namespace(\n",
-    "    synchronous=(os.environ.get('HERMES_CURATOR_RUN_SYNCHRONOUS') == '1'),\n",
-    "    dry_run=(os.environ.get('HERMES_CURATOR_RUN_DRY') == '1'),\n",
-    ")))\n",
+    "from agent import curator\n",
+    "dry = (os.environ.get('HERMES_CURATOR_RUN_DRY') == '1')\n",
+    "def _on_summary(msg):\n",
+    "    print(msg)\n",
+    "result = curator.run_curator_review(on_summary=_on_summary, synchronous=True, dry_run=dry)\n",
+    "auto = result.get('auto_transitions', {}) or {}\n",
+    "if dry:\n",
+    "    print(f\"auto (preview): {auto.get('checked', 0)} candidate skill(s) — no transitions applied in dry-run\")\n",
+    "else:\n",
+    "    print(f\"auto: checked={auto.get('checked', 0)} stale={auto.get('marked_stale', 0)} archived={auto.get('archived', 0)} reactivated={auto.get('reactivated', 0)}\")\n",
+    "if dry:\n",
+    "    print(\"dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply.\")\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -2179,10 +2236,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn curator_run_uses_python_override_and_env_flags() {
+    fn curator_run_sync_uses_python_override_and_env_flags() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("curator-run");
         fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         let fake_python = home.join("python3");
         let log = home.join("python.log");
         fs::write(
@@ -2190,7 +2248,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'run sync=%s dry=%s\\n' \"$HERMES_CURATOR_RUN_SYNCHRONOUS\" \"$HERMES_CURATOR_RUN_DRY\" >> '{}'\n\
+  printf 'run dry=%s\\n' \"$HERMES_CURATOR_RUN_DRY\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -2203,16 +2261,65 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
-        print_curator_run(RunArgs {
-            synchronous: true,
-            dry_run: true,
-        })
+        print_curator_run(
+            &context,
+            RunArgs {
+                synchronous: true,
+                dry_run: true,
+            },
+        )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("run sync=1 dry=1"));
+        assert!(output.contains("run dry=1"));
 
         remove_env_var("HERMES_CURATOR_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn curator_run_async_spawns_detached_sync_child() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("curator-run-async");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let fake_binary = home.join("hermes");
+        let log = home.join("curator.log");
+        fs::write(
+            &fake_binary,
+            format!(
+                "#!/bin/sh\nprintf 'argv=%s\\n' \"$*\" >> '{}'\nprintf 'home=%s\\n' \"$HERMES_HOME\" >> '{}'\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_binary).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_binary, perms).unwrap();
+
+        set_env_var("HERMES_CURATOR_BINARY", &fake_binary);
+        print_curator_run(
+            &context,
+            RunArgs {
+                synchronous: false,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        for _ in 0..20 {
+            if log.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("argv=curator run --sync --dry-run"));
+        assert!(output.contains(&format!("home={}", home.display())));
+
+        remove_env_var("HERMES_CURATOR_BINARY");
         let _ = fs::remove_dir_all(home);
     }
 
