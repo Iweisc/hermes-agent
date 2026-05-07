@@ -15,7 +15,6 @@ use regex::Regex;
 use serde_json::{Value as JsonValue, json};
 use serde_yaml::{Mapping, Value};
 
-use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
@@ -28,7 +27,7 @@ pub enum McpCommand {
     List,
     #[command(alias = "rm")]
     Remove(RemoveArgs),
-    Serve(CompatArgs),
+    Serve(ServeArgs),
     Add(AddArgs),
     Test(TestArgs),
     #[command(alias = "config")]
@@ -41,6 +40,14 @@ pub struct RemoveArgs {
     pub name: String,
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+    #[arg(long)]
+    pub accept_hooks: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -95,7 +102,7 @@ pub fn print_mcp(
         Some(McpCommand::List) => print_list(context),
         Some(McpCommand::Remove(args)) => remove_server(context, args),
         Some(McpCommand::Add(args)) => add_server(context, args),
-        Some(McpCommand::Serve(args)) => bridge_mcp("serve", &args.args),
+        Some(McpCommand::Serve(args)) => print_mcp_serve(args),
         Some(McpCommand::Test(args)) => test_server(context, args),
         Some(McpCommand::Configure(args)) => configure_server(context, args),
         Some(McpCommand::Login(args)) => login_server(context, args),
@@ -205,6 +212,31 @@ fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn 
     }
     println!("  Starting OAuth flow for '{name}'...");
     bridge_mcp("test", &[name.to_string()])
+}
+
+fn print_mcp_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_MCP_PYTHON"))
+        .ok_or("could not find a Python interpreter for mcp serve")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-c")
+        .arg(MCP_SERVE_BOOTSTRAP);
+    if args.verbose {
+        command.env("HERMES_MCP_VERBOSE", "1");
+    }
+    if args.accept_hooks {
+        command.env("HERMES_ACCEPT_HOOKS", "1");
+    }
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("mcp serve", status).into())
 }
 
 fn configure_server_io<R: BufRead, W: Write>(
@@ -1134,6 +1166,12 @@ const MCP_BOOTSTRAP: &str = concat!(
     "mcp_command(parser.parse_args(sys.argv[1:]))\n",
 );
 
+const MCP_SERVE_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from mcp_serve import run_mcp_server\n",
+    "run_mcp_server(verbose=os.environ.get('HERMES_MCP_VERBOSE') == '1')\n",
+);
+
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("{command} exited with status {code}"),
@@ -1867,6 +1905,19 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
     }
 
     #[test]
+    fn serve_subcommand_parses_flags() {
+        let parsed =
+            McpHarness::try_parse_from(["mcp", "serve", "--verbose", "--accept-hooks"]).unwrap();
+        match parsed.command {
+            McpCommand::Serve(args) => {
+                assert!(args.verbose);
+                assert!(args.accept_hooks);
+            }
+            _ => panic!("expected serve args"),
+        }
+    }
+
+    #[test]
     fn add_http_server_writes_native_config() {
         let home = temp_path("add-http");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2129,6 +2180,45 @@ exit 9\n",
 
         remove_env_var("HERMES_MCP_PYTHON");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn serve_uses_python_override_and_env_flags() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'verbose=%s accept=%s\\n' \"$HERMES_MCP_VERBOSE\" \"$HERMES_ACCEPT_HOOKS\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+        print_mcp_serve(ServeArgs {
+            verbose: true,
+            accept_hooks: true,
+        })
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("verbose=1"));
+        assert!(output.contains("accept=1"));
+
+        remove_env_var("HERMES_MCP_PYTHON");
     }
 
     #[test]
