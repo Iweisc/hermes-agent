@@ -261,17 +261,16 @@ fn token_expiry(access_token: &str) -> Option<i64> {
 }
 
 fn chatgpt_account_id_from_token(access_token: &str) -> Option<String> {
-    decode_jwt_claims(access_token)
-        .and_then(|claims| {
-            claims
-                .get("https://api.openai.com/auth")
-                .and_then(Value::as_object)
-                .and_then(|auth| auth.get("chatgpt_account_id"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
+    decode_jwt_claims(access_token).and_then(|claims| {
+        claims
+            .get("https://api.openai.com/auth")
+            .and_then(Value::as_object)
+            .and_then(|auth| auth.get("chatgpt_account_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn decode_jwt_claims(access_token: &str) -> Option<Value> {

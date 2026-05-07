@@ -22,6 +22,9 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MINIMAX_MODEL: &str = "speech-01";
 const DEFAULT_MINIMAX_VOICE_ID: &str = "female-shaonv";
 const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.chat/v1/text_to_speech";
+const DEFAULT_GEMINI_TTS_MODEL: &str = "gemini-2.5-flash-preview-tts";
+const DEFAULT_GEMINI_TTS_VOICE: &str = "Kore";
+const DEFAULT_GEMINI_TTS_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_MISTRAL_TTS_MODEL: &str = "voxtral-mini-tts-2603";
 const DEFAULT_MISTRAL_TTS_VOICE_ID: &str = "c69964a6-ab8b-4f8a-9465-ec0925096ec8";
 const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
@@ -33,8 +36,12 @@ const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const EDGE_MAX_TEXT_LENGTH: usize = 5_000;
 const OPENAI_MAX_TEXT_LENGTH: usize = 4_096;
 const MINIMAX_MAX_TEXT_LENGTH: usize = 10_000;
+const GEMINI_MAX_TEXT_LENGTH: usize = 5_000;
 const MISTRAL_MAX_TEXT_LENGTH: usize = 4_000;
 const XAI_MAX_TEXT_LENGTH: usize = 15_000;
+const GEMINI_TTS_SAMPLE_RATE: u32 = 24_000;
+const GEMINI_TTS_CHANNELS: u16 = 1;
+const GEMINI_TTS_SAMPLE_WIDTH: u16 = 2;
 
 #[derive(Debug, Clone)]
 struct TtsSettings {
@@ -53,6 +60,10 @@ struct TtsSettings {
     minimax_voice_id: String,
     minimax_base_url: String,
     minimax_api_key: String,
+    gemini_model: String,
+    gemini_voice: String,
+    gemini_base_url: String,
+    gemini_api_key: String,
     mistral_model: String,
     mistral_voice_id: String,
     mistral_base_url: String,
@@ -122,7 +133,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         text.to_string()
     };
 
-    let voice_compatible = matches!(provider, "openai" | "mistral" | "elevenlabs")
+    let voice_compatible = matches!(provider, "openai" | "mistral" | "elevenlabs" | "gemini")
         && output_path
             .extension()
             .and_then(|value| value.to_str())
@@ -133,10 +144,11 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
         "openai" => synthesize_openai(&settings, &truncated, &output_path),
         "minimax" => synthesize_minimax(&settings, &truncated, &output_path),
+        "gemini" => synthesize_gemini(&settings, &truncated, &output_path),
         "mistral" => synthesize_mistral(&settings, &truncated, &output_path),
         "xai" => synthesize_xai(&settings, &truncated, &output_path),
         other => Err(format!(
-            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, minimax, mistral, xai."
+            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, minimax, gemini, mistral, xai."
         )),
     };
     if let Err(error) = result {
@@ -211,6 +223,19 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let minimax_api_key = yaml_mapping_value(root, &["minimax", "api_key"])
         .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
         .unwrap_or_default();
+    let gemini_model = yaml_mapping_value(root, &["gemini", "model"])
+        .unwrap_or_else(|| DEFAULT_GEMINI_TTS_MODEL.to_string());
+    let gemini_voice = yaml_mapping_value(root, &["gemini", "voice"])
+        .unwrap_or_else(|| DEFAULT_GEMINI_TTS_VOICE.to_string());
+    let gemini_base_url = yaml_mapping_value(root, &["gemini", "base_url"])
+        .or_else(|| std::env::var("GEMINI_BASE_URL").ok())
+        .unwrap_or_else(|| DEFAULT_GEMINI_TTS_BASE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let gemini_api_key = yaml_mapping_value(root, &["gemini", "api_key"])
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+        .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+        .unwrap_or_default();
     let mistral_model = yaml_mapping_value(root, &["mistral", "model"])
         .unwrap_or_else(|| DEFAULT_MISTRAL_TTS_MODEL.to_string());
     let mistral_voice_id = yaml_mapping_value(root, &["mistral", "voice_id"])
@@ -254,6 +279,10 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
         minimax_voice_id,
         minimax_base_url,
         minimax_api_key,
+        gemini_model,
+        gemini_voice,
+        gemini_base_url,
+        gemini_api_key,
         mistral_model,
         mistral_voice_id,
         mistral_base_url,
@@ -521,6 +550,84 @@ fn synthesize_minimax(
     ensure_audio_file(output_path)
 }
 
+fn synthesize_gemini(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
+    if settings.gemini_api_key.trim().is_empty() {
+        return Err(
+            "GEMINI_API_KEY not set. Get one at https://aistudio.google.com/app/apikey".to_string(),
+        );
+    }
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("building HTTP client failed: {error}"))?;
+    let url = format!(
+        "{}/models/{}:generateContent",
+        settings.gemini_base_url, settings.gemini_model
+    );
+    let response = client
+        .post(&url)
+        .query(&[("key", settings.gemini_api_key.as_str())])
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "contents": [{
+                "parts": [{"text": text}]
+            }],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": settings.gemini_voice,
+                        }
+                    }
+                }
+            }
+        }))
+        .send()
+        .map_err(|error| format!("Gemini TTS request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("reading Gemini TTS response failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Gemini TTS API error (HTTP {}): {}",
+            status.as_u16(),
+            extract_tts_api_error_message(&body)
+        ));
+    }
+    let parsed = serde_json::from_str::<Value>(&body)
+        .map_err(|error| format!("Gemini TTS response was malformed: {error}"))?;
+    let audio_b64 = parsed
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .and_then(|parts| {
+            parts.iter().find_map(|part| {
+                part.get("inlineData")
+                    .or_else(|| part.get("inline_data"))
+                    .and_then(Value::as_object)
+                    .and_then(|inline| inline.get("data"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .ok_or_else(|| "Gemini TTS response contained no audio data".to_string())?;
+    let pcm_bytes = base64::engine::general_purpose::STANDARD
+        .decode(audio_b64)
+        .map_err(|error| format!("decoding Gemini TTS audio failed: {error}"))?;
+    if pcm_bytes.is_empty() {
+        return Err("Gemini TTS returned empty audio data".to_string());
+    }
+    let wav_bytes = wrap_pcm_as_wav(
+        &pcm_bytes,
+        GEMINI_TTS_SAMPLE_RATE,
+        GEMINI_TTS_CHANNELS,
+        GEMINI_TTS_SAMPLE_WIDTH,
+    );
+    write_wav_or_transcode(&wav_bytes, output_path)
+}
+
 fn synthesize_mistral(
     settings: &TtsSettings,
     text: &str,
@@ -592,7 +699,7 @@ fn resolve_output_path(
         .to_ascii_lowercase();
     let extension = if matches!(
         settings.provider.as_str(),
-        "openai" | "mistral" | "elevenlabs"
+        "openai" | "mistral" | "elevenlabs" | "gemini"
     ) && platform == "telegram"
     {
         "ogg"
@@ -655,6 +762,7 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
         "edge" => EDGE_MAX_TEXT_LENGTH,
         "openai" => OPENAI_MAX_TEXT_LENGTH,
         "minimax" => MINIMAX_MAX_TEXT_LENGTH,
+        "gemini" => GEMINI_MAX_TEXT_LENGTH,
         "mistral" => MISTRAL_MAX_TEXT_LENGTH,
         "xai" => XAI_MAX_TEXT_LENGTH,
         "elevenlabs" => match settings.elevenlabs_model_id.trim() {
@@ -669,6 +777,114 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
         },
         _ => EDGE_MAX_TEXT_LENGTH,
     }
+}
+
+fn wrap_pcm_as_wav(
+    pcm_bytes: &[u8],
+    sample_rate: u32,
+    channels: u16,
+    sample_width: u16,
+) -> Vec<u8> {
+    let byte_rate = sample_rate * channels as u32 * sample_width as u32;
+    let block_align = channels * sample_width;
+    let data_size = pcm_bytes.len() as u32;
+    let riff_size = 4 + 24 + 8 + data_size;
+
+    let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&(sample_width * 8).to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(pcm_bytes);
+    wav
+}
+
+fn write_wav_or_transcode(wav_bytes: &[u8], output_path: &Path) -> Result<(), String> {
+    let extension = output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "mp3".to_string());
+    if extension == "wav" {
+        fs::write(output_path, wav_bytes)
+            .map_err(|error| format!("writing {} failed: {error}", output_path.display()))?;
+        return ensure_audio_file(output_path);
+    }
+
+    let temp_wav = output_path.with_extension("wav.tmp");
+    fs::write(&temp_wav, wav_bytes)
+        .map_err(|error| format!("writing {} failed: {error}", temp_wav.display()))?;
+
+    let ffmpeg = Command::new("ffmpeg").arg("-version").output();
+    if ffmpeg.is_ok() {
+        let mut command = Command::new("ffmpeg");
+        command.arg("-i").arg(&temp_wav);
+        if extension == "ogg" {
+            command
+                .arg("-acodec")
+                .arg("libopus")
+                .arg("-ac")
+                .arg("1")
+                .arg("-b:a")
+                .arg("64k")
+                .arg("-vbr")
+                .arg("off");
+        }
+        let status = command
+            .arg("-y")
+            .arg("-loglevel")
+            .arg("error")
+            .arg(output_path)
+            .status()
+            .map_err(|error| format!("ffmpeg conversion failed: {error}"))?;
+        let _ = fs::remove_file(&temp_wav);
+        if !status.success() {
+            return Err(format!(
+                "ffmpeg conversion failed with code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        return ensure_audio_file(output_path);
+    }
+
+    fs::write(output_path, wav_bytes)
+        .map_err(|error| format!("writing {} failed: {error}", output_path.display()))?;
+    let _ = fs::remove_file(&temp_wav);
+    ensure_audio_file(output_path)
+}
+
+fn extract_tts_api_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    value
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| body.to_string())
 }
 
 fn decode_hex_bytes(raw: &str) -> Result<Vec<u8>, String> {
@@ -930,6 +1146,102 @@ mod tests {
             json!(output_path.display().to_string())
         );
         assert_eq!(fs::read(&output_path).unwrap(), b"xai-audio");
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn gemini_tts_writes_wav_and_request_payload() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pcm_bytes = vec![0_u8; 4800];
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(&pcm_bytes);
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(
+                request_line.trim_end(),
+                "POST /v1beta/models/gemini-2.5-pro-preview-tts:generateContent?key=gemini-test-key HTTP/1.1"
+            );
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut payload = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut payload);
+            let body: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                body["contents"][0]["parts"][0]["text"],
+                json!("hello gemini")
+            );
+            assert_eq!(
+                body["generationConfig"]["responseModalities"],
+                json!(["AUDIO"])
+            );
+            assert_eq!(
+                body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+                json!("Puck")
+            );
+
+            let response_body = json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "inlineData": {
+                                "mimeType": "audio/L16;codec=pcm;rate=24000",
+                                "data": pcm_b64,
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: gemini\n  gemini:\n    base_url: http://{}/v1beta\n    api_key: gemini-test-key\n    model: gemini-2.5-pro-preview-tts\n    voice: Puck\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("speech.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello gemini",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("gemini"));
+        let wav = fs::read(&output_path).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[44..], pcm_bytes.as_slice());
         join.join().unwrap();
     }
 
@@ -1222,6 +1534,92 @@ mod tests {
             json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
         );
         assert_eq!(fs::read(file_path).unwrap(), b"opus-audio");
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn gemini_tts_telegram_defaults_to_ogg_voice_media() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pcm_bytes = vec![1_u8; 4800];
+        let pcm_b64 = base64::engine::general_purpose::STANDARD.encode(&pcm_bytes);
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(
+                request_line.trim_end(),
+                "POST /v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=gemini-test-key HTTP/1.1"
+            );
+            let response_body = json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "inline_data": {
+                                "data": pcm_b64,
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: gemini\n  gemini:\n    base_url: http://{}/v1beta\n    api_key: gemini-test-key\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join("ffmpeg");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\nin=''\nout=''\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -i)\n      shift\n      in=\"$1\"\n      ;;\n    -acodec|-ac|-b:a|-vbr|-loglevel)\n      shift\n      ;;\n    -y)\n      ;;\n    *)\n      if [ \"${1#-}\" = \"$1\" ]; then out=\"$1\"; fi\n      ;;\n  esac\n  shift\ndone\ncp \"$in\" \"$out\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        unsafe {
+            env::set_var("PATH", format!("{}:{}", bin_dir.display(), original_path));
+            env::set_var("HERMES_SESSION_PLATFORM", "telegram");
+        }
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(&json!({"text":"voice me gemini"}), &runtime);
+        unsafe {
+            env::set_var("PATH", original_path);
+            env::remove_var("HERMES_SESSION_PLATFORM");
+        }
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("gemini"));
+        assert_eq!(parsed["voice_compatible"], json!(true));
+        let file_path = parsed["file_path"].as_str().unwrap();
+        assert!(file_path.ends_with(".ogg"));
+        assert_eq!(
+            parsed["media_tag"],
+            json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
+        );
+        let output = fs::read(file_path).unwrap();
+        assert!(output.starts_with(b"RIFF") || output.starts_with(b"OggS"));
         join.join().unwrap();
     }
 
