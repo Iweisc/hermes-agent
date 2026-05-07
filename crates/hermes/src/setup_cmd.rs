@@ -1,15 +1,15 @@
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
-use hermes_core::HermesContext;
+use hermes_core::{HermesContext, get_auth_status_summary};
 use serde_yaml::{Mapping, Value};
 
-use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Args, Debug, Clone)]
@@ -49,6 +49,13 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
     {
         let mut ui = TerminalUi;
         return run_native_agent_setup(context, &mut ui);
+    }
+    if should_use_native_tts_setup(context, &args)
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let mut ui = TerminalUi;
+        return run_native_tts_setup(context, &mut ui);
     }
     print_setup_python(args)
 }
@@ -92,6 +99,15 @@ fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
+fn should_use_native_tts_setup(context: &HermesContext, args: &SetupArgs) -> bool {
+    matches!(args.section, Some(SetupSection::Tts))
+        && !args.non_interactive
+        && !args.reset
+        && !args.reconfigure
+        && !args.quick
+        && !nous_auth_present(context)
+}
+
 impl SetupSection {
     fn as_str(self) -> &'static str {
         match self {
@@ -129,6 +145,7 @@ fn exit_status_message(command: &str, status: ExitStatus) -> String {
 trait SetupUi {
     fn line(&mut self, text: &str) -> Result<(), Box<dyn Error>>;
     fn prompt(&mut self, prompt: &str) -> Result<String, Box<dyn Error>>;
+    fn prompt_secret(&mut self, prompt: &str) -> Result<String, Box<dyn Error>>;
 
     fn blank(&mut self) -> Result<(), Box<dyn Error>> {
         self.line("")
@@ -149,6 +166,35 @@ impl SetupUi for TerminalUi {
         stdout.flush()?;
         let mut input = String::new();
         let read = io::stdin().read_line(&mut input)?;
+        if read == 0 {
+            return Err("setup cancelled".into());
+        }
+        Ok(input.trim().to_string())
+    }
+
+    fn prompt_secret(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
+        let mut stdout = io::stdout();
+        stdout.write_all(prompt.as_bytes())?;
+        stdout.flush()?;
+
+        let echo_disabled = if cfg!(unix) && io::stdin().is_terminal() {
+            Command::new("stty")
+                .arg("-echo")
+                .status()
+                .ok()
+                .is_some_and(|status| status.success())
+        } else {
+            false
+        };
+
+        let mut input = String::new();
+        let read = io::stdin().read_line(&mut input)?;
+
+        if echo_disabled {
+            let _ = Command::new("stty").arg("echo").status();
+            println!();
+        }
+
         if read == 0 {
             return Err("setup cancelled".into());
         }
@@ -289,6 +335,316 @@ fn run_native_agent_setup(
     ui.blank()?;
     ui.line("Agent Settings configuration complete!")?;
     Ok(())
+}
+
+fn run_native_tts_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_provider =
+        get_nested_string(&root, &["tts", "provider"]).unwrap_or_else(|| "edge".to_string());
+
+    let providers = [
+        ("edge", "Edge TTS"),
+        ("elevenlabs", "ElevenLabs"),
+        ("openai", "OpenAI TTS"),
+        ("xai", "xAI TTS"),
+        ("minimax", "MiniMax TTS"),
+        ("mistral", "Mistral Voxtral TTS"),
+        ("gemini", "Google Gemini TTS"),
+        ("neutts", "NeuTTS"),
+        ("kittentts", "KittenTTS"),
+    ];
+
+    ui.blank()?;
+    ui.line("⚕ Hermes Setup — Text-to-Speech")?;
+    ui.line(&format!(
+        "Current: {}",
+        provider_label(&current_provider, &providers)
+    ))?;
+    ui.blank()?;
+    for (index, (_, label)) in providers.iter().enumerate() {
+        ui.line(&format!("  {}. {}", index + 1, label))?;
+    }
+    ui.line(&format!(
+        "  {}. Keep current ({})",
+        providers.len() + 1,
+        provider_label(&current_provider, &providers)
+    ))?;
+
+    let selection = prompt_menu_choice(
+        ui,
+        "Select TTS provider: ",
+        providers.len() + 1,
+        providers.len() + 1,
+    )?;
+    if selection == providers.len() + 1 {
+        ui.line(&format!(
+            "Keeping current TTS provider: {}",
+            provider_label(&current_provider, &providers)
+        ))?;
+        return Ok(());
+    }
+
+    let mut selected = providers[selection - 1].0.to_string();
+    match selected.as_str() {
+        "elevenlabs" => {
+            if env_value("ELEVENLABS_API_KEY").is_none() {
+                let api_key = ui.prompt_secret("ElevenLabs API key: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "ELEVENLABS_API_KEY", api_key.trim())?;
+                    ui.line("ElevenLabs API key saved")?;
+                }
+            }
+        }
+        "openai" => {
+            if env_value("VOICE_TOOLS_OPENAI_KEY").is_none()
+                && env_value("OPENAI_API_KEY").is_none()
+            {
+                let api_key = ui.prompt_secret("OpenAI API key for TTS: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "VOICE_TOOLS_OPENAI_KEY", api_key.trim())?;
+                    ui.line("OpenAI TTS API key saved")?;
+                }
+            }
+        }
+        "xai" => {
+            if env_value("XAI_API_KEY").is_none() {
+                let api_key = ui.prompt_secret("xAI API key for TTS: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "XAI_API_KEY", api_key.trim())?;
+                    ui.line("xAI TTS API key saved")?;
+                }
+            }
+            if selected == "xai" {
+                let voice_id = ui.prompt("xAI voice_id (Enter for default eve): ")?;
+                if !voice_id.trim().is_empty() {
+                    ensure_mapping(ensure_mapping(&mut root, "tts"), "xai").insert(
+                        yaml_key("voice_id"),
+                        Value::String(voice_id.trim().to_string()),
+                    );
+                    ui.line(&format!("xAI voice_id set to: {}", voice_id.trim()))?;
+                }
+            }
+        }
+        "minimax" => {
+            if env_value("MINIMAX_API_KEY").is_none() {
+                let api_key = ui.prompt_secret("MiniMax API key for TTS: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "MINIMAX_API_KEY", api_key.trim())?;
+                    ui.line("MiniMax TTS API key saved")?;
+                }
+            }
+        }
+        "mistral" => {
+            if env_value("MISTRAL_API_KEY").is_none() {
+                let api_key = ui.prompt_secret("Mistral API key for TTS: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "MISTRAL_API_KEY", api_key.trim())?;
+                    ui.line("Mistral TTS API key saved")?;
+                }
+            }
+        }
+        "gemini" => {
+            if env_value("GEMINI_API_KEY").is_none() && env_value("GOOGLE_API_KEY").is_none() {
+                ui.line("Get a free API key at https://aistudio.google.com/app/apikey")?;
+                let api_key = ui.prompt_secret("Gemini API key for TTS: ")?;
+                if api_key.trim().is_empty() {
+                    ui.line("No API key provided. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                } else {
+                    save_env_value(context.env_path(), "GEMINI_API_KEY", api_key.trim())?;
+                    ui.line("Gemini TTS API key saved")?;
+                }
+            }
+        }
+        "neutts" => {
+            if !python_module_installed("neutts")? {
+                ui.line("NeuTTS requires a Python package and espeak-ng.")?;
+                if prompt_yes_no(ui, "Install NeuTTS dependencies now? [Y/n]: ", true)? {
+                    if !install_neutts_deps(ui)? {
+                        ui.line("NeuTTS installation incomplete. Falling back to Edge TTS.")?;
+                        selected = "edge".to_string();
+                    }
+                } else {
+                    ui.line("Skipping install. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                }
+            } else {
+                ui.line("NeuTTS is already installed")?;
+            }
+        }
+        "kittentts" => {
+            if !python_module_installed("kittentts")? {
+                ui.line("KittenTTS is lightweight and requires no API key.")?;
+                if prompt_yes_no(ui, "Install KittenTTS now? [Y/n]: ", true)? {
+                    if !install_kittentts_deps(ui)? {
+                        ui.line("KittenTTS installation incomplete. Falling back to Edge TTS.")?;
+                        selected = "edge".to_string();
+                    }
+                } else {
+                    ui.line("Skipping install. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                }
+            } else {
+                ui.line("KittenTTS is already installed")?;
+            }
+        }
+        _ => {}
+    }
+
+    ensure_mapping(&mut root, "tts").insert(yaml_key("provider"), Value::String(selected.clone()));
+    write_yaml_mapping(&context.config_path(), &root)?;
+    ui.line(&format!(
+        "TTS provider set to: {}",
+        provider_label(&selected, &providers)
+    ))?;
+    Ok(())
+}
+
+fn provider_label<'a>(provider: &str, providers: &'a [(&str, &'a str)]) -> &'a str {
+    providers
+        .iter()
+        .find_map(|(key, label)| (*key == provider).then_some(*label))
+        .unwrap_or("Custom")
+}
+
+fn prompt_yes_no(
+    ui: &mut dyn SetupUi,
+    prompt: &str,
+    default_yes: bool,
+) -> Result<bool, Box<dyn Error>> {
+    loop {
+        let input = ui.prompt(prompt)?;
+        let normalized = input.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Ok(default_yes);
+        }
+        match normalized.as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => ui.line("Please answer yes or no.")?,
+        }
+    }
+}
+
+fn env_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn nous_auth_present(context: &HermesContext) -> bool {
+    get_auth_status_summary(&context.hermes_home(), "nous")
+        .map(|status| status.logged_in)
+        .unwrap_or(false)
+}
+
+fn setup_python_interpreter() -> Option<PathBuf> {
+    resolve_repo_python(&project_root(), Some("HERMES_SETUP_PYTHON"))
+}
+
+fn python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(python) = setup_python_interpreter() else {
+        return Ok(false);
+    };
+    let status = Command::new(python)
+        .arg("-c")
+        .arg(format!(
+            "import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec({module:?}) else 1)"
+        ))
+        .status()?;
+    Ok(status.success())
+}
+
+fn install_neutts_deps(ui: &mut dyn SetupUi) -> Result<bool, Box<dyn Error>> {
+    if !command_exists("espeak-ng") {
+        ui.line("NeuTTS requires espeak-ng for phonemization.")?;
+        ui.line(&format!(
+            "Install with: {}",
+            if cfg!(target_os = "macos") {
+                "brew install espeak-ng"
+            } else if cfg!(target_os = "windows") {
+                "choco install espeak-ng"
+            } else {
+                "sudo apt install espeak-ng"
+            }
+        ))?;
+        if !prompt_yes_no(ui, "Install espeak-ng now? [Y/n]: ", true)? {
+            return Ok(false);
+        }
+        let mut install = if cfg!(target_os = "macos") {
+            let mut cmd = Command::new("brew");
+            cmd.args(["install", "espeak-ng"]);
+            cmd
+        } else if cfg!(target_os = "windows") {
+            let mut cmd = Command::new("choco");
+            cmd.args(["install", "espeak-ng", "-y"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sudo");
+            cmd.args(["apt", "install", "-y", "espeak-ng"]);
+            cmd
+        };
+        if !install.status().ok().is_some_and(|status| status.success()) {
+            return Ok(false);
+        }
+        ui.line("espeak-ng installed")?;
+    }
+
+    let Some(python) = setup_python_interpreter() else {
+        return Ok(false);
+    };
+    ui.line("Installing neutts Python package...")?;
+    let status = Command::new(python)
+        .args(["-m", "pip", "install", "-U", "neutts[all]", "--quiet"])
+        .status()?;
+    Ok(status.success())
+}
+
+fn install_kittentts_deps(ui: &mut dyn SetupUi) -> Result<bool, Box<dyn Error>> {
+    let Some(python) = setup_python_interpreter() else {
+        return Ok(false);
+    };
+    let wheel_url = "https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl";
+    ui.line("Installing kittentts Python package...")?;
+    let status = Command::new(python)
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "-U",
+            wheel_url,
+            "soundfile",
+            "--quiet",
+        ])
+        .status()?;
+    Ok(status.success())
+}
+
+fn command_exists(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .map(|path| path.join(command))
+        .any(|candidate| candidate.is_file())
 }
 
 fn prompt_positive_i64(
@@ -532,6 +888,10 @@ mod tests {
             self.cursor += 1;
             Ok(answer)
         }
+
+        fn prompt_secret(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
+            self.prompt(prompt)
+        }
     }
 
     #[test]
@@ -642,6 +1002,23 @@ exit 9\n",
     }
 
     #[test]
+    fn native_tts_setup_writes_provider_and_secret() {
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "tts:\n  provider: edge\n").unwrap();
+
+        let mut ui = TestUi::new(&["3", "sk-tts-test"]);
+        run_native_tts_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: openai"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("VOICE_TOOLS_OPENAI_KEY=sk-tts-test"));
+    }
+
+    #[test]
     fn agent_setup_with_extra_flags_stays_on_python_path() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -681,6 +1058,56 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("section=agent quick=1"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tts_setup_with_nous_auth_stays_on_python_path() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'section=%s\\n' \"$HERMES_SETUP_SECTION\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(
+            context.hermes_home().join("auth.json"),
+            r#"{"providers":{"nous":{"agent_key":"test-key"}}}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Tts),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("section=tts"));
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 }
