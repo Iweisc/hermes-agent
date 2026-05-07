@@ -5,6 +5,7 @@ mod config_cmd;
 mod debug;
 mod doctor;
 mod dump;
+mod hooks;
 mod logs;
 
 use std::error::Error;
@@ -44,6 +45,10 @@ enum Command {
     Debug {
         #[command(subcommand)]
         command: Option<debug::DebugCommand>,
+    },
+    Hooks {
+        #[command(subcommand)]
+        command: Option<hooks::HooksCommand>,
     },
     Completion(completion::CompletionArgs),
     Logout(auth_cmd::LogoutArgs),
@@ -234,6 +239,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             doctor::print_doctor(&context, &env_report, &config, &session_store, args)?
         }
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
+        Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
