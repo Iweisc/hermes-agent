@@ -25,6 +25,16 @@ const LEGACY_UNIT_EXECSTART_MARKERS: &[&str] = &[
     " hermes gateway ",
     "/hermes gateway ",
 ];
+const GATEWAY_PROCESS_PATTERNS: &[&str] = &[
+    "hermes_cli.main gateway",
+    "hermes_cli.main --profile",
+    "hermes_cli.main -p",
+    "hermes_cli/main.py gateway",
+    "hermes_cli/main.py --profile",
+    "hermes_cli/main.py -p",
+    "hermes gateway run",
+    "gateway/run.py",
+];
 
 #[derive(Args, Debug, Clone)]
 pub struct GatewayArgs {
@@ -115,6 +125,12 @@ struct LegacyGatewayUnit {
     is_system: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayProcess {
+    pid: i64,
+    command: String,
+}
+
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
@@ -147,11 +163,23 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
 
 fn print_gateway_start(
     context: &HermesContext,
-    accept_hooks: bool,
+    _accept_hooks: bool,
     args: GatewayServiceArgs,
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
-        return bridge_gateway(accept_hooks, &bridge_service_args("start", args));
+        let processes = find_all_gateway_processes()?;
+        let killed = kill_gateway_processes(&processes, false);
+        if killed > 0 {
+            println!("Killed {killed} stale gateway process(es) across all profiles");
+            let _ = wait_for_processes_exit(
+                &processes
+                    .into_iter()
+                    .map(|process| process.pid)
+                    .collect::<Vec<_>>(),
+                Duration::from_secs(10),
+                Some(Duration::from_secs(5)),
+            );
+        }
     }
 
     if is_termux(context) {
@@ -191,11 +219,28 @@ fn print_gateway_start(
 
 fn print_gateway_stop(
     context: &HermesContext,
-    accept_hooks: bool,
+    _accept_hooks: bool,
     args: GatewayServiceArgs,
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
-        return bridge_gateway(accept_hooks, &bridge_service_args("stop", args));
+        let service_stopped = stop_gateway_service_if_available(context, args.system);
+        let processes = find_all_gateway_processes()?;
+        let killed = kill_gateway_processes(&processes, false);
+        let total = killed + usize::from(service_stopped);
+        if total > 0 {
+            println!("Stopped {total} gateway process(es) across all profiles");
+            let _ = wait_for_processes_exit(
+                &processes
+                    .into_iter()
+                    .map(|process| process.pid)
+                    .collect::<Vec<_>>(),
+                Duration::from_secs(10),
+                Some(Duration::from_secs(5)),
+            );
+        } else {
+            println!("No gateway processes found");
+        }
+        return Ok(());
     }
 
     if has_any_systemd_unit(context) {
@@ -224,7 +269,41 @@ fn print_gateway_restart(
     args: GatewayServiceArgs,
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
-        return bridge_gateway(accept_hooks, &bridge_service_args("restart", args));
+        let service_stopped = stop_gateway_service_if_available(context, args.system);
+        let processes = find_all_gateway_processes()?;
+        let killed = kill_gateway_processes(&processes, false);
+        let total = killed + usize::from(service_stopped);
+        if total > 0 {
+            println!("Stopped {total} gateway process(es) across all profiles");
+        }
+        let _ = wait_for_processes_exit(
+            &processes
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            Duration::from_secs(10),
+            Some(Duration::from_secs(5)),
+        );
+        println!("Starting gateway...");
+
+        if has_any_systemd_unit(context) {
+            start_systemd_service(context, args.system)?;
+            println!("Started {} service", gateway_service_name(context));
+            return Ok(());
+        }
+        if launchd_plist_path(context).exists() {
+            start_launchd_service(context)?;
+            println!("Started {} service", launchd_label(context));
+            return Ok(());
+        }
+        return print_gateway_run(
+            accept_hooks,
+            GatewayRunArgs {
+                verbose: 0,
+                quiet: false,
+                replace: false,
+            },
+        );
     }
 
     if has_any_systemd_unit(context) {
@@ -530,17 +609,6 @@ const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     ")\n",
 );
 
-fn bridge_service_args(subcommand: &str, args: GatewayServiceArgs) -> Vec<String> {
-    let mut argv = vec![subcommand.to_string()];
-    if args.system {
-        argv.push("--system".to_string());
-    }
-    if args.all {
-        argv.push("--all".to_string());
-    }
-    argv
-}
-
 fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
     let mut argv = vec!["install".to_string()];
     if args.force {
@@ -809,6 +877,144 @@ fn other_profile_gateway_processes(
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(rows)
+}
+
+fn find_all_gateway_processes() -> Result<Vec<GatewayProcess>, Box<dyn Error>> {
+    let exclude = ancestor_pids();
+    #[cfg(windows)]
+    {
+        let _ = exclude;
+        Ok(Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("ps")
+            .args(["-A", "eww", "-o", "pid=,command="])
+            .output()?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_gateway_ps_processes(&stdout, &exclude))
+    }
+}
+
+#[cfg(not(windows))]
+fn parse_gateway_ps_processes(output: &str, exclude_pids: &[i64]) -> Vec<GatewayProcess> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let stripped = line.trim();
+            if stripped.is_empty() || stripped.contains("grep") {
+                return None;
+            }
+            let mut parts = stripped.splitn(2, char::is_whitespace);
+            let pid = parts.next()?.trim().parse::<i64>().ok()?;
+            let command = parts.next().unwrap_or("").trim().to_string();
+            gateway_process_matches(pid, &command, exclude_pids)
+                .then_some(GatewayProcess { pid, command })
+        })
+        .collect()
+}
+
+fn gateway_process_matches(pid: i64, command: &str, exclude_pids: &[i64]) -> bool {
+    pid > 0
+        && !exclude_pids.contains(&pid)
+        && GATEWAY_PROCESS_PATTERNS
+            .iter()
+            .any(|pattern| command.contains(pattern))
+}
+
+fn ancestor_pids() -> Vec<i64> {
+    let mut ancestors = Vec::new();
+    let mut pid = std::process::id() as i64;
+    for _ in 0..64 {
+        if pid <= 0 || ancestors.contains(&pid) {
+            break;
+        }
+        ancestors.push(pid);
+        let Some(parent) = parent_pid(pid) else {
+            break;
+        };
+        pid = parent;
+    }
+    ancestors
+}
+
+fn parent_pid(pid: i64) -> Option<i64> {
+    if pid <= 1 {
+        return None;
+    }
+    let output = Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let parent = stdout.trim().parse::<i64>().ok()?;
+    (parent > 0).then_some(parent)
+}
+
+fn kill_gateway_processes(processes: &[GatewayProcess], force: bool) -> usize {
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let mut killed = 0;
+    for process in processes {
+        if !process_running(process.pid) {
+            continue;
+        }
+        match signal_pid(process.pid, signal) {
+            Ok(()) => killed += 1,
+            Err(_) if !process_running(process.pid) => {}
+            Err(error) => eprintln!("Failed to kill PID {}: {}", process.pid, error),
+        }
+    }
+    killed
+}
+
+fn wait_for_processes_exit(pids: &[i64], timeout: Duration, force_after: Option<Duration>) -> bool {
+    let mut pending = pids
+        .iter()
+        .copied()
+        .filter(|pid| process_running(*pid))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return true;
+    }
+
+    let start = Instant::now();
+    let force_deadline = force_after.map(|value| start + value);
+    let deadline = start + timeout;
+    let mut force_sent = false;
+
+    loop {
+        pending.retain(|pid| process_running(*pid));
+        if pending.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return pending.is_empty();
+        }
+        if !force_sent && force_deadline.is_some_and(|value| now >= value) {
+            for pid in &pending {
+                let _ = signal_pid(*pid, libc::SIGKILL);
+            }
+            force_sent = true;
+        }
+        sleep(Duration::from_millis(300));
+    }
+}
+
+fn stop_gateway_service_if_available(context: &HermesContext, system: bool) -> bool {
+    if has_any_systemd_unit(context) {
+        return stop_systemd_service(context, system).is_ok();
+    }
+    if launchd_plist_path(context).exists() {
+        return stop_launchd_service(context).is_ok();
+    }
+    false
 }
 
 fn systemd_service_active(context: &HermesContext, system: bool) -> bool {
@@ -1720,15 +1926,16 @@ mod tests {
     }
 
     #[test]
-    fn bridge_gateway_for_status_subcommands_preserves_argv() {
-        let args = bridge_service_args(
-            "restart",
-            GatewayServiceArgs {
-                system: true,
-                all: true,
-            },
-        );
-        assert_eq!(args, vec!["restart", "--system", "--all"]);
+    #[cfg(not(windows))]
+    fn parse_gateway_ps_processes_matches_run_commands() {
+        let output = "\
+123 /usr/bin/python -m hermes_cli.main gateway run --replace\n\
+124 hermes chat hi\n\
+125 /usr/bin/env HERMES_HOME=/tmp/x hermes gateway run\n";
+        let processes = parse_gateway_ps_processes(output, &[999]);
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 123);
+        assert_eq!(processes[1].pid, 125);
     }
 
     #[test]
@@ -1772,6 +1979,60 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("accept=1 verbose=2 quiet=1 replace=1"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_restart_all_kills_existing_process_and_relaunches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'restart verbose=%s quiet=%s replace=%s\\n' \\\n\
+    \"$HERMES_GATEWAY_VERBOSE\" \"$HERMES_GATEWAY_QUIET\" \"$HERMES_GATEWAY_REPLACE\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let mut child = Command::new("bash")
+            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .spawn()
+            .unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Restart(GatewayServiceArgs {
+                    system: false,
+                    all: true,
+                })),
+            },
+        )
+        .unwrap();
+
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("restart verbose=0 quiet=0 replace=0"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
