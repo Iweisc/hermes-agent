@@ -54,6 +54,7 @@ struct MemoryFile {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SetupMode {
     NativeGeneric,
+    NativeHoncho,
     NativeHindsight,
     PythonHook,
 }
@@ -197,6 +198,7 @@ fn print_memory_setup(
                 .ok_or("invalid memory provider selection")?;
             match provider.mode {
                 SetupMode::NativeGeneric => run_native_provider_setup(context, provider),
+                SetupMode::NativeHoncho => run_honcho_provider_setup(context, provider),
                 SetupMode::NativeHindsight => run_hindsight_provider_setup(context, provider),
                 SetupMode::PythonHook => {
                     println!(
@@ -426,8 +428,8 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                 required: true,
             }],
         ),
+        "honcho" => (SetupMode::NativeHoncho, Vec::new()),
         "hindsight" => (SetupMode::NativeHindsight, Vec::new()),
-        "honcho" => (SetupMode::PythonHook, Vec::new()),
         _ => (SetupMode::PythonHook, Vec::new()),
     };
 
@@ -771,6 +773,273 @@ fn run_hindsight_provider_setup(
     Ok(())
 }
 
+fn run_honcho_provider_setup(
+    context: &HermesContext,
+    provider: &SetupProvider,
+) -> Result<(), Box<dyn Error>> {
+    let mut config = load_honcho_setup_config(context);
+    let existing_env = load_simple_env(context.env_path());
+    let host_key = honcho_host_key(context);
+    let current_host = config
+        .get("hosts")
+        .and_then(|value| value.as_object())
+        .and_then(|hosts| hosts.get(&host_key))
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    println!("\n  Configuring {}:\n", provider.name);
+
+    ensure_honcho_dependency()?;
+
+    let current_deploy = if honcho_base_url(&config).is_some_and(|url| is_local_base_url(&url)) {
+        "local"
+    } else {
+        "cloud"
+    };
+    let deploy = prompt_choice(
+        "  Deployment",
+        &[
+            ("cloud", "Honcho cloud (api.honcho.dev)"),
+            ("local", "Self-hosted Honcho server"),
+        ],
+        current_deploy,
+    )?;
+    let is_local = deploy == "local";
+
+    if is_local {
+        let base_url = prompt_http_url(
+            "  Base URL",
+            honcho_base_url(&config)
+                .as_deref()
+                .unwrap_or("http://localhost:8000"),
+        )?;
+        config.insert(String::from("baseUrl"), serde_json::Value::String(base_url));
+        println!("  Local connections will skip auth automatically.");
+    } else {
+        config.remove("baseUrl");
+        config.remove("base_url");
+
+        let existing_key = current_host
+            .get("apiKey")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| honcho_api_key(&config))
+            .or_else(|| existing_env.get("HONCHO_API_KEY").cloned())
+            .unwrap_or_default();
+        let api_key = prompt_secret_with_existing(
+            "  Honcho API key",
+            (!existing_key.trim().is_empty()).then_some(existing_key.as_str()),
+            false,
+        )?;
+        if api_key.trim().is_empty() {
+            return Err("No API key configured. Set one and run setup again.".into());
+        }
+        save_env_value(context.env_path(), "HONCHO_API_KEY", &api_key)?;
+    }
+
+    config.remove("apiKey");
+
+    let user_default = std::env::var("USER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from("user"));
+    let peer_name = prompt_string_value(
+        "  Your name (user peer)",
+        current_host
+            .get("peerName")
+            .and_then(|value| value.as_str())
+            .or_else(|| config.get("peerName").and_then(|value| value.as_str()))
+            .unwrap_or(user_default.as_str()),
+    )?;
+
+    let ai_default = if host_key == "hermes" {
+        "hermes".to_string()
+    } else {
+        host_key
+            .strip_prefix("hermes.")
+            .map(str::to_string)
+            .unwrap_or_else(|| String::from("hermes"))
+    };
+    let ai_peer = prompt_string_value(
+        "  AI peer name",
+        current_host
+            .get("aiPeer")
+            .and_then(|value| value.as_str())
+            .or_else(|| config.get("aiPeer").and_then(|value| value.as_str()))
+            .unwrap_or(ai_default.as_str()),
+    )?;
+
+    let workspace = prompt_string_value(
+        "  Workspace ID",
+        current_host
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .or_else(|| config.get("workspace").and_then(|value| value.as_str()))
+            .unwrap_or("hermes"),
+    )?;
+
+    let observation_mode = prompt_choice(
+        "  Observation mode",
+        &[
+            ("directional", "each AI peer builds its own view"),
+            ("unified", "shared pool across peers"),
+        ],
+        current_host
+            .get("observationMode")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                config
+                    .get("observationMode")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("directional"),
+    )?;
+
+    let write_frequency = prompt_honcho_write_frequency(
+        current_host
+            .get("writeFrequency")
+            .or_else(|| config.get("writeFrequency"))
+            .unwrap_or(&serde_json::Value::String(String::from("async"))),
+    )?;
+
+    let recall_mode = prompt_choice(
+        "  Recall mode",
+        &[
+            ("hybrid", "auto-injected context + Honcho tools"),
+            ("context", "auto-injected context only"),
+            ("tools", "Honcho tools only"),
+        ],
+        current_host
+            .get("recallMode")
+            .and_then(|value| value.as_str())
+            .or_else(|| config.get("recallMode").and_then(|value| value.as_str()))
+            .unwrap_or("hybrid"),
+    )?;
+
+    let context_tokens = prompt_honcho_context_tokens(
+        current_host
+            .get("contextTokens")
+            .or_else(|| config.get("contextTokens"))
+            .and_then(honcho_integer),
+    )?;
+
+    let dialectic_cadence = prompt_integer_value(
+        "  Dialectic cadence",
+        current_host
+            .get("dialecticCadence")
+            .or_else(|| config.get("dialecticCadence"))
+            .and_then(honcho_integer)
+            .unwrap_or(2),
+    )?;
+    let dialectic_cadence = std::cmp::max(dialectic_cadence, 1);
+
+    let reasoning_level = prompt_choice(
+        "  Reasoning level",
+        &[
+            ("minimal", "quick factual lookups"),
+            ("low", "straightforward questions"),
+            ("medium", "multi-aspect synthesis"),
+            ("high", "complex behavioral patterns"),
+            ("max", "audit-level analysis"),
+        ],
+        current_host
+            .get("dialecticReasoningLevel")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                config
+                    .get("dialecticReasoningLevel")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("low"),
+    )?;
+
+    let session_strategy = prompt_choice(
+        "  Session strategy",
+        &[
+            ("per-session", "start clean each run"),
+            ("per-directory", "reuse per directory"),
+            ("per-repo", "reuse per git repository"),
+            ("global", "single shared session"),
+        ],
+        current_host
+            .get("sessionStrategy")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                config
+                    .get("sessionStrategy")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("per-session"),
+    )?;
+    let preserve_save_messages = current_host.contains_key("saveMessages");
+
+    let host = ensure_honcho_host_block(&mut config, &host_key);
+    host.remove("apiKey");
+    host.insert(
+        String::from("peerName"),
+        serde_json::Value::String(peer_name),
+    );
+    host.insert(String::from("aiPeer"), serde_json::Value::String(ai_peer));
+    host.insert(
+        String::from("workspace"),
+        serde_json::Value::String(workspace),
+    );
+    host.insert(
+        String::from("observationMode"),
+        serde_json::Value::String(observation_mode),
+    );
+    host.insert(String::from("writeFrequency"), write_frequency);
+    host.insert(
+        String::from("recallMode"),
+        serde_json::Value::String(recall_mode),
+    );
+    match context_tokens {
+        Some(value) => {
+            host.insert(
+                String::from("contextTokens"),
+                serde_json::Value::from(value),
+            );
+        }
+        None => {
+            host.remove("contextTokens");
+        }
+    }
+    host.insert(
+        String::from("dialecticCadence"),
+        serde_json::Value::from(dialectic_cadence),
+    );
+    host.insert(
+        String::from("dialecticReasoningLevel"),
+        serde_json::Value::String(reasoning_level),
+    );
+    host.insert(
+        String::from("sessionStrategy"),
+        serde_json::Value::String(session_strategy),
+    );
+    host.insert(String::from("enabled"), serde_json::Value::Bool(true));
+    if !preserve_save_messages {
+        host.insert(String::from("saveMessages"), serde_json::Value::Bool(true));
+    }
+
+    save_honcho_config(context, &config)?;
+    save_memory_provider_only(context, "honcho")?;
+
+    println!("\n  Memory provider: {}", provider.name);
+    println!("  Activation saved to config.yaml");
+    println!(
+        "  Honcho config saved to {}",
+        context.hermes_home().join("honcho.json").display()
+    );
+    if !is_local {
+        println!("  API key saved to .env");
+    }
+    println!("\n  Start a new session to activate.\n");
+    Ok(())
+}
+
 fn prompt_setup_field(
     field: &SetupField,
     existing_value: Option<SetupValue>,
@@ -874,6 +1143,45 @@ fn prompt_integer_value(label: &str, current: i64) -> Result<i64, Box<dyn Error>
         match trimmed.parse::<i64>() {
             Ok(value) => return Ok(value),
             Err(_) => println!("  expected an integer"),
+        }
+    }
+}
+
+fn prompt_http_url(label: &str, current: &str) -> Result<String, Box<dyn Error>> {
+    loop {
+        let value = prompt_string_value(label, current)?;
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return Ok(value);
+        }
+        println!("  Invalid URL — must start with http:// or https://.");
+    }
+}
+
+fn prompt_honcho_write_frequency(
+    current: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let current_display = honcho_display_value(current);
+    loop {
+        let raw = prompt_string_value("  Write frequency", current_display.as_str())?;
+        if let Some(value) = parse_honcho_write_frequency(&raw) {
+            return Ok(value);
+        }
+        println!("  Enter async, turn, session, or a non-negative integer.");
+    }
+}
+
+fn prompt_honcho_context_tokens(current: Option<i64>) -> Result<Option<i64>, Box<dyn Error>> {
+    let current_display = current
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| String::from("uncapped"));
+    loop {
+        let raw = prompt_string_value("  Context tokens", current_display.as_str())?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" | "uncapped" | "no limit" => return Ok(None),
+            _ => match raw.trim().parse::<i64>() {
+                Ok(value) if value >= 0 => return Ok(Some(value)),
+                _ => println!("  Enter a non-negative integer or 'uncapped'."),
+            },
         }
     }
 }
@@ -1122,6 +1430,19 @@ fn write_json_config(
     Ok(())
 }
 
+fn save_memory_provider_only(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let memory = ensure_mapping_child(&mut root, "memory")?;
+    memory.insert(
+        Value::String(String::from("provider")),
+        Value::String(provider_name.to_string()),
+    );
+    write_yaml_mapping(&context.config_path(), &root)
+}
+
 fn ensure_hindsight_dependencies(mode: &str) -> Result<(), Box<dyn Error>> {
     let dependency = if mode == "local_embedded" {
         "hindsight-all"
@@ -1162,6 +1483,22 @@ fn resolve_binary(name: &str) -> Option<PathBuf> {
             path.is_file().then_some(path)
         })
     })
+}
+
+fn ensure_honcho_dependency() -> Result<(), Box<dyn Error>> {
+    let Some(uv_path) = resolve_binary("uv") else {
+        println!("  uv not found — skipping automatic dependency install");
+        return Ok(());
+    };
+    let status = Command::new(uv_path)
+        .args(["pip", "install", "--python", "python3", "honcho-ai>=2.0.1"])
+        .status();
+    match status {
+        Ok(status) if status.success() => println!("  Dependencies up to date"),
+        Ok(_) => println!("  Dependency install failed — continue manually if needed"),
+        Err(error) => println!("  Dependency install failed: {error}"),
+    }
+    Ok(())
 }
 
 fn hindsight_default_model(provider: &str) -> &'static str {
@@ -1237,6 +1574,138 @@ fn materialize_hindsight_embedded_profile_env(
     }
     fs::write(profile_env, format!("{}\n", lines.join("\n")))?;
     Ok(())
+}
+
+fn load_honcho_setup_config(context: &HermesContext) -> BTreeMap<String, serde_json::Value> {
+    for path in honcho_config_candidates(context) {
+        if path.exists()
+            && let Ok(text) = fs::read_to_string(&path)
+            && let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&text)
+        {
+            return map.into_iter().collect();
+        }
+    }
+    BTreeMap::new()
+}
+
+fn honcho_config_candidates(context: &HermesContext) -> Vec<PathBuf> {
+    let mut paths = vec![context.hermes_home().join("honcho.json")];
+    if let Some(home) = dirs::home_dir() {
+        let default_path = home.join(".hermes").join("honcho.json");
+        if !paths.contains(&default_path) {
+            paths.push(default_path);
+        }
+        let legacy = home.join(".honcho").join("config.json");
+        if !paths.contains(&legacy) {
+            paths.push(legacy);
+        }
+    }
+    paths
+}
+
+fn save_honcho_config(
+    context: &HermesContext,
+    config: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), Box<dyn Error>> {
+    let path = context.hermes_home().join("honcho.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::Value::Object(
+                config.clone().into_iter().collect(),
+            ))?
+        ),
+    )?;
+    Ok(())
+}
+
+fn honcho_host_key(context: &HermesContext) -> String {
+    let profile = context.current_profile_name();
+    if matches!(profile.as_str(), "default" | "custom") {
+        String::from("hermes")
+    } else {
+        format!("hermes.{profile}")
+    }
+}
+
+fn ensure_honcho_host_block<'a>(
+    config: &'a mut BTreeMap<String, serde_json::Value>,
+    host_key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let hosts = config
+        .entry(String::from("hosts"))
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !hosts.is_object() {
+        *hosts = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let hosts = hosts.as_object_mut().expect("hosts object");
+    let entry = hosts
+        .entry(host_key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    entry.as_object_mut().expect("host object")
+}
+
+fn honcho_base_url(config: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    config
+        .get("baseUrl")
+        .or_else(|| config.get("base_url"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn is_local_base_url(url: &str) -> bool {
+    ["localhost", "127.0.0.1", "::1"]
+        .iter()
+        .any(|needle| url.contains(needle))
+}
+
+fn honcho_api_key(config: &BTreeMap<String, serde_json::Value>) -> Option<String> {
+    config
+        .get("apiKey")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn honcho_display_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(boolean) => boolean.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn parse_honcho_write_frequency(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = raw.trim().parse::<i64>() {
+        if value >= 0 {
+            return Some(serde_json::Value::from(value));
+        }
+        return None;
+    }
+    match raw.trim() {
+        "async" | "turn" | "session" => Some(serde_json::Value::String(raw.trim().to_string())),
+        _ => None,
+    }
+}
+
+fn honcho_integer(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn ensure_mapping_child<'a>(
@@ -1716,8 +2185,16 @@ mod tests {
                 description: String::from("Mem0"),
             },
         );
+        let honcho = setup_provider_spec(
+            &context,
+            ProviderInfo {
+                name: String::from("honcho"),
+                description: String::from("Honcho"),
+            },
+        );
 
         assert_eq!(hindsight.mode, SetupMode::NativeHindsight);
+        assert_eq!(honcho.mode, SetupMode::NativeHoncho);
         assert_eq!(mem0.mode, SetupMode::NativeGeneric);
         assert!(mem0.fields.iter().any(|field| field.key == "api_key"));
     }
@@ -1832,6 +2309,41 @@ mod tests {
             Some(value) => set_env_var("HOME", value),
             None => remove_env_var("HOME"),
         }
+    }
+
+    #[test]
+    fn save_honcho_config_writes_profile_scoped_host_block() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes").join("profiles").join("coder");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+
+        let mut config = BTreeMap::new();
+        config.insert(
+            String::from("baseUrl"),
+            serde_json::Value::String(String::from("http://localhost:8000")),
+        );
+        let host = ensure_honcho_host_block(&mut config, &honcho_host_key(&context));
+        host.insert(
+            String::from("peerName"),
+            serde_json::Value::String(String::from("alice")),
+        );
+        host.insert(
+            String::from("workspace"),
+            serde_json::Value::String(String::from("hermes")),
+        );
+        host.insert(String::from("enabled"), serde_json::Value::Bool(true));
+
+        save_honcho_config(&context, &config).unwrap();
+        save_memory_provider_only(&context, "honcho").unwrap();
+
+        let honcho_text = fs::read_to_string(home.join("honcho.json")).unwrap();
+        assert!(honcho_text.contains("\"baseUrl\": \"http://localhost:8000\""));
+        assert!(honcho_text.contains("\"hermes.coder\""));
+        assert!(honcho_text.contains("\"peerName\": \"alice\""));
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: honcho"));
     }
 
     #[test]
