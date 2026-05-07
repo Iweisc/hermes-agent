@@ -141,6 +141,15 @@ struct OfficialSkillSummary {
 }
 
 #[derive(Debug, Clone)]
+struct InstallArgsParsed {
+    identifier: String,
+    category: String,
+    name_override: String,
+    force: bool,
+    yes: bool,
+}
+
+#[derive(Debug, Clone)]
 struct OfficialSkillCandidate {
     name: String,
     source: String,
@@ -175,7 +184,7 @@ pub fn print_skills(
         None => bridge_skills(None, &[]),
         Some(SkillsCommand::Browse(args)) => browse_skills_command(&args.args),
         Some(SkillsCommand::Search(args)) => search_skills_command(&args.args),
-        Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
+        Some(SkillsCommand::Install(args)) => install_skill_command(context, &args.args),
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
@@ -480,6 +489,133 @@ fn search_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn install_skill_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(args) = parse_install_args(passthrough)? else {
+        return bridge_prefixed("install", passthrough);
+    };
+    if !args.identifier.starts_with("official/") {
+        return bridge_prefixed("install", passthrough);
+    }
+    if !args.name_override.trim().is_empty() {
+        return bridge_prefixed("install", passthrough);
+    }
+
+    let summary = collect_official_skill_summaries()?
+        .into_iter()
+        .find(|skill| skill.identifier == args.identifier)
+        .ok_or_else(|| format!("Could not fetch '{}' from official skills", args.identifier))?;
+
+    let source = discover_optional_skill_records()?
+        .into_iter()
+        .find(|record| optional_skill_matches(record, &args.identifier))
+        .ok_or_else(|| format!("Could not fetch '{}' from official skills", args.identifier))?;
+    let source_dir = source
+        .skill_md
+        .parent()
+        .ok_or("official skill is missing a parent directory")?
+        .to_path_buf();
+
+    let category = if !args.category.trim().is_empty() {
+        validate_category_name(&args.category)?.to_string()
+    } else {
+        summary.category.clone().unwrap_or_default()
+    };
+    let skill_name = validate_skill_name(&summary.name)?.to_string();
+
+    let mut installed = load_hub_lock(context)?;
+    if let Some(existing) = installed.get(&skill_name) {
+        println!(
+            "Warning: '{}' is already installed at {}",
+            skill_name, existing.install_path
+        );
+        if !args.force {
+            println!("Use --force to reinstall.");
+            println!();
+            return Ok(());
+        }
+    }
+
+    if !args.force && !args.yes && !confirm_prompt(&format!("Install '{}'? [y/N]: ", skill_name))? {
+        println!("Installation cancelled.");
+        println!();
+        return Ok(());
+    }
+
+    let skills_root = context.hermes_home().join("skills");
+    let install_path = if category.is_empty() {
+        skills_root.join(&skill_name)
+    } else {
+        skills_root.join(&category).join(&skill_name)
+    };
+    install_official_bundle(&source_dir, &install_path)?;
+
+    let hash = bundle_content_hash_from_dir(&source_dir)?;
+    let files = collect_bundle_file_paths(&source_dir)?;
+    let now = iso8601_now();
+    let relative_install = install_path
+        .strip_prefix(&skills_root)?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let mut raw = JsonMap::new();
+    raw.insert(
+        "source".to_string(),
+        JsonValue::String(String::from("official")),
+    );
+    raw.insert(
+        "identifier".to_string(),
+        JsonValue::String(summary.identifier.clone()),
+    );
+    raw.insert(
+        "trust_level".to_string(),
+        JsonValue::String(String::from("builtin")),
+    );
+    raw.insert(
+        "scan_verdict".to_string(),
+        JsonValue::String(String::from("safe")),
+    );
+    raw.insert("content_hash".to_string(), JsonValue::String(hash.clone()));
+    raw.insert(
+        "install_path".to_string(),
+        JsonValue::String(relative_install.clone()),
+    );
+    raw.insert(
+        "files".to_string(),
+        JsonValue::Array(files.iter().cloned().map(JsonValue::String).collect()),
+    );
+    raw.insert("metadata".to_string(), JsonValue::Object(JsonMap::new()));
+    raw.insert("installed_at".to_string(), JsonValue::String(now.clone()));
+    raw.insert("updated_at".to_string(), JsonValue::String(now));
+
+    installed.insert(
+        skill_name.clone(),
+        HubInstalledEntry {
+            source: String::from("official"),
+            trust_level: String::from("builtin"),
+            install_path: relative_install.clone(),
+            raw,
+        },
+    );
+    save_hub_lock(context, &installed)?;
+    append_audit_log(
+        context,
+        "INSTALL",
+        &skill_name,
+        "official",
+        "builtin",
+        "safe",
+        &hash,
+    )?;
+
+    println!("Installed: {relative_install}");
+    println!("Files: {}", files.join(", "));
+    println!();
+    Ok(())
+}
+
 fn parse_browse_args(
     passthrough: &[String],
 ) -> Result<Option<(usize, usize, String)>, Box<dyn Error>> {
@@ -555,6 +691,58 @@ fn parse_search_args(
     }
 
     Ok(query.map(|query| (query, limit.max(1), source)))
+}
+
+fn parse_install_args(passthrough: &[String]) -> Result<Option<InstallArgsParsed>, Box<dyn Error>> {
+    let mut identifier = None::<String>;
+    let mut category = String::new();
+    let mut name_override = String::new();
+    let mut force = false;
+    let mut yes = false;
+
+    let mut index = 0_usize;
+    while index < passthrough.len() {
+        match passthrough[index].as_str() {
+            "--category" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --category".into());
+                };
+                category = value.trim().to_string();
+                index += 2;
+            }
+            "--name" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("missing value for --name".into());
+                };
+                name_override = value.trim().to_string();
+                index += 2;
+            }
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            "--yes" | "-y" => {
+                yes = true;
+                index += 1;
+            }
+            flag if flag.starts_with('-') => return Ok(None),
+            value => {
+                if identifier.is_some() {
+                    return Ok(None);
+                }
+                identifier = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(identifier.map(|identifier| InstallArgsParsed {
+        identifier,
+        category,
+        name_override,
+        force,
+        yes,
+    }))
 }
 
 fn parse_positive_usize(raw: &str, flag: &str) -> Result<usize, Box<dyn Error>> {
@@ -2830,6 +3018,27 @@ fn validate_skill_name(raw: &str) -> Result<&str, Box<dyn Error>> {
     Ok(name)
 }
 
+fn validate_category_name(raw: &str) -> Result<&str, Box<dyn Error>> {
+    let category = raw.trim();
+    if category.is_empty() {
+        return Err("category cannot be empty".into());
+    }
+    if !category
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '/'))
+    {
+        return Err("category contains invalid characters".into());
+    }
+    if !category
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase())
+    {
+        return Err("category must start with a lowercase letter".into());
+    }
+    Ok(category)
+}
+
 fn truncate(value: &str, max_len: usize) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     if chars.len() <= max_len {
@@ -3398,6 +3607,23 @@ exit 9\n",
     }
 
     #[test]
+    fn parse_install_args_accepts_official_identifier() {
+        let parsed = parse_install_args(&[
+            String::from("official/research/demo"),
+            String::from("--category"),
+            String::from("custom"),
+            String::from("--force"),
+            String::from("--yes"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.identifier, "official/research/demo");
+        assert_eq!(parsed.category, "custom");
+        assert!(parsed.force);
+        assert!(parsed.yes);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn inspect_bridges_when_native_resolution_misses() {
         let _guard = test_env_lock().lock().unwrap();
@@ -3473,6 +3699,97 @@ exit 9\n",
         assert!(output.contains("action=browse argv=--source all --page 1"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
+    }
+
+    #[test]
+    fn install_native_official_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-official-home");
+        let optional = temp_path("install-official-src");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let source_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo helper\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(source_dir.join("notes.txt"), "hello\n").unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        install_skill_command(
+            &context,
+            &[
+                String::from("official/research/demo"),
+                String::from("--yes"),
+            ],
+        )
+        .unwrap();
+
+        let install_dir = home.join("skills").join("research").join("demo");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            fs::read_to_string(source_dir.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("demo").unwrap();
+        assert_eq!(entry.source, "official");
+        assert_eq!(entry.trust_level, "builtin");
+        assert_eq!(entry.install_path, "research/demo");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("official/research/demo")
+        );
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_bridges_for_non_official_identifier() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("install-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        install_skill_command(
+            &context,
+            &[String::from("owner/repo/demo"), String::from("--force")],
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=install argv=owner/repo/demo --force"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
