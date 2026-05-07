@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::HermesContext;
@@ -10,7 +11,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 
 use crate::compat_cmd::CompatArgs;
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
 const MAX_NAME_LENGTH: usize = 64;
@@ -77,7 +78,7 @@ pub fn print_skills(
     command: Option<SkillsCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        None => bridge_skills(&[]),
+        None => bridge_skills(None, &[]),
         Some(SkillsCommand::Browse(args)) => bridge_prefixed("browse", &args.args),
         Some(SkillsCommand::Search(args)) => bridge_prefixed("search", &args.args),
         Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
@@ -96,14 +97,97 @@ pub fn print_skills(
 }
 
 fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut argv = Vec::with_capacity(1 + passthrough.len());
-    argv.push(action.to_string());
-    argv.extend(passthrough.iter().cloned());
-    bridge_skills(&argv)
+    bridge_skills(Some(action), passthrough)
 }
 
-fn bridge_skills(argv: &[String]) -> Result<(), Box<dyn Error>> {
-    launch_python_main_command("skills", argv, Some("HERMES_SKILLS_PYTHON"), &[])
+fn bridge_skills(action: Option<&str>, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_SKILLS_PYTHON"))
+        .ok_or("could not find a Python interpreter for skills")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_SKILLS_ACTION", action.unwrap_or(""))
+        .arg("-c")
+        .arg(SKILLS_BOOTSTRAP)
+        .args(passthrough);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("skills", status).into())
+}
+
+const SKILLS_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "import sys\n",
+    "action = (os.environ.get('HERMES_SKILLS_ACTION') or '').strip()\n",
+    "if action == 'config':\n",
+    "    from hermes_cli.skills_config import skills_command\n",
+    "else:\n",
+    "    from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills')\n",
+    "parser.set_defaults(skills_action=(action or None))\n",
+    "if action == 'browse':\n",
+    "    parser.add_argument('--page', type=int, default=1)\n",
+    "    parser.add_argument('--size', type=int, default=20)\n",
+    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','lobehub'])\n",
+    "elif action == 'search':\n",
+    "    parser.add_argument('query')\n",
+    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','lobehub'])\n",
+    "    parser.add_argument('--limit', type=int, default=10)\n",
+    "elif action == 'install':\n",
+    "    parser.add_argument('identifier')\n",
+    "    parser.add_argument('--category', default='')\n",
+    "    parser.add_argument('--name', default='')\n",
+    "    parser.add_argument('--force', action='store_true')\n",
+    "    parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
+    "elif action == 'inspect':\n",
+    "    parser.add_argument('identifier')\n",
+    "elif action == 'check':\n",
+    "    parser.add_argument('name', nargs='?')\n",
+    "elif action == 'update':\n",
+    "    parser.add_argument('name', nargs='?')\n",
+    "elif action == 'audit':\n",
+    "    parser.add_argument('name', nargs='?')\n",
+    "elif action == 'reset':\n",
+    "    parser.add_argument('name')\n",
+    "    parser.add_argument('--restore', action='store_true')\n",
+    "    parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
+    "elif action == 'publish':\n",
+    "    parser.add_argument('skill_path')\n",
+    "    parser.add_argument('--to', default='github', choices=['github', 'clawhub'])\n",
+    "    parser.add_argument('--repo', default='')\n",
+    "elif action == 'snapshot':\n",
+    "    subparsers = parser.add_subparsers(dest='snapshot_action')\n",
+    "    export_p = subparsers.add_parser('export')\n",
+    "    export_p.add_argument('output')\n",
+    "    import_p = subparsers.add_parser('import')\n",
+    "    import_p.add_argument('input')\n",
+    "    import_p.add_argument('--force', action='store_true')\n",
+    "elif action == 'tap':\n",
+    "    subparsers = parser.add_subparsers(dest='tap_action')\n",
+    "    subparsers.add_parser('list')\n",
+    "    add_p = subparsers.add_parser('add')\n",
+    "    add_p.add_argument('repo')\n",
+    "    remove_p = subparsers.add_parser('remove')\n",
+    "    remove_p.add_argument('name')\n",
+    "elif action == 'config':\n",
+    "    pass\n",
+    "elif action:\n",
+    "    raise SystemExit(f'unsupported skills action: {action}')\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn print_list(context: &HermesContext, args: ListArgs) -> Result<(), Box<dyn Error>> {
@@ -767,7 +851,34 @@ fn yaml_key(key: &str) -> YamlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -888,5 +999,49 @@ mod tests {
         assert!(saved.contains("\"metadata\""));
         assert!(saved.contains("\"foo\": \"bar\""));
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_skills_uses_python_override_and_passes_action_and_args() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        bridge_prefixed(
+            "install",
+            &[
+                String::from("official/mlops/demo"),
+                String::from("--force"),
+                String::from("--yes"),
+            ],
+        )
+        .unwrap();
+        bridge_skills(None, &[]).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=install argv=official/mlops/demo --force --yes"));
+        assert!(output.contains("action= argv="));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
     }
 }
