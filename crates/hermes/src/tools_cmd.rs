@@ -313,11 +313,15 @@ const RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "spotify",
 ];
 
-const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &["web", "vision", "moa", "homeassistant", "tts"];
+const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] =
+    &["web", "vision", "moa", "homeassistant", "tts", "image_gen"];
 
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
 const DEFAULT_SEARXNG_URL: &str = "http://localhost:8080";
+const DEFAULT_FAL_IMAGE_MODEL: &str = "fal-ai/flux-2/klein/9b";
+const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-2-medium";
+const DEFAULT_XAI_IMAGE_MODEL: &str = "grok-imagine-image";
 
 pub fn print_tools(
     context: &HermesContext,
@@ -596,6 +600,7 @@ fn run_native_tool_reconfigure_with_io(
         ),
         "homeassistant" => reconfigure_homeassistant_with_io(context, input, output),
         "tts" => reconfigure_tts_with_io(context, input, output),
+        "image_gen" => reconfigure_image_gen_with_io(context, input, output),
         other => run_python_tools_reconfigure_toolset(other),
     }
 }
@@ -755,6 +760,107 @@ fn reconfigure_tts_with_io(
         return Ok(());
     }
     run_python_tools_reconfigure_toolset("tts")
+}
+
+fn reconfigure_image_gen_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_provider = nested_string(&root, &["image_gen", "provider"]).unwrap_or_default();
+    let current_use_gateway = nested_bool(&root, &["image_gen", "use_gateway"]).unwrap_or(false);
+    let compatibility_recommended =
+        current_use_gateway || !matches!(current_provider.as_str(), "" | "fal" | "openai" | "xai");
+
+    writeln!(output)?;
+    writeln!(output, "Image Generation")?;
+    let choices = [
+        "FAL.ai",
+        "OpenAI Images",
+        "xAI Images",
+        if compatibility_recommended {
+            "Use compatibility flow (recommended)"
+        } else {
+            "Use compatibility flow"
+        },
+    ];
+    let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
+    if selection == choices.len() - 1 {
+        return run_python_tools_reconfigure_toolset("image_gen");
+    }
+
+    {
+        let image_gen = ensure_mapping(&mut root, "image_gen");
+        image_gen.insert(yaml_key("use_gateway"), Value::Bool(false));
+    }
+
+    match selection {
+        0 => {
+            let current_model = nested_string(&root, &["image_gen", "model"]);
+            let image_gen = ensure_mapping(&mut root, "image_gen");
+            image_gen.insert(yaml_key("provider"), Value::String("fal".to_string()));
+            if !current_model.as_deref().is_some_and(is_known_fal_model) {
+                image_gen.insert(
+                    yaml_key("model"),
+                    Value::String(DEFAULT_FAL_IMAGE_MODEL.to_string()),
+                );
+            }
+            writeln!(output, "Get key at: https://fal.ai/dashboard/keys")?;
+            prompt_secret_env_update(context, input, output, "FAL_KEY", "FAL API key")?;
+            writeln!(
+                output,
+                "Image generation provider set to FAL.ai ({})",
+                nested_string(&root, &["image_gen", "model"])
+                    .unwrap_or_else(|| DEFAULT_FAL_IMAGE_MODEL.to_string())
+            )?;
+        }
+        1 => {
+            let openai_model = nested_string(&root, &["image_gen", "openai", "model"]);
+            let image_gen = ensure_mapping(&mut root, "image_gen");
+            image_gen.insert(yaml_key("provider"), Value::String("openai".to_string()));
+            let openai = ensure_nested_mapping(image_gen, "openai");
+            if !openai_model
+                .as_deref()
+                .is_some_and(is_known_openai_image_model)
+            {
+                openai.insert(
+                    yaml_key("model"),
+                    Value::String(DEFAULT_OPENAI_IMAGE_MODEL.to_string()),
+                );
+            }
+            prompt_secret_env_update(context, input, output, "OPENAI_API_KEY", "OpenAI API key")?;
+            writeln!(
+                output,
+                "Image generation provider set to OpenAI ({})",
+                nested_string(&root, &["image_gen", "openai", "model"])
+                    .unwrap_or_else(|| DEFAULT_OPENAI_IMAGE_MODEL.to_string())
+            )?;
+        }
+        2 => {
+            let xai_model = nested_string(&root, &["image_gen", "xai", "model"]);
+            let image_gen = ensure_mapping(&mut root, "image_gen");
+            image_gen.insert(yaml_key("provider"), Value::String("xai".to_string()));
+            let xai = ensure_nested_mapping(image_gen, "xai");
+            if !xai_model.as_deref().is_some_and(is_known_xai_image_model) {
+                xai.insert(
+                    yaml_key("model"),
+                    Value::String(DEFAULT_XAI_IMAGE_MODEL.to_string()),
+                );
+            }
+            prompt_secret_env_update(context, input, output, "XAI_API_KEY", "xAI API key")?;
+            writeln!(
+                output,
+                "Image generation provider set to xAI ({})",
+                nested_string(&root, &["image_gen", "xai", "model"])
+                    .unwrap_or_else(|| DEFAULT_XAI_IMAGE_MODEL.to_string())
+            )?;
+        }
+        _ => unreachable!(),
+    }
+
+    write_yaml_mapping(&context.config_path(), &root)?;
+    Ok(())
 }
 
 fn reconfigure_simple_env_tool_with_io(
@@ -1459,6 +1565,8 @@ fn toolset_has_known_configuration(context: &HermesContext, root: &Mapping, tool
         "image_gen" => {
             nested_mapping(root, &["image_gen"]).is_some()
                 || env_value_for_context(context, "FAL_KEY").is_some()
+                || env_value_for_context(context, "OPENAI_API_KEY").is_some()
+                || env_value_for_context(context, "XAI_API_KEY").is_some()
         }
         "homeassistant" => {
             env_value_for_context(context, "HASS_TOKEN").is_some()
@@ -1528,6 +1636,32 @@ fn masked_secret_preview(value: &str) -> String {
 fn looks_like_http_url(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.starts_with("http://") || normalized.starts_with("https://")
+}
+
+fn is_known_fal_model(model: &str) -> bool {
+    matches!(
+        model,
+        "fal-ai/flux-2/klein/9b"
+            | "fal-ai/flux-2-pro"
+            | "fal-ai/z-image/turbo"
+            | "fal-ai/nano-banana-pro"
+            | "fal-ai/gpt-image-1.5"
+            | "fal-ai/gpt-image-2"
+            | "fal-ai/ideogram/v3"
+            | "fal-ai/recraft/v4/pro/text-to-image"
+            | "fal-ai/qwen-image"
+    )
+}
+
+fn is_known_openai_image_model(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-image-2-low" | "gpt-image-2-medium" | "gpt-image-2-high"
+    )
+}
+
+fn is_known_xai_image_model(model: &str) -> bool {
+    model == DEFAULT_XAI_IMAGE_MODEL
 }
 
 fn nested_mapping<'a>(root: &'a Mapping, path: &[&str]) -> Option<&'a Mapping> {
@@ -2023,6 +2157,28 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Hermes Setup"));
         assert!(rendered.contains("TTS provider set to: OpenAI TTS"));
+    }
+
+    #[test]
+    fn tools_reconfigure_image_gen_sets_openai_provider_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-image-gen");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(&context.config_path(), "image_gen:\n  provider: fal\n");
+
+        let mut input = Cursor::new(b"2\nsk-openai-image\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_image_gen_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: openai"));
+        assert!(saved.contains("model: gpt-image-2-medium"));
+        assert!(saved.contains("use_gateway: false"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("OPENAI_API_KEY=sk-openai-image"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Image Generation"));
+        assert!(rendered.contains("Image generation provider set to OpenAI"));
     }
 
     #[test]
