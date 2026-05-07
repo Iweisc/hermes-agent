@@ -66,14 +66,20 @@ fn print_update_apply(args: UpdateArgs) -> Result<(), Box<dyn Error>> {
 const UPDATE_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import os\n",
-    "from hermes_cli.main import cmd_update\n",
-    "cmd_update(argparse.Namespace(\n",
-    "    gateway=(os.environ.get('HERMES_UPDATE_GATEWAY') == '1'),\n",
+    "from hermes_cli.main import _cmd_update_impl, _finalize_update_output, _install_hangup_protection\n",
+    "gateway_mode = (os.environ.get('HERMES_UPDATE_GATEWAY') == '1')\n",
+    "args = argparse.Namespace(\n",
+    "    gateway=gateway_mode,\n",
     "    check=False,\n",
     "    no_backup=(os.environ.get('HERMES_UPDATE_NO_BACKUP') == '1'),\n",
     "    backup=(os.environ.get('HERMES_UPDATE_BACKUP') == '1'),\n",
     "    yes=(os.environ.get('HERMES_UPDATE_YES') == '1'),\n",
-    "))\n",
+    ")\n",
+    "state = _install_hangup_protection(gateway_mode=gateway_mode)\n",
+    "try:\n",
+    "    _cmd_update_impl(args, gateway_mode=gateway_mode)\n",
+    "finally:\n",
+    "    _finalize_update_output(state)\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
