@@ -1192,6 +1192,11 @@ fn should_allow_install(result: &ScanResult, force: bool) -> (InstallDecision, S
     )
 }
 
+pub(crate) fn install_allowed(result: &ScanResult, force: bool) -> (bool, String) {
+    let (decision, reason) = should_allow_install(result, force);
+    (decision == InstallDecision::Allow, reason)
+}
+
 fn install_policy(trust_level: &str, verdict: &str) -> InstallDecision {
     match (trust_level, verdict) {
         ("builtin", _) => InstallDecision::Allow,

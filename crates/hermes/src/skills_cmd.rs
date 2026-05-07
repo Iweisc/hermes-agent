@@ -17,7 +17,7 @@ use sha2::Digest;
 use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
-use crate::skills_guard::{format_scan_report, resolve_trust_level, scan_skill};
+use crate::skills_guard::{format_scan_report, install_allowed, resolve_trust_level, scan_skill};
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
 const MAX_NAME_LENGTH: usize = 64;
@@ -519,7 +519,7 @@ fn install_skill_command(
         return bridge_prefixed("install", passthrough);
     };
     if !args.identifier.starts_with("official/") {
-        return bridge_prefixed("install", passthrough);
+        return install_github_skill_command(context, passthrough, &args);
     }
     if !args.name_override.trim().is_empty() {
         return bridge_prefixed("install", passthrough);
@@ -629,6 +629,137 @@ fn install_skill_command(
         "official",
         "builtin",
         "safe",
+        &hash,
+    )?;
+
+    println!("Installed: {relative_install}");
+    println!("Files: {}", files.join(", "));
+    println!();
+    Ok(())
+}
+
+fn install_github_skill_command(
+    context: &HermesContext,
+    passthrough: &[String],
+    args: &InstallArgsParsed,
+) -> Result<(), Box<dyn Error>> {
+    if !args.name_override.trim().is_empty() {
+        return bridge_prefixed("install", passthrough);
+    }
+    if github_app_auth_configured() && resolve_github_publish_token().is_none() {
+        return bridge_prefixed("install", passthrough);
+    }
+
+    let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_github_bundle_to_tempdir(&args.identifier)?
+    else {
+        return bridge_prefixed("install", passthrough);
+    };
+
+    let category = if args.category.trim().is_empty() {
+        String::new()
+    } else {
+        validate_category_name(&args.category)?.to_string()
+    };
+    let skill_name = validate_skill_name(&skill_name)?.to_string();
+
+    let mut installed = load_hub_lock(context)?;
+    if let Some(existing) = installed.get(&skill_name) {
+        println!(
+            "Warning: '{}' is already installed at {}",
+            skill_name, existing.install_path
+        );
+        if !args.force {
+            println!("Use --force to reinstall.");
+            println!();
+            return Ok(());
+        }
+    }
+
+    println!("Running security scan...");
+    let scan_result = scan_skill(bundle_dir.path(), &identifier);
+    println!("{}", format_scan_report(&scan_result));
+    println!();
+    let (allowed, reason) = install_allowed(&scan_result, args.force);
+    if !allowed {
+        return Err(reason.into());
+    }
+
+    if !args.force
+        && !args.yes
+        && !confirm_prompt(&format!(
+            "Install third-party skill '{}' from GitHub? [y/N]: ",
+            skill_name
+        ))?
+    {
+        println!("Installation cancelled.");
+        println!();
+        return Ok(());
+    }
+
+    let skills_root = context.hermes_home().join("skills");
+    let install_path = if category.is_empty() {
+        skills_root.join(&skill_name)
+    } else {
+        skills_root.join(&category).join(&skill_name)
+    };
+    install_official_bundle(bundle_dir.path(), &install_path)?;
+
+    let hash = bundle_content_hash_from_dir(bundle_dir.path())?;
+    let files = collect_bundle_file_paths(bundle_dir.path())?;
+    let now = iso8601_now();
+    let relative_install = install_path
+        .strip_prefix(&skills_root)?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let mut raw = JsonMap::new();
+    raw.insert(
+        "source".to_string(),
+        JsonValue::String(String::from("github")),
+    );
+    raw.insert(
+        "identifier".to_string(),
+        JsonValue::String(identifier.clone()),
+    );
+    raw.insert(
+        "trust_level".to_string(),
+        JsonValue::String(trust_level.clone()),
+    );
+    raw.insert(
+        "scan_verdict".to_string(),
+        JsonValue::String(scan_result.verdict.to_string()),
+    );
+    raw.insert("content_hash".to_string(), JsonValue::String(hash.clone()));
+    raw.insert(
+        "install_path".to_string(),
+        JsonValue::String(relative_install.clone()),
+    );
+    raw.insert(
+        "files".to_string(),
+        JsonValue::Array(files.iter().cloned().map(JsonValue::String).collect()),
+    );
+    raw.insert("metadata".to_string(), JsonValue::Object(JsonMap::new()));
+    raw.insert("installed_at".to_string(), JsonValue::String(now.clone()));
+    raw.insert("updated_at".to_string(), JsonValue::String(now));
+
+    installed.insert(
+        skill_name.clone(),
+        HubInstalledEntry {
+            source: String::from("github"),
+            trust_level: trust_level.clone(),
+            install_path: relative_install.clone(),
+            raw,
+        },
+    );
+    save_hub_lock(context, &installed)?;
+    append_audit_log(
+        context,
+        "INSTALL",
+        &skill_name,
+        "github",
+        &trust_level,
+        scan_result.verdict,
         &hash,
     )?;
 
@@ -1705,6 +1836,158 @@ fn parse_github_inspect_identifier(identifier: &str) -> Option<(String, String, 
     let repo_slug = format!("{owner}/{repo}");
     let normalized_identifier = format!("{repo_slug}/{skill_path}");
     Some((repo_slug, skill_path, skill_md_path, normalized_identifier))
+}
+
+fn fetch_github_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, String, String, String)>, Box<dyn Error>> {
+    let Some((repo, skill_path, _skill_md_path, normalized_identifier)) =
+        parse_github_inspect_identifier(identifier)
+    else {
+        return Ok(None);
+    };
+
+    let bundle_dir = tempfile::TempDir::new()?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let token = resolve_github_publish_token();
+    let found = download_github_directory_recursive(
+        &client,
+        &repo,
+        &skill_path,
+        &skill_path,
+        bundle_dir.path(),
+        token.as_deref(),
+    )?;
+    if !found || !bundle_dir.path().join("SKILL.md").is_file() {
+        return Ok(None);
+    }
+
+    let skill_name = skill_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("skill")
+        .to_string();
+    let trust = resolve_trust_level(&normalized_identifier).to_string();
+    Ok(Some((bundle_dir, skill_name, trust, normalized_identifier)))
+}
+
+fn download_github_directory_recursive(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    root_path: &str,
+    current_path: &str,
+    dest_root: &Path,
+    token: Option<&str>,
+) -> Result<bool, Box<dyn Error>> {
+    let response = client
+        .get(format!(
+            "{}/repos/{repo}/contents/{current_path}",
+            github_api_base()
+        ))
+        .headers(github_raw_headers(token, "application/vnd.github.v3+json")?)
+        .send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if response.status() != StatusCode::OK {
+        return Err(format!(
+            "Failed to fetch GitHub directory '{}': {}",
+            current_path,
+            response.status()
+        )
+        .into());
+    }
+
+    let entries = response.json::<JsonValue>()?;
+    let Some(items) = entries.as_array() else {
+        return Ok(false);
+    };
+
+    let mut downloaded_any = false;
+    for item in items {
+        let Some(entry_type) = item.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(entry_path) = item.get("path").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let relative = github_relative_bundle_path(root_path, entry_path)?;
+        if entry_type == "dir" {
+            let nested = download_github_directory_recursive(
+                client, repo, root_path, entry_path, dest_root, token,
+            )?;
+            downloaded_any |= nested;
+            continue;
+        }
+        if entry_type != "file" {
+            continue;
+        }
+
+        let content_response = client
+            .get(format!(
+                "{}/repos/{repo}/contents/{entry_path}",
+                github_api_base()
+            ))
+            .headers(github_raw_headers(token, "application/vnd.github.v3.raw")?)
+            .send()?;
+        if content_response.status() != StatusCode::OK {
+            return Err(format!(
+                "Failed to fetch GitHub file '{}': {}",
+                entry_path,
+                content_response.status()
+            )
+            .into());
+        }
+        let dest_path = dest_root.join(&relative);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest_path, content_response.bytes()?)?;
+        downloaded_any = true;
+    }
+
+    Ok(downloaded_any)
+}
+
+fn github_relative_bundle_path(
+    root_path: &str,
+    entry_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let prefix = format!("{}/", root_path.trim_end_matches('/'));
+    let relative = if entry_path == root_path {
+        entry_path
+            .rsplit('/')
+            .next()
+            .ok_or("invalid GitHub bundle path")?
+    } else {
+        entry_path
+            .strip_prefix(&prefix)
+            .ok_or("GitHub bundle path is outside skill root")?
+    };
+    normalize_bundle_relative_path(relative)
+}
+
+fn normalize_bundle_relative_path(raw: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let raw = raw.trim().replace('\\', "/");
+    if raw.is_empty() {
+        return Err("bundle file path cannot be empty".into());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(&raw).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            _ => return Err(format!("Unsafe bundle file path: {raw}").into()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(format!("Unsafe bundle file path: {raw}").into());
+    }
+    Ok(normalized)
 }
 
 fn build_installed_inspect_skill(
@@ -4391,6 +4674,61 @@ exit 9\n",
     }
 
     #[test]
+    fn install_native_github_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-github-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        install_skill_command(
+            &context,
+            &[String::from("openai/skills/shipit"), String::from("--yes")],
+        )
+        .unwrap();
+
+        let install_dir = home.join("skills").join("shipit");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        assert_eq!(entry.source, "github");
+        assert_eq!(entry.trust_level, "trusted");
+        assert_eq!(entry.install_path, "shipit");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("openai/skills/shipit")
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 3);
+        assert!(logged[0].starts_with("GET /repos/openai/skills/contents/shipit "));
+        assert!(logged[1].starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md "));
+        assert!(logged[2].starts_with("GET /repos/openai/skills/contents/shipit/notes.txt "));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn install_bridges_for_non_official_identifier() {
         let _guard = test_env_lock().lock().unwrap();
@@ -4421,12 +4759,12 @@ exit 9\n",
         set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
         install_skill_command(
             &context,
-            &[String::from("owner/repo/demo"), String::from("--force")],
+            &[String::from("clawhub/demo"), String::from("--force")],
         )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=owner/repo/demo --force"));
+        assert!(output.contains("action=install argv=clawhub/demo --force"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -4859,6 +5197,56 @@ exit 9\n",
                 body
             );
             stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_github_install_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                requests.lock().unwrap().push(request.clone());
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body, content_type) = if first_line
+                    .starts_with("GET /repos/openai/skills/contents/shipit ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"[{"type":"file","path":"shipit/SKILL.md"},{"type":"file","path":"shipit/notes.txt"}]"#
+                            .to_string(),
+                        "application/json",
+                    )
+                } else if first_line
+                    .starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        "---\nname: shipit\ndescription: Remote demo\n---\nbody\n".to_string(),
+                        "text/plain",
+                    )
+                } else if first_line
+                    .starts_with("GET /repos/openai/skills/contents/shipit/notes.txt ")
+                {
+                    ("HTTP/1.1 200 OK", "hello\n".to_string(), "text/plain")
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        "{}".to_string(),
+                        "application/json",
+                    )
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
         });
         (format!("http://{addr}"), handle)
     }
