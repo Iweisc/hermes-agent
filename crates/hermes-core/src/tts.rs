@@ -21,6 +21,8 @@ const DEFAULT_EDGE_VOICE: &str = "en-US-AriaNeural";
 const DEFAULT_ELEVENLABS_VOICE_ID: &str = "pNInz6obpgDQGcFmaJgB";
 const DEFAULT_ELEVENLABS_MODEL_ID: &str = "eleven_multilingual_v2";
 const DEFAULT_ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io/v1";
+const DEFAULT_KITTENTTS_MODEL: &str = "KittenML/kitten-tts-nano-0.8-int8";
+const DEFAULT_KITTENTTS_VOICE: &str = "Jasper";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE: &str = "alloy";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -74,6 +76,11 @@ struct TtsSettings {
     elevenlabs_model_id: String,
     elevenlabs_base_url: String,
     elevenlabs_api_key: String,
+    kittentts_model: String,
+    kittentts_voice: String,
+    kittentts_speed: f64,
+    kittentts_clean_text: bool,
+    kittentts_pythonpath: Option<String>,
     openai_model: String,
     openai_voice: String,
     openai_base_url: String,
@@ -176,6 +183,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         }
         "edge" => synthesize_edge(&settings, &truncated, &output_path),
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
+        "kittentts" => synthesize_kittentts(&settings, &truncated, &output_path),
         "openai" => synthesize_openai(&settings, &truncated, &output_path),
         "piper" => synthesize_piper(&settings, &truncated, &output_path),
         "minimax" => synthesize_minimax(&settings, &truncated, &output_path),
@@ -183,7 +191,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "mistral" => synthesize_mistral(&settings, &truncated, &output_path),
         "xai" => synthesize_xai(&settings, &truncated, &output_path),
         other => Err(format!(
-            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, openai, piper, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
+            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, kittentts, openai, piper, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
         )),
     };
     if let Err(error) = result {
@@ -249,6 +257,14 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let elevenlabs_api_key = yaml_mapping_value(root, &["elevenlabs", "api_key"])
         .or_else(|| std::env::var("ELEVENLABS_API_KEY").ok())
         .unwrap_or_default();
+    let kittentts_model = yaml_mapping_value(root, &["kittentts", "model"])
+        .unwrap_or_else(|| DEFAULT_KITTENTTS_MODEL.to_string());
+    let kittentts_voice = yaml_mapping_value(root, &["kittentts", "voice"])
+        .unwrap_or_else(|| DEFAULT_KITTENTTS_VOICE.to_string());
+    let kittentts_speed = yaml_mapping_f64(root, &["kittentts", "speed"]).unwrap_or(1.0);
+    let kittentts_clean_text =
+        yaml_mapping_bool(root, &["kittentts", "clean_text"]).unwrap_or(true);
+    let kittentts_pythonpath = yaml_mapping_value(root, &["kittentts", "pythonpath"]);
     let openai_model = yaml_mapping_value(root, &["openai", "model"])
         .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
     let openai_voice = yaml_mapping_value(root, &["openai", "voice"])
@@ -335,6 +351,11 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
         elevenlabs_model_id,
         elevenlabs_base_url,
         elevenlabs_api_key,
+        kittentts_model,
+        kittentts_voice,
+        kittentts_speed,
+        kittentts_clean_text,
+        kittentts_pythonpath,
         openai_model,
         openai_voice,
         openai_base_url,
@@ -523,6 +544,85 @@ fn synthesize_openai(settings: &TtsSettings, text: &str, output_path: &Path) -> 
     fs::write(output_path, &bytes)
         .map_err(|error| format!("writing {} failed: {error}", output_path.display()))?;
     ensure_audio_file(output_path)
+}
+
+fn synthesize_kittentts(
+    settings: &TtsSettings,
+    text: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    let wav_path = if output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    {
+        output_path.to_path_buf()
+    } else {
+        output_path.with_extension("wav")
+    };
+    let synth_code = r#"
+import sys
+from kittentts import KittenTTS
+import soundfile as sf
+
+text, model_name, voice, speed_raw, clean_text_raw, wav_path = sys.argv[1:7]
+model = KittenTTS(model_name)
+audio = model.generate(
+    text,
+    voice=voice,
+    speed=float(speed_raw),
+    clean_text=(clean_text_raw == "1"),
+)
+sf.write(wav_path, audio, 24000)
+"#;
+    let interpreter = resolve_python_interpreter();
+    let mut command = Command::new(&interpreter);
+    command
+        .arg("-c")
+        .arg(synth_code)
+        .arg(text)
+        .arg(&settings.kittentts_model)
+        .arg(&settings.kittentts_voice)
+        .arg(settings.kittentts_speed.to_string())
+        .arg(if settings.kittentts_clean_text {
+            "1"
+        } else {
+            "0"
+        })
+        .arg(&wav_path);
+    apply_pythonpath_override(&mut command, settings.kittentts_pythonpath.as_deref());
+    let output = command.output().map_err(|error| {
+        format!(
+            "starting KittenTTS synthesis with {} failed: {error}",
+            interpreter.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No module named 'kittentts'")
+            || stderr.contains("No module named \"kittentts\"")
+        {
+            return Err(
+                "KittenTTS provider selected but 'kittentts' package is not installed. Install it from https://github.com/KittenML/KittenTTS/releases"
+                    .to_string(),
+            );
+        }
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!(
+                "KittenTTS synthesis exited with code {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            format!(
+                "KittenTTS synthesis exited with code {}: {}",
+                output.status.code().unwrap_or(-1),
+                detail
+            )
+        });
+    }
+    ensure_audio_file(&wav_path)?;
+    finalize_wav_output(&wav_path, output_path)
 }
 
 fn synthesize_xai(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
@@ -1058,7 +1158,15 @@ fn is_command_provider_config(config: &serde_yaml::Mapping) -> bool {
 fn is_builtin_tts_provider(provider: &str) -> bool {
     matches!(
         provider.to_ascii_lowercase().as_str(),
-        "edge" | "elevenlabs" | "openai" | "piper" | "minimax" | "gemini" | "mistral" | "xai"
+        "edge"
+            | "elevenlabs"
+            | "kittentts"
+            | "openai"
+            | "piper"
+            | "minimax"
+            | "gemini"
+            | "mistral"
+            | "xai"
     )
 }
 
@@ -1140,6 +1248,7 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
     match settings.provider.as_str() {
         "edge" => EDGE_MAX_TEXT_LENGTH,
         "openai" => OPENAI_MAX_TEXT_LENGTH,
+        "kittentts" => 2_000,
         "piper" => DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH,
         "minimax" => MINIMAX_MAX_TEXT_LENGTH,
         "gemini" => GEMINI_MAX_TEXT_LENGTH,
@@ -1929,6 +2038,48 @@ download_dir = pathlib.Path(sys.argv[sys.argv.index("--download-dir") + 1])
 download_dir.mkdir(parents=True, exist_ok=True)
 (download_dir / f"{voice}.onnx").write_bytes(b"model")
 (download_dir / f"{voice}.onnx.json").write_text("{}")
+"#,
+        )
+        .unwrap();
+    }
+
+    fn install_fake_kittentts_package(root: &Path, broken: bool) {
+        let package = root.join("kittentts");
+        fs::create_dir_all(&package).unwrap();
+        if broken {
+            fs::write(
+                package.join("__init__.py"),
+                "raise ModuleNotFoundError(\"No module named 'kittentts'\")\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                package.join("__init__.py"),
+                r#"
+class KittenTTS:
+    def __init__(self, model_name):
+        self.model_name = model_name
+
+    def generate(self, text, voice="Jasper", speed=1.0, clean_text=True):
+        return {
+            "text": text,
+            "voice": voice,
+            "speed": speed,
+            "clean_text": clean_text,
+            "model_name": self.model_name,
+        }
+"#,
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("soundfile.py"),
+            r#"
+def write(path, audio, samplerate):
+    payload = str(audio).encode("utf-8")
+    with open(path, "wb") as fh:
+        fh.write(b"RIFF")
+        fh.write(payload)
 "#,
         )
         .unwrap();
@@ -2898,5 +3049,70 @@ download_dir.mkdir(parents=True, exist_ok=True)
 
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["error"].as_str().unwrap().contains("piper-tts"));
+    }
+
+    #[test]
+    fn kittentts_writes_audio_file_with_custom_config() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        install_fake_kittentts_package(&pyroot, false);
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: kittentts\n  kittentts:\n    model: KittenML/kitten-tts-mini-0.8\n    voice: Luna\n    speed: 1.25\n    clean_text: false\n    pythonpath: {}\n",
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("kittentts.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello kitten",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("kittentts"));
+        let audio = fs::read(&output_path).unwrap();
+        let text = String::from_utf8_lossy(&audio);
+        assert!(text.contains("hello kitten"));
+        assert!(text.contains("Luna"));
+        assert!(text.contains("1.25"));
+        assert!(text.contains("False"));
+        assert!(text.contains("KittenML/kitten-tts-mini-0.8"));
+    }
+
+    #[test]
+    fn kittentts_missing_package_returns_helpful_error() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        install_fake_kittentts_package(&pyroot, true);
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: kittentts\n  kittentts:\n    pythonpath: {}\n",
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(&json!({"text":"hello kitten"}), &runtime);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("kittentts")
+        );
     }
 }
