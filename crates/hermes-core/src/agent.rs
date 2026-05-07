@@ -597,7 +597,7 @@ fn send_anthropic_message(
         payload["tool_choice"] = json!({"type": "auto"});
     }
 
-    let url = format!("{}/messages", runtime_model.base_url.trim_end_matches('/'));
+    let url = anthropic_messages_url(&runtime_model.base_url);
     let response = client.post(&url).json(&payload);
     let response = apply_anthropic_auth_headers(response, runtime_model)?
         .send()
@@ -623,6 +623,15 @@ fn send_anthropic_message(
         codex_reasoning_items: None,
         codex_message_items: None,
     })
+}
+
+fn anthropic_messages_url(base_url: &str) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+    if normalized.ends_with("/v1") {
+        format!("{normalized}/messages")
+    } else {
+        format!("{normalized}/v1/messages")
+    }
 }
 
 fn send_codex_response(
@@ -3478,7 +3487,7 @@ for raw in sys.stdin:
                 &ModelOverrides {
                     model: Some("anthropic/claude-sonnet-4.6".to_string()),
                     provider: Some("copilot".to_string()),
-                    base_url: Some(format!("http://{addr}/v1")),
+                    base_url: Some(format!("http://{addr}")),
                     ..ModelOverrides::default()
                 },
                 None,
@@ -3740,6 +3749,22 @@ for raw in sys.stdin:
         assert_eq!(
             fs::read_to_string(temp.path().join("anthropic.txt")).unwrap(),
             "hello from anthropic tool"
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_url_adds_v1_suffix_when_missing() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.minimax.io/anthropic"),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://opencode.ai/zen/v1"),
+            "https://opencode.ai/zen/v1/messages"
         );
     }
 
