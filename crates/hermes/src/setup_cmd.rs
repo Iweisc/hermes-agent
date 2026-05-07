@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -378,6 +378,32 @@ impl SetupUi for TerminalUi {
     }
 }
 
+struct StreamUi<'a> {
+    input: &'a mut dyn BufRead,
+    output: &'a mut dyn Write,
+}
+
+impl SetupUi for StreamUi<'_> {
+    fn line(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+        writeln!(self.output, "{text}")?;
+        Ok(())
+    }
+
+    fn prompt(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
+        write!(self.output, "{prompt}")?;
+        self.output.flush()?;
+        let mut line = String::new();
+        if self.input.read_line(&mut line)? == 0 {
+            return Err("setup cancelled".into());
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).trim().to_string())
+    }
+
+    fn prompt_secret(&mut self, prompt: &str) -> Result<String, Box<dyn Error>> {
+        self.prompt(prompt)
+    }
+}
+
 fn run_native_agent_setup(
     context: &HermesContext,
     ui: &mut dyn SetupUi,
@@ -692,6 +718,19 @@ fn run_native_tts_setup(
         provider_label(&selected, &providers)
     ))?;
     Ok(())
+}
+
+pub(crate) fn run_native_tts_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<bool, Box<dyn Error>> {
+    if nous_auth_present(context) {
+        return Ok(false);
+    }
+    let mut ui = StreamUi { input, output };
+    run_native_tts_setup(context, &mut ui)?;
+    Ok(true)
 }
 
 fn run_native_terminal_setup(

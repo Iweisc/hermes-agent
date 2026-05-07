@@ -15,6 +15,7 @@ use serde_yaml::{Mapping, Value};
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::setup_cmd;
 use crate::{disabled_memory_toolsets, run_clarify_prompt};
 
 #[derive(Args, Debug, Clone)]
@@ -312,7 +313,7 @@ const RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "spotify",
 ];
 
-const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &["web", "vision", "moa", "homeassistant"];
+const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &["web", "vision", "moa", "homeassistant", "tts"];
 
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
@@ -594,6 +595,7 @@ fn run_native_tool_reconfigure_with_io(
             Some("https://openrouter.ai/keys"),
         ),
         "homeassistant" => reconfigure_homeassistant_with_io(context, input, output),
+        "tts" => reconfigure_tts_with_io(context, input, output),
         other => run_python_tools_reconfigure_toolset(other),
     }
 }
@@ -742,6 +744,17 @@ fn reconfigure_homeassistant_with_io(
     )?;
     writeln!(output, "Home Assistant settings updated.")?;
     Ok(())
+}
+
+fn reconfigure_tts_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    if setup_cmd::run_native_tts_setup_with_io(context, input, output)? {
+        return Ok(());
+    }
+    run_python_tools_reconfigure_toolset("tts")
 }
 
 fn reconfigure_simple_env_tool_with_io(
@@ -1990,6 +2003,26 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Which tool would you like to reconfigure?"));
         assert!(rendered.contains("Saved web backend: firecrawl"));
+    }
+
+    #[test]
+    fn tools_reconfigure_tts_uses_native_setup_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-tts");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(&context.config_path(), "tts:\n  provider: edge\n");
+
+        let mut input = Cursor::new(b"3\nsk-tts-test\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_tts_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: openai"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("VOICE_TOOLS_OPENAI_KEY=sk-tts-test"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Hermes Setup"));
+        assert!(rendered.contains("TTS provider set to: OpenAI TTS"));
     }
 
     #[test]
