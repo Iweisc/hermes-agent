@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(not(windows))]
+use std::os::fd::AsRawFd;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -30,7 +32,7 @@ pub enum McpCommand {
     Add(AddArgs),
     Test(TestArgs),
     #[command(alias = "config")]
-    Configure(CompatArgs),
+    Configure(ConfigureArgs),
     Login(CompatArgs),
 }
 
@@ -65,6 +67,11 @@ pub struct TestArgs {
     pub name: String,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct ConfigureArgs {
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 struct McpServerEntry {
     config: Mapping,
@@ -85,7 +92,7 @@ pub fn print_mcp(
         Some(McpCommand::Add(args)) => add_server(context, args),
         Some(McpCommand::Serve(args)) => bridge_mcp("serve", &args.args),
         Some(McpCommand::Test(args)) => test_server(context, args),
-        Some(McpCommand::Configure(args)) => bridge_mcp("configure", &args.args),
+        Some(McpCommand::Configure(args)) => configure_server(context, args),
         Some(McpCommand::Login(args)) => bridge_mcp("login", &args.args),
     }
 }
@@ -142,6 +149,108 @@ fn test_server(context: &HermesContext, args: TestArgs) -> Result<(), Box<dyn Er
         }
     }
     println!();
+    Ok(())
+}
+
+fn configure_server(context: &HermesContext, args: ConfigureArgs) -> Result<(), Box<dyn Error>> {
+    if !stdin_is_terminal() {
+        return Err("'hermes mcp configure' requires an interactive terminal.".into());
+    }
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    configure_server_io(context, &args, stdin.lock(), stdout.lock())
+}
+
+fn configure_server_io<R: BufRead, W: Write>(
+    context: &HermesContext,
+    args: &ConfigureArgs,
+    mut input: R,
+    mut output: W,
+) -> Result<(), Box<dyn Error>> {
+    let name = normalize_server_lookup_name(&args.name)?;
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let servers = collect_mcp_servers(&root);
+    let Some(entry) = servers.get(name) else {
+        let suffix = if servers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Available: {}",
+                servers.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        };
+        return Err(format!("Server '{name}' not found in config.{suffix}").into());
+    };
+
+    if config_string(&entry.config, "auth")
+        .map(|value| value.eq_ignore_ascii_case("oauth"))
+        .unwrap_or(false)
+    {
+        return bridge_mcp("configure", &[name.to_string()]);
+    }
+
+    writeln!(output)?;
+    writeln!(output, "  Connecting to '{name}' to discover tools...")?;
+    let all_tools = probe_server_tools(name, &entry.config)?;
+    if all_tools.is_empty() {
+        writeln!(output, "  Server reports no tools.")?;
+        return Ok(());
+    }
+
+    let preselected = preselected_tool_indices(&entry.config, &all_tools);
+    writeln!(
+        output,
+        "  Currently {}/{} tools enabled for '{name}'.",
+        preselected.len(),
+        all_tools.len()
+    )?;
+
+    let labels = all_tools
+        .iter()
+        .map(|(tool_name, description)| format!("{tool_name} — {description}"))
+        .collect::<Vec<_>>();
+    let chosen =
+        prompt_enabled_indices_io("Tools", &labels, &preselected, &mut input, &mut output)?;
+    if chosen == preselected {
+        writeln!(output, "  No changes made.")?;
+        return Ok(());
+    }
+
+    let mut updated = entry.config.clone();
+    if chosen.len() == all_tools.len() {
+        updated.remove(yaml_key("tools"));
+    } else {
+        let chosen_names = all_tools
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (tool_name, _))| {
+                chosen.contains(&index).then_some(tool_name.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut tools = updated
+            .get(yaml_key("tools"))
+            .and_then(Value::as_mapping)
+            .cloned()
+            .unwrap_or_else(Mapping::new);
+        tools.insert(
+            yaml_key("include"),
+            Value::Sequence(chosen_names.into_iter().map(yaml_string).collect()),
+        );
+        tools.remove(yaml_key("exclude"));
+        updated.insert(yaml_key("tools"), Value::Mapping(tools));
+    }
+
+    let _ = remove_mcp_server(&mut root, name);
+    upsert_top_level_mcp_server(&mut root, name, Value::Mapping(updated));
+    write_yaml_mapping(&context.config_path(), &root)?;
+
+    writeln!(
+        output,
+        "  Updated config: {}/{} tools enabled",
+        chosen.len(),
+        all_tools.len()
+    )?;
+    writeln!(output, "  Start a new session for changes to take effect.")?;
     Ok(())
 }
 
@@ -797,6 +906,135 @@ fn normalize_server_lookup_name(raw: &str) -> Result<&str, Box<dyn Error>> {
         return Err("server name cannot be empty".into());
     }
     Ok(name)
+}
+
+fn preselected_tool_indices(
+    config: &Mapping,
+    all_tools: &[(String, String)],
+) -> std::collections::BTreeSet<usize> {
+    let tool_names = all_tools
+        .iter()
+        .map(|(tool_name, _)| tool_name.as_str())
+        .collect::<Vec<_>>();
+    let tools_cfg = config.get(yaml_key("tools")).and_then(Value::as_mapping);
+    let include = tools_cfg
+        .and_then(|mapping| mapping.get(yaml_key("include")))
+        .and_then(Value::as_sequence);
+    let exclude = tools_cfg
+        .and_then(|mapping| mapping.get(yaml_key("exclude")))
+        .and_then(Value::as_sequence);
+    if let Some(include) = include {
+        let include_set = include
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        return tool_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| include_set.contains(name).then_some(index))
+            .collect();
+    }
+    if let Some(exclude) = exclude {
+        let exclude_set = exclude
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        return tool_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (!exclude_set.contains(name)).then_some(index))
+            .collect();
+    }
+    (0..all_tools.len()).collect()
+}
+
+fn prompt_enabled_indices_io<R: BufRead, W: Write>(
+    title: &str,
+    labels: &[String],
+    preselected: &std::collections::BTreeSet<usize>,
+    input: &mut R,
+    output: &mut W,
+) -> Result<std::collections::BTreeSet<usize>, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "{title}:")?;
+    for (index, label) in labels.iter().enumerate() {
+        let marker = if preselected.contains(&index) {
+            'x'
+        } else {
+            ' '
+        };
+        writeln!(output, "  {:>2}. [{}] {}", index + 1, marker, label)?;
+    }
+    writeln!(
+        output,
+        "Enter enabled numbers like 1,3-5, 'all', 'none', or press Enter to keep current."
+    )?;
+    write!(output, "Enabled [keep]: ")?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let raw = line.trim();
+    if raw.is_empty() {
+        return Ok(preselected.clone());
+    }
+    parse_enabled_indices(raw, labels.len())
+}
+
+fn parse_enabled_indices(
+    raw: &str,
+    total: usize,
+) -> Result<std::collections::BTreeSet<usize>, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok((0..total).collect());
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(std::collections::BTreeSet::new());
+    }
+
+    let mut selected = std::collections::BTreeSet::new();
+    for segment in trimmed.split(',') {
+        let piece = segment.trim();
+        if piece.is_empty() {
+            return Err("selection contains an empty item".into());
+        }
+        if let Some((start_raw, end_raw)) = piece.split_once('-') {
+            let start = parse_selection_index(start_raw, total)?;
+            let end = parse_selection_index(end_raw, total)?;
+            if start > end {
+                return Err("selection range must be ascending".into());
+            }
+            for index in start..=end {
+                selected.insert(index);
+            }
+        } else {
+            selected.insert(parse_selection_index(piece, total)?);
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_selection_index(raw: &str, total: usize) -> Result<usize, Box<dyn Error>> {
+    let selection = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "selection must use numeric entries")?;
+    if selection == 0 || selection > total {
+        return Err("selection is out of range".into());
+    }
+    Ok(selection - 1)
+}
+
+fn stdin_is_terminal() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe { libc::isatty(io::stdin().as_raw_fd()) == 1 }
+    }
 }
 
 fn bridge_mcp(subcommand: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
@@ -1565,6 +1803,15 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
     }
 
     #[test]
+    fn configure_subcommand_parses_structured_args() {
+        let parsed = McpHarness::try_parse_from(["mcp", "configure", "alpha"]).unwrap();
+        match parsed.command {
+            McpCommand::Configure(args) => assert_eq!(args.name, "alpha"),
+            _ => panic!("expected configure args"),
+        }
+    }
+
+    #[test]
     fn add_http_server_writes_native_config() {
         let home = temp_path("add-http");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -1731,6 +1978,51 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
 
     #[test]
     #[cfg(unix)]
+    fn native_configure_updates_tool_include_list() {
+        let home = temp_path("native-configure");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(&home).unwrap();
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("server.sh");
+        write_stdio_test_server(&script);
+        fs::write(
+            context.config_path(),
+            format!(
+                "mcp_servers:\n  alpha:\n    command: {}\n",
+                serde_yaml::to_string(&script.display().to_string())
+                    .unwrap()
+                    .trim()
+            ),
+        )
+        .unwrap();
+
+        let input = std::io::Cursor::new("2\n");
+        let mut output = Vec::new();
+        configure_server_io(
+            &context,
+            &ConfigureArgs {
+                name: String::from("alpha"),
+            },
+            input,
+            &mut output,
+        )
+        .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("tools:"));
+        assert!(saved.contains("include:"));
+        assert!(saved.contains("- beta"));
+        assert!(!saved.contains("- alpha"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Currently 2/2 tools enabled"));
+        assert!(rendered.contains("Updated config: 1/2 tools enabled"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn bridge_uses_python_override_and_passes_subcommand_and_args() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -1755,10 +2047,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_MCP_PYTHON", &fake_python);
-        bridge_mcp("configure", &[String::from("alpha")]).unwrap();
+        bridge_mcp("login", &[String::from("alpha")]).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("subcommand=configure"));
+        assert!(output.contains("subcommand=login"));
         assert!(output.contains("argv=alpha"));
 
         remove_env_var("HERMES_MCP_PYTHON");
