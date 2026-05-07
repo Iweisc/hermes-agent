@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use hermes_core::{HermesContext, is_container, is_wsl};
@@ -102,13 +104,13 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
         None => bridge_gateway(args.accept_hooks, &[String::from("run")]),
         Some(GatewayCommand::Run(run)) => bridge_gateway(args.accept_hooks, &bridge_run_args(run)),
         Some(GatewayCommand::Start(service)) => {
-            bridge_gateway(args.accept_hooks, &bridge_service_args("start", service))
+            print_gateway_start(context, args.accept_hooks, service)
         }
         Some(GatewayCommand::Stop(service)) => {
-            bridge_gateway(args.accept_hooks, &bridge_service_args("stop", service))
+            print_gateway_stop(context, args.accept_hooks, service)
         }
         Some(GatewayCommand::Restart(service)) => {
-            bridge_gateway(args.accept_hooks, &bridge_service_args("restart", service))
+            print_gateway_restart(context, args.accept_hooks, service)
         }
         Some(GatewayCommand::Status(status)) => print_gateway_status(context, status),
         Some(GatewayCommand::Install(install)) => {
@@ -122,6 +124,105 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
             bridge_gateway(args.accept_hooks, &bridge_migrate_legacy_args(args2))
         }
     }
+}
+
+fn print_gateway_start(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayServiceArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.all {
+        return bridge_gateway(accept_hooks, &bridge_service_args("start", args));
+    }
+
+    if is_termux(context) {
+        return Err(
+            "Gateway service start is not supported on Termux. Run manually: hermes gateway run"
+                .into(),
+        );
+    }
+
+    if has_any_systemd_unit(context) {
+        start_systemd_service(context, args.system)?;
+        println!("Started {} service", gateway_service_name(context));
+        return Ok(());
+    }
+
+    if is_macos() {
+        start_launchd_service(context)?;
+        println!("Started {} service", launchd_label(context));
+        return Ok(());
+    }
+
+    if is_wsl() {
+        return Err(
+            "WSL detected but systemd is not available. Run `hermes gateway run` or use tmux."
+                .into(),
+        );
+    }
+
+    if is_container() {
+        println!("Service start is not applicable inside a Docker container.");
+        println!("Start the container itself or run `hermes gateway run`.");
+        return Ok(());
+    }
+
+    Err("Gateway service start is not supported on this platform".into())
+}
+
+fn print_gateway_stop(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayServiceArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.all {
+        return bridge_gateway(accept_hooks, &bridge_service_args("stop", args));
+    }
+
+    if has_any_systemd_unit(context) {
+        stop_systemd_service(context, args.system)?;
+        println!("Stopped {} service", gateway_service_name(context));
+        return Ok(());
+    }
+
+    if launchd_plist_path(context).exists() {
+        stop_launchd_service(context)?;
+        println!("Stopped {} service", launchd_label(context));
+        return Ok(());
+    }
+
+    if stop_manual_gateway(context)? {
+        println!("Stopped gateway for this profile");
+    } else {
+        println!("No gateway running for this profile");
+    }
+    Ok(())
+}
+
+fn print_gateway_restart(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayServiceArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.all {
+        return bridge_gateway(accept_hooks, &bridge_service_args("restart", args));
+    }
+
+    if has_any_systemd_unit(context) {
+        restart_systemd_service(context, args.system)?;
+        println!("Restarted {} service", gateway_service_name(context));
+        return Ok(());
+    }
+
+    if launchd_plist_path(context).exists() {
+        restart_launchd_service(context)?;
+        println!("Restarted {} service", launchd_label(context));
+        return Ok(());
+    }
+
+    let _ = stop_manual_gateway(context)?;
+    println!("Starting gateway...");
+    bridge_gateway(accept_hooks, &[String::from("run")])
 }
 
 fn print_gateway_status(
@@ -584,6 +685,80 @@ fn systemd_service_active(context: &HermesContext, system: bool) -> bool {
         .is_some_and(|value| value.trim() == "active")
 }
 
+fn has_any_systemd_unit(context: &HermesContext) -> bool {
+    systemd_unit_path(context, false).exists() || systemd_unit_path(context, true).exists()
+}
+
+fn require_systemd_service_installed(
+    context: &HermesContext,
+    system: bool,
+    action: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let selected_system = select_systemd_scope(context, system);
+    let unit_path = systemd_unit_path(context, selected_system);
+    if !unit_path.exists() {
+        let scope_flag = if selected_system { " --system" } else { "" };
+        let prefix = if selected_system { "sudo " } else { "" };
+        return Err(
+            format!(
+                "Gateway service is not installed. Run: {prefix}hermes gateway install{scope_flag} before {action}."
+            )
+            .into(),
+        );
+    }
+    if selected_system {
+        require_root_for_system_service(action)?;
+    }
+    Ok(selected_system)
+}
+
+fn start_systemd_service(context: &HermesContext, system: bool) -> Result<(), Box<dyn Error>> {
+    let selected_system = require_systemd_service_installed(context, system, "starting")?;
+    run_systemctl(selected_system, &["start", &gateway_service_name(context)])?;
+    Ok(())
+}
+
+fn stop_systemd_service(context: &HermesContext, system: bool) -> Result<(), Box<dyn Error>> {
+    let selected_system = require_systemd_service_installed(context, system, "stopping")?;
+    run_systemctl(selected_system, &["stop", &gateway_service_name(context)])?;
+    Ok(())
+}
+
+fn restart_systemd_service(context: &HermesContext, system: bool) -> Result<(), Box<dyn Error>> {
+    let selected_system = require_systemd_service_installed(context, system, "restarting")?;
+    let _ = run_systemctl_allow_failure(
+        selected_system,
+        &["reset-failed", &gateway_service_name(context)],
+    );
+    run_systemctl(
+        selected_system,
+        &["reload-or-restart", &gateway_service_name(context)],
+    )?;
+    Ok(())
+}
+
+fn run_systemctl(system: bool, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let output = build_systemctl_command(system, args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(command_failure_message("systemctl", &output).into())
+}
+
+fn run_systemctl_allow_failure(system: bool, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let _ = build_systemctl_command(system, args).status()?;
+    Ok(())
+}
+
+fn build_systemctl_command(system: bool, args: &[&str]) -> Command {
+    let mut command = Command::new("systemctl");
+    if !system {
+        command.arg("--user");
+    }
+    command.args(args);
+    command
+}
+
 fn launchd_service_active(context: &HermesContext) -> bool {
     Command::new("launchctl")
         .arg("list")
@@ -593,6 +768,148 @@ fn launchd_service_active(context: &HermesContext) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn start_launchd_service(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let plist_path = launchd_plist_path(context);
+    if !plist_path.exists() {
+        return Err("Gateway service is not installed. Run: hermes gateway install".into());
+    }
+    let target = launchd_target(context);
+    let output = Command::new("launchctl")
+        .args(["kickstart", &target])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    match output.status.code() {
+        Some(3) | Some(113) => {
+            let domain = launchd_domain();
+            let plist = plist_path.display().to_string();
+            run_launchctl(&["bootstrap", &domain, &plist])?;
+            run_launchctl(&["kickstart", &target])?;
+            Ok(())
+        }
+        _ => Err(command_failure_message("launchctl", &output).into()),
+    }
+}
+
+fn stop_launchd_service(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let target = launchd_target(context);
+    let output = Command::new("launchctl")
+        .args(["bootout", &target])
+        .output()?;
+    if !(output.status.success() || matches!(output.status.code(), Some(3) | Some(113))) {
+        return Err(command_failure_message("launchctl", &output).into());
+    }
+    let _ = wait_for_gateway_exit(
+        &context.hermes_home(),
+        Duration::from_secs(10),
+        Some(Duration::from_secs(5)),
+    );
+    Ok(())
+}
+
+fn restart_launchd_service(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let plist_path = launchd_plist_path(context);
+    if !plist_path.exists() {
+        return Err("Gateway service is not installed. Run: hermes gateway install".into());
+    }
+    let target = launchd_target(context);
+    let output = Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    match output.status.code() {
+        Some(3) | Some(113) => {
+            let domain = launchd_domain();
+            let plist = plist_path.display().to_string();
+            run_launchctl(&["bootstrap", &domain, &plist])?;
+            run_launchctl(&["kickstart", &target])?;
+            Ok(())
+        }
+        _ => Err(command_failure_message("launchctl", &output).into()),
+    }
+}
+
+fn run_launchctl(args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("launchctl").args(args).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(command_failure_message("launchctl", &output).into())
+}
+
+fn launchd_domain() -> String {
+    format!("gui/{}", current_uid())
+}
+
+fn launchd_target(context: &HermesContext) -> String {
+    format!("{}/{}", launchd_domain(), launchd_label(context))
+}
+
+fn stop_manual_gateway(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+    let pids = gateway_pids_for_profile(&context.hermes_home());
+    let Some(pid) = pids.first().copied() else {
+        return Ok(false);
+    };
+    signal_pid(pid, libc::SIGTERM)?;
+    let _ = wait_for_gateway_exit(
+        &context.hermes_home(),
+        Duration::from_secs(10),
+        Some(Duration::from_secs(5)),
+    );
+    Ok(true)
+}
+
+fn wait_for_gateway_exit(
+    hermes_home: &Path,
+    timeout: Duration,
+    force_after: Option<Duration>,
+) -> bool {
+    let start = Instant::now();
+    let force_deadline = force_after.map(|value| start + value);
+    let deadline = start + timeout;
+    let mut force_sent = false;
+
+    loop {
+        if gateway_pids_for_profile(hermes_home).is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return gateway_pids_for_profile(hermes_home).is_empty();
+        }
+        if !force_sent
+            && force_deadline.is_some_and(|value| now >= value)
+            && let Some(pid) = gateway_pids_for_profile(hermes_home).first().copied()
+        {
+            let _ = signal_pid(pid, libc::SIGKILL);
+            force_sent = true;
+        }
+        sleep(Duration::from_millis(300));
+    }
+}
+
+fn signal_pid(pid: i64, signal: i32) -> Result<(), Box<dyn Error>> {
+    if pid <= 0 {
+        return Err("invalid pid".into());
+    }
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        Err("process signalling is not supported on this platform".into())
+    }
 }
 
 fn select_systemd_scope(context: &HermesContext, system: bool) -> bool {
@@ -666,8 +983,44 @@ fn systemd_linger_status() -> Option<(bool, String)> {
     }
 }
 
+fn require_root_for_system_service(action: &str) -> Result<(), Box<dyn Error>> {
+    if current_uid() == 0 {
+        return Ok(());
+    }
+    Err(
+        format!("System gateway service {action} requires root. Run: sudo hermes gateway --system")
+            .into(),
+    )
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() as u32 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 fn run_optional_status_command(binary: &str, args: &[String]) {
     let _ = Command::new(binary).args(args).status();
+}
+
+fn command_failure_message(command: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    match output.status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn process_running(pid: i64) -> bool {
@@ -923,6 +1276,105 @@ mod tests {
             },
         );
         assert_eq!(args, vec!["restart", "--system", "--all"]);
+    }
+
+    #[test]
+    fn gateway_start_stop_restart_use_systemctl_for_user_units() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        fs::create_dir_all(ctx.hermes_home()).unwrap();
+        let fake_bin = ctx.home_dir().join("bin");
+        let log_path = ctx.home_dir().join("systemctl.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+        let unit_path = systemd_unit_path(&ctx, false);
+        fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+        fs::write(&unit_path, "unit").unwrap();
+
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Start(GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                })),
+            },
+        )
+        .unwrap();
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Stop(GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                })),
+            },
+        )
+        .unwrap();
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Restart(GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                })),
+            },
+        )
+        .unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--user start hermes-gateway"));
+        assert!(log.contains("--user stop hermes-gateway"));
+        assert!(log.contains("--user reset-failed hermes-gateway"));
+        assert!(log.contains("--user reload-or-restart hermes-gateway"));
+        set_env_var("PATH", original_path);
+    }
+
+    #[test]
+    fn gateway_stop_kills_manual_profile_process() {
+        let (_temp, ctx) = test_context();
+        fs::create_dir_all(ctx.hermes_home()).unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        fs::write(
+            ctx.hermes_home().join("gateway.pid"),
+            format!("{{\"pid\":{}}}\n", child.id()),
+        )
+        .unwrap();
+
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Stop(GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                })),
+            },
+        )
+        .unwrap();
+
+        let status = child.wait().unwrap();
+        assert!(!status.success());
     }
 
     #[test]
