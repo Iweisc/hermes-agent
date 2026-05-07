@@ -1,15 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
+use std::fs::File;
 use std::io::{self, Write};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{Args, Subcommand};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use hermes_core::HermesContext;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
+use tar::{Archive, Builder};
 
 use crate::python_bridge::{project_root, resolve_repo_python};
 
@@ -123,8 +128,8 @@ pub fn print_curator(
         Some(CuratorCommand::Restore { skill }) => restore_command(context, &skill),
         Some(CuratorCommand::Archive { skill }) => archive_command(context, &skill),
         Some(CuratorCommand::Prune(args)) => prune_command(context, args),
-        Some(CuratorCommand::Backup(args)) => print_curator_backup(args),
-        Some(CuratorCommand::Rollback(args)) => print_curator_rollback(args),
+        Some(CuratorCommand::Backup(args)) => print_curator_backup(context, args),
+        Some(CuratorCommand::Rollback(args)) => print_curator_rollback(context, args),
     }
 }
 
@@ -157,45 +162,107 @@ fn print_curator_run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     run_curator_python(CURATOR_RUN_BOOTSTRAP, &mut envs)
 }
 
-fn print_curator_backup(args: BackupArgs) -> Result<(), Box<dyn Error>> {
-    let mut envs = Vec::new();
-    if let Some(reason) = args
+fn print_curator_backup(context: &HermesContext, args: BackupArgs) -> Result<(), Box<dyn Error>> {
+    if !curator_backup_enabled(&context)? {
+        println!(
+            "curator: backups are disabled via config (`curator.backup.enabled: false`); re-enable to snapshot"
+        );
+        return Err("curator backups disabled".into());
+    }
+    let reason = args
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        envs.push((
-            "HERMES_CURATOR_BACKUP_REASON".to_string(),
-            reason.to_string(),
-        ));
-    }
-    run_curator_python(CURATOR_BACKUP_BOOTSTRAP, &mut envs)
+        .unwrap_or("manual");
+    let Some(snapshot) = snapshot_skills(&context, reason)? else {
+        println!("curator: snapshot failed — check logs (backup disabled or IO error)");
+        return Err("curator snapshot failed".into());
+    };
+    println!("curator: snapshot created at {}", snapshot.display());
+    Ok(())
 }
 
-fn print_curator_rollback(args: RollbackArgs) -> Result<(), Box<dyn Error>> {
-    let mut envs = vec![
-        (
-            "HERMES_CURATOR_ROLLBACK_LIST".to_string(),
-            if args.list { "1" } else { "0" }.to_string(),
-        ),
-        (
-            "HERMES_CURATOR_ROLLBACK_YES".to_string(),
-            if args.yes { "1" } else { "0" }.to_string(),
-        ),
-    ];
-    if let Some(backup_id) = args
+fn print_curator_rollback(
+    context: &HermesContext,
+    args: RollbackArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.list {
+        println!("{}", summarize_backups(context)?);
+        return Ok(());
+    }
+
+    let backup_id = args
         .backup_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        envs.push((
-            "HERMES_CURATOR_ROLLBACK_ID".to_string(),
-            backup_id.to_string(),
-        ));
+        .filter(|value| !value.is_empty());
+    let Some(target) = resolve_backup(context, backup_id)? else {
+        let rows = list_backups(context)?;
+        if rows.is_empty() {
+            println!(
+                "curator: no snapshots exist yet. Take one with `hermes curator backup` or wait for the next curator run."
+            );
+        } else {
+            let label = backup_id
+                .map(|value| format!("id '{value}'"))
+                .unwrap_or_else(|| "your query".to_string());
+            println!("curator: no snapshot matching {label}.");
+            println!("Available:");
+            println!("{}", summarize_backups(context)?);
+        }
+        return Err("curator rollback snapshot not found".into());
+    };
+
+    let manifest = read_backup_manifest(&target);
+    println!(
+        "Rollback target: {}",
+        target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("?")
+    );
+    if let Some(reason) = manifest.get("reason").and_then(JsonValue::as_str) {
+        println!("  reason:      {reason}");
     }
-    run_curator_python(CURATOR_ROLLBACK_BOOTSTRAP, &mut envs)
+    if let Some(created_at) = manifest.get("created_at").and_then(JsonValue::as_str) {
+        println!("  created_at:  {created_at}");
+    }
+    if let Some(skill_files) = manifest.get("skill_files").and_then(JsonValue::as_i64) {
+        println!("  skill files: {skill_files}");
+    }
+    if let Some(cron) = manifest.get("cron_jobs").and_then(JsonValue::as_object) {
+        if cron
+            .get("backed_up")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            println!(
+                "  cron jobs:   {} (will restore skill-link fields only)",
+                cron.get("jobs_count")
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or(0)
+            );
+        } else if let Some(reason) = cron.get("reason").and_then(JsonValue::as_str) {
+            println!("  cron jobs:   not in snapshot ({reason})");
+        }
+    }
+    println!(
+        "\nThis will replace the current ~/.hermes/skills/ tree. A safety snapshot of the current state is taken first so this is undoable. Cron jobs that still exist will have only their skills/skill fields restored from the snapshot."
+    );
+    if !args.yes && !confirm_prompt("Proceed? [y/N] ")? {
+        println!("cancelled");
+        return Err("curator rollback cancelled".into());
+    }
+
+    let (ok, msg, _) = rollback_skills(context, backup_id)?;
+    if ok {
+        println!("curator: {msg}");
+        Ok(())
+    } else {
+        println!("curator: rollback failed — {msg}");
+        Err(msg.into())
+    }
 }
 
 fn run_curator_python(
@@ -229,26 +296,6 @@ const CURATOR_RUN_BOOTSTRAP: &str = concat!(
     "raise SystemExit(_cmd_run(argparse.Namespace(\n",
     "    synchronous=(os.environ.get('HERMES_CURATOR_RUN_SYNCHRONOUS') == '1'),\n",
     "    dry_run=(os.environ.get('HERMES_CURATOR_RUN_DRY') == '1'),\n",
-    ")))\n",
-);
-
-const CURATOR_BACKUP_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "from hermes_cli.curator import _cmd_backup\n",
-    "raise SystemExit(_cmd_backup(argparse.Namespace(\n",
-    "    reason=(os.environ.get('HERMES_CURATOR_BACKUP_REASON') or None),\n",
-    ")))\n",
-);
-
-const CURATOR_ROLLBACK_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "from hermes_cli.curator import _cmd_rollback\n",
-    "raise SystemExit(_cmd_rollback(argparse.Namespace(\n",
-    "    list=(os.environ.get('HERMES_CURATOR_ROLLBACK_LIST') == '1'),\n",
-    "    backup_id=(os.environ.get('HERMES_CURATOR_ROLLBACK_ID') or None),\n",
-    "    yes=(os.environ.get('HERMES_CURATOR_ROLLBACK_YES') == '1'),\n",
     ")))\n",
 );
 
@@ -1317,6 +1364,620 @@ fn format_interval(hours: i64) -> String {
     }
 }
 
+const CURATOR_DEFAULT_KEEP: usize = 5;
+const CURATOR_SKILLS_ARCHIVE: &str = "skills.tar.gz";
+const CURATOR_CRON_JOBS_FILE: &str = "cron-jobs.json";
+const CURATOR_EXCLUDE_TOP_LEVEL: [&str; 2] = [".curator_backups", ".hub"];
+
+#[derive(Debug, Clone)]
+struct CuratorBackupRow {
+    id: String,
+    reason: String,
+    archive_bytes: u64,
+    skill_files: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CronRestoreReport {
+    attempted: bool,
+    restored: usize,
+    skipped_missing: usize,
+    unchanged: usize,
+    error: Option<String>,
+}
+
+fn curator_backup_enabled(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+    let raw = load_raw_config(context)?;
+    let Some(root) = raw.as_mapping() else {
+        return Ok(true);
+    };
+    let Some(curator) = root
+        .get(&yaml_key("curator"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Ok(true);
+    };
+    let Some(backup) = curator
+        .get(&yaml_key("backup"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Ok(true);
+    };
+    Ok(backup
+        .get(&yaml_key("enabled"))
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(true))
+}
+
+fn curator_backup_keep(context: &HermesContext) -> Result<usize, Box<dyn Error>> {
+    let raw = load_raw_config(context)?;
+    let Some(root) = raw.as_mapping() else {
+        return Ok(CURATOR_DEFAULT_KEEP);
+    };
+    let Some(curator) = root
+        .get(&yaml_key("curator"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Ok(CURATOR_DEFAULT_KEEP);
+    };
+    let Some(backup) = curator
+        .get(&yaml_key("backup"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Ok(CURATOR_DEFAULT_KEEP);
+    };
+    let keep = backup
+        .get(&yaml_key("keep"))
+        .and_then(yaml_value_to_i64)
+        .unwrap_or(CURATOR_DEFAULT_KEEP as i64)
+        .max(1) as usize;
+    Ok(keep)
+}
+
+fn curator_backups_dir(context: &HermesContext) -> PathBuf {
+    context
+        .hermes_home()
+        .join("skills")
+        .join(".curator_backups")
+}
+
+fn curator_skills_dir(context: &HermesContext) -> PathBuf {
+    context.hermes_home().join("skills")
+}
+
+fn curator_cron_jobs_path(context: &HermesContext) -> PathBuf {
+    context.hermes_home().join("cron").join("jobs.json")
+}
+
+fn curator_timestamp_id() -> String {
+    Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
+}
+
+fn next_snapshot_id(backups: &Path) -> String {
+    let base = curator_timestamp_id();
+    let mut candidate = base.clone();
+    let mut counter = 1;
+    while backups.join(&candidate).exists() {
+        candidate = format!("{base}-{counter:02}");
+        counter += 1;
+    }
+    candidate
+}
+
+fn snapshot_skills(
+    context: &HermesContext,
+    reason: &str,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    if !curator_backup_enabled(context)? {
+        return Ok(None);
+    }
+    let skills = curator_skills_dir(context);
+    if !skills.exists() {
+        return Ok(None);
+    }
+    let backups = curator_backups_dir(context);
+    fs::create_dir_all(&backups)?;
+    let snapshot_id = next_snapshot_id(&backups);
+    let dest = backups.join(snapshot_id);
+    fs::create_dir_all(&dest)?;
+
+    let archive_path = dest.join(CURATOR_SKILLS_ARCHIVE);
+    let archive_file = File::create(&archive_path)?;
+    let encoder = GzEncoder::new(archive_file, Compression::new(6));
+    let mut builder = Builder::new(encoder);
+    for entry in fs::read_dir(&skills)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if CURATOR_EXCLUDE_TOP_LEVEL.contains(&name_str.as_ref()) {
+            continue;
+        }
+        if path.is_dir() {
+            builder.append_dir_all(Path::new(name_str.as_ref()), &path)?;
+        } else {
+            builder.append_path_with_name(&path, Path::new(name_str.as_ref()))?;
+        }
+    }
+    builder.finish()?;
+    let encoder = builder.into_inner()?;
+    encoder.finish()?;
+
+    let cron_info = backup_cron_jobs_into(context, &dest)?;
+    write_backup_manifest(
+        &dest,
+        reason,
+        &archive_path,
+        count_skill_files(&skills)?,
+        &cron_info,
+    )?;
+    prune_old_backups(context, curator_backup_keep(context)?)?;
+    Ok(Some(dest))
+}
+
+fn count_skill_files(root: &Path) -> Result<i64, Box<dyn Error>> {
+    Ok(skill_markdown_files(root)?.len() as i64)
+}
+
+fn backup_cron_jobs_into(
+    context: &HermesContext,
+    dest: &Path,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let source = curator_cron_jobs_path(context);
+    let mut info = JsonMap::new();
+    info.insert("backed_up".to_string(), JsonValue::Bool(false));
+    info.insert("jobs_count".to_string(), JsonValue::from(0));
+    if !source.exists() {
+        info.insert(
+            "reason".to_string(),
+            JsonValue::String("no cron/jobs.json present".to_string()),
+        );
+        return Ok(JsonValue::Object(info));
+    }
+
+    let raw = match fs::read_to_string(&source) {
+        Ok(raw) => raw,
+        Err(error) => {
+            info.insert(
+                "reason".to_string(),
+                JsonValue::String(format!("read error: {error}")),
+            );
+            return Ok(JsonValue::Object(info));
+        }
+    };
+    let jobs_count = serde_json::from_str::<JsonValue>(&raw)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("jobs")
+                .and_then(JsonValue::as_array)
+                .map(|items| items.len())
+                .or_else(|| parsed.as_array().map(|items| items.len()))
+        })
+        .unwrap_or(0);
+    fs::write(dest.join(CURATOR_CRON_JOBS_FILE), raw)?;
+    info.insert("backed_up".to_string(), JsonValue::Bool(true));
+    info.insert("jobs_count".to_string(), JsonValue::from(jobs_count as i64));
+    Ok(JsonValue::Object(info))
+}
+
+fn write_backup_manifest(
+    snapshot_dir: &Path,
+    reason: &str,
+    archive_path: &Path,
+    skill_files: i64,
+    cron_info: &JsonValue,
+) -> Result<(), Box<dyn Error>> {
+    let archive_bytes = archive_path.metadata()?.len();
+    let mut manifest = JsonMap::new();
+    manifest.insert(
+        "id".to_string(),
+        JsonValue::String(
+            snapshot_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    manifest.insert("reason".to_string(), JsonValue::String(reason.to_string()));
+    manifest.insert("created_at".to_string(), JsonValue::String(now_iso()));
+    manifest.insert(
+        "archive".to_string(),
+        JsonValue::String(CURATOR_SKILLS_ARCHIVE.to_string()),
+    );
+    manifest.insert("archive_bytes".to_string(), JsonValue::from(archive_bytes));
+    manifest.insert("skill_files".to_string(), JsonValue::from(skill_files));
+    manifest.insert("cron_jobs".to_string(), cron_info.clone());
+    atomic_write_json(
+        &snapshot_dir.join("manifest.json"),
+        &JsonValue::Object(manifest),
+    )
+}
+
+fn prune_old_backups(context: &HermesContext, keep: usize) -> Result<Vec<String>, Box<dyn Error>> {
+    let backups = curator_backups_dir(context);
+    if !backups.exists() {
+        return Ok(Vec::new());
+    }
+    let mut regular = Vec::new();
+    let mut staging = Vec::new();
+    for entry in fs::read_dir(&backups)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(".rollback-staging-") {
+            staging.push(path);
+            continue;
+        }
+        if path.join(CURATOR_SKILLS_ARCHIVE).exists() {
+            regular.push((name, path));
+        }
+    }
+    regular.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut deleted = Vec::new();
+    for (_, path) in regular.into_iter().skip(keep) {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        fs::remove_dir_all(&path)?;
+        deleted.push(name);
+    }
+    for path in staging {
+        let _ = fs::remove_dir_all(path);
+    }
+    Ok(deleted)
+}
+
+fn list_backups(context: &HermesContext) -> Result<Vec<CuratorBackupRow>, Box<dyn Error>> {
+    let backups = curator_backups_dir(context);
+    if !backups.exists() {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    for entry in fs::read_dir(&backups)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() || !path.join(CURATOR_SKILLS_ARCHIVE).exists() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        let manifest = read_backup_manifest(&path);
+        rows.push(CuratorBackupRow {
+            id: id.clone(),
+            reason: manifest
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            archive_bytes: manifest
+                .get("archive_bytes")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or_else(|| {
+                    path.join(CURATOR_SKILLS_ARCHIVE)
+                        .metadata()
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                }),
+            skill_files: manifest
+                .get("skill_files")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0),
+        });
+    }
+    rows.sort_by(|left, right| right.id.cmp(&left.id));
+    Ok(rows)
+}
+
+fn summarize_backups(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let rows = list_backups(context)?;
+    if rows.is_empty() {
+        return Ok("No curator snapshots yet.".to_string());
+    }
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{:<24}  {:<40}  {:>6}  {:>8}",
+        "id", "reason", "skills", "size"
+    ));
+    lines.push("─".repeat(lines[0].len()));
+    for row in rows {
+        lines.push(format!(
+            "{:<24}  {:<40}  {:>6}  {:>8}",
+            row.id,
+            truncate_reason(&row.reason, 40),
+            row.skill_files,
+            format_size(row.archive_bytes)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn truncate_reason(value: &str, max_len: usize) -> String {
+    value.chars().take(max_len).collect::<String>()
+}
+
+fn resolve_backup(
+    context: &HermesContext,
+    backup_id: Option<&str>,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let backups = curator_backups_dir(context);
+    if !backups.exists() {
+        return Ok(None);
+    }
+    if let Some(backup_id) = backup_id {
+        let target = backups.join(backup_id);
+        return Ok(target
+            .is_dir()
+            .then_some(target.clone())
+            .filter(|path| path.join(CURATOR_SKILLS_ARCHIVE).exists()));
+    }
+    Ok(list_backups(context)?
+        .first()
+        .map(|row| backups.join(&row.id))
+        .filter(|path| path.join(CURATOR_SKILLS_ARCHIVE).exists()))
+}
+
+fn read_backup_manifest(snapshot_dir: &Path) -> JsonValue {
+    fs::read_to_string(snapshot_dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<JsonValue>(&raw).ok())
+        .unwrap_or_else(|| JsonValue::Object(JsonMap::new()))
+}
+
+fn rollback_skills(
+    context: &HermesContext,
+    backup_id: Option<&str>,
+) -> Result<(bool, String, Option<PathBuf>), Box<dyn Error>> {
+    let Some(target) = resolve_backup(context, backup_id)? else {
+        return Ok((false, "no matching backup found".to_string(), None));
+    };
+    let archive = target.join(CURATOR_SKILLS_ARCHIVE);
+    if !archive.exists() {
+        return Ok((
+            false,
+            format!(
+                "snapshot {} has no {}",
+                target
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("?"),
+                CURATOR_SKILLS_ARCHIVE
+            ),
+            None,
+        ));
+    }
+
+    let skills = curator_skills_dir(context);
+    let backups = curator_backups_dir(context);
+    fs::create_dir_all(&skills)?;
+    fs::create_dir_all(&backups)?;
+
+    let _ = snapshot_skills(
+        context,
+        &format!(
+            "pre-rollback to {}",
+            target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("?")
+        ),
+    )?;
+
+    let staged = backups.join(format!(".rollback-staging-{}", curator_timestamp_id()));
+    fs::create_dir_all(&staged)?;
+    let mut moved = Vec::new();
+    for entry in fs::read_dir(&skills)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if CURATOR_EXCLUDE_TOP_LEVEL.contains(&name.as_str()) {
+            continue;
+        }
+        let dest = staged.join(&name);
+        move_directory(&path, &dest)?;
+        moved.push((path, dest));
+    }
+
+    if let Err(error) = extract_backup_archive(&archive, &skills) {
+        for (original, staged_path) in moved {
+            let _ = move_directory(&staged_path, &original);
+        }
+        let _ = fs::remove_dir_all(&staged);
+        return Ok((
+            false,
+            format!("snapshot extract failed (state restored): {error}"),
+            None,
+        ));
+    }
+
+    let _ = fs::remove_dir_all(&staged);
+    let cron_report = restore_cron_skill_links(context, &target)?;
+    let mut summary = format!(
+        "restored from snapshot {}",
+        target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("?")
+    );
+    if cron_report.attempted {
+        if let Some(error) = cron_report.error {
+            summary.push_str(&format!("; cron links: error — {error}"));
+        } else {
+            let mut parts = Vec::new();
+            if cron_report.restored > 0 {
+                parts.push(format!(
+                    "{} job(s) had skill links restored",
+                    cron_report.restored
+                ));
+            }
+            if cron_report.skipped_missing > 0 {
+                parts.push(format!(
+                    "{} backed-up job(s) no longer exist (skipped)",
+                    cron_report.skipped_missing
+                ));
+            }
+            if cron_report.unchanged > 0 {
+                parts.push(format!("{} already matched", cron_report.unchanged));
+            }
+            if !parts.is_empty() {
+                summary.push_str(&format!("; cron links: {}", parts.join(", ")));
+            }
+        }
+    }
+    Ok((true, summary, Some(target)))
+}
+
+fn extract_backup_archive(archive_path: &Path, skills_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let file = File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let path = entry.path()?.into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(format!("refusing to extract unsafe path: {:?}", path).into());
+        }
+        entry.unpack_in(skills_dir)?;
+    }
+    Ok(())
+}
+
+fn restore_cron_skill_links(
+    context: &HermesContext,
+    snapshot_dir: &Path,
+) -> Result<CronRestoreReport, Box<dyn Error>> {
+    let backup_file = snapshot_dir.join(CURATOR_CRON_JOBS_FILE);
+    if !backup_file.exists() {
+        return Ok(CronRestoreReport {
+            error: Some(format!("snapshot has no {CURATOR_CRON_JOBS_FILE}")),
+            ..Default::default()
+        });
+    }
+    let backup = serde_json::from_str::<JsonValue>(&fs::read_to_string(&backup_file)?)?;
+    let Some(backup_jobs) = json_jobs_list(&backup) else {
+        return Ok(CronRestoreReport {
+            error: Some("backed-up cron-jobs.json has no jobs list".to_string()),
+            ..Default::default()
+        });
+    };
+    let live_path = curator_cron_jobs_path(context);
+    if !live_path.exists() {
+        return Ok(CronRestoreReport {
+            attempted: true,
+            ..Default::default()
+        });
+    }
+    let mut live = serde_json::from_str::<JsonValue>(&fs::read_to_string(&live_path)?)?;
+    let Some(live_jobs) = json_jobs_list_mut(&mut live) else {
+        return Ok(CronRestoreReport {
+            attempted: true,
+            error: Some("live cron/jobs.json has no jobs list".to_string()),
+            ..Default::default()
+        });
+    };
+
+    let mut backup_by_id = HashMap::new();
+    for job in backup_jobs {
+        let Some(id) = job.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        backup_by_id.insert(id.to_string(), job.clone());
+    }
+
+    let mut report = CronRestoreReport {
+        attempted: true,
+        ..Default::default()
+    };
+    let mut live_ids = HashSet::new();
+    let mut changed = false;
+    for live_job in live_jobs.iter_mut() {
+        let Some(id) = live_job.get("id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        live_ids.insert(id.to_string());
+        let Some(backup_job) = backup_by_id.get(id) else {
+            continue;
+        };
+        let current_skills = live_job.get("skills").cloned();
+        let current_skill = live_job.get("skill").cloned();
+        let backup_skills = backup_job.get("skills").cloned();
+        let backup_skill = backup_job.get("skill").cloned();
+        if current_skills == backup_skills && current_skill == backup_skill {
+            report.unchanged += 1;
+            continue;
+        }
+        let Some(object) = live_job.as_object_mut() else {
+            continue;
+        };
+        match backup_skills {
+            Some(value) => {
+                object.insert("skills".to_string(), value);
+            }
+            None => {
+                object.remove("skills");
+            }
+        }
+        match backup_skill {
+            Some(value) => {
+                object.insert("skill".to_string(), value);
+            }
+            None => {
+                object.remove("skill");
+            }
+        }
+        report.restored += 1;
+        changed = true;
+    }
+    for id in backup_by_id.keys() {
+        if !live_ids.contains(id) {
+            report.skipped_missing += 1;
+        }
+    }
+    if changed {
+        atomic_write_json(&live_path, &live)?;
+    }
+    Ok(report)
+}
+
+fn json_jobs_list(value: &JsonValue) -> Option<&Vec<JsonValue>> {
+    value
+        .get("jobs")
+        .and_then(JsonValue::as_array)
+        .or_else(|| value.as_array())
+}
+
+fn json_jobs_list_mut(value: &mut JsonValue) -> Option<&mut Vec<JsonValue>> {
+    match value {
+        JsonValue::Array(array) => Some(array),
+        JsonValue::Object(object) => object.get_mut("jobs").and_then(JsonValue::as_array_mut),
+        _ => None,
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    for unit in ["B", "KB", "MB", "GB"] {
+        if value < 1024.0 || unit == "GB" {
+            return if unit == "B" {
+                format!("{} {unit}", value as u64)
+            } else {
+                format!("{value:.1} {unit}")
+            };
+        }
+        value /= 1024.0;
+    }
+    format!("{value:.1} GB")
+}
+
 fn atomic_write_json(path: &Path, value: &JsonValue) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1556,80 +2217,104 @@ exit 9\n",
     }
 
     #[test]
-    #[cfg(unix)]
-    fn curator_backup_uses_python_override_and_reason() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn curator_backup_creates_snapshot_and_manifest() {
         let home = temp_path("curator-backup");
-        fs::create_dir_all(&home).unwrap();
-        let fake_python = home.join("python3");
-        let log = home.join("python.log");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("skills").join("demo")).unwrap();
+        fs::create_dir_all(home.join("cron")).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'backup reason=%s\\n' \"$HERMES_CURATOR_BACKUP_REASON\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            home.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\nBody\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
-        print_curator_backup(BackupArgs {
-            reason: Some(String::from("manual-snapshot")),
-        })
+        fs::write(
+            home.join("cron").join("jobs.json"),
+            r#"{"jobs":[{"id":"job-1","skills":["demo"]}],"updated_at":"now"}"#,
+        )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("backup reason=manual-snapshot"));
-
-        remove_env_var("HERMES_CURATOR_PYTHON");
+        let snapshot = snapshot_skills(&context, "manual-snapshot")
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.join(CURATOR_SKILLS_ARCHIVE).exists());
+        assert!(snapshot.join(CURATOR_CRON_JOBS_FILE).exists());
+        let manifest = read_backup_manifest(&snapshot);
+        assert_eq!(
+            manifest["reason"],
+            JsonValue::String("manual-snapshot".to_string())
+        );
+        assert_eq!(manifest["skill_files"], JsonValue::from(1));
+        assert_eq!(manifest["cron_jobs"]["backed_up"], JsonValue::Bool(true));
         let _ = fs::remove_dir_all(home);
     }
 
     #[test]
-    #[cfg(unix)]
-    fn curator_rollback_uses_python_override_and_env_flags() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn curator_rollback_restores_skills_and_cron_links() {
         let home = temp_path("curator-rollback");
-        fs::create_dir_all(&home).unwrap();
-        let fake_python = home.join("python3");
-        let log = home.join("python.log");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("skills").join("demo")).unwrap();
+        fs::create_dir_all(home.join("cron")).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'rollback list=%s id=%s yes=%s\\n' \"$HERMES_CURATOR_ROLLBACK_LIST\" \"$HERMES_CURATOR_ROLLBACK_ID\" \"$HERMES_CURATOR_ROLLBACK_YES\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            home.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\nOriginal\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        fs::write(
+            home.join("cron").join("jobs.json"),
+            r#"{"jobs":[{"id":"job-1","skills":["demo"],"schedule":"daily"},{"id":"job-2","skills":["extra"]}],"updated_at":"now"}"#,
+        )
+        .unwrap();
+        let snapshot = snapshot_skills(&context, "baseline").unwrap().unwrap();
 
-        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
-        print_curator_rollback(RollbackArgs {
-            list: true,
-            backup_id: Some(String::from("snap-123")),
-            yes: true,
-        })
+        fs::write(
+            home.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\nChanged\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("cron").join("jobs.json"),
+            r#"{"jobs":[{"id":"job-1","skills":["merged"],"schedule":"daily"},{"id":"job-3","skills":["new"]}],"updated_at":"later"}"#,
+        )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("rollback list=1 id=snap-123 yes=1"));
+        let snapshot_id = snapshot
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap()
+            .to_string();
+        let result = rollback_skills(&context, Some(&snapshot_id)).unwrap();
+        assert!(result.0);
+        let restored_skill =
+            fs::read_to_string(home.join("skills").join("demo").join("SKILL.md")).unwrap();
+        assert!(restored_skill.contains("Original"));
 
-        remove_env_var("HERMES_CURATOR_PYTHON");
+        let cron: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("cron").join("jobs.json")).unwrap())
+                .unwrap();
+        let jobs = cron["jobs"].as_array().unwrap();
+        let job_one = jobs
+            .iter()
+            .find(|job| job["id"] == JsonValue::String("job-1".to_string()))
+            .unwrap();
+        assert_eq!(
+            job_one["skills"],
+            JsonValue::Array(vec![JsonValue::String("demo".to_string())])
+        );
+        assert_eq!(job_one["schedule"], JsonValue::String("daily".to_string()));
+        let job_three = jobs
+            .iter()
+            .find(|job| job["id"] == JsonValue::String("job-3".to_string()))
+            .unwrap();
+        assert_eq!(
+            job_three["skills"],
+            JsonValue::Array(vec![JsonValue::String("new".to_string())])
+        );
+        let backups = list_backups(&context).unwrap();
+        assert!(
+            backups
+                .iter()
+                .any(|row| row.reason.starts_with("pre-rollback to"))
+        );
         let _ = fs::remove_dir_all(home);
     }
 }
