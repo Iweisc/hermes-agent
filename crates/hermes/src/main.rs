@@ -1,3 +1,5 @@
+mod logs;
+
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -56,6 +58,7 @@ enum Command {
         #[command(subcommand)]
         command: CronCommand,
     },
+    Logs(logs::LogsArgs),
     Kanban {
         #[command(subcommand)]
         command: KanbanCommand,
@@ -222,6 +225,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
         Command::Sessions { command } => print_sessions(&context, &session_store, command)?,
         Command::Cron { command } => print_cron(&context, &config, &session_store, command)?,
+        Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
         Command::Tools { command } => print_tools(&context, &config, command)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
