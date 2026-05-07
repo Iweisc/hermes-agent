@@ -2,13 +2,14 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::{HermesContext, LoadedConfig};
 use serde_yaml::Value;
 
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
-use crate::python_bridge::{launch_python_main_command, project_root};
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
@@ -54,12 +55,7 @@ pub fn print_memory(
     command: Option<MemoryCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command.unwrap_or(MemoryCommand::Status) {
-        MemoryCommand::Setup => launch_python_main_command(
-            "memory",
-            &[String::from("setup")],
-            Some("HERMES_MEMORY_PYTHON"),
-            &[],
-        ),
+        MemoryCommand::Setup => print_memory_setup(),
         MemoryCommand::Status => {
             println!("{}", render_status(context, loaded));
             Ok(())
@@ -73,6 +69,38 @@ pub fn print_memory(
             Ok(())
         }
         MemoryCommand::Reset(args) => reset_memory_files(context, args),
+    }
+}
+
+fn print_memory_setup() -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
+        .ok_or("could not find a Python interpreter for memory setup")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-c")
+        .arg(MEMORY_SETUP_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("memory", status).into())
+}
+
+const MEMORY_SETUP_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "from hermes_cli.memory_setup import cmd_setup\n",
+    "cmd_setup(argparse.Namespace())\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
     }
 }
 
@@ -345,7 +373,33 @@ fn render_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     #[test]
     fn discovery_prefers_bundled_provider_name_collisions() {
@@ -406,6 +460,39 @@ mod tests {
         let written = fs::read_to_string(home.join("config.yaml")).unwrap();
         assert!(written.contains("provider: \"\"") || written.contains("provider: ''"));
         assert!(written.contains("workspace: test"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn memory_setup_uses_python_override() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'memory setup bootstrap\\n' >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        print_memory_setup().unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("memory setup bootstrap"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
