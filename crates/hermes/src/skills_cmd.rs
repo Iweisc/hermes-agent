@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::HermesContext;
 use md5::Context as Md5Context;
+use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
@@ -157,6 +158,15 @@ struct GitHubSkillSummary {
     description: String,
     identifier: String,
     tags: Vec<String>,
+    trust: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillsShSkillSummary {
+    name: String,
+    repo: String,
+    description: String,
+    identifier: String,
     trust: String,
 }
 
@@ -506,6 +516,50 @@ fn browse_skills_command(
         println!();
         return Ok(());
     }
+    if source == "skills-sh" {
+        let skills =
+            collect_skills_sh_featured_summaries(page.saturating_mul(page_size).max(page_size))?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        let total = skills.len();
+        let total_pages = ((total + page_size - 1) / page_size).max(1);
+        let page = page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        let end = (start + page_size).min(total);
+
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} Description",
+            "Name", "Repo", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills[start..end] {
+            println!(
+                "{:<24} {:<24} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                truncate(&skill.repo, 24),
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page}/{total_pages} — {total} skills.sh skill(s)");
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source == "lobehub" {
         let skills = collect_lobehub_skill_summaries()?;
         if skills.is_empty() {
@@ -678,6 +732,46 @@ fn search_skills_command(
                 "{:<24} {:<12} {:<10} {:<30} {}",
                 truncate(&skill.name, 24),
                 "github",
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
+    if source == "skills-sh" {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return bridge_prefixed("search", passthrough);
+        }
+        let matches = search_skills_sh_summaries(needle, limit)?;
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "skills-sh",
                 truncate(&skill.trust, 10),
                 truncate(&skill.identifier, 30),
                 truncate(&skill.description, 60),
@@ -4200,6 +4294,147 @@ fn collect_github_skill_summaries(
     Ok(summaries)
 }
 
+fn skills_sh_base_url() -> String {
+    std::env::var("HERMES_SKILLS_SH_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("https://skills.sh"))
+}
+
+fn collect_skills_sh_featured_summaries(
+    limit: usize,
+) -> Result<Vec<SkillsShSkillSummary>, Box<dyn Error>> {
+    let limit = limit.max(1);
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let response = client.get(skills_sh_base_url()).send()?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("Failed to fetch skills.sh homepage: {}", response.status()).into());
+    }
+    let html = response.text()?;
+    let link_re = Regex::new(r#"href=["']/(?P<id>[^"' ]+)["']"#)?;
+    let mut seen = HashSet::new();
+    let mut summaries = Vec::new();
+    for captures in link_re.captures_iter(&html) {
+        let Some(matched) = captures.name("id") else {
+            continue;
+        };
+        let raw = matched.as_str().trim();
+        let canonical = raw.trim_start_matches('/');
+        if canonical.starts_with("agents/")
+            || canonical.starts_with("_next/")
+            || canonical.starts_with("api/")
+            || canonical.contains(' ')
+        {
+            continue;
+        }
+        let canonical = canonical.to_string();
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let parts = canonical.split('/').collect::<Vec<_>>();
+        if parts.len() < 3 {
+            continue;
+        }
+        let repo = format!("{}/{}", parts[0], parts[1]);
+        let name = parts.last().copied().unwrap_or("skill").to_string();
+        summaries.push(SkillsShSkillSummary {
+            name,
+            repo: repo.clone(),
+            description: format!("Featured on skills.sh from {repo}"),
+            identifier: format!("skills-sh/{canonical}"),
+            trust: resolve_trust_level(&canonical).to_string(),
+        });
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+    Ok(summaries)
+}
+
+fn search_skills_sh_summaries(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SkillsShSkillSummary>, Box<dyn Error>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let response = client
+        .get(format!("{}/api/search", skills_sh_base_url()))
+        .query(&[("q", query), ("limit", &limit.max(1).to_string())])
+        .send()?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("Failed to search skills.sh: {}", response.status()).into());
+    }
+    let value = response.json::<JsonValue>()?;
+    let Some(items) = value.get("skills").and_then(JsonValue::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut summaries = Vec::new();
+    for item in items.iter().take(limit.max(1)) {
+        let Some(summary) = skills_sh_summary_from_search_item(item) else {
+            continue;
+        };
+        summaries.push(summary);
+    }
+    Ok(summaries)
+}
+
+fn skills_sh_summary_from_search_item(item: &JsonValue) -> Option<SkillsShSkillSummary> {
+    let object = item.as_object()?;
+    let canonical = object
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| value.matches('/').count() >= 2)
+        .map(str::to_string)
+        .or_else(|| {
+            let repo = object
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| value.matches('/').count() == 1)?;
+            let skill_id = object
+                .get("skillId")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(format!("{repo}/{skill_id}"))
+        })?;
+
+    let parts = canonical.split('/').collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    let name = object
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| parts.last().copied().unwrap_or("skill").to_string());
+    let installs = object.get("installs").and_then(JsonValue::as_u64);
+    let installs_label = installs
+        .map(|count| format!(" · {} installs", count))
+        .unwrap_or_default();
+    Some(SkillsShSkillSummary {
+        name,
+        repo: repo.clone(),
+        description: format!("Indexed by skills.sh from {repo}{installs_label}"),
+        identifier: format!("skills-sh/{canonical}"),
+        trust: resolve_trust_level(&canonical).to_string(),
+    })
+}
+
 fn collect_lobehub_skill_summaries() -> Result<Vec<LobeHubSkillSummary>, Box<dyn Error>> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("hermes-rs-cli")
@@ -7364,6 +7599,54 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_skills_sh_summaries_reads_featured_and_search() {
+        let _guard = test_env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_skills_sh_server(requests.clone());
+        let old_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &base_url);
+
+        let featured = collect_skills_sh_featured_summaries(10).unwrap();
+        assert_eq!(featured.len(), 2);
+        let shipit = featured
+            .iter()
+            .find(|skill| skill.name == "shipit")
+            .unwrap();
+        assert_eq!(shipit.repo, "openai/skills");
+        assert_eq!(shipit.identifier, "skills-sh/openai/skills/shipit");
+        assert_eq!(shipit.trust, "trusted");
+
+        let search = search_skills_sh_summaries("deploy", 10).unwrap();
+        assert_eq!(search.len(), 2);
+        let deploy = search
+            .iter()
+            .find(|skill| skill.name == "deploy-guide")
+            .unwrap();
+        assert_eq!(deploy.repo, "community/repo");
+        assert_eq!(deploy.identifier, "skills-sh/community/repo/deploy-guide");
+        assert_eq!(deploy.trust, "community");
+        assert!(
+            deploy
+                .description
+                .contains("Indexed by skills.sh from community/repo")
+        );
+        assert!(deploy.description.contains("7 installs"));
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(logged.iter().any(|request| request.starts_with("GET / ")));
+        assert!(logged.iter().any(|request| {
+            request.starts_with("GET /api/search?q=deploy&limit=10 ")
+                || request.starts_with("GET /api/search?limit=10&q=deploy ")
+        }));
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+    }
+
+    #[test]
     fn collect_lobehub_skill_summaries_reads_index() {
         let _guard = test_env_lock().lock().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -8209,6 +8492,53 @@ exit 9\n",
                         "HTTP/1.1 200 OK",
                         "---\nname: shipit\ndescription: Remote demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n      - ops\n---\nbody\n".to_string(),
                         "text/plain",
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        "{}".to_string(),
+                        "application/json",
+                    )
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_skills_sh_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                requests.lock().unwrap().push(request.clone());
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body, content_type) = if first_line.starts_with("GET /api/search?") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"skills":[{"id":"openai/skills/shipit","name":"shipit","installs":42},{"source":"community/repo","skillId":"deploy-guide","name":"deploy-guide","installs":7}]}"#
+                            .to_string(),
+                        "application/json",
+                    )
+                } else if first_line.starts_with("GET / ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"<html><body>
+<a href="/openai/skills/shipit">Shipit</a>
+<a href="/community/repo/deploy-guide">Deploy</a>
+<a href="/openai/skills/shipit">Duplicate</a>
+</body></html>"#
+                            .to_string(),
+                        "text/html",
                     )
                 } else {
                     (
