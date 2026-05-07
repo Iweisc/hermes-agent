@@ -21,6 +21,13 @@ use crate::skills_guard::{format_scan_report, install_allowed, resolve_trust_lev
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
 const MAX_NAME_LENGTH: usize = 64;
+const DEFAULT_GITHUB_SKILL_TAPS: &[(&str, &str)] = &[
+    ("openai/skills", "skills/"),
+    ("anthropics/skills", "skills/"),
+    ("VoltAgent/awesome-agent-skills", "skills/"),
+    ("garrytan/gstack", ""),
+    ("MiniMax-AI/cli", "skill/"),
+];
 
 #[derive(Subcommand, Debug)]
 pub enum SkillsCommand {
@@ -144,6 +151,16 @@ struct OfficialSkillSummary {
 }
 
 #[derive(Debug, Clone)]
+struct GitHubSkillSummary {
+    name: String,
+    repo: String,
+    description: String,
+    identifier: String,
+    tags: Vec<String>,
+    trust: String,
+}
+
+#[derive(Debug, Clone)]
 struct InstallArgsParsed {
     identifier: String,
     category: String,
@@ -197,8 +214,8 @@ pub fn print_skills(
             print_skills_usage();
             Ok(())
         }
-        Some(SkillsCommand::Browse(args)) => browse_skills_command(&args.args),
-        Some(SkillsCommand::Search(args)) => search_skills_command(&args.args),
+        Some(SkillsCommand::Browse(args)) => browse_skills_command(context, &args.args),
+        Some(SkillsCommand::Search(args)) => search_skills_command(context, &args.args),
         Some(SkillsCommand::Install(args)) => install_skill_command(context, &args.args),
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
@@ -404,10 +421,56 @@ fn inspect_skill_command(
     bridge_prefixed("inspect", &[identifier.to_string()])
 }
 
-fn browse_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+fn browse_skills_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
     let Some((page, page_size, source)) = parse_browse_args(passthrough)? else {
         return bridge_prefixed("browse", passthrough);
     };
+    if source == "github" {
+        let skills = collect_github_skill_summaries(context)?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        let total = skills.len();
+        let total_pages = ((total + page_size - 1) / page_size).max(1);
+        let page = page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        let end = (start + page_size).min(total);
+
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} Description",
+            "Name", "Repo", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills[start..end] {
+            println!(
+                "{:<24} {:<24} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                truncate(&skill.repo, 24),
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page}/{total_pages} — {total} github skill(s)");
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("browse", passthrough);
     }
@@ -452,10 +515,66 @@ fn browse_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn search_skills_command(passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+fn search_skills_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
     let Some((query, limit, source)) = parse_search_args(passthrough)? else {
         return bridge_prefixed("search", passthrough);
     };
+    if source == "github" {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return bridge_prefixed("search", passthrough);
+        }
+        let matches = collect_github_skill_summaries(context)?
+            .into_iter()
+            .filter(|skill| {
+                let searchable = format!(
+                    "{} {} {}",
+                    skill.name,
+                    skill.description,
+                    skill.tags.join(" ")
+                )
+                .to_ascii_lowercase();
+                searchable.contains(&needle)
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "github",
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("search", passthrough);
     }
@@ -3224,6 +3343,145 @@ fn collect_official_skill_summaries() -> Result<Vec<OfficialSkillSummary>, Box<d
     Ok(skills)
 }
 
+fn collect_github_skill_summaries(
+    context: &HermesContext,
+) -> Result<Vec<GitHubSkillSummary>, Box<dyn Error>> {
+    if github_app_auth_configured() && resolve_github_publish_token().is_none() {
+        return Ok(Vec::new());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let token = resolve_github_publish_token();
+    let mut summaries = Vec::new();
+    for (repo, path) in github_skill_taps(context)? {
+        summaries.extend(list_github_skills_in_tap(
+            &client,
+            &repo,
+            &path,
+            token.as_deref(),
+        )?);
+    }
+    summaries.sort_by(|left, right| {
+        let left_key = (left.trust.as_str(), left.repo.as_str(), left.name.as_str());
+        let right_key = (
+            right.trust.as_str(),
+            right.repo.as_str(),
+            right.name.as_str(),
+        );
+        right_key.cmp(&left_key)
+    });
+    Ok(summaries)
+}
+
+fn github_skill_taps(context: &HermesContext) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let mut seen = HashSet::new();
+    let mut taps = Vec::new();
+    for (repo, path) in DEFAULT_GITHUB_SKILL_TAPS {
+        let key = format!("{repo}::{path}");
+        if seen.insert(key) {
+            taps.push((repo.to_string(), path.to_string()));
+        }
+    }
+
+    for tap in load_taps(context)? {
+        let path = tap
+            .raw
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("skills/");
+        let normalized = normalize_github_tap_path(path)?;
+        let key = format!("{}::{}", tap.repo, normalized);
+        if seen.insert(key) {
+            taps.push((tap.repo, normalized));
+        }
+    }
+    Ok(taps)
+}
+
+fn normalize_github_tap_path(raw: &str) -> Result<String, Box<dyn Error>> {
+    let trimmed = raw.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(&trimmed).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            _ => return Err(format!("Unsafe tap path: {raw}").into()),
+        }
+    }
+    Ok(normalized.to_string_lossy().replace('\\', "/"))
+}
+
+fn list_github_skills_in_tap(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    tap_path: &str,
+    token: Option<&str>,
+) -> Result<Vec<GitHubSkillSummary>, Box<dyn Error>> {
+    let normalized_tap_path = normalize_github_tap_path(tap_path)?;
+    let contents_path = normalized_tap_path.trim_end_matches('/');
+    let url = if contents_path.is_empty() {
+        format!("{}/repos/{repo}/contents/", github_api_base())
+    } else {
+        format!(
+            "{}/repos/{repo}/contents/{contents_path}",
+            github_api_base()
+        )
+    };
+    let response = client
+        .get(url)
+        .headers(github_raw_headers(token, "application/vnd.github.v3+json")?)
+        .send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if response.status() != StatusCode::OK {
+        return Ok(Vec::new());
+    }
+
+    let entries = response.json::<JsonValue>()?;
+    let Some(items) = entries.as_array() else {
+        return Ok(Vec::new());
+    };
+
+    let mut summaries = Vec::new();
+    for item in items {
+        if item.get("type").and_then(JsonValue::as_str) != Some("dir") {
+            continue;
+        }
+        let Some(dir_name) = item.get("name").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if dir_name.starts_with('.') || dir_name.starts_with('_') {
+            continue;
+        }
+
+        let identifier = if contents_path.is_empty() {
+            format!("{repo}/{dir_name}")
+        } else {
+            format!("{repo}/{contents_path}/{dir_name}")
+        };
+        let Some(skill) = fetch_remote_github_inspect_skill(&identifier)? else {
+            continue;
+        };
+        summaries.push(GitHubSkillSummary {
+            name: skill.name,
+            repo: repo.to_string(),
+            description: skill.description,
+            identifier: skill.identifier,
+            tags: skill.tags,
+            trust: skill.trust,
+        });
+    }
+
+    Ok(summaries)
+}
+
 fn frontmatter_string(frontmatter: &YamlMapping, key: &str) -> Option<String> {
     frontmatter
         .get(&yaml_key(key))
@@ -4681,13 +4939,17 @@ exit 9\n",
         perms.set_mode(0o755);
         fs::set_permissions(&fake_python, perms).unwrap();
 
+        let context = HermesContext::new("/tmp");
         set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        browse_skills_command(&[
-            String::from("--source"),
-            String::from("all"),
-            String::from("--page"),
-            String::from("1"),
-        ])
+        browse_skills_command(
+            &context,
+            &[
+                String::from("--source"),
+                String::from("all"),
+                String::from("--page"),
+                String::from("1"),
+            ],
+        )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
@@ -4867,12 +5129,16 @@ exit 9\n",
         perms.set_mode(0o755);
         fs::set_permissions(&fake_python, perms).unwrap();
 
+        let context = HermesContext::new("/tmp");
         set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        search_skills_command(&[
-            String::from("deploy"),
-            String::from("--source"),
-            String::from("all"),
-        ])
+        search_skills_command(
+            &context,
+            &[
+                String::from("deploy"),
+                String::from("--source"),
+                String::from("all"),
+            ],
+        )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
@@ -4960,6 +5226,54 @@ exit 9\n",
         );
 
         handle.join().unwrap();
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn collect_github_skill_summaries_reads_default_tap() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("github-browse-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_browse_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let summaries = collect_github_skill_summaries(&context).unwrap();
+        assert!(!summaries.is_empty());
+        let shipit = summaries
+            .iter()
+            .find(|skill| skill.name == "shipit")
+            .unwrap();
+        assert_eq!(shipit.repo, "openai/skills");
+        assert_eq!(shipit.identifier, "openai/skills/skills/shipit");
+        assert_eq!(shipit.trust, "trusted");
+        assert_eq!(
+            shipit.tags,
+            vec![String::from("deploy"), String::from("ops")]
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /repos/openai/skills/contents/skills "))
+        );
+        assert!(logged.iter().any(|request| {
+            request.starts_with("GET /repos/openai/skills/contents/skills/shipit/SKILL.md ")
+        }));
+
         match old_api_base {
             Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
             None => remove_env_var("GITHUB_API_BASE_URL"),
@@ -5409,6 +5723,51 @@ exit 9\n",
                     .starts_with("GET /repos/openai/skills/contents/shipit/notes.txt ")
                 {
                     ("HTTP/1.1 200 OK", "hello\n".to_string(), "text/plain")
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        "{}".to_string(),
+                        "application/json",
+                    )
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_github_browse_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                requests.lock().unwrap().push(request.clone());
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body, content_type) = if first_line
+                    .starts_with("GET /repos/openai/skills/contents/skills ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"[{"type":"dir","name":"shipit","path":"skills/shipit"}]"#.to_string(),
+                        "application/json",
+                    )
+                } else if first_line
+                    .starts_with("GET /repos/openai/skills/contents/skills/shipit/SKILL.md ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        "---\nname: shipit\ndescription: Remote demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n      - ops\n---\nbody\n".to_string(),
+                        "text/plain",
+                    )
                 } else {
                     (
                         "HTTP/1.1 404 Not Found",
