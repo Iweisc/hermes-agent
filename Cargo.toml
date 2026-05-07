@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "crates/hermes-core",
+    "crates/hermes",
+    "crates/hermes-agent",
+    "crates/hermes-acp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.12.0"
+edition = "2024"
+license = "MIT"
+authors = ["Nous Research"]
+
+[workspace.dependencies]
+base64 = "0.22.1"
+chrono = { version = "0.4.42", default-features = true, features = ["clock"] }
+clap = { version = "4.5.41", features = ["derive"] }
+cronexpr = "1.5.0"
+ctrlc = "3.5.0"
+dirs = "6.0.0"
+hmac = "0.12.1"
+libc = "0.2.177"
+log = "0.4.28"
+md5 = "0.7.0"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml = "0.9.34"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots"] }
+unicode-normalization = "0.1.24"
+url = "2.5.7"
