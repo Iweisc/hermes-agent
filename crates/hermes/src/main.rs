@@ -7,6 +7,7 @@ mod dashboard_cmd;
 mod debug;
 mod doctor;
 mod dump;
+mod fallback_cmd;
 mod hooks;
 mod login_cmd;
 mod logs;
@@ -58,7 +59,10 @@ enum Command {
         command: Option<hooks::HooksCommand>,
     },
     Login(login_cmd::LoginArgs),
-    Fallback(compat_cmd::CompatArgs),
+    Fallback {
+        #[command(subcommand)]
+        command: Option<fallback_cmd::FallbackCommand>,
+    },
     Model {
         #[command(subcommand)]
         command: Option<model_cmd::ModelCommand>,
@@ -279,7 +283,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
         Command::Login(args) => login_cmd::print_login(args)?,
-        Command::Fallback(args) => compat_cmd::print_fallback(args)?,
+        Command::Fallback { command } => {
+            fallback_cmd::print_fallback(&context.config_path(), &config, command)?
+        }
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Gateway(args) => compat_cmd::print_gateway(args)?,
