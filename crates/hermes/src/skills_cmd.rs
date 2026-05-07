@@ -339,11 +339,7 @@ fn print_snapshot(context: &HermesContext, args: SkillSnapshotArgs) -> Result<()
     match args.command {
         Some(SkillSnapshotCommand::Export { output }) => export_skill_snapshot(context, &output),
         Some(SkillSnapshotCommand::Import { input, force }) => {
-            let mut passthrough = vec![String::from("import"), input];
-            if force {
-                passthrough.push(String::from("--force"));
-            }
-            bridge_prefixed("snapshot", &passthrough)
+            import_skill_snapshot(context, &input, force)
         }
         None => {
             println!("Usage: hermes skills snapshot [export|import]");
@@ -439,6 +435,83 @@ fn export_skill_snapshot(context: &HermesContext, output_path: &str) -> Result<(
     Ok(())
 }
 
+fn import_skill_snapshot(
+    context: &HermesContext,
+    input_path: &str,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    let input = Path::new(input_path);
+    if !input.exists() {
+        return Err(format!("File not found: {}", input.display()).into());
+    }
+
+    let snapshot = serde_json::from_str::<JsonValue>(&fs::read_to_string(input)?)?;
+    let taps = snapshot
+        .get("taps")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !taps.is_empty() {
+        import_snapshot_taps(context, &taps)?;
+        println!("Restored {} tap(s)", taps.len());
+    }
+
+    let skills = snapshot
+        .get("skills")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if skills.is_empty() {
+        println!("No skills in snapshot to install.");
+        println!();
+        return Ok(());
+    }
+
+    println!("Importing {} skill(s) from snapshot...", skills.len());
+    println!();
+    for item in skills {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let display_name = object
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("?");
+        let identifier = object
+            .get("identifier")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(identifier) = identifier else {
+            println!("Skipping entry with no identifier: {display_name}");
+            continue;
+        };
+
+        let category = object
+            .get("category")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut passthrough = vec![identifier.to_string()];
+        if let Some(category) = category {
+            passthrough.push(String::from("--category"));
+            passthrough.push(category.to_string());
+        }
+        if force {
+            passthrough.push(String::from("--force"));
+        }
+
+        println!("--- {display_name} ---");
+        bridge_prefixed("install", &passthrough)?;
+    }
+
+    println!("Snapshot import complete.");
+    println!();
+    Ok(())
+}
+
 fn list_taps(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     let taps = load_taps(context)?;
     if taps.is_empty() {
@@ -501,6 +574,48 @@ fn remove_tap(context: &HermesContext, raw_repo: &str) -> Result<(), Box<dyn Err
     println!("Removed tap: {repo}");
     println!();
     Ok(())
+}
+
+fn import_snapshot_taps(
+    context: &HermesContext,
+    items: &[JsonValue],
+) -> Result<(), Box<dyn Error>> {
+    let mut existing = load_taps(context)?;
+    let mut seen = existing
+        .iter()
+        .map(|entry| entry.repo.clone())
+        .collect::<HashSet<_>>();
+
+    for item in items {
+        let Some(raw) = item.as_object() else {
+            continue;
+        };
+        let repo = raw
+            .get("repo")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(repo) = repo else {
+            continue;
+        };
+        let repo = validate_tap_repo(repo)?.to_string();
+        if !seen.insert(repo.clone()) {
+            continue;
+        }
+        let path = raw
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("skills/")
+            .to_string();
+        let mut stored = raw.clone();
+        stored.insert("repo".to_string(), JsonValue::String(repo.clone()));
+        stored.insert("path".to_string(), JsonValue::String(path));
+        existing.push(TapEntry { repo, raw: stored });
+    }
+
+    save_taps(context, &existing)
 }
 
 const SKILL_CONFIG_PLATFORMS: &[(&str, &str)] = &[
@@ -1735,6 +1850,64 @@ mod tests {
             taps[0].get("repo").and_then(JsonValue::as_str),
             Some("owner/repo")
         );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn import_snapshot_restores_taps_and_bridges_installs() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("snapshot-import");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let input = home.join("snapshot.json");
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            &input,
+            r#"{
+  "skills": [
+    {"name": "alpha", "identifier": "official/dev/alpha", "category": "dev"},
+    {"name": "beta", "identifier": "official/beta", "category": ""}
+  ],
+  "taps": [
+    {"repo": "owner/repo", "path": "skills/"}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        import_skill_snapshot(&context, input.to_str().unwrap(), true).unwrap();
+
+        let taps = load_taps(&context).unwrap();
+        assert_eq!(taps.len(), 1);
+        assert_eq!(taps[0].repo, "owner/repo");
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=install argv=official/dev/alpha --category dev --force"));
+        assert!(output.contains("action=install argv=official/beta --force"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
     }
 
