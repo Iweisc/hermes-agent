@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand};
 use hermes_core::HermesContext;
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
-use crate::python_bridge::{launch_python_main_command, project_root};
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Subcommand, Debug)]
 pub enum PluginsCommand {
@@ -55,7 +56,7 @@ pub fn print_plugins(
     command: Option<PluginsCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        None => launch_python_main_command("plugins", &[], Some("HERMES_PLUGINS_PYTHON"), &[]),
+        None => bridge_plugins(None, &[]),
         Some(PluginsCommand::Install(args)) => bridge_install(args),
         Some(PluginsCommand::Update { name }) => bridge_update(&name),
         Some(PluginsCommand::List) => print_list(context),
@@ -70,7 +71,7 @@ fn bridge_install(args: InstallArgs) -> Result<(), Box<dyn Error>> {
     if identifier.is_empty() {
         return Err("plugin identifier cannot be empty".into());
     }
-    let mut argv = vec![String::from("install"), identifier.to_string()];
+    let mut argv = vec![identifier.to_string()];
     if args.force {
         argv.push(String::from("--force"));
     }
@@ -80,7 +81,7 @@ fn bridge_install(args: InstallArgs) -> Result<(), Box<dyn Error>> {
     if args.no_enable {
         argv.push(String::from("--no-enable"));
     }
-    launch_python_main_command("plugins", &argv, Some("HERMES_PLUGINS_PYTHON"), &[])
+    bridge_plugins(Some("install"), &argv)
 }
 
 fn bridge_update(name: &str) -> Result<(), Box<dyn Error>> {
@@ -88,12 +89,56 @@ fn bridge_update(name: &str) -> Result<(), Box<dyn Error>> {
     if name.is_empty() {
         return Err("plugin name cannot be empty".into());
     }
-    launch_python_main_command(
-        "plugins",
-        &[String::from("update"), name.to_string()],
-        Some("HERMES_PLUGINS_PYTHON"),
-        &[],
-    )
+    bridge_plugins(Some("update"), &[name.to_string()])
+}
+
+fn bridge_plugins(action: Option<&str>, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_PLUGINS_PYTHON"))
+        .ok_or("could not find a Python interpreter for plugins")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_PLUGINS_ACTION", action.unwrap_or(""))
+        .arg("-c")
+        .arg(PLUGINS_BOOTSTRAP)
+        .args(passthrough);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("plugins", status).into())
+}
+
+const PLUGINS_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "import sys\n",
+    "from hermes_cli.plugins_cmd import plugins_command\n",
+    "action = (os.environ.get('HERMES_PLUGINS_ACTION') or '').strip()\n",
+    "parser = argparse.ArgumentParser(prog='hermes plugins')\n",
+    "parser.set_defaults(plugins_action=(action or None))\n",
+    "if action == 'install':\n",
+    "    parser.add_argument('identifier')\n",
+    "    parser.add_argument('--force', '-f', action='store_true')\n",
+    "    group = parser.add_mutually_exclusive_group()\n",
+    "    group.add_argument('--enable', action='store_true')\n",
+    "    group.add_argument('--no-enable', action='store_true')\n",
+    "elif action == 'update':\n",
+    "    parser.add_argument('name')\n",
+    "elif action:\n",
+    "    raise SystemExit(f'unsupported plugins action: {action}')\n",
+    "plugins_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -431,7 +476,33 @@ fn validate_plugin_name(raw_name: &str) -> Result<String, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[cfg(test)]
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     #[test]
     fn discover_plugins_prefers_user_over_bundled() {
@@ -533,5 +604,47 @@ mod tests {
         assert!(validate_plugin_name("../bad").is_err());
         assert!(validate_plugin_name("bad/name").is_err());
         assert!(validate_plugin_name("").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_plugins_uses_python_override_and_passes_action_and_args() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_PLUGINS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_PLUGINS_PYTHON", &fake_python);
+        bridge_install(InstallArgs {
+            identifier: String::from("owner/repo"),
+            force: true,
+            enable: false,
+            no_enable: true,
+        })
+        .unwrap();
+        bridge_plugins(None, &[]).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=install argv=owner/repo --force --no-enable"));
+        assert!(output.contains("action= argv="));
+
+        remove_env_var("HERMES_PLUGINS_PYTHON");
     }
 }
