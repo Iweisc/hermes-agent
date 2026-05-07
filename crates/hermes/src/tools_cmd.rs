@@ -315,6 +315,7 @@ const RECONFIGURABLE_TOOLSETS: &[&str] = &[
 
 const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "web",
+    "browser",
     "vision",
     "moa",
     "homeassistant",
@@ -326,6 +327,7 @@ const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &[
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
 const DEFAULT_SEARXNG_URL: &str = "http://localhost:8080";
+const DEFAULT_CAMOFOX_URL: &str = "http://localhost:9377";
 const DEFAULT_FAL_IMAGE_MODEL: &str = "fal-ai/flux-2/klein/9b";
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-2-medium";
 const DEFAULT_XAI_IMAGE_MODEL: &str = "grok-imagine-image";
@@ -589,6 +591,7 @@ fn run_native_tool_reconfigure_with_io(
 ) -> Result<(), Box<dyn Error>> {
     match toolset {
         "web" => reconfigure_web_with_io(context, input, output),
+        "browser" => reconfigure_browser_with_io(context, input, output),
         "vision" => reconfigure_simple_env_tool_with_io(
             context,
             input,
@@ -728,6 +731,123 @@ fn reconfigure_web_with_io(
         "Saved web backend: {}",
         nested_string(&root, &["web", "backend"]).unwrap_or_default()
     )?;
+    Ok(())
+}
+
+fn reconfigure_browser_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_provider = nested_string(&root, &["browser", "cloud_provider"]).unwrap_or_default();
+    let current_use_gateway = nested_bool(&root, &["browser", "use_gateway"]).unwrap_or(false);
+    let current_camofox_url = env_value_for_context(context, "CAMOFOX_URL");
+    let compatibility_recommended = current_use_gateway
+        || !matches!(
+            current_provider.as_str(),
+            "" | "local" | "browserbase" | "browser-use" | "firecrawl" | "camofox"
+        );
+
+    writeln!(output)?;
+    writeln!(output, "Browser Automation")?;
+    let choices = [
+        "Local Browser",
+        "Browserbase",
+        "Browser Use",
+        "Firecrawl",
+        "Camofox",
+        if compatibility_recommended {
+            "Use compatibility flow (recommended)"
+        } else {
+            "Use compatibility flow"
+        },
+    ];
+    let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
+    if selection == choices.len() - 1 {
+        return run_python_tools_reconfigure_toolset("browser");
+    }
+
+    {
+        let browser = ensure_mapping(&mut root, "browser");
+        browser.insert(
+            yaml_key("cloud_provider"),
+            Value::String(
+                match selection {
+                    0 => "local",
+                    1 => "browserbase",
+                    2 => "browser-use",
+                    3 => "firecrawl",
+                    4 => "camofox",
+                    _ => unreachable!(),
+                }
+                .to_string(),
+            ),
+        );
+        browser.insert(yaml_key("use_gateway"), Value::Bool(false));
+    }
+
+    match selection {
+        0 => {
+            writeln!(output, "Browser set to local mode.")?;
+        }
+        1 => {
+            writeln!(output, "Get key at: https://browserbase.com")?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "BROWSERBASE_API_KEY",
+                "Browserbase API key",
+            )?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "BROWSERBASE_PROJECT_ID",
+                "Browserbase project ID",
+            )?;
+            writeln!(output, "Browser cloud provider set to: browserbase")?;
+        }
+        2 => {
+            writeln!(output, "Get key at: https://browser-use.com")?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "BROWSER_USE_API_KEY",
+                "Browser Use API key",
+            )?;
+            writeln!(output, "Browser cloud provider set to: browser-use")?;
+        }
+        3 => {
+            writeln!(output, "Get key at: https://firecrawl.dev")?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "FIRECRAWL_API_KEY",
+                "Firecrawl API key",
+            )?;
+            writeln!(output, "Browser cloud provider set to: firecrawl")?;
+        }
+        4 => {
+            prompt_url_env_update(
+                context,
+                input,
+                output,
+                "CAMOFOX_URL",
+                "Camofox server URL",
+                current_camofox_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CAMOFOX_URL),
+            )?;
+            writeln!(output, "Browser cloud provider set to: camofox")?;
+        }
+        _ => unreachable!(),
+    }
+
+    write_yaml_mapping(&context.config_path(), &root)?;
     Ok(())
 }
 
@@ -2230,7 +2350,32 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
-    fn tools_reconfigure_browser_uses_python_override() {
+    fn tools_reconfigure_browserbase_updates_keys_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-browserbase");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - browser\n",
+        );
+
+        let mut input = Cursor::new(b"2\nbb-test-key\nproj-test-id\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_browser_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("cloud_provider: browserbase"));
+        assert!(saved.contains("use_gateway: false"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("BROWSERBASE_API_KEY=bb-test-key"));
+        assert!(env_text.contains("BROWSERBASE_PROJECT_ID=proj-test-id"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Browser Automation"));
+        assert!(rendered.contains("Browser cloud provider set to: browserbase"));
+    }
+
+    #[test]
+    fn tools_reconfigure_browser_uses_python_override_when_requested() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let root = project_root();
         let temp = temp_path("bridge");
@@ -2261,7 +2406,7 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         }
 
         unsafe { std::env::set_var("HERMES_TOOLS_PYTHON", &python) };
-        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut input = Cursor::new(b"1\n6\n".to_vec());
         let mut output = Vec::new();
         let result = run_tools_reconfigure_with_io(&context, &mut input, &mut output);
         unsafe { std::env::remove_var("HERMES_TOOLS_PYTHON") };
