@@ -14,7 +14,8 @@ use getrandom::fill as fill_random;
 use hermes_core::{
     AuthStatusSummary, HermesContext, LoadedConfig, OPENROUTER_BASE_URL, clear_provider_auth_state,
     get_active_auth_provider, get_auth_status_summary, get_provider_profile,
-    normalize_provider_alias,
+    normalize_provider_alias, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_qwen_runtime_credentials,
 };
 use reqwest::Url;
 use reqwest::blocking::Client;
@@ -201,6 +202,9 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     if should_use_native_auth_add(args) {
         return native_auth_add_api_key(context, args);
     }
+    if should_use_native_runtime_oauth_add(args) {
+        return native_auth_add_runtime_oauth(context, args);
+    }
     run_python_auth_add(args)
 }
 
@@ -376,6 +380,32 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     }
 }
 
+fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    if !matches!(
+        provider.as_str(),
+        "google-gemini-cli" | "qwen-oauth" | "minimax-oauth"
+    ) {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") | None => {
+            args.api_key.is_none()
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
+                && !args.no_browser
+                && args.timeout.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
 fn native_auth_add_api_key(
     context: &HermesContext,
     args: &AuthAddArgs,
@@ -460,6 +490,76 @@ fn native_auth_add_api_key(
     println!(
         "Added {} credential #{}: \"{}\"",
         provider, entry_count, label
+    );
+    Ok(())
+}
+
+fn native_auth_add_runtime_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let (source, access_token, refresh_token, base_url, derived_label) = match provider.as_str() {
+        "google-gemini-cli" => {
+            let creds = resolve_google_gemini_runtime_credentials(context.hermes_home().as_path())?;
+            (
+                "manual:google_pkce".to_string(),
+                creds.access_token,
+                Some(creds.refresh_token),
+                None,
+                creds.email,
+            )
+        }
+        "qwen-oauth" => {
+            let creds = resolve_qwen_runtime_credentials()?;
+            let label = label_from_token(&creds.access_token, &default_label);
+            (
+                "manual:qwen_cli".to_string(),
+                creds.access_token,
+                None,
+                non_empty_trimmed_owned(&creds.base_url),
+                label,
+            )
+        }
+        "minimax-oauth" => {
+            let creds = resolve_minimax_oauth_runtime_credentials(context.hermes_home().as_path())?;
+            let label = label_from_token(&creds.access_token, &default_label);
+            (
+                "manual:minimax_oauth".to_string(),
+                creds.access_token,
+                None,
+                non_empty_trimmed_owned(&creds.base_url),
+                label,
+            )
+        }
+        _ => return run_python_auth_add(args),
+    };
+    let label = requested_label.unwrap_or(derived_label);
+    let stored_count = add_auth_pool_entry(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source,
+            access_token,
+            refresh_token,
+            base_url,
+        },
+    )?;
+    println!(
+        "Added {} OAuth credential #{}: \"{}\"",
+        provider, stored_count, label
     );
     Ok(())
 }
@@ -1640,6 +1740,15 @@ fn save_auth_store_json(hermes_home: &Path, value: &JsonValue) -> Result<(), Box
     atomic_write(&auth_path, rendered.as_bytes())
 }
 
+struct NewPoolEntry {
+    label: String,
+    auth_type: String,
+    source: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    base_url: Option<String>,
+}
+
 fn ensure_json_object<'a>(
     root: &'a mut serde_json::Map<String, JsonValue>,
     key: &str,
@@ -1663,6 +1772,111 @@ fn generate_short_id() -> String {
     } else {
         hex[hex.len() - 6..].to_string()
     }
+}
+
+fn next_provider_entry_index(hermes_home: &Path, provider: &str) -> Result<usize, Box<dyn Error>> {
+    let auth_store = load_auth_store_json(hermes_home)?;
+    let count = auth_store
+        .get("credential_pool")
+        .and_then(JsonValue::as_object)
+        .and_then(|pool| pool.get(provider))
+        .and_then(JsonValue::as_array)
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    Ok(count + 1)
+}
+
+fn add_auth_pool_entry(
+    hermes_home: &Path,
+    provider: &str,
+    entry: NewPoolEntry,
+) -> Result<usize, Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let root = auth_store
+        .as_object_mut()
+        .ok_or("auth store is not a JSON object")?;
+    if !root.contains_key("version") {
+        root.insert("version".to_string(), JsonValue::from(1));
+    }
+    if !root.contains_key("providers") {
+        root.insert(
+            "providers".to_string(),
+            JsonValue::Object(Default::default()),
+        );
+    }
+    let pool = ensure_json_object(root, "credential_pool")?;
+    let provider_entries = pool
+        .entry(provider.to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let provider_entries = provider_entries
+        .as_array_mut()
+        .ok_or("credential_pool entry is not an array")?;
+    let existing = provider_entries
+        .iter()
+        .filter_map(parse_pool_entry)
+        .collect::<Vec<_>>();
+    let priority = existing
+        .iter()
+        .map(|existing| existing.priority)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    let mut payload = JsonMap::new();
+    payload.insert("id".to_string(), JsonValue::String(generate_short_id()));
+    payload.insert("label".to_string(), JsonValue::String(entry.label));
+    payload.insert("auth_type".to_string(), JsonValue::String(entry.auth_type));
+    payload.insert("priority".to_string(), JsonValue::from(priority));
+    payload.insert("source".to_string(), JsonValue::String(entry.source));
+    payload.insert(
+        "access_token".to_string(),
+        JsonValue::String(entry.access_token),
+    );
+    if let Some(refresh_token) = entry.refresh_token.filter(|value| !value.trim().is_empty()) {
+        payload.insert(
+            "refresh_token".to_string(),
+            JsonValue::String(refresh_token),
+        );
+    }
+    if let Some(base_url) = entry.base_url.filter(|value| !value.trim().is_empty()) {
+        payload.insert("base_url".to_string(), JsonValue::String(base_url));
+    }
+    provider_entries.push(JsonValue::Object(payload));
+    let count = provider_entries.len();
+    save_auth_store_json(hermes_home, &auth_store)?;
+    Ok(count)
+}
+
+fn oauth_default_label(provider: &str, count: usize) -> String {
+    format!("{provider}-oauth-{count}")
+}
+
+fn label_from_token(token: &str, fallback: &str) -> String {
+    let Some(claims) = decode_jwt_claims(token) else {
+        return fallback.to_string();
+    };
+    for key in ["email", "preferred_username", "upn"] {
+        if let Some(value) = claims.get(key).and_then(JsonValue::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn decode_jwt_claims(token: &str) -> Option<JsonMap<String, JsonValue>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    serde_json::from_slice::<JsonValue>(&decoded)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+fn non_empty_trimmed_owned(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn resolve_auth_remove_target<'a>(
@@ -2115,6 +2329,136 @@ mod tests {
         assert!(logged.contains("-c"));
         assert!(logged.contains("auth_add_command"));
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn auth_add_google_gemini_oauth_uses_native_runtime() {
+        let home = temp_path("auth-add-google");
+        let auth_dir = home.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh|proj-123|managed-456",
+                "access": "google-fresh",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "google-gemini-cli".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["google-gemini-cli"][0];
+        assert_eq!(entry["label"], "dev@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:google_pkce");
+        assert_eq!(entry["access_token"], "google-fresh");
+        assert_eq!(entry["refresh_token"], "google-refresh");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_qwen_oauth_uses_native_runtime() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-qwen-home");
+        let qwen_dir = home.join(".qwen");
+        fs::create_dir_all(&qwen_dir).unwrap();
+        fs::write(
+            qwen_dir.join("oauth_creds.json"),
+            json!({
+                "access_token": "header.eyJlbWFpbCI6InF3ZW5AZXhhbXBsZS5jb20ifQ.sig",
+                "refresh_token": "qwen-refresh",
+                "token_type": "Bearer",
+                "resource_url": "portal.qwen.ai",
+                "expiry_date": i64::MAX / 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let previous_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "qwen-oauth".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        );
+
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result.unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["qwen-oauth"][0];
+        assert_eq!(entry["label"], "qwen@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:qwen_cli");
+        assert_eq!(entry["base_url"], "https://portal.qwen.ai/v1");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_minimax_oauth_uses_native_runtime() {
+        let home = temp_path("auth-add-minimax");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "minimax-oauth": {
+                        "access_token": "header.eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJtaW5pQGV4YW1wbGUuY29tIn0.sig",
+                        "refresh_token": "refresh-fresh",
+                        "portal_base_url": "https://api.minimax.io",
+                        "inference_base_url": "https://api.minimax.io/anthropic",
+                        "client_id": "client-mini",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "minimax-oauth".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["minimax-oauth"][0];
+        assert_eq!(entry["label"], "mini@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:minimax_oauth");
+        assert_eq!(entry["base_url"], "https://api.minimax.io/anthropic");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
