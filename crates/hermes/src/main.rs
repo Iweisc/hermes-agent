@@ -375,7 +375,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
         Command::Tools { command } => print_tools(&context, &config, command)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
-        Command::Whatsapp => whatsapp_cmd::print_whatsapp()?,
+        Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
     }
 
