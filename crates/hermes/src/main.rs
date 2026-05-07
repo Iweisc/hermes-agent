@@ -2,6 +2,7 @@ mod acp_cmd;
 mod auth_cmd;
 mod backup;
 mod checkpoints_cmd;
+mod claw_cmd;
 mod compat_cmd;
 mod completion;
 mod config_cmd;
@@ -97,9 +98,10 @@ enum Command {
     Memory(compat_cmd::CompatArgs),
     Mcp(compat_cmd::CompatArgs),
     Insights(insights_cmd::InsightsArgs),
-    Claw(compat_cmd::CompatArgs),
-    Migrate(compat_cmd::CompatArgs),
-    Cleanup(compat_cmd::CompatArgs),
+    Claw {
+        #[command(subcommand)]
+        command: Option<claw_cmd::ClawCommand>,
+    },
     Acp(acp_cmd::AcpArgs),
     Logout(auth_cmd::LogoutArgs),
     Auth {
@@ -313,9 +315,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Memory(args) => compat_cmd::print_memory(args)?,
         Command::Mcp(args) => compat_cmd::print_mcp(args)?,
         Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
-        Command::Claw(args) => compat_cmd::print_claw(args)?,
-        Command::Migrate(args) => compat_cmd::print_migrate(args)?,
-        Command::Cleanup(args) => compat_cmd::print_cleanup(args)?,
+        Command::Claw { command } => claw_cmd::print_claw(command)?,
         Command::Acp(args) => acp_cmd::print_acp(args)?,
         Command::Slack { command } => slack_cmd::print_slack(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
