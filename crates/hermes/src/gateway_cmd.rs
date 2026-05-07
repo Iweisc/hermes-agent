@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
@@ -117,8 +117,15 @@ struct LegacyGatewayUnit {
 
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
-        None => bridge_gateway(args.accept_hooks, &[String::from("run")]),
-        Some(GatewayCommand::Run(run)) => bridge_gateway(args.accept_hooks, &bridge_run_args(run)),
+        None => print_gateway_run(
+            args.accept_hooks,
+            GatewayRunArgs {
+                verbose: 0,
+                quiet: false,
+                replace: false,
+            },
+        ),
+        Some(GatewayCommand::Run(run)) => print_gateway_run(args.accept_hooks, run),
         Some(GatewayCommand::Start(service)) => {
             print_gateway_start(context, args.accept_hooks, service)
         }
@@ -234,7 +241,14 @@ fn print_gateway_restart(
 
     let _ = stop_manual_gateway(context)?;
     println!("Starting gateway...");
-    bridge_gateway(accept_hooks, &[String::from("run")])
+    print_gateway_run(
+        accept_hooks,
+        GatewayRunArgs {
+            verbose: 0,
+            quiet: false,
+            replace: false,
+        },
+    )
 }
 
 fn print_gateway_uninstall(
@@ -479,28 +493,42 @@ fn bridge_gateway(accept_hooks: bool, argv: &[String]) -> Result<(), Box<dyn Err
     launch_python_main_command("gateway", argv, Some("HERMES_GATEWAY_PYTHON"), &extra_env)
 }
 
-fn bridge_run_args(args: GatewayRunArgs) -> Vec<String> {
-    let mut argv = Vec::new();
-    if args.verbose > 0 {
-        argv.push("run".to_string());
+fn print_gateway_run(accept_hooks: bool, args: GatewayRunArgs) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
+        .ok_or("could not find a Python interpreter for gateway launch")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_GATEWAY_VERBOSE", args.verbose.to_string())
+        .env("HERMES_GATEWAY_QUIET", if args.quiet { "1" } else { "0" })
+        .env(
+            "HERMES_GATEWAY_REPLACE",
+            if args.replace { "1" } else { "0" },
+        );
+    if accept_hooks {
+        command.env("HERMES_ACCEPT_HOOKS", "1");
     }
-    for _ in 0..args.verbose {
-        argv.push("--verbose".to_string());
+    command.arg("-c").arg(GATEWAY_RUN_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
     }
-    if args.quiet {
-        if argv.is_empty() {
-            argv.push("run".to_string());
-        }
-        argv.push("--quiet".to_string());
-    }
-    if args.replace {
-        if argv.is_empty() {
-            argv.push("run".to_string());
-        }
-        argv.push("--replace".to_string());
-    }
-    argv
+    Err(exit_status_message("gateway", status).into())
 }
+
+const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from hermes_cli.gateway import run_gateway\n",
+    "run_gateway(\n",
+    "    verbose=int(os.environ.get('HERMES_GATEWAY_VERBOSE', '0')),\n",
+    "    quiet=os.environ.get('HERMES_GATEWAY_QUIET') == '1',\n",
+    "    replace=os.environ.get('HERMES_GATEWAY_REPLACE') == '1',\n",
+    ")\n",
+);
 
 fn bridge_service_args(subcommand: &str, args: GatewayServiceArgs) -> Vec<String> {
     let mut argv = vec![subcommand.to_string()];
@@ -531,6 +559,13 @@ fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
         argv.push(user.to_string());
     }
     argv
+}
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 impl GatewaySnapshot {
@@ -1602,15 +1637,18 @@ mod tests {
     }
 
     #[test]
-    fn bridge_run_args_omits_run_for_default_invocation() {
-        assert!(
-            bridge_run_args(GatewayRunArgs {
-                verbose: 0,
-                quiet: false,
-                replace: false,
-            })
-            .is_empty()
-        );
+    fn gateway_run_args_parse_replace_verbose_and_quiet() {
+        let parsed =
+            GatewayHarness::try_parse_from(["gateway", "run", "-vv", "--quiet", "--replace"])
+                .unwrap();
+        match parsed.args.command.unwrap() {
+            GatewayCommand::Run(args) => {
+                assert_eq!(args.verbose, 2);
+                assert!(args.quiet);
+                assert!(args.replace);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
@@ -1691,6 +1729,51 @@ mod tests {
             },
         );
         assert_eq!(args, vec!["restart", "--system", "--all"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_run_uses_python_override_and_env_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'accept=%s verbose=%s quiet=%s replace=%s\\n' \\\n\
+    \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_VERBOSE\" \\\n\
+    \"$HERMES_GATEWAY_QUIET\" \"$HERMES_GATEWAY_REPLACE\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        print_gateway_run(
+            true,
+            GatewayRunArgs {
+                verbose: 2,
+                quiet: true,
+                replace: true,
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("accept=1 verbose=2 quiet=1 replace=1"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
     }
 
     #[test]
