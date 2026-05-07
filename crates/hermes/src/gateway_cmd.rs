@@ -1279,15 +1279,12 @@ fn generate_systemd_unit(
     run_as_user: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
     let root = project_root();
-    let python = resolve_repo_python(&root, None)
-        .ok_or("could not find a Python interpreter for gateway service install")?;
     let mut gateway_binary = resolve_gateway_service_binary(context, None)?;
     let mut working_dir = root;
     let mut hermes_home = context.hermes_home();
     let profile_arg = gateway_profile_arg(context);
-    let mut venv_dir = derive_venv_dir(&python).unwrap_or_else(|| working_dir.join(".venv"));
-    let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
-    let mut path_entries = build_gateway_path_entries(&working_dir, &venv_bin);
+    let mut venv_dir = resolve_gateway_virtual_env(&working_dir);
+    let mut path_entries = build_gateway_path_entries(&working_dir, venv_dir.as_deref());
     let mut wanted_by = "default.target";
     let mut identity = None;
 
@@ -1298,7 +1295,8 @@ fn generate_systemd_unit(
         working_dir =
             remap_path_for_target_user(&working_dir, context.home_dir(), &resolved.home_dir);
         hermes_home = remap_hermes_home_for_target_user(context, &resolved.home_dir);
-        venv_dir = remap_path_for_target_user(&venv_dir, context.home_dir(), &resolved.home_dir);
+        venv_dir = venv_dir
+            .map(|path| remap_path_for_target_user(&path, context.home_dir(), &resolved.home_dir));
         path_entries = path_entries
             .into_iter()
             .map(|entry| {
@@ -1341,9 +1339,14 @@ fn generate_systemd_unit(
         service_lines.push(format!("Environment=\"USER={}\"", identity.username));
         service_lines.push(format!("Environment=\"LOGNAME={}\"", identity.username));
     }
+    service_lines.push(format!("Environment=\"PATH={sane_path}\""));
+    if let Some(venv_dir) = venv_dir.as_ref() {
+        service_lines.push(format!(
+            "Environment=\"VIRTUAL_ENV={}\"",
+            venv_dir.display()
+        ));
+    }
     service_lines.extend([
-        format!("Environment=\"PATH={sane_path}\""),
-        format!("Environment=\"VIRTUAL_ENV={}\"", venv_dir.display()),
         format!("Environment=\"HERMES_HOME={}\"", hermes_home.display()),
         String::from("Restart=always"),
         String::from("RestartSec=60"),
@@ -1364,12 +1367,16 @@ fn generate_systemd_unit(
     ))
 }
 
-fn build_gateway_path_entries(root: &Path, venv_bin: &Path) -> Vec<String> {
+fn build_gateway_path_entries(root: &Path, venv_dir: Option<&Path>) -> Vec<String> {
     let mut path_entries = Vec::new();
-    for candidate in [
-        venv_bin.to_path_buf(),
-        root.join("node_modules").join(".bin"),
-    ] {
+    if let Some(venv_dir) = venv_dir {
+        let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let rendered = venv_bin.display().to_string();
+        if !rendered.is_empty() {
+            path_entries.push(rendered);
+        }
+    }
+    for candidate in [root.join("node_modules").join(".bin")] {
         let rendered = candidate.display().to_string();
         if !rendered.is_empty() {
             path_entries.push(rendered);
@@ -1382,6 +1389,7 @@ fn build_gateway_path_entries(root: &Path, venv_bin: &Path) -> Vec<String> {
                 .filter(|entry| !entry.is_empty()),
         );
     }
+    path_entries.dedup();
     path_entries
 }
 
@@ -1667,31 +1675,13 @@ fn launchd_target(context: &HermesContext) -> String {
 
 fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Error>> {
     let root = project_root();
-    let python = resolve_repo_python(&root, None)
-        .ok_or("could not find a Python interpreter for gateway service install")?;
     let gateway_binary = resolve_gateway_service_binary(context, None)?;
     let working_dir = root.display().to_string();
     let hermes_home = context.hermes_home().display().to_string();
     let log_dir = context.hermes_home().join("logs");
     let profile_arg = gateway_profile_arg(context);
-    let venv_dir = derive_venv_dir(&python).unwrap_or_else(|| root.join(".venv"));
-    let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
-    let node_bin = root.join("node_modules").join(".bin");
-    let mut path_entries = Vec::new();
-    for candidate in [venv_bin, node_bin] {
-        let rendered = candidate.display().to_string();
-        if !rendered.is_empty() {
-            path_entries.push(rendered);
-        }
-    }
-    if let Some(path) = env::var_os("PATH") {
-        path_entries.extend(
-            env::split_paths(&path)
-                .map(|entry| entry.display().to_string())
-                .filter(|entry| !entry.is_empty()),
-        );
-    }
-    path_entries.dedup();
+    let venv_dir = resolve_gateway_virtual_env(&root);
+    let path_entries = build_gateway_path_entries(&root, venv_dir.as_deref());
     let sane_path = path_entries.join(":");
 
     let mut program_args = vec![gateway_binary.display().to_string()];
@@ -1709,11 +1699,25 @@ fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Err
         .collect::<Vec<_>>()
         .join("\n");
 
+    let mut env_xml = vec![
+        format!("        <key>PATH</key>\n        <string>{sane_path}</string>"),
+        format!("        <key>HERMES_HOME</key>\n        <string>{hermes_home}</string>"),
+    ];
+    if let Some(venv_dir) = venv_dir.as_ref() {
+        env_xml.insert(
+            1,
+            format!(
+                "        <key>VIRTUAL_ENV</key>\n        <string>{}</string>",
+                venv_dir.display()
+            ),
+        );
+    }
+
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{}</string>\n\n    <key>ProgramArguments</key>\n    <array>\n{}\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>{working_dir}</string>\n\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{sane_path}</string>\n        <key>VIRTUAL_ENV</key>\n        <string>{}</string>\n        <key>HERMES_HOME</key>\n        <string>{hermes_home}</string>\n    </dict>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>\n\n    <key>StandardOutPath</key>\n    <string>{}/gateway.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>{}/gateway.error.log</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{}</string>\n\n    <key>ProgramArguments</key>\n    <array>\n{}\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>{working_dir}</string>\n\n    <key>EnvironmentVariables</key>\n    <dict>\n{}\n    </dict>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>\n\n    <key>StandardOutPath</key>\n    <string>{}/gateway.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>{}/gateway.error.log</string>\n</dict>\n</plist>\n",
         launchd_label(context),
         args_xml,
-        venv_dir.display(),
+        env_xml.join("\n"),
         log_dir.display(),
         log_dir.display()
     ))
@@ -1758,8 +1762,42 @@ fn gateway_profile_arg(context: &HermesContext) -> String {
 fn derive_venv_dir(python: &Path) -> Option<PathBuf> {
     let parent = python.parent()?;
     let name = parent.file_name()?.to_string_lossy();
-    if name == "bin" || name == "Scripts" {
-        return parent.parent().map(Path::to_path_buf);
+    if name != "bin" && name != "Scripts" {
+        return None;
+    }
+    let venv_dir = parent.parent()?.to_path_buf();
+    if venv_dir.join("pyvenv.cfg").exists() {
+        return Some(venv_dir);
+    }
+    let file_name = venv_dir.file_name()?.to_string_lossy();
+    if file_name == ".venv" || file_name == "venv" {
+        return Some(venv_dir);
+    }
+    None
+}
+
+fn resolve_gateway_virtual_env(project_root: &Path) -> Option<PathBuf> {
+    if let Some(value) = env_nonempty("VIRTUAL_ENV") {
+        return Some(PathBuf::from(value));
+    }
+    if let Some(venv_dir) =
+        resolve_repo_python(project_root, Some("HERMES_GATEWAY_PYTHON"))
+            .and_then(|python| derive_venv_dir(&python))
+    {
+        return Some(venv_dir);
+    }
+    for candidate in [
+        project_root.join(".venv"),
+        project_root.join("venv"),
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".hermes")
+            .join("hermes-agent")
+            .join("venv"),
+    ] {
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
     None
 }
@@ -2629,6 +2667,58 @@ exit 9\n",
         assert!(plist.contains(&xml_escape(&current_exe.display().to_string())));
         assert!(!plist.contains("hermes_cli.main"));
         assert!(plist.contains("HERMES_HOME"));
+    }
+
+    #[test]
+    fn resolve_gateway_virtual_env_prefers_explicit_env() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let venv = temp.path().join("custom-venv");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&venv).unwrap();
+        let original_home = env::var_os("HOME");
+        set_env_var("HOME", &home);
+        set_env_var("VIRTUAL_ENV", &venv);
+
+        let resolved = resolve_gateway_virtual_env(&root).unwrap();
+        assert_eq!(resolved, venv);
+
+        remove_env_var("VIRTUAL_ENV");
+        if let Some(home) = original_home {
+            set_env_var("HOME", home);
+        } else {
+            remove_env_var("HOME");
+        }
+    }
+
+    #[test]
+    fn resolve_gateway_virtual_env_ignores_system_python_layout() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let python = temp.path().join("bin").join("python3");
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+        let original_home = env::var_os("HOME");
+        set_env_var("HOME", &home);
+        set_env_var("HERMES_GATEWAY_PYTHON", &python);
+        remove_env_var("VIRTUAL_ENV");
+
+        let resolved = resolve_gateway_virtual_env(&root);
+        assert!(resolved.is_none());
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+        if let Some(home) = original_home {
+            set_env_var("HOME", home);
+        } else {
+            remove_env_var("HOME");
+        }
     }
 
     #[test]
