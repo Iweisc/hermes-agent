@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 
 use clap::{Args, Subcommand};
 use hermes_core::HermesContext;
@@ -11,7 +11,7 @@ use serde_yaml::{Mapping, Value};
 use tempfile::TempDir;
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
-use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::python_bridge::project_root;
 
 #[derive(Subcommand, Debug)]
 pub enum PluginsCommand {
@@ -61,6 +61,18 @@ struct EnvSpec {
     secret: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderInfo {
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderOption {
+    name: String,
+    description: String,
+}
+
 const SUPPORTED_MANIFEST_VERSION: i64 = 1;
 
 pub fn print_plugins(
@@ -68,7 +80,7 @@ pub fn print_plugins(
     command: Option<PluginsCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        None => bridge_plugins(None, &[]),
+        None => toggle_plugins(context),
         Some(PluginsCommand::Install(args)) => install_plugin(context, args),
         Some(PluginsCommand::Update { name }) => update_plugin(context, &name),
         Some(PluginsCommand::List) => print_list(context),
@@ -78,53 +90,41 @@ pub fn print_plugins(
     }
 }
 
-fn bridge_plugins(action: Option<&str>, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_PLUGINS_PYTHON"))
-        .ok_or("could not find a Python interpreter for plugins")?;
+fn toggle_plugins(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let entries = discover_all_plugins(context)?;
+    let enabled = load_plugin_set(context, "enabled")?;
+    let disabled = load_plugin_set(context, "disabled")?;
+    let memory_options = discover_memory_providers(context)
+        .into_iter()
+        .map(|provider| ProviderOption {
+            name: provider.name,
+            description: provider.description,
+        })
+        .collect::<Vec<_>>();
+    let context_options = discover_context_engines(context)?;
 
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_PLUGINS_ACTION", action.unwrap_or(""))
-        .arg("-c")
-        .arg(PLUGINS_BOOTSTRAP)
-        .args(passthrough);
-
-    let status = command.status()?;
-    if status.success() {
+    if entries.is_empty() && memory_options.is_empty() && context_options.is_empty() {
+        println!("No plugins installed and no provider categories available.");
+        println!("Install with: hermes plugins install owner/repo");
         return Ok(());
     }
-    Err(exit_status_message("plugins", status).into())
-}
-
-const PLUGINS_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "import sys\n",
-    "from hermes_cli.plugins_cmd import plugins_command\n",
-    "action = (os.environ.get('HERMES_PLUGINS_ACTION') or '').strip()\n",
-    "parser = argparse.ArgumentParser(prog='hermes plugins')\n",
-    "parser.set_defaults(plugins_action=(action or None))\n",
-    "if action == 'install':\n",
-    "    parser.add_argument('identifier')\n",
-    "    parser.add_argument('--force', '-f', action='store_true')\n",
-    "    group = parser.add_mutually_exclusive_group()\n",
-    "    group.add_argument('--enable', action='store_true')\n",
-    "    group.add_argument('--no-enable', action='store_true')\n",
-    "elif action == 'update':\n",
-    "    parser.add_argument('name')\n",
-    "elif action:\n",
-    "    raise SystemExit(f'unsupported plugins action: {action}')\n",
-    "plugins_command(parser.parse_args(sys.argv[1:]))\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
+    if !io::stdin().is_terminal() {
+        println!("Interactive mode requires a terminal.");
+        return Ok(());
     }
+
+    if !entries.is_empty() {
+        configure_general_plugins(context, &entries, &enabled, &disabled)?;
+    }
+    if !memory_options.is_empty() {
+        configure_memory_provider(context, &memory_options)?;
+    }
+    if !context_options.is_empty() || current_context_engine(context)? != "compressor" {
+        configure_context_engine(context, &context_options)?;
+    }
+
+    println!("Changes take effect on next session.");
+    Ok(())
 }
 
 fn install_plugin(context: &HermesContext, args: InstallArgs) -> Result<(), Box<dyn Error>> {
@@ -591,6 +591,234 @@ fn read_prompt(prompt: &str, secret: bool) -> Result<Option<String>, Box<dyn Err
     Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
 }
 
+fn configure_general_plugins(
+    context: &HermesContext,
+    entries: &[PluginEntry],
+    enabled: &BTreeSet<String>,
+    disabled: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    println!("\nGeneral Plugins");
+    for (index, entry) in entries.iter().enumerate() {
+        let marker = if disabled.contains(&entry.name) {
+            " "
+        } else if enabled.contains(&entry.name) {
+            "x"
+        } else {
+            " "
+        };
+        let mut label = entry.name.clone();
+        if !entry.description.trim().is_empty() {
+            label.push_str(" — ");
+            label.push_str(entry.description.trim());
+        }
+        if entry.source == "bundled" {
+            label.push_str(" [bundled]");
+        }
+        println!("  {:>2}. [{}] {}", index + 1, marker, label);
+    }
+
+    let Some(input) = read_prompt(
+        "\nToggle plugin numbers separated by spaces or commas (Enter to keep): ",
+        false,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let mut chosen = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (enabled.contains(&entry.name) && !disabled.contains(&entry.name)).then_some(index)
+        })
+        .collect::<BTreeSet<_>>();
+
+    for token in input.split(|ch: char| ch.is_ascii_whitespace() || ch == ',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let index = trimmed
+            .parse::<usize>()
+            .map_err(|_| format!("invalid plugin selection: {trimmed}"))?;
+        if index == 0 || index > entries.len() {
+            return Err(format!("plugin selection {index} is out of range").into());
+        }
+        let zero_based = index - 1;
+        if !chosen.insert(zero_based) {
+            chosen.remove(&zero_based);
+        }
+    }
+
+    let mut new_enabled = BTreeSet::new();
+    let mut new_disabled = disabled.clone();
+    for (index, entry) in entries.iter().enumerate() {
+        if chosen.contains(&index) {
+            new_enabled.insert(entry.name.clone());
+            new_disabled.remove(&entry.name);
+        } else {
+            new_disabled.insert(entry.name.clone());
+        }
+    }
+
+    if &new_enabled != enabled || &new_disabled != disabled {
+        save_plugin_set(context, "enabled", &new_enabled)?;
+        save_plugin_set(context, "disabled", &new_disabled)?;
+        println!(
+            "Saved plugin selection: {} enabled, {} disabled.",
+            new_enabled.len(),
+            entries.len().saturating_sub(new_enabled.len())
+        );
+    } else {
+        println!("General plugins unchanged.");
+    }
+
+    Ok(())
+}
+
+fn configure_memory_provider(
+    context: &HermesContext,
+    providers: &[ProviderOption],
+) -> Result<(), Box<dyn Error>> {
+    let current = current_memory_provider(context)?;
+    println!("\nMemory Provider");
+    println!(
+        "   0. built-in (default){}",
+        if current.is_empty() { " [current]" } else { "" }
+    );
+    for (index, provider) in providers.iter().enumerate() {
+        let current_marker = if provider.name == current {
+            " [current]"
+        } else {
+            ""
+        };
+        if provider.description.trim().is_empty() {
+            println!("  {:>2}. {}{}", index + 1, provider.name, current_marker);
+        } else {
+            println!(
+                "  {:>2}. {} — {}{}",
+                index + 1,
+                provider.name,
+                provider.description.trim(),
+                current_marker
+            );
+        }
+    }
+
+    let Some(input) = read_prompt("Select memory provider (Enter to keep): ", false)? else {
+        return Ok(());
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let selected = if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "0" | "built-in" | "builtin" | "none" | "default"
+    ) {
+        String::new()
+    } else if let Ok(index) = trimmed.parse::<usize>() {
+        let provider = providers
+            .get(
+                index
+                    .checked_sub(1)
+                    .ok_or("memory provider selection must be >= 1")?,
+            )
+            .ok_or_else(|| format!("memory provider selection {index} is out of range"))?;
+        provider.name.clone()
+    } else {
+        providers
+            .iter()
+            .find(|provider| provider.name.eq_ignore_ascii_case(trimmed))
+            .map(|provider| provider.name.clone())
+            .ok_or_else(|| format!("unknown memory provider: {trimmed}"))?
+    };
+
+    if selected != current {
+        save_memory_provider(context, &selected)?;
+        println!(
+            "Memory provider set to {}.",
+            if selected.is_empty() {
+                "built-in"
+            } else {
+                selected.as_str()
+            }
+        );
+    }
+    Ok(())
+}
+
+fn configure_context_engine(
+    context: &HermesContext,
+    engines: &[ProviderOption],
+) -> Result<(), Box<dyn Error>> {
+    let current = current_context_engine(context)?;
+    println!("\nContext Engine");
+    println!(
+        "   0. compressor (default){}",
+        if current == "compressor" {
+            " [current]"
+        } else {
+            ""
+        }
+    );
+    for (index, engine) in engines.iter().enumerate() {
+        let current_marker = if engine.name == current {
+            " [current]"
+        } else {
+            ""
+        };
+        if engine.description.trim().is_empty() {
+            println!("  {:>2}. {}{}", index + 1, engine.name, current_marker);
+        } else {
+            println!(
+                "  {:>2}. {} — {}{}",
+                index + 1,
+                engine.name,
+                engine.description.trim(),
+                current_marker
+            );
+        }
+    }
+
+    let Some(input) = read_prompt("Select context engine (Enter to keep): ", false)? else {
+        return Ok(());
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let selected = if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "0" | "compressor" | "default"
+    ) {
+        String::from("compressor")
+    } else if let Ok(index) = trimmed.parse::<usize>() {
+        let engine = engines
+            .get(
+                index
+                    .checked_sub(1)
+                    .ok_or("context engine selection must be >= 1")?,
+            )
+            .ok_or_else(|| format!("context engine selection {index} is out of range"))?;
+        engine.name.clone()
+    } else {
+        engines
+            .iter()
+            .find(|engine| engine.name.eq_ignore_ascii_case(trimmed))
+            .map(|engine| engine.name.clone())
+            .ok_or_else(|| format!("unknown context engine: {trimmed}"))?
+    };
+
+    if selected != current {
+        save_context_engine(context, &selected)?;
+        println!("Context engine set to {}.", selected);
+    }
+    Ok(())
+}
+
 fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     let entries = discover_all_plugins(context)?;
     if entries.is_empty() {
@@ -798,6 +1026,157 @@ fn user_plugins_dir(context: &HermesContext) -> Result<PathBuf, Box<dyn Error>> 
     Ok(path)
 }
 
+fn discover_memory_providers(context: &HermesContext) -> Vec<ProviderInfo> {
+    let bundled = project_root().join("plugins").join("memory");
+    let user = context.hermes_home().join("plugins");
+    discover_provider_dirs(&bundled, Some(&user), looks_like_memory_provider)
+}
+
+fn discover_context_engines(
+    context: &HermesContext,
+) -> Result<Vec<ProviderOption>, Box<dyn Error>> {
+    let bundled = project_root().join("plugins").join("context_engine");
+    let user = context.hermes_home().join("plugins");
+    let providers = discover_provider_dirs(&bundled, Some(&user), looks_like_context_engine);
+    Ok(providers
+        .into_iter()
+        .map(|provider| ProviderOption {
+            name: provider.name,
+            description: provider.description,
+        })
+        .collect())
+}
+
+fn discover_provider_dirs(
+    bundled_root: &Path,
+    user_root: Option<&Path>,
+    predicate: fn(&Path) -> bool,
+) -> Vec<ProviderInfo> {
+    let mut results = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for (root, require_marker) in [
+        (bundled_root, false),
+        (user_root.unwrap_or(Path::new("")), true),
+    ] {
+        if root.as_os_str().is_empty() || !root.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !path.is_dir() || name.starts_with(['.', '_']) || seen.contains(&name) {
+                continue;
+            }
+            let init = path.join("__init__.py");
+            if !init.exists() {
+                continue;
+            }
+            if require_marker && !predicate(&init) {
+                continue;
+            }
+            let description = read_plugin_description(&path).unwrap_or_default();
+            seen.insert(name.clone());
+            results.push(ProviderInfo { name, description });
+        }
+    }
+
+    results.sort_by(|left, right| left.name.cmp(&right.name));
+    results
+}
+
+fn looks_like_memory_provider(init_file: &Path) -> bool {
+    let Ok(source) = fs::read_to_string(init_file) else {
+        return false;
+    };
+    let prefix = source.chars().take(8_192).collect::<String>();
+    prefix.contains("register_memory_provider") || prefix.contains("MemoryProvider")
+}
+
+fn looks_like_context_engine(init_file: &Path) -> bool {
+    let Ok(source) = fs::read_to_string(init_file) else {
+        return false;
+    };
+    let prefix = source.chars().take(8_192).collect::<String>();
+    prefix.contains("register_context_engine") || prefix.contains("ContextEngine")
+}
+
+fn read_plugin_description(dir: &Path) -> Option<String> {
+    let manifest = manifest_path(dir)?;
+    let text = fs::read_to_string(manifest).ok()?;
+    let parsed = serde_yaml::from_str::<Value>(&text).ok()?;
+    parsed
+        .as_mapping()
+        .and_then(|mapping| mapping.get(Value::String(String::from("description"))))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn current_memory_provider(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let raw = read_raw_yaml_mapping(&context.config_path())?;
+    Ok(raw
+        .get(Value::String(String::from("memory")))
+        .and_then(Value::as_mapping)
+        .and_then(|mapping| mapping.get(Value::String(String::from("provider"))))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+fn save_memory_provider(context: &HermesContext, name: &str) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let key = Value::String(String::from("memory"));
+    let memory = if let Some(Value::Mapping(mapping)) = root.get_mut(&key) {
+        mapping
+    } else {
+        root.insert(key.clone(), Value::Mapping(Mapping::new()));
+        root.get_mut(&key)
+            .and_then(Value::as_mapping_mut)
+            .ok_or("failed to initialize memory config mapping")?
+    };
+    memory.insert(
+        Value::String(String::from("provider")),
+        Value::String(name.trim().to_string()),
+    );
+    write_yaml_mapping(&context.config_path(), &root)
+}
+
+fn current_context_engine(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let raw = read_raw_yaml_mapping(&context.config_path())?;
+    Ok(raw
+        .get(Value::String(String::from("context")))
+        .and_then(Value::as_mapping)
+        .and_then(|mapping| mapping.get(Value::String(String::from("engine"))))
+        .and_then(Value::as_str)
+        .unwrap_or("compressor")
+        .trim()
+        .to_string())
+}
+
+fn save_context_engine(context: &HermesContext, name: &str) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let key = Value::String(String::from("context"));
+    let context_mapping = if let Some(Value::Mapping(mapping)) = root.get_mut(&key) {
+        mapping
+    } else {
+        root.insert(key.clone(), Value::Mapping(Mapping::new()));
+        root.get_mut(&key)
+            .and_then(Value::as_mapping_mut)
+            .ok_or("failed to initialize context config mapping")?
+    };
+    context_mapping.insert(
+        Value::String(String::from("engine")),
+        Value::String(name.trim().to_string()),
+    );
+    write_yaml_mapping(&context.config_path(), &root)
+}
+
 fn resolve_existing_plugin_name(
     context: &HermesContext,
     raw_name: &str,
@@ -926,35 +1305,10 @@ fn validate_plugin_name(raw_name: &str) -> Result<String, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
-    #[cfg(test)]
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
-
-    #[cfg(test)]
-    fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[cfg(test)]
-    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-        unsafe {
-            env::set_var(key, value);
-        }
-    }
-
-    #[cfg(test)]
-    fn remove_env_var(key: &str) {
-        unsafe {
-            env::remove_var(key);
-        }
-    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1154,36 +1508,81 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn bridge_plugins_uses_python_override_for_bare_command() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn save_memory_and_context_provider_updates_config() {
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
+        let home = temp.path().join(".hermes");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+
+        save_memory_provider(&context, "mem0").unwrap();
+        save_context_engine(&context, "compressor").unwrap();
+
+        assert_eq!(current_memory_provider(&context).unwrap(), "mem0");
+        assert_eq!(current_context_engine(&context).unwrap(), "compressor");
+    }
+
+    #[test]
+    fn discover_context_engines_handles_empty_roots() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        let engines = discover_context_engines(&context).unwrap();
+        assert!(engines.iter().all(|engine| !engine.name.trim().is_empty()));
+    }
+
+    #[test]
+    fn configure_general_plugins_updates_enabled_and_disabled_sets() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(home.join("plugins").join("alpha")).unwrap();
+        fs::create_dir_all(home.join("plugins").join("beta")).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_PLUGINS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            home.join("plugins").join("alpha").join("plugin.yaml"),
+            "name: alpha\ndescription: alpha\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        fs::write(
+            home.join("plugins").join("beta").join("plugin.yaml"),
+            "name: beta\ndescription: beta\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
 
-        set_env_var("HERMES_PLUGINS_PYTHON", &fake_python);
-        bridge_plugins(None, &[]).unwrap();
+        let entries = discover_all_plugins(&context).unwrap();
+        let enabled = BTreeSet::from([String::from("alpha")]);
+        let disabled = BTreeSet::new();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action= argv="));
+        // Exercise the same enabled/disabled write pattern used by the toggle flow.
+        let mut chosen = BTreeSet::new();
+        chosen.insert(1usize);
 
-        remove_env_var("HERMES_PLUGINS_PYTHON");
+        let mut new_enabled = BTreeSet::new();
+        let mut new_disabled = disabled.clone();
+        for (index, entry) in entries.iter().enumerate() {
+            if chosen.contains(&index) {
+                new_enabled.insert(entry.name.clone());
+                new_disabled.remove(&entry.name);
+            } else {
+                new_disabled.insert(entry.name.clone());
+            }
+        }
+        save_plugin_set(&context, "enabled", &new_enabled).unwrap();
+        save_plugin_set(&context, "disabled", &new_disabled).unwrap();
+
+        assert!(
+            !load_plugin_set(&context, "enabled")
+                .unwrap()
+                .contains("alpha")
+        );
+        assert!(
+            load_plugin_set(&context, "enabled")
+                .unwrap()
+                .contains("beta")
+        );
+        assert!(
+            load_plugin_set(&context, "disabled")
+                .unwrap()
+                .contains("alpha")
+        );
+        assert!(!enabled.is_empty());
     }
 }
