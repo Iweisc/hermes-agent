@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -360,7 +361,7 @@ fn print_gateway_uninstall(
 
 fn print_gateway_install(
     context: &HermesContext,
-    accept_hooks: bool,
+    _accept_hooks: bool,
     args: GatewayInstallArgs,
 ) -> Result<(), Box<dyn Error>> {
     if args
@@ -374,8 +375,8 @@ fn print_gateway_install(
     if args.run_as_user.is_some() && !args.system {
         return Err("--run-as-user requires --system".into());
     }
-    if args.system || args.run_as_user.is_some() {
-        return print_gateway_install_bridge(accept_hooks, args);
+    if args.run_as_user.is_some() && !supports_systemd_services() {
+        return Err("--run-as-user is only supported for systemd installs".into());
     }
 
     if is_termux(context) {
@@ -386,8 +387,21 @@ fn print_gateway_install(
     }
 
     if supports_systemd_services() {
-        install_systemd_service(context, args.force)?;
-        println!("Installed {} user service", gateway_service_name(context));
+        install_systemd_service(
+            context,
+            args.force,
+            args.system,
+            args.run_as_user.as_deref(),
+        )?;
+        println!(
+            "Installed {} {} service",
+            gateway_service_name(context),
+            if args.system { "system" } else { "user" }
+        );
+        if args.system {
+            let identity = system_service_identity(args.run_as_user.as_deref())?;
+            println!("Configured to run as: {}", identity.username);
+        }
         return Ok(());
     }
 
@@ -574,46 +588,6 @@ fn print_gateway_status(
     Ok(())
 }
 
-fn print_gateway_install_bridge(
-    accept_hooks: bool,
-    args: GatewayInstallArgs,
-) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
-        .ok_or("could not find a Python interpreter for gateway install")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env(
-            "HERMES_GATEWAY_INSTALL_FORCE",
-            if args.force { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_GATEWAY_INSTALL_SYSTEM",
-            if args.system { "1" } else { "0" },
-        );
-    if let Some(user) = args
-        .run_as_user
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        command.env("HERMES_GATEWAY_INSTALL_RUN_AS_USER", user);
-    }
-    if accept_hooks {
-        command.env("HERMES_ACCEPT_HOOKS", "1");
-    }
-    command.arg("-c").arg(GATEWAY_INSTALL_BOOTSTRAP);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("gateway", status).into())
-}
-
 fn print_gateway_run(accept_hooks: bool, args: GatewayRunArgs) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
@@ -649,18 +623,6 @@ const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     "    quiet=os.environ.get('HERMES_GATEWAY_QUIET') == '1',\n",
     "    replace=os.environ.get('HERMES_GATEWAY_REPLACE') == '1',\n",
     ")\n",
-);
-
-const GATEWAY_INSTALL_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "from hermes_cli.gateway import gateway_command\n",
-    "gateway_command(argparse.Namespace(\n",
-    "    gateway_command='install',\n",
-    "    force=(os.environ.get('HERMES_GATEWAY_INSTALL_FORCE') == '1'),\n",
-    "    system=(os.environ.get('HERMES_GATEWAY_INSTALL_SYSTEM') == '1'),\n",
-    "    run_as_user=(os.environ.get('HERMES_GATEWAY_INSTALL_RUN_AS_USER') or None),\n",
-    "))\n",
 );
 
 fn print_gateway_setup(accept_hooks: bool) -> Result<(), Box<dyn Error>> {
@@ -1256,10 +1218,18 @@ fn remove_legacy_gateway_units(
     Ok((removed, remaining))
 }
 
-fn install_systemd_service(context: &HermesContext, force: bool) -> Result<(), Box<dyn Error>> {
-    let unit_path = systemd_unit_path(context, false);
+fn install_systemd_service(
+    context: &HermesContext,
+    force: bool,
+    system: bool,
+    run_as_user: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if system {
+        require_root_for_system_service("install")?;
+    }
+    let unit_path = systemd_unit_path(context, system);
     let service_name = gateway_service_name(context);
-    let unit = generate_systemd_unit(context)?;
+    let unit = generate_systemd_unit(context, system, run_as_user)?;
     if unit_path.exists() && !force {
         let current = fs::read_to_string(&unit_path).unwrap_or_default();
         if current == unit {
@@ -1276,8 +1246,8 @@ fn install_systemd_service(context: &HermesContext, force: bool) -> Result<(), B
         fs::create_dir_all(parent)?;
     }
     fs::write(&unit_path, unit)?;
-    run_systemctl(false, &["daemon-reload"])?;
-    run_systemctl(false, &["enable", &service_name])?;
+    run_systemctl(system, &["daemon-reload"])?;
+    run_systemctl(system, &["enable", &service_name])?;
     Ok(())
 }
 
@@ -1303,20 +1273,106 @@ fn build_systemctl_command(system: bool, args: &[&str]) -> Command {
     command
 }
 
-fn generate_systemd_unit(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+fn generate_systemd_unit(
+    context: &HermesContext,
+    system: bool,
+    run_as_user: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, None)
         .ok_or("could not find a Python interpreter for gateway service install")?;
-    let python_path = python.display().to_string();
-    let working_dir = root.display().to_string();
-    let hermes_home = context.hermes_home().display().to_string();
+    let mut python_path = python;
+    let mut working_dir = root;
+    let mut hermes_home = context.hermes_home();
     let profile_arg = gateway_profile_arg(context);
-    let venv_dir = derive_venv_dir(&python).unwrap_or_else(|| root.join(".venv"));
+    let mut venv_dir = derive_venv_dir(&python_path).unwrap_or_else(|| working_dir.join(".venv"));
     let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
-    let node_bin = root.join("node_modules").join(".bin");
+    let mut path_entries = build_gateway_path_entries(&working_dir, &venv_bin);
+    let mut wanted_by = "default.target";
+    let mut identity = None;
 
+    if system {
+        let resolved = system_service_identity(run_as_user)?;
+        python_path =
+            remap_path_for_target_user(&python_path, context.home_dir(), &resolved.home_dir);
+        working_dir =
+            remap_path_for_target_user(&working_dir, context.home_dir(), &resolved.home_dir);
+        hermes_home = remap_hermes_home_for_target_user(context, &resolved.home_dir);
+        venv_dir = remap_path_for_target_user(&venv_dir, context.home_dir(), &resolved.home_dir);
+        path_entries = path_entries
+            .into_iter()
+            .map(|entry| {
+                remap_path_for_target_user(
+                    &PathBuf::from(&entry),
+                    context.home_dir(),
+                    &resolved.home_dir,
+                )
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        append_user_local_paths(&resolved.home_dir, &mut path_entries);
+        wanted_by = "multi-user.target";
+        identity = Some(resolved);
+    }
+
+    path_entries.dedup();
+    let sane_path = path_entries.join(":");
+    let exec_start = if profile_arg.is_empty() {
+        format!(
+            "{} -m hermes_cli.main gateway run --replace",
+            python_path.display()
+        )
+    } else {
+        format!(
+            "{} -m hermes_cli.main {profile_arg} gateway run --replace",
+            python_path.display()
+        )
+    };
+
+    let mut service_lines = vec![
+        String::from("Type=simple"),
+        format!("ExecStart={exec_start}"),
+        format!("WorkingDirectory={}", working_dir.display()),
+    ];
+    if let Some(identity) = identity.as_ref() {
+        service_lines.push(format!("User={}", identity.username));
+        service_lines.push(format!("Group={}", identity.group_name));
+        service_lines.push(format!(
+            "Environment=\"HOME={}\"",
+            identity.home_dir.display()
+        ));
+        service_lines.push(format!("Environment=\"USER={}\"", identity.username));
+        service_lines.push(format!("Environment=\"LOGNAME={}\"", identity.username));
+    }
+    service_lines.extend([
+        format!("Environment=\"PATH={sane_path}\""),
+        format!("Environment=\"VIRTUAL_ENV={}\"", venv_dir.display()),
+        format!("Environment=\"HERMES_HOME={}\"", hermes_home.display()),
+        String::from("Restart=always"),
+        String::from("RestartSec=60"),
+        String::from("RestartMaxDelaySec=300"),
+        String::from("RestartSteps=5"),
+        String::from("RestartForceExitStatus=75"),
+        String::from("KillMode=mixed"),
+        String::from("KillSignal=SIGTERM"),
+        String::from("ExecReload=/bin/kill -USR1 $MAINPID"),
+        String::from("TimeoutStopSec=330"),
+        String::from("StandardOutput=journal"),
+        String::from("StandardError=journal"),
+    ]);
+
+    Ok(format!(
+        "[Unit]\nDescription=Hermes Agent Gateway - Messaging Platform Integration\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\n{}\n\n[Install]\nWantedBy={wanted_by}\n",
+        service_lines.join("\n")
+    ))
+}
+
+fn build_gateway_path_entries(root: &Path, venv_bin: &Path) -> Vec<String> {
     let mut path_entries = Vec::new();
-    for candidate in [venv_bin, node_bin] {
+    for candidate in [
+        venv_bin.to_path_buf(),
+        root.join("node_modules").join(".bin"),
+    ] {
         let rendered = candidate.display().to_string();
         if !rendered.is_empty() {
             path_entries.push(rendered);
@@ -1329,18 +1385,155 @@ fn generate_systemd_unit(context: &HermesContext) -> Result<String, Box<dyn Erro
                 .filter(|entry| !entry.is_empty()),
         );
     }
-    path_entries.dedup();
-    let sane_path = path_entries.join(":");
-    let exec_start = if profile_arg.is_empty() {
-        format!("{python_path} -m hermes_cli.main gateway run --replace")
-    } else {
-        format!("{python_path} -m hermes_cli.main {profile_arg} gateway run --replace")
-    };
+    path_entries
+}
 
-    Ok(format!(
-        "[Unit]\nDescription=Hermes Agent Gateway - Messaging Platform Integration\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={exec_start}\nWorkingDirectory={working_dir}\nEnvironment=\"PATH={sane_path}\"\nEnvironment=\"VIRTUAL_ENV={}\"\nEnvironment=\"HERMES_HOME={hermes_home}\"\nRestart=always\nRestartSec=60\nRestartMaxDelaySec=300\nRestartSteps=5\nRestartForceExitStatus=75\nKillMode=mixed\nKillSignal=SIGTERM\nExecReload=/bin/kill -USR1 $MAINPID\nTimeoutStopSec=330\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n",
-        venv_dir.display()
-    ))
+fn append_user_local_paths(home_dir: &Path, path_entries: &mut Vec<String>) {
+    for suffix in [".local/bin", ".cargo/bin", "go/bin", ".npm-global/bin"] {
+        let path = home_dir.join(suffix);
+        if !path.exists() {
+            continue;
+        }
+        let rendered = path.display().to_string();
+        if !path_entries.iter().any(|entry| entry == &rendered) {
+            path_entries.push(rendered);
+        }
+    }
+}
+
+fn remap_path_for_target_user(path: &Path, current_home: &Path, target_home: &Path) -> PathBuf {
+    path.strip_prefix(current_home)
+        .map(|relative| target_home.join(relative))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn remap_hermes_home_for_target_user(context: &HermesContext, target_home: &Path) -> PathBuf {
+    let current_hermes = context.hermes_home();
+    let current_default = context.home_dir().join(".hermes");
+    let target_default = target_home.join(".hermes");
+    if current_hermes == current_default {
+        return target_default;
+    }
+    current_hermes
+        .strip_prefix(&current_default)
+        .map(|relative| target_default.join(relative))
+        .unwrap_or(current_hermes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemServiceIdentity {
+    username: String,
+    group_name: String,
+    home_dir: PathBuf,
+}
+
+fn system_service_identity(
+    run_as_user: Option<&str>,
+) -> Result<SystemServiceIdentity, Box<dyn Error>> {
+    if !is_linux() {
+        return Err("system gateway install is not supported on this platform".into());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = run_as_user;
+        Err("system gateway install is not supported on this platform".into())
+    }
+    #[cfg(unix)]
+    {
+        let username = run_as_user
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| env_nonempty("SUDO_USER"))
+            .or_else(|| env_nonempty("USER"))
+            .or_else(|| env_nonempty("LOGNAME"))
+            .ok_or("Could not determine which user the gateway service should run as")?;
+        if username == "root" && run_as_user.is_none() {
+            return Err("Refusing to install the gateway system service as root; pass --run-as-user root to override".into());
+        }
+        if username == "root" {
+            println!("Installing gateway service to run as root.");
+        }
+        let (gid, home_dir) = lookup_passwd(&username)?;
+        let group_name = lookup_group_name(gid)?;
+        Ok(SystemServiceIdentity {
+            username,
+            group_name,
+            home_dir,
+        })
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(unix)]
+fn lookup_passwd(username: &str) -> Result<(libc::gid_t, PathBuf), Box<dyn Error>> {
+    let username = CString::new(username)?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let status = unsafe {
+            libc::getpwnam_r(
+                username.as_ptr(),
+                &mut pwd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == 0 {
+            break;
+        }
+        if status == libc::ERANGE {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        return Err(std::io::Error::from_raw_os_error(status).into());
+    }
+    if result.is_null() {
+        let requested = username.to_string_lossy().into_owned();
+        return Err(format!("Unknown user: {requested}").into());
+    }
+    let home_dir = unsafe { CStr::from_ptr(pwd.pw_dir) }
+        .to_str()
+        .map(PathBuf::from)?;
+    Ok((pwd.pw_gid, home_dir))
+}
+
+#[cfg(unix)]
+fn lookup_group_name(gid: libc::gid_t) -> Result<String, Box<dyn Error>> {
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let status = unsafe {
+            libc::getgrgid_r(
+                gid,
+                &mut grp,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == 0 {
+            break;
+        }
+        if status == libc::ERANGE {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        return Err(std::io::Error::from_raw_os_error(status).into());
+    }
+    if result.is_null() {
+        return Err(format!("Unknown group id: {gid}").into());
+    }
+    Ok(unsafe { CStr::from_ptr(grp.gr_name) }.to_str()?.to_string())
 }
 
 fn launchd_service_active(context: &HermesContext) -> bool {
@@ -1710,6 +1903,12 @@ fn require_root_for_system_service(action: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn current_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(value) = env_nonempty("HERMES_TEST_EUID")
+        && let Ok(parsed) = value.parse::<u32>()
+    {
+        return parsed;
+    }
     #[cfg(unix)]
     {
         unsafe { libc::geteuid() as u32 }
@@ -2080,50 +2279,6 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn gateway_install_bridge_uses_python_override_and_env_flags() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'accept=%s force=%s system=%s run_as_user=%s\\n' \\\n\
-    \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_INSTALL_FORCE\" \\\n\
-    \"$HERMES_GATEWAY_INSTALL_SYSTEM\" \"$HERMES_GATEWAY_INSTALL_RUN_AS_USER\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        print_gateway_install_bridge(
-            true,
-            GatewayInstallArgs {
-                force: true,
-                system: true,
-                run_as_user: Some(String::from("alice")),
-            },
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("accept=1 force=1 system=1 run_as_user=alice"));
-
-        remove_env_var("HERMES_GATEWAY_PYTHON");
-    }
-
-    #[test]
     fn gateway_install_rejects_run_as_user_without_system() {
         let (_temp, ctx) = test_context();
         let error = print_gateway_install(
@@ -2268,6 +2423,7 @@ exit 9\n",
 
     #[test]
     fn gateway_stop_kills_manual_profile_process() {
+        let _guard = test_env_lock().lock().unwrap();
         let (_temp, ctx) = test_context();
         fs::create_dir_all(ctx.hermes_home()).unwrap();
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
@@ -2387,6 +2543,62 @@ exit 9\n",
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(log.contains("--user daemon-reload"));
         assert!(log.contains("--user enable hermes-gateway"));
+        set_env_var("PATH", original_path);
+    }
+
+    #[test]
+    fn gateway_install_writes_system_systemd_unit() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let fake_bin = ctx.home_dir().join("bin");
+        let fake_systemd = ctx.home_dir().join("etc-systemd");
+        let log_path = ctx.home_dir().join("systemctl-install-system.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(&fake_systemd).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+        set_env_var("HERMES_FAKE_SYSTEMD_DIR", &fake_systemd);
+        set_env_var("HERMES_TEST_EUID", "0");
+
+        let run_as_user = env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("LOGNAME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| String::from("root"));
+        install_systemd_service(&ctx, false, true, Some(&run_as_user)).unwrap();
+
+        let unit_path = systemd_unit_path(&ctx, true);
+        let unit = fs::read_to_string(&unit_path).unwrap();
+        assert!(unit.contains("gateway run --replace"));
+        assert!(unit.contains(&format!("User={run_as_user}")));
+        assert!(unit.contains("WantedBy=multi-user.target"));
+        assert!(unit.contains("Environment=\"HOME="));
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("daemon-reload"));
+        assert!(log.contains("enable hermes-gateway"));
+
+        remove_env_var("HERMES_TEST_EUID");
+        remove_env_var("HERMES_FAKE_SYSTEMD_DIR");
         set_env_var("PATH", original_path);
     }
 
