@@ -16,6 +16,11 @@ const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
 const DEFAULT_COPILOT_ACP_BASE_URL: &str = "acp://copilot";
 const DEFAULT_COPILOT_ACP_COMMAND: &str = "copilot";
+const DEFAULT_NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
+const DEFAULT_NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com/v1";
+const DEFAULT_NOUS_CLIENT_ID: &str = "hermes-cli";
+const DEFAULT_AGENT_KEY_MIN_TTL_SECONDS: i64 = 30 * 60;
+const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
 const GOOGLE_OAUTH_CLIENT_ID_ENV: &str = "HERMES_GEMINI_CLIENT_ID";
 const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -45,6 +50,13 @@ pub struct MinimaxOAuthRuntimeCredentials {
 pub struct CopilotAcpRuntimeCredentials {
     pub base_url: String,
     pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NousRuntimeCredentials {
+    pub api_key: String,
+    pub base_url: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +126,19 @@ pub fn resolve_copilot_acp_runtime_credentials() -> Result<CopilotAcpRuntimeCred
         base_url: base_url.trim_end_matches('/').to_string(),
         command: resolved,
     })
+}
+
+pub fn resolve_nous_runtime_credentials(
+    hermes_home: &Path,
+    min_key_ttl_seconds: i64,
+    timeout_seconds: f64,
+) -> Result<NousRuntimeCredentials, HermesError> {
+    resolve_nous_runtime_credentials_with_client(
+        hermes_home,
+        min_key_ttl_seconds,
+        timeout_seconds,
+        &Client::new(),
+    )
 }
 
 pub fn resolve_google_gemini_runtime_credentials(
@@ -422,6 +447,18 @@ fn persist_minimax_oauth_state(
     })
 }
 
+fn persist_nous_state(auth_path: &Path, auth_store: &Value) -> Result<(), HermesError> {
+    let payload = serde_json::to_string_pretty(auth_store).map_err(|error| HermesError::State {
+        action: "serializing auth store",
+        detail: error.to_string(),
+    })?;
+    fs::write(auth_path, format!("{payload}\n")).map_err(|source| HermesError::Io {
+        action: "writing",
+        path: auth_path.to_path_buf(),
+        source,
+    })
+}
+
 fn persist_qwen_tokens(auth_path: &Path, tokens: &Value) -> Result<(), HermesError> {
     let payload = serde_json::to_string_pretty(tokens).map_err(|error| HermesError::State {
         action: "serializing Qwen OAuth credentials",
@@ -552,6 +589,32 @@ struct MinimaxOAuthState {
     resource_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NousAccessTokenRefresh {
+    access_token: String,
+    refresh_token: String,
+    token_type: Option<String>,
+    scope: Option<String>,
+    inference_base_url: Option<String>,
+    expires_in: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NousAgentKeyMint {
+    api_key: String,
+    key_id: Option<String>,
+    expires_at: Option<String>,
+    expires_in: Option<i64>,
+    inference_base_url: Option<String>,
+    reused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NousMintError {
+    code: String,
+    detail: String,
+}
+
 fn refresh_minimax_oauth_state(
     client: &Client,
     provider_state: &serde_json::Map<String, Value>,
@@ -671,6 +734,533 @@ fn refresh_minimax_oauth_state(
         token_type,
         resource_url,
     })
+}
+
+fn resolve_nous_runtime_credentials_with_client(
+    hermes_home: &Path,
+    min_key_ttl_seconds: i64,
+    timeout_seconds: f64,
+    client: &Client,
+) -> Result<NousRuntimeCredentials, HermesError> {
+    let min_key_ttl_seconds = if min_key_ttl_seconds > 0 {
+        min_key_ttl_seconds
+    } else {
+        DEFAULT_AGENT_KEY_MIN_TTL_SECONDS
+    }
+    .max(60);
+    let auth_path = hermes_home.join("auth.json");
+    let mut auth_store = load_auth_store(&auth_path)?;
+    let mut provider_state = auth_store
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("nous"))
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Nous runtime auth",
+            detail: "No Nous credentials stored. Authenticate with the Python runtime first."
+                .to_string(),
+        })?;
+
+    let portal_base_url = provider_state
+        .get("portal_base_url")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            env::var("HERMES_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .or_else(|| {
+            env::var("NOUS_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_NOUS_PORTAL_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let mut inference_base_url = provider_state
+        .get("inference_base_url")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            env::var("NOUS_INFERENCE_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_NOUS_INFERENCE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let client_id = provider_state
+        .get("client_id")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| DEFAULT_NOUS_CLIENT_ID.to_string());
+
+    let mut access_token = provider_state
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Nous runtime auth",
+            detail:
+                "Nous auth state is missing access_token. Re-authenticate in the Python runtime."
+                    .to_string(),
+        })?;
+    let mut refresh_token = provider_state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let mut mutated = false;
+
+    if oauth_token_needs_refresh(
+        provider_state
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_epoch_seconds),
+        ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    ) {
+        let current_refresh = refresh_token.clone().ok_or_else(|| HermesError::State {
+            action: "resolving Nous runtime auth",
+            detail: "Nous session expired and no refresh_token is available. Re-authenticate in the Python runtime."
+                .to_string(),
+        })?;
+        let refreshed = refresh_nous_access_token(
+            client,
+            &portal_base_url,
+            &client_id,
+            &current_refresh,
+            timeout_seconds,
+        )?;
+        apply_nous_refresh(&mut provider_state, &refreshed, &mut inference_base_url);
+        access_token = refreshed.access_token;
+        refresh_token = Some(refreshed.refresh_token);
+        mutated = true;
+        replace_provider_state(&mut auth_store, "nous", &provider_state)?;
+        persist_nous_state_with_metadata(&auth_path, &mut auth_store)?;
+    }
+
+    if !nous_agent_key_is_usable(&provider_state, min_key_ttl_seconds) {
+        let minted = match mint_nous_agent_key(
+            client,
+            &portal_base_url,
+            &access_token,
+            min_key_ttl_seconds,
+            timeout_seconds,
+        ) {
+            Ok(payload) => payload,
+            Err(error)
+                if matches!(error.code.as_str(), "invalid_token" | "invalid_grant")
+                    && refresh_token.is_some() =>
+            {
+                let refreshed = refresh_nous_access_token(
+                    client,
+                    &portal_base_url,
+                    &client_id,
+                    refresh_token.as_deref().unwrap_or_default(),
+                    timeout_seconds,
+                )?;
+                apply_nous_refresh(&mut provider_state, &refreshed, &mut inference_base_url);
+                access_token = refreshed.access_token;
+                replace_provider_state(&mut auth_store, "nous", &provider_state)?;
+                persist_nous_state_with_metadata(&auth_path, &mut auth_store)?;
+                mint_nous_agent_key(
+                    client,
+                    &portal_base_url,
+                    &access_token,
+                    min_key_ttl_seconds,
+                    timeout_seconds,
+                )
+                .map_err(|retry_error| HermesError::State {
+                    action: "minting Nous agent key",
+                    detail: retry_error.detail,
+                })?
+            }
+            Err(error) => {
+                return Err(HermesError::State {
+                    action: "minting Nous agent key",
+                    detail: error.detail,
+                });
+            }
+        };
+        apply_nous_agent_key(&mut provider_state, &minted, &mut inference_base_url);
+        mutated = true;
+    }
+
+    if provider_state
+        .get("portal_base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        != portal_base_url
+    {
+        provider_state.insert(
+            "portal_base_url".to_string(),
+            Value::String(portal_base_url.clone()),
+        );
+        mutated = true;
+    }
+    if provider_state
+        .get("inference_base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        != inference_base_url
+    {
+        provider_state.insert(
+            "inference_base_url".to_string(),
+            Value::String(inference_base_url.clone()),
+        );
+        mutated = true;
+    }
+    if provider_state
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        != client_id
+    {
+        provider_state.insert("client_id".to_string(), Value::String(client_id));
+        mutated = true;
+    }
+
+    if mutated {
+        replace_provider_state(&mut auth_store, "nous", &provider_state)?;
+        persist_nous_state_with_metadata(&auth_path, &mut auth_store)?;
+    }
+
+    let api_key = provider_state
+        .get("agent_key")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Nous runtime auth",
+            detail: "Failed to resolve a Nous inference API key.".to_string(),
+        })?;
+
+    Ok(NousRuntimeCredentials {
+        api_key,
+        base_url: inference_base_url,
+        expires_at: provider_state
+            .get("agent_key_expires_at")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+    })
+}
+
+fn refresh_nous_access_token(
+    client: &Client,
+    portal_base_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+    timeout_seconds: f64,
+) -> Result<NousAccessTokenRefresh, HermesError> {
+    let refresh_url = format!("{}/oauth/token", portal_base_url.trim_end_matches('/'));
+    let response = client
+        .post(&refresh_url)
+        .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .map_err(|error| HermesError::State {
+            action: "refreshing Nous auth",
+            detail: error.to_string(),
+        })?;
+    let status = response.status();
+    let body = response.text().map_err(|error| HermesError::State {
+        action: "reading Nous refresh response",
+        detail: error.to_string(),
+    })?;
+    if !status.is_success() {
+        return Err(HermesError::State {
+            action: "refreshing Nous auth",
+            detail: format!(
+                "Nous OAuth refresh failed with status {}. Re-authenticate in the Python runtime.",
+                status.as_u16()
+            ),
+        });
+    }
+    let payload = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Nous refresh response",
+        detail: format!("{error}: {body}"),
+    })?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| HermesError::State {
+            action: "refreshing Nous auth",
+            detail: "Nous refresh response was missing access_token.".to_string(),
+        })?;
+    Ok(NousAccessTokenRefresh {
+        access_token,
+        refresh_token: payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+            .unwrap_or_else(|| refresh_token.to_string()),
+        token_type: payload
+            .get("token_type")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        scope: payload
+            .get("scope")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        inference_base_url: payload
+            .get("inference_base_url")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        expires_in: value_to_i64(payload.get("expires_in").unwrap_or(&Value::Null))
+            .unwrap_or(0)
+            .max(0),
+    })
+}
+
+fn mint_nous_agent_key(
+    client: &Client,
+    portal_base_url: &str,
+    access_token: &str,
+    min_key_ttl_seconds: i64,
+    timeout_seconds: f64,
+) -> Result<NousAgentKeyMint, NousMintError> {
+    let response = client
+        .post(format!(
+            "{}/api/oauth/agent-key",
+            portal_base_url.trim_end_matches('/')
+        ))
+        .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .header("Accept", "application/json")
+        .bearer_auth(access_token)
+        .json(&json!({
+            "min_ttl_seconds": min_key_ttl_seconds.max(60),
+        }))
+        .send()
+        .map_err(|error| NousMintError {
+            code: "request_failed".to_string(),
+            detail: error.to_string(),
+        })?;
+    let status = response.status();
+    let body = response.text().map_err(|error| NousMintError {
+        code: "response_read_failed".to_string(),
+        detail: error.to_string(),
+    })?;
+    let payload = serde_json::from_str::<Value>(&body).map_err(|error| NousMintError {
+        code: "invalid_response".to_string(),
+        detail: format!("{error}: {body}"),
+    })?;
+    if !status.is_success() {
+        let code = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+            .unwrap_or_else(|| "server_error".to_string());
+        let detail = payload
+            .get("error_description")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+            .or_else(|| {
+                payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_trimmed)
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "Nous agent key mint failed with status {}.",
+                    status.as_u16()
+                )
+            });
+        return Err(NousMintError { code, detail });
+    }
+    let api_key = payload
+        .get("api_key")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| NousMintError {
+            code: "server_error".to_string(),
+            detail: "Nous agent key mint response was missing api_key.".to_string(),
+        })?;
+    Ok(NousAgentKeyMint {
+        api_key,
+        key_id: payload
+            .get("key_id")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        expires_at: payload
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        expires_in: payload.get("expires_in").and_then(value_to_i64),
+        inference_base_url: payload
+            .get("inference_base_url")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        reused: payload
+            .get("reused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn apply_nous_refresh(
+    provider_state: &mut serde_json::Map<String, Value>,
+    refreshed: &NousAccessTokenRefresh,
+    inference_base_url: &mut String,
+) {
+    let now = Utc::now();
+    provider_state.insert(
+        "access_token".to_string(),
+        Value::String(refreshed.access_token.clone()),
+    );
+    provider_state.insert(
+        "refresh_token".to_string(),
+        Value::String(refreshed.refresh_token.clone()),
+    );
+    provider_state.insert(
+        "token_type".to_string(),
+        Value::String(
+            refreshed
+                .token_type
+                .clone()
+                .or_else(|| {
+                    provider_state
+                        .get("token_type")
+                        .and_then(Value::as_str)
+                        .and_then(non_empty_trimmed)
+                })
+                .unwrap_or_else(|| "Bearer".to_string()),
+        ),
+    );
+    if let Some(scope) = refreshed.scope.clone().or_else(|| {
+        provider_state
+            .get("scope")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed)
+    }) {
+        provider_state.insert("scope".to_string(), Value::String(scope));
+    }
+    if let Some(next_base_url) = refreshed.inference_base_url.clone() {
+        *inference_base_url = next_base_url.clone();
+        provider_state.insert(
+            "inference_base_url".to_string(),
+            Value::String(next_base_url),
+        );
+    }
+    provider_state.insert(
+        "obtained_at".to_string(),
+        Value::String(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    provider_state.insert(
+        "expires_in".to_string(),
+        Value::from(refreshed.expires_in.max(0)),
+    );
+    provider_state.insert(
+        "expires_at".to_string(),
+        Value::String(
+            (now + chrono::TimeDelta::seconds(refreshed.expires_in.max(0)))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+    );
+}
+
+fn apply_nous_agent_key(
+    provider_state: &mut serde_json::Map<String, Value>,
+    minted: &NousAgentKeyMint,
+    inference_base_url: &mut String,
+) {
+    let now = Utc::now();
+    provider_state.insert(
+        "agent_key".to_string(),
+        Value::String(minted.api_key.clone()),
+    );
+    if let Some(key_id) = &minted.key_id {
+        provider_state.insert("agent_key_id".to_string(), Value::String(key_id.clone()));
+    }
+    if let Some(expires_at) = &minted.expires_at {
+        provider_state.insert(
+            "agent_key_expires_at".to_string(),
+            Value::String(expires_at.clone()),
+        );
+    }
+    if let Some(expires_in) = minted.expires_in {
+        provider_state.insert("agent_key_expires_in".to_string(), Value::from(expires_in));
+    }
+    provider_state.insert("agent_key_reused".to_string(), Value::Bool(minted.reused));
+    provider_state.insert(
+        "agent_key_obtained_at".to_string(),
+        Value::String(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    if let Some(next_base_url) = &minted.inference_base_url {
+        *inference_base_url = next_base_url.clone();
+        provider_state.insert(
+            "inference_base_url".to_string(),
+            Value::String(next_base_url.clone()),
+        );
+    }
+}
+
+fn persist_nous_state_with_metadata(
+    auth_path: &Path,
+    auth_store: &mut Value,
+) -> Result<(), HermesError> {
+    if let Some(root) = auth_store.as_object_mut() {
+        root.insert("version".to_string(), Value::from(AUTH_STORE_VERSION));
+        root.insert(
+            "updated_at".to_string(),
+            Value::String(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
+    }
+    persist_nous_state(auth_path, auth_store)
+}
+
+fn replace_provider_state(
+    auth_store: &mut Value,
+    provider: &str,
+    state: &serde_json::Map<String, Value>,
+) -> Result<(), HermesError> {
+    let root = ensure_object_mut(auth_store, &[])?;
+    let providers = ensure_object_mut(
+        root.entry("providers".to_string())
+            .or_insert_with(|| json!({})),
+        &["providers"],
+    )?;
+    providers.insert(provider.to_string(), Value::Object(state.clone()));
+    Ok(())
+}
+
+fn oauth_token_needs_refresh(expires_at: Option<i64>, skew_seconds: i64) -> bool {
+    let Some(expires_at) = expires_at else {
+        return true;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    now >= expires_at - skew_seconds.max(0)
+}
+
+fn nous_agent_key_is_usable(
+    provider_state: &serde_json::Map<String, Value>,
+    min_ttl_seconds: i64,
+) -> bool {
+    provider_state
+        .get("agent_key")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .is_some()
+        && !oauth_token_needs_refresh(
+            provider_state
+                .get("agent_key_expires_at")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_epoch_seconds),
+            min_ttl_seconds.max(0),
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1402,6 +1992,172 @@ mod tests {
         let resolved = resolve_minimax_oauth_runtime_credentials(temp.path()).unwrap();
         assert_eq!(resolved.access_token, "mini-fresh");
         assert_eq!(resolved.base_url, "https://api.minimax.io/anthropic");
+    }
+
+    #[test]
+    fn resolve_nous_runtime_credentials_reads_fresh_agent_key() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access",
+                        "refresh_token": "nous-refresh",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "inference_base_url": "https://inference-api.nousresearch.com/v1",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z",
+                        "agent_key": "nous-agent-key",
+                        "agent_key_expires_at": "2999-01-02T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = resolve_nous_runtime_credentials(temp.path(), 1800, 15.0).unwrap();
+        assert_eq!(resolved.api_key, "nous-agent-key");
+        assert_eq!(
+            resolved.base_url,
+            "https://inference-api.nousresearch.com/v1"
+        );
+        assert_eq!(resolved.expires_at.as_deref(), Some("2999-01-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_nous_runtime_credentials_refreshes_and_mints_agent_key() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "stale-access",
+                        "refresh_token": "refresh-old",
+                        "portal_base_url": format!("http://{addr}"),
+                        "inference_base_url": "https://inference-api.nousresearch.com/v1",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2000-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let header_end = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .unwrap()
+                            + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        while request.len() < header_end + content_length {
+                            let read = stream.read(&mut buffer).unwrap();
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&buffer[..read]);
+                        }
+                        break;
+                    }
+                }
+
+                let request_text = String::from_utf8_lossy(&request);
+                let (body, content_type) = if expected == 0 {
+                    assert!(request_text.starts_with("POST /oauth/token "));
+                    assert!(request_text.contains("grant_type=refresh_token"));
+                    assert!(request_text.contains("refresh_token=refresh-old"));
+                    (
+                        json!({
+                            "access_token": "access-new",
+                            "refresh_token": "refresh-new",
+                            "token_type": "Bearer",
+                            "scope": "inference:mint_agent_key",
+                            "inference_base_url": "https://minted.nous.example/v1",
+                            "expires_in": 3600
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                } else {
+                    assert!(request_text.starts_with("POST /api/oauth/agent-key "));
+                    assert!(
+                        request_text
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer access-new")
+                    );
+                    assert!(request_text.contains("\"min_ttl_seconds\":1800"));
+                    (
+                        json!({
+                            "api_key": "agent-key-new",
+                            "key_id": "key-123",
+                            "expires_at": "2999-01-03T00:00:00Z",
+                            "expires_in": 7200,
+                            "inference_base_url": "https://minted-final.nous.example/v1",
+                            "reused": false
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved =
+            resolve_nous_runtime_credentials_with_client(temp.path(), 1800, 15.0, &client).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.api_key, "agent-key-new");
+        assert_eq!(resolved.base_url, "https://minted-final.nous.example/v1");
+        assert_eq!(resolved.expires_at.as_deref(), Some("2999-01-03T00:00:00Z"));
+
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        let state = &persisted["providers"]["nous"];
+        assert_eq!(state["access_token"], "access-new");
+        assert_eq!(state["refresh_token"], "refresh-new");
+        assert_eq!(state["agent_key"], "agent-key-new");
+        assert_eq!(
+            state["inference_base_url"],
+            "https://minted-final.nous.example/v1"
+        );
+        assert_eq!(state["agent_key_id"], "key-123");
+        assert_eq!(state["agent_key_reused"], false);
     }
 
     #[test]

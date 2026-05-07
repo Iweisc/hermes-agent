@@ -267,7 +267,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "nous",
         aliases: &["nous-portal", "nousresearch"],
         api_mode: "chat_completions",
-        env_vars: &["NOUS_API_KEY"],
+        env_vars: &["NOUS_API_KEY", "NOUS_INFERENCE_BASE_URL"],
         base_url: "https://inference.nousresearch.com/v1",
         auth_type: "oauth_device_code",
         default_headers: EMPTY_HEADERS,

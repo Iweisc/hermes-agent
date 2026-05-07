@@ -10,8 +10,8 @@ use crate::{
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
     resolve_copilot_acp_runtime_credentials, resolve_google_gemini_runtime_credentials,
-    resolve_minimax_oauth_runtime_credentials, resolve_provider_api_mode,
-    resolve_qwen_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
+    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -464,17 +464,44 @@ impl HermesContext {
         } else {
             None
         };
+        let nous_runtime = if provider == "nous"
+            && explicit_api_key.is_none()
+            && env::var("NOUS_API_KEY")
+                .ok()
+                .and_then(non_empty_string)
+                .is_none()
+        {
+            Some(resolve_nous_runtime_credentials(
+                &self.hermes_home(),
+                env::var("HERMES_NOUS_MIN_KEY_TTL_SECONDS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .unwrap_or(1800),
+                env::var("HERMES_NOUS_TIMEOUT_SECONDS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<f64>().ok())
+                    .unwrap_or(15.0),
+            )?)
+        } else {
+            None
+        };
 
         let base_url = explicit_base_url
             .or(config_base_url)
             .or_else(|| copilot_acp.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| minimax_oauth.as_ref().map(|creds| creds.base_url.clone()))
+            .or_else(|| nous_runtime.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| qwen_oauth.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| {
                 profile
                     .base_url_env_var()
                     .and_then(|name| env::var(name).ok())
                     .and_then(non_empty_string)
+            })
+            .or_else(|| {
+                (provider == "nous")
+                    .then(|| env::var("NOUS_INFERENCE_BASE_URL").ok().and_then(non_empty_string))
+                    .flatten()
             })
             .or_else(|| non_empty_string(profile.base_url.to_string()))
             .ok_or_else(|| HermesError::State {
@@ -492,6 +519,7 @@ impl HermesContext {
                     .as_ref()
                     .map(|creds| creds.access_token.clone())
             })
+            .or_else(|| nous_runtime.as_ref().map(|creds| creds.api_key.clone()))
             .or_else(|| {
                 google_gemini
                     .as_ref()
@@ -1152,6 +1180,50 @@ mod tests {
         assert_eq!(runtime.api_mode, "chat_completions");
         assert_eq!(runtime.api_key, "google-runtime-token");
         assert_eq!(runtime.base_url, "cloudcode-pa://google");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_nous_runtime_credentials() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.hermes_home().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access",
+                        "refresh_token": "nous-refresh",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "inference_base_url": "https://inference-api.nousresearch.com/v1",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z",
+                        "agent_key": "nous-agent-key",
+                        "agent_key_expires_at": "2999-01-02T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: Nous-Hermes-2-Mixtral-8x7B-DPO\n  provider: nous\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.provider, "nous");
+        assert_eq!(runtime.api_mode, "chat_completions");
+        assert_eq!(runtime.api_key, "nous-agent-key");
+        assert_eq!(
+            runtime.base_url,
+            "https://inference-api.nousresearch.com/v1"
+        );
     }
 
     #[test]
