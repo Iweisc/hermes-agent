@@ -21,6 +21,7 @@ mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
 mod plugins_cmd;
+mod profile_cmd;
 mod python_bridge;
 mod skills_cmd;
 mod slack_cmd;
@@ -144,7 +145,7 @@ enum Command {
     Import(backup::ImportArgs),
     Profile {
         #[command(subcommand)]
-        command: Option<ProfileCommand>,
+        command: Option<profile_cmd::ProfileCommand>,
     },
     Chat {
         prompt: String,
@@ -183,14 +184,6 @@ enum Command {
     Update(update_cmd::UpdateArgs),
     Whatsapp(compat_cmd::CompatArgs),
     Status,
-}
-
-#[derive(Subcommand, Debug)]
-enum ProfileCommand {
-    Current,
-    Path { name: Option<String> },
-    Create { name: String },
-    Use { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -350,7 +343,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Uninstall(args) => uninstall_cmd::print_uninstall(&context, args)?,
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
-        Command::Profile { command } => print_profile(&context, command)?,
+        Command::Profile { command } => profile_cmd::print_profile(&context, command)?,
         Command::Chat {
             prompt,
             session,
@@ -402,34 +395,6 @@ fn print_paths(context: &HermesContext, config: &LoadedConfig, logging: &Logging
         Some(path) => print_kv("subprocess_home", path),
         None => println!("subprocess_home=<disabled>"),
     }
-}
-
-fn print_profile(
-    context: &HermesContext,
-    command: Option<ProfileCommand>,
-) -> Result<(), Box<dyn Error>> {
-    match command.unwrap_or(ProfileCommand::Current) {
-        ProfileCommand::Current => {
-            println!("active_profile={}", context.active_profile());
-            println!("current_profile={}", context.current_profile_name());
-            println!("display_home={}", context.display_hermes_home());
-        }
-        ProfileCommand::Path { name } => {
-            let selected = name.unwrap_or_else(|| context.current_profile_name());
-            println!("profile={selected}");
-            println!("path={}", context.profile_dir(&selected)?.display());
-        }
-        ProfileCommand::Create { name } => {
-            let path = context.create_profile(&name)?;
-            println!("created={name}");
-            println!("path={}", path.display());
-        }
-        ProfileCommand::Use { name } => {
-            context.set_active_profile(&name)?;
-            println!("active_profile={}", context.active_profile());
-        }
-    }
-    Ok(())
 }
 
 fn print_sessions(
