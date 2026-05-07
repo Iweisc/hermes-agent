@@ -2368,12 +2368,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
     use std::thread;
 
     use tempfile::TempDir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 
     fn stop_all_browser_supervisors_for_test() {
         let handles = {
@@ -2481,7 +2484,7 @@ esac
 
     #[test]
     fn browser_tools_run_against_fake_agent_browser_cli() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let temp = TempDir::new().unwrap();
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -2651,7 +2654,7 @@ esac
 
     #[test]
     fn browser_cdp_available_reads_config() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("config.yaml"),
@@ -2680,7 +2683,7 @@ esac
 
     #[test]
     fn browser_cdp_calls_websocket_endpoint_with_target_attach() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2760,7 +2763,7 @@ esac
 
     #[test]
     fn browser_cdp_calls_websocket_endpoint_with_frame_attach() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2861,7 +2864,7 @@ esac
 
     #[test]
     fn browser_dialog_calls_cdp_with_explicit_target() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2937,7 +2940,7 @@ esac
 
     #[test]
     fn browser_dialog_discovers_single_page_target() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -3035,7 +3038,7 @@ esac
 
     #[test]
     fn browser_snapshot_merges_pending_dialogs_from_supervisor() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         stop_all_browser_supervisors_for_test();
         let temp = TempDir::new().unwrap();
         let old_path = install_fake_snapshot_browser_cli(&temp);
@@ -3124,7 +3127,7 @@ esac
 
     #[test]
     fn browser_dialog_routes_dialog_id_via_supervisor() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = env_lock();
         stop_all_browser_supervisors_for_test();
         let temp = TempDir::new().unwrap();
         let old_path = install_fake_snapshot_browser_cli(&temp);

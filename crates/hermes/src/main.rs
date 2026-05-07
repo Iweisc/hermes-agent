@@ -1,3 +1,4 @@
+mod dump;
 mod logs;
 
 use std::error::Error;
@@ -29,6 +30,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Paths,
+    Version,
+    Dump(dump::DumpArgs),
     Profile {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
@@ -200,6 +203,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli.command.unwrap_or(Command::Status) {
         Command::Paths => print_paths(&context, &config, &logging),
+        Command::Version => dump::print_version(),
+        Command::Dump(args) => dump::print_dump(&context, &config, args)?,
         Command::Profile { command } => print_profile(&context, command)?,
         Command::Chat {
             prompt,

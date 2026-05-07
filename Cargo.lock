@@ -573,8 +573,10 @@ dependencies = [
  "clap",
  "ctrlc",
  "hermes-core",
+ "libc",
  "log",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

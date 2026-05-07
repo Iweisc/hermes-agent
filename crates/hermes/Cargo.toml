@@ -10,8 +10,10 @@ chrono.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 hermes-core = { path = "../hermes-core" }
+libc.workspace = true
 log.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 
 [[bin]]
 name = "hermes"
