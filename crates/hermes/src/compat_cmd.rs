@@ -38,10 +38,6 @@ pub fn print_mcp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("mcp", args)
 }
 
-pub fn print_insights(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("insights", args)
-}
-
 pub fn print_claw(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("claw", args)
 }

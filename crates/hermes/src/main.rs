@@ -10,6 +10,7 @@ mod doctor;
 mod dump;
 mod fallback_cmd;
 mod hooks;
+mod insights_cmd;
 mod login_cmd;
 mod logs;
 mod model_cmd;
@@ -89,7 +90,7 @@ enum Command {
     Curator(compat_cmd::CompatArgs),
     Memory(compat_cmd::CompatArgs),
     Mcp(compat_cmd::CompatArgs),
-    Insights(compat_cmd::CompatArgs),
+    Insights(insights_cmd::InsightsArgs),
     Claw(compat_cmd::CompatArgs),
     Migrate(compat_cmd::CompatArgs),
     Cleanup(compat_cmd::CompatArgs),
@@ -300,7 +301,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Curator(args) => compat_cmd::print_curator(args)?,
         Command::Memory(args) => compat_cmd::print_memory(args)?,
         Command::Mcp(args) => compat_cmd::print_mcp(args)?,
-        Command::Insights(args) => compat_cmd::print_insights(args)?,
+        Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
         Command::Claw(args) => compat_cmd::print_claw(args)?,
         Command::Migrate(args) => compat_cmd::print_migrate(args)?,
         Command::Cleanup(args) => compat_cmd::print_cleanup(args)?,
