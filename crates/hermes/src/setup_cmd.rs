@@ -65,10 +65,17 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         let mut ui = TerminalUi;
         return run_native_terminal_setup(context, &mut ui);
     }
+    if let Some(section) = direct_python_setup_section(&args) {
+        return print_direct_setup_python(section);
+    }
     print_setup_python(args)
 }
 
 fn print_setup_python(args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    print_setup_python_bootstrap(SETUP_BOOTSTRAP, args)
+}
+
+fn print_setup_python_bootstrap(bootstrap: &str, args: SetupArgs) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_SETUP_PYTHON"))
         .ok_or("could not find a Python interpreter for setup")?;
@@ -90,13 +97,34 @@ fn print_setup_python(args: SetupArgs) -> Result<(), Box<dyn Error>> {
     if let Some(section) = args.section {
         command.env("HERMES_SETUP_SECTION", section.as_str());
     }
-    command.arg("-c").arg(SETUP_BOOTSTRAP);
+    command.arg("-c").arg(bootstrap);
 
     let status = command.status()?;
     if status.success() {
         return Ok(());
     }
     Err(exit_status_message("setup", status).into())
+}
+
+fn print_direct_setup_python(section: SetupSection) -> Result<(), Box<dyn Error>> {
+    let bootstrap = match section {
+        SetupSection::Model => SETUP_MODEL_BOOTSTRAP,
+        SetupSection::Gateway => SETUP_GATEWAY_BOOTSTRAP,
+        SetupSection::Tools => SETUP_TOOLS_BOOTSTRAP,
+        SetupSection::Tts | SetupSection::Terminal | SetupSection::Agent => {
+            return Err(format!("unsupported direct setup section: {}", section.as_str()).into());
+        }
+    };
+    print_setup_python_bootstrap(
+        bootstrap,
+        SetupArgs {
+            section: Some(section),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        },
+    )
 }
 
 fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
@@ -124,6 +152,16 @@ fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
+fn direct_python_setup_section(args: &SetupArgs) -> Option<SetupSection> {
+    if args.non_interactive || args.reset || args.reconfigure || args.quick {
+        return None;
+    }
+    match args.section {
+        Some(SetupSection::Model | SetupSection::Gateway | SetupSection::Tools) => args.section,
+        _ => None,
+    }
+}
+
 impl SetupSection {
     fn as_str(self) -> &'static str {
         match self {
@@ -149,6 +187,54 @@ const SETUP_BOOTSTRAP: &str = concat!(
     "    quick=(os.environ.get('HERMES_SETUP_QUICK') == '1'),\n",
     ")\n",
     "run_setup_wizard(args)\n",
+);
+
+const SETUP_MODEL_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
+    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
+    "if is_managed():\n",
+    "    managed_error('run setup wizard')\n",
+    "else:\n",
+    "    ensure_hermes_home()\n",
+    "    if not is_interactive_stdin():\n",
+    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
+    "    else:\n",
+    "        config = load_config()\n",
+    "        from hermes_cli.setup import setup_model_provider\n",
+    "        setup_model_provider(config)\n",
+    "        save_config(config)\n",
+);
+
+const SETUP_GATEWAY_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
+    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
+    "if is_managed():\n",
+    "    managed_error('run setup wizard')\n",
+    "else:\n",
+    "    ensure_hermes_home()\n",
+    "    if not is_interactive_stdin():\n",
+    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
+    "    else:\n",
+    "        config = load_config()\n",
+    "        from hermes_cli.setup import setup_gateway\n",
+    "        setup_gateway(config)\n",
+    "        save_config(config)\n",
+);
+
+const SETUP_TOOLS_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
+    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
+    "if is_managed():\n",
+    "    managed_error('run setup wizard')\n",
+    "else:\n",
+    "    ensure_hermes_home()\n",
+    "    if not is_interactive_stdin():\n",
+    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
+    "    else:\n",
+    "        config = load_config()\n",
+    "        from hermes_cli.setup import setup_tools\n",
+    "        setup_tools(config, first_install=False)\n",
+    "        save_config(config)\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -1452,6 +1538,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_python_setup_section_only_allows_plain_model_gateway_tools() {
+        assert_eq!(
+            direct_python_setup_section(&SetupArgs {
+                section: Some(SetupSection::Model),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            }),
+            Some(SetupSection::Model)
+        );
+        assert_eq!(
+            direct_python_setup_section(&SetupArgs {
+                section: Some(SetupSection::Gateway),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            }),
+            Some(SetupSection::Gateway)
+        );
+        assert_eq!(
+            direct_python_setup_section(&SetupArgs {
+                section: Some(SetupSection::Tools),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            }),
+            Some(SetupSection::Tools)
+        );
+        assert_eq!(
+            direct_python_setup_section(&SetupArgs {
+                section: Some(SetupSection::Tools),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: true,
+            }),
+            None
+        );
+        assert_eq!(
+            direct_python_setup_section(&SetupArgs {
+                section: Some(SetupSection::Tts),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn setup_section_names_are_stable() {
         assert_eq!(SetupSection::Model.as_str(), "model");
         assert_eq!(SetupSection::Tts.as_str(), "tts");
@@ -1504,6 +1644,150 @@ exit 9\n",
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("section=gateway non_interactive=1 reset=1 reconfigure=1 quick=1"));
 
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_model_section_uses_direct_python_bootstrap() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  case \"$2\" in\n\
+    *\"setup_model_provider\"*) echo model >> '{}';;\n\
+    *\"run_setup_wizard\"*) echo wizard >> '{}';;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+        let context = HermesContext::new(temp.path());
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Model),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("model"));
+        assert!(!output.contains("wizard"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_gateway_section_uses_direct_python_bootstrap() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  case \"$2\" in\n\
+    *\"setup_gateway\"*) echo gateway >> '{}';;\n\
+    *\"run_setup_wizard\"*) echo wizard >> '{}';;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+        let context = HermesContext::new(temp.path());
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Gateway),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("gateway"));
+        assert!(!output.contains("wizard"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_tools_section_uses_direct_python_bootstrap() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  case \"$2\" in\n\
+    *\"setup_tools(config, first_install=False)\"*) echo tools >> '{}';;\n\
+    *\"run_setup_wizard\"*) echo wizard >> '{}';;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+        let context = HermesContext::new(temp.path());
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Tools),
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("tools"));
+        assert!(!output.contains("wizard"));
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 
