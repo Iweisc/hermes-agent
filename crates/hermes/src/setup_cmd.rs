@@ -590,7 +590,7 @@ fn run_native_terminal_setup(
     }
 
     let selected_backend = choices[selected_index - 1].0;
-    if matches!(selected_backend, "modal" | "daytona") {
+    if matches!(selected_backend, "modal") {
         ui.line("Falling back to Python setup for this backend.")?;
         return print_setup_python(SetupArgs {
             section: Some(SetupSection::Terminal),
@@ -612,6 +612,7 @@ fn run_native_terminal_setup(
         "docker" => configure_docker_terminal(context, ui, terminal)?,
         "singularity" => configure_singularity_terminal(context, ui, terminal)?,
         "ssh" => configure_ssh_terminal(context, ui)?,
+        "daytona" => configure_daytona_terminal(context, ui, terminal)?,
         "vercel_sandbox" => configure_vercel_terminal(ui, terminal)?,
         _ => unreachable!(),
     }
@@ -620,6 +621,11 @@ fn run_native_terminal_setup(
     if selected_backend == "vercel_sandbox" {
         if let Some(runtime) = mapping_string(terminal, "vercel_runtime") {
             save_env_value(context.env_path(), "TERMINAL_VERCEL_RUNTIME", &runtime)?;
+        }
+    }
+    if selected_backend == "daytona" {
+        if let Some(image) = mapping_string(terminal, "daytona_image") {
+            save_env_value(context.env_path(), "TERMINAL_DAYTONA_IMAGE", &image)?;
         }
     }
     write_yaml_mapping(&context.config_path(), &root)?;
@@ -802,6 +808,50 @@ fn configure_vercel_terminal(
     Ok(())
 }
 
+fn configure_daytona_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: Daytona")?;
+    ui.line("Persistent cloud development environments.")?;
+    ui.line("Sign up at: https://daytona.io")?;
+    if !python_module_installed("daytona")? {
+        ui.line("daytona SDK not detected; attempting install...")?;
+        if install_python_package(&["daytona"])? {
+            ui.line("daytona SDK installed")?;
+        } else {
+            ui.line("Install failed — run manually: pip install daytona")?;
+        }
+    }
+
+    let existing_key = env_value("DAYTONA_API_KEY");
+    if let Some(current) = existing_key {
+        ui.line("  Daytona API key: already configured")?;
+        if prompt_yes_no(ui, "  Update API key? [y/N]: ", false)? {
+            let api_key = ui.prompt_secret("    Daytona API key: ")?;
+            if !api_key.trim().is_empty() {
+                save_env_value(context.env_path(), "DAYTONA_API_KEY", api_key.trim())?;
+                ui.line("    Updated")?;
+            } else {
+                let _ = current;
+            }
+        }
+    } else {
+        let api_key = ui.prompt_secret("    Daytona API key: ")?;
+        if !api_key.trim().is_empty() {
+            save_env_value(context.env_path(), "DAYTONA_API_KEY", api_key.trim())?;
+            ui.line("    Configured")?;
+        }
+    }
+
+    let current_image = mapping_string(terminal, "daytona_image")
+        .unwrap_or_else(|| "nikolaik/python-nodejs:python3.11-nodejs20".to_string());
+    let image = prompt_with_default(ui, "  Sandbox image", &current_image)?;
+    terminal.insert(yaml_key("daytona_image"), Value::String(image));
+    prompt_container_resources(ui, terminal)
+}
+
 fn prompt_container_resources(
     ui: &mut dyn SetupUi,
     terminal: &mut Mapping,
@@ -924,6 +974,18 @@ fn python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
         ))
         .status()?;
     Ok(status.success())
+}
+
+fn install_python_package(packages: &[&str]) -> Result<bool, Box<dyn Error>> {
+    let Some(python) = setup_python_interpreter() else {
+        return Ok(false);
+    };
+    let mut command = Command::new(python);
+    command.arg("-m").arg("pip").arg("install").arg("-U");
+    for package in packages {
+        command.arg(package);
+    }
+    Ok(command.status()?.success())
 }
 
 fn install_neutts_deps(ui: &mut dyn SetupUi) -> Result<bool, Box<dyn Error>> {
@@ -1395,6 +1457,7 @@ exit 9\n",
 
     #[test]
     fn native_terminal_setup_writes_vercel_backend() {
+        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let context = HermesContext::new(temp.path());
         fs::create_dir_all(context.hermes_home()).unwrap();
@@ -1414,6 +1477,52 @@ exit 9\n",
         let env_text = fs::read_to_string(context.env_path()).unwrap();
         assert!(env_text.contains("TERMINAL_ENV=vercel_sandbox"));
         assert!(env_text.contains("TERMINAL_VERCEL_RUNTIME=node22"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_terminal_setup_writes_daytona_backend() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "terminal:\n  backend: local\n").unwrap();
+
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nif [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then exit 0; fi\nexit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+
+        let mut ui = TestUi::new(&[
+            "5",
+            "daytona-key",
+            "sandbox:latest",
+            "yes",
+            "2",
+            "4096",
+            "20480",
+        ]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: daytona"));
+        assert!(saved.contains("daytona_image: sandbox:latest"));
+        assert!(saved.contains("container_persistent: true"));
+        assert!(saved.contains("container_cpu: 2.0"));
+        assert!(saved.contains("container_memory: 4096"));
+        assert!(saved.contains("container_disk: 20480"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TERMINAL_ENV=daytona"));
+        assert!(env_text.contains("DAYTONA_API_KEY=daytona-key"));
+        assert!(env_text.contains("TERMINAL_DAYTONA_IMAGE=sandbox:latest"));
+        remove_env_var("HERMES_SETUP_PYTHON");
     }
 
     #[test]
