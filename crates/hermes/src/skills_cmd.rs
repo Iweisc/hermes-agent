@@ -321,10 +321,10 @@ const SKILLS_BOOTSTRAP: &str = concat!(
     "if action == 'browse':\n",
     "    parser.add_argument('--page', type=int, default=1)\n",
     "    parser.add_argument('--size', type=int, default=20)\n",
-    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','lobehub'])\n",
+    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
     "elif action == 'search':\n",
     "    parser.add_argument('query')\n",
-    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','lobehub'])\n",
+    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
     "    parser.add_argument('--limit', type=int, default=10)\n",
     "elif action == 'install':\n",
     "    parser.add_argument('identifier')\n",
@@ -697,6 +697,51 @@ fn browse_skills_command(
         println!();
         return Ok(());
     }
+    if source == "claude-marketplace" {
+        let skills = collect_claude_marketplace_skill_summaries(
+            page.saturating_mul(page_size).max(page_size),
+        )?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        let total = skills.len();
+        let total_pages = ((total + page_size - 1) / page_size).max(1);
+        let page = page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        let end = (start + page_size).min(total);
+
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} Description",
+            "Name", "Repo", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<24} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills[start..end] {
+            println!(
+                "{:<24} {:<24} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                truncate(&skill.repo, 24),
+                truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page}/{total_pages} — {total} claude-marketplace skill(s)");
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("browse", passthrough);
     }
@@ -995,6 +1040,52 @@ fn search_skills_command(
                 truncate(&skill.name, 24),
                 "clawhub",
                 "community",
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
+    if source == "claude-marketplace" {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return bridge_prefixed("search", passthrough);
+        }
+        let matches = collect_claude_marketplace_skill_summaries(limit)?
+            .into_iter()
+            .filter(|skill| {
+                catalog_matches_query(&skill.name, &skill.description, &skill.tags, &needle)
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "claude-marketplace",
+                truncate(&skill.trust, 10),
                 truncate(&skill.identifier, 30),
                 truncate(&skill.description, 60),
             );
@@ -4391,6 +4482,113 @@ fn collect_github_skill_summaries(
     Ok(summaries)
 }
 
+const CLAUDE_MARKETPLACE_REPOS: &[&str] = &["anthropics/skills", "aiskillstore/marketplace"];
+
+fn collect_claude_marketplace_skill_summaries(
+    limit: usize,
+) -> Result<Vec<GitHubSkillSummary>, Box<dyn Error>> {
+    let limit = limit.max(1);
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let token = resolve_github_publish_token();
+    let mut summaries = Vec::new();
+    for repo in CLAUDE_MARKETPLACE_REPOS {
+        summaries.extend(fetch_claude_marketplace_repo_summaries(
+            &client,
+            repo,
+            token.as_deref(),
+        )?);
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+    summaries.sort_by(|left, right| {
+        let left_key = (left.trust.as_str(), left.repo.as_str(), left.name.as_str());
+        let right_key = (
+            right.trust.as_str(),
+            right.repo.as_str(),
+            right.name.as_str(),
+        );
+        right_key.cmp(&left_key)
+    });
+    summaries.truncate(limit);
+    Ok(summaries)
+}
+
+fn fetch_claude_marketplace_repo_summaries(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+    token: Option<&str>,
+) -> Result<Vec<GitHubSkillSummary>, Box<dyn Error>> {
+    let response = match client
+        .get(format!(
+            "{}/repos/{repo}/contents/.claude-plugin/marketplace.json",
+            github_api_base()
+        ))
+        .headers(github_raw_headers(token, "application/vnd.github.v3.raw")?)
+        .send()
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if response.status() != StatusCode::OK {
+        return Ok(Vec::new());
+    }
+    let body = response.text()?;
+    let parsed = match serde_json::from_str::<JsonValue>(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let plugins = parsed
+        .get("plugins")
+        .and_then(JsonValue::as_array)
+        .or_else(|| parsed.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut summaries = Vec::new();
+    for plugin in plugins {
+        let Some(source_path) = plugin
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let identifier = if let Some(relative) = source_path.strip_prefix("./") {
+            format!("{repo}/{}", relative.trim_start_matches('/'))
+        } else if source_path.contains('/') {
+            source_path.to_string()
+        } else {
+            format!("{repo}/{source_path}")
+        };
+        let name = plugin
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| identifier.rsplit('/').next().unwrap_or("skill").to_string());
+        let description = plugin
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        summaries.push(GitHubSkillSummary {
+            name,
+            repo: repo.to_string(),
+            description,
+            trust: resolve_trust_level(&identifier).to_string(),
+            identifier,
+            tags: Vec::new(),
+        });
+    }
+    Ok(summaries)
+}
+
 fn skills_sh_base_url() -> String {
     std::env::var("HERMES_SKILLS_SH_BASE_URL")
         .ok()
@@ -5454,6 +5652,19 @@ fn collect_all_browse_catalog_summaries(
         );
     }
 
+    for skill in collect_claude_marketplace_skill_summaries(100)? {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("claude-marketplace"),
+                trust: skill.trust,
+                identifier: skill.identifier,
+            },
+        );
+    }
+
     for skill in collect_lobehub_skill_summaries()? {
         merge_catalog_search_result(
             &mut results,
@@ -5564,6 +5775,24 @@ fn search_all_catalog_summaries(
                 description: skill.description,
                 source: String::from("clawhub"),
                 trust: String::from("community"),
+                identifier: skill.identifier,
+            },
+        );
+    }
+
+    for skill in collect_claude_marketplace_skill_summaries(limit)?
+        .into_iter()
+        .filter(|skill| {
+            catalog_matches_query(&skill.name, &skill.description, &skill.tags, &needle)
+        })
+    {
+        merge_catalog_search_result(
+            &mut results,
+            SearchCatalogSummary {
+                name: skill.name,
+                description: skill.description,
+                source: String::from("claude-marketplace"),
+                trust: skill.trust,
                 identifier: skill.identifier,
             },
         );
@@ -7404,7 +7633,7 @@ exit 9\n",
             &context,
             &[
                 String::from("--source"),
-                String::from("claude-marketplace"),
+                String::from("mystery-source"),
                 String::from("--page"),
                 String::from("1"),
             ],
@@ -7412,7 +7641,7 @@ exit 9\n",
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=browse argv=--source claude-marketplace --page 1"));
+        assert!(output.contains("action=browse argv=--source mystery-source --page 1"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -7829,7 +8058,7 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn search_bridges_when_source_is_not_official() {
+    fn search_bridges_when_source_is_unsupported() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -7859,13 +8088,13 @@ exit 9\n",
             &[
                 String::from("deploy"),
                 String::from("--source"),
-                String::from("claude-marketplace"),
+                String::from("mystery-source"),
             ],
         )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=search argv=deploy --source claude-marketplace"));
+        assert!(output.contains("action=search argv=deploy --source mystery-source"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -8006,6 +8235,66 @@ exit 9\n",
             None => remove_env_var("GITHUB_TOKEN"),
         }
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn collect_claude_marketplace_skill_summaries_reads_marketplace_index() {
+        let _guard = test_env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_claude_marketplace_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let summaries = collect_claude_marketplace_skill_summaries(10).unwrap();
+        assert_eq!(summaries.len(), 3);
+        let deploy = summaries
+            .iter()
+            .find(|skill| skill.name == "deploy-market")
+            .unwrap();
+        assert_eq!(deploy.repo, "anthropics/skills");
+        assert_eq!(deploy.identifier, "anthropics/skills/skills/deploy-market");
+        assert_eq!(deploy.trust, "trusted");
+        let shared = summaries
+            .iter()
+            .find(|skill| skill.name == "shared-market")
+            .unwrap();
+        assert_eq!(shared.repo, "anthropics/skills");
+        assert_eq!(shared.identifier, "community/repo/shared-market");
+        assert_eq!(shared.trust, "community");
+        let research = summaries
+            .iter()
+            .find(|skill| skill.name == "research-market")
+            .unwrap();
+        assert_eq!(research.repo, "aiskillstore/marketplace");
+        assert_eq!(
+            research.identifier,
+            "aiskillstore/marketplace/research-market"
+        );
+        assert_eq!(research.trust, "community");
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(logged.iter().any(|request| {
+            request.starts_with(
+                "GET /repos/anthropics/skills/contents/.claude-plugin/marketplace.json ",
+            )
+        }));
+        assert!(logged.iter().any(|request| {
+            request.starts_with(
+                "GET /repos/aiskillstore/marketplace/contents/.claude-plugin/marketplace.json ",
+            )
+        }));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
     }
 
     #[test]
@@ -9045,6 +9334,63 @@ exit 9\n",
                         thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(error) => panic!("github empty test server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_claude_marketplace_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line.starts_with(
+                            "GET /repos/anthropics/skills/contents/.claude-plugin/marketplace.json ",
+                        ) {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"plugins":[{"name":"deploy-market","description":"Trusted deploy helper","source":"./skills/deploy-market"},{"name":"shared-market","description":"Shared marketplace helper","source":"community/repo/shared-market"}]}"#.to_string(),
+                                "application/json",
+                            )
+                        } else if first_line.starts_with(
+                            "GET /repos/aiskillstore/marketplace/contents/.claude-plugin/marketplace.json ",
+                        ) {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"plugins":[{"name":"research-market","description":"Research helper","source":"research-market"}]}"#.to_string(),
+                                "application/json",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_secs(2) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("claude marketplace test server accept failed: {error}"),
                 }
             }
         });
