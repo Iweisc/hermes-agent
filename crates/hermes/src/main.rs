@@ -42,6 +42,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -52,6 +54,12 @@ use hermes_core::{
     get_tool_definitions, is_container, is_wsl, kanban_has_spawnable_ready, run_cron_job_now,
     run_due_cron_jobs, run_kanban_task,
 };
+
+#[cfg(test)]
+pub(crate) fn cli_test_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hermes", version, about = "Hermes Rust bootstrap")]

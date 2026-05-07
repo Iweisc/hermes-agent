@@ -147,6 +147,24 @@ struct BridgedDefaultFrom {
     map: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MemoryPluginManifest {
+    #[serde(default)]
+    pip_dependencies: Vec<String>,
+    #[serde(default)]
+    external_dependencies: Vec<ExternalDependency>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExternalDependency {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    install: String,
+    #[serde(default)]
+    check: String,
+}
+
 impl SetupField {
     fn default_value(
         &self,
@@ -269,6 +287,7 @@ fn print_memory_setup(
             let provider = providers
                 .get(index.saturating_sub(1))
                 .ok_or("invalid memory provider selection")?;
+            ensure_memory_setup_dependencies(context, &provider.name)?;
             match provider.mode {
                 SetupMode::NativeGeneric => run_native_provider_setup(context, provider),
                 SetupMode::NativeHoncho => run_honcho_provider_setup(context, provider),
@@ -1799,29 +1818,8 @@ fn ensure_hindsight_dependencies(mode: &str) -> Result<(), Box<dyn Error>> {
     } else {
         "hindsight-client>=0.4.22"
     };
-    let Some(uv_path) = resolve_binary("uv") else {
-        println!("  uv not found — skipping automatic dependency install");
-        return Ok(());
-    };
-
-    let status = Command::new(uv_path)
-        .args([
-            "pip",
-            "install",
-            "--python",
-            &std::env::current_exe()
-                .ok()
-                .and_then(|_| std::env::var("PYTHON").ok())
-                .unwrap_or_else(|| String::from("python3")),
-            "--quiet",
-            "--upgrade",
-            dependency,
-        ])
-        .status();
-    match status {
-        Ok(status) if status.success() => println!("  Dependencies up to date"),
-        Ok(_) => println!("  Dependency install failed — continue manually if needed"),
-        Err(error) => println!("  Dependency install failed: {error}"),
+    if let Some(python) = resolve_memory_python() {
+        install_missing_memory_python_dependencies(&python, &[dependency.to_string()])?;
     }
     Ok(())
 }
@@ -1836,17 +1834,8 @@ fn resolve_binary(name: &str) -> Option<PathBuf> {
 }
 
 fn ensure_honcho_dependency() -> Result<(), Box<dyn Error>> {
-    let Some(uv_path) = resolve_binary("uv") else {
-        println!("  uv not found — skipping automatic dependency install");
-        return Ok(());
-    };
-    let status = Command::new(uv_path)
-        .args(["pip", "install", "--python", "python3", "honcho-ai>=2.0.1"])
-        .status();
-    match status {
-        Ok(status) if status.success() => println!("  Dependencies up to date"),
-        Ok(_) => println!("  Dependency install failed — continue manually if needed"),
-        Err(error) => println!("  Dependency install failed: {error}"),
+    if let Some(python) = resolve_memory_python() {
+        install_missing_memory_python_dependencies(&python, &[String::from("honcho-ai>=2.0.1")])?;
     }
     Ok(())
 }
@@ -2419,6 +2408,25 @@ fn discover_memory_providers(context: &HermesContext) -> Vec<ProviderInfo> {
     discover_memory_providers_from_roots(&bundled, Some(&user))
 }
 
+fn find_memory_provider_dir(context: &HermesContext, provider_name: &str) -> Option<PathBuf> {
+    let bundled = project_root()
+        .join("plugins")
+        .join("memory")
+        .join(provider_name);
+    if bundled.is_dir() && bundled.join("__init__.py").exists() {
+        return Some(bundled);
+    }
+
+    let user = context.hermes_home().join("plugins").join(provider_name);
+    if user.is_dir()
+        && user.join("__init__.py").exists()
+        && looks_like_memory_provider(&user.join("__init__.py"))
+    {
+        return Some(user);
+    }
+    None
+}
+
 fn discover_memory_providers_from_roots(
     bundled_root: &Path,
     user_root: Option<&Path>,
@@ -2480,6 +2488,131 @@ fn read_plugin_description(dir: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn read_memory_plugin_manifest(dir: &Path) -> Option<MemoryPluginManifest> {
+    let plugin_yaml = dir.join("plugin.yaml");
+    let text = fs::read_to_string(plugin_yaml).ok()?;
+    serde_yaml::from_str::<MemoryPluginManifest>(&text).ok()
+}
+
+fn ensure_memory_setup_dependencies(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(provider_dir) = find_memory_provider_dir(context, provider_name) else {
+        return Ok(());
+    };
+    let Some(manifest) = read_memory_plugin_manifest(&provider_dir) else {
+        return Ok(());
+    };
+
+    if let Some(python) = resolve_memory_python() {
+        install_missing_memory_python_dependencies(&python, &manifest.pip_dependencies)?;
+    }
+    print_missing_external_dependency_hints(&manifest.external_dependencies);
+    Ok(())
+}
+
+fn resolve_memory_python() -> Option<PathBuf> {
+    let root = project_root();
+    resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
+}
+
+fn install_missing_memory_python_dependencies(
+    python: &Path,
+    dependencies: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if dependencies.is_empty() {
+        return Ok(());
+    }
+
+    let missing = dependencies
+        .iter()
+        .filter(|dependency| !python_import_available(python, dependency))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    println!("\n  Installing dependencies: {}", missing.join(", "));
+
+    let Some(uv_path) = resolve_binary("uv") else {
+        println!("  uv not found — cannot install dependencies");
+        return Ok(());
+    };
+
+    let output = Command::new(uv_path)
+        .args(["pip", "install", "--python"])
+        .arg(python)
+        .arg("--quiet")
+        .args(&missing)
+        .output()?;
+
+    if output.status.success() {
+        println!("  Dependencies installed");
+        return Ok(());
+    }
+
+    println!("  Dependency install failed — continue manually if needed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(line) = stderr.lines().find(|line| !line.trim().is_empty()) {
+        println!("  {}", line.trim());
+    }
+    Ok(())
+}
+
+fn python_import_available(python: &Path, dependency: &str) -> bool {
+    let import_name = python_dependency_import_name(dependency);
+    Command::new(python)
+        .arg("-c")
+        .arg(format!("import {import_name}"))
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success())
+}
+
+fn python_dependency_import_name(dependency: &str) -> String {
+    let package = dependency
+        .split(['<', '>', '=', '!', '~', '['])
+        .next()
+        .unwrap_or(dependency)
+        .trim();
+    match package {
+        "honcho-ai" => String::from("honcho"),
+        "mem0ai" => String::from("mem0"),
+        "hindsight-client" => String::from("hindsight_client"),
+        "hindsight-all" => String::from("hindsight"),
+        other => other.replace('-', "_"),
+    }
+}
+
+fn print_missing_external_dependency_hints(dependencies: &[ExternalDependency]) {
+    for dependency in dependencies {
+        let check = dependency.check.trim();
+        let install = dependency.install.trim();
+        if check.is_empty() || install.is_empty() {
+            continue;
+        }
+        if external_dependency_is_available(check) {
+            continue;
+        }
+
+        let name = dependency.name.trim();
+        if name.is_empty() {
+            println!("  Missing external dependency. Install with: {install}");
+        } else {
+            println!("  Missing external dependency '{name}'. Install with: {install}");
+        }
+    }
+}
+
+fn external_dependency_is_available(check: &str) -> bool {
+    let Some(binary) = check.split_whitespace().next() else {
+        return true;
+    };
+    resolve_binary(binary).is_some()
+}
+
 fn render_value(value: &Value) -> String {
     match value {
         Value::Null => String::from("null"),
@@ -2502,13 +2635,12 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     #[cfg(test)]
     fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::cli_test_env_lock()
     }
 
     #[cfg(test)]
@@ -2659,6 +2791,32 @@ mod tests {
             field.default_value(&current, &existing),
             Some(SetupValue::String(String::from("qwen/qwen3.5-9b")))
         );
+    }
+
+    #[test]
+    fn read_memory_plugin_manifest_parses_dependency_lists() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("plugin.yaml"),
+            "pip_dependencies:\n  - mem0ai\nexternal_dependencies:\n  - name: brv\n    install: curl install\n    check: brv --version\n",
+        )
+        .unwrap();
+
+        let manifest = read_memory_plugin_manifest(temp.path()).unwrap();
+        assert_eq!(manifest.pip_dependencies, vec!["mem0ai"]);
+        assert_eq!(manifest.external_dependencies.len(), 1);
+        assert_eq!(manifest.external_dependencies[0].name, "brv");
+    }
+
+    #[test]
+    fn python_dependency_import_name_maps_special_cases() {
+        assert_eq!(python_dependency_import_name("honcho-ai>=2.0.1"), "honcho");
+        assert_eq!(python_dependency_import_name("mem0ai"), "mem0");
+        assert_eq!(
+            python_dependency_import_name("hindsight-client>=0.4.22"),
+            "hindsight_client"
+        );
+        assert_eq!(python_dependency_import_name("supermemory"), "supermemory");
     }
 
     #[test]
@@ -2920,6 +3078,81 @@ exit 9\n",
         assert!(provider.fields.is_empty());
         assert!(!provider.bridge_save_config);
 
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_memory_setup_dependencies_installs_missing_pip_dependencies() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        let plugin_dir = home.join("plugins").join("demo");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            "class Demo(MemoryProvider):\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "pip_dependencies:\n  - missingpkg>=1.0\n",
+        )
+        .unwrap();
+
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  case \"$2\" in\n\
+    *\"import missingpkg\"*) exit 1 ;;\n\
+    *) exit 0 ;;\n\
+  esac\n\
+fi\n\
+exit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let fake_uv = temp.path().join("uv");
+        let uv_log = temp.path().join("uv.log");
+        fs::write(
+            &fake_uv,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                uv_log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_uv).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_uv, perms).unwrap();
+
+        let old_path = env::var_os("PATH");
+        set_env_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                temp.path().display(),
+                env::var("PATH").unwrap_or_default()
+            ),
+        );
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        ensure_memory_setup_dependencies(&context, "demo").unwrap();
+
+        let output = fs::read_to_string(&uv_log).unwrap();
+        assert!(output.contains("pip install --python"));
+        assert!(output.contains("missingpkg>=1.0"));
+
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
         remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
