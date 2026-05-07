@@ -4,10 +4,27 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aws_config::BehaviorVersion as AwsBehaviorVersion;
+use aws_sdk_bedrockruntime::Client as BedrockClient;
+use aws_sdk_bedrockruntime::config::Region as BedrockRegion;
+use aws_sdk_bedrockruntime::primitives::Blob as BedrockBlob;
+use aws_sdk_bedrockruntime::types::{
+    ContentBlock as BedrockContentBlock, ConversationRole as BedrockConversationRole,
+    ConverseOutput as BedrockConverseMessageOutput, ImageBlock as BedrockImageBlock,
+    ImageFormat as BedrockImageFormat, ImageSource as BedrockImageSource,
+    InferenceConfiguration as BedrockInferenceConfiguration, Message as BedrockMessage,
+    StopReason as BedrockStopReason, SystemContentBlock as BedrockSystemContentBlock,
+    Tool as BedrockTool, ToolConfiguration as BedrockToolConfiguration,
+    ToolInputSchema as BedrockToolInputSchema, ToolResultBlock as BedrockToolResultBlock,
+    ToolResultContentBlock as BedrockToolResultContentBlock,
+    ToolSpecification as BedrockToolSpecification,
+};
+use aws_smithy_types::{Document as SmithyDocument, Number as SmithyNumber};
+use base64::Engine as _;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -692,7 +709,6 @@ fn send_bedrock_converse(
     messages: &[Value],
     tools: &[crate::ToolDefinition],
 ) -> Result<NormalizedAssistantResponse, HermesError> {
-    let python = resolve_python_interpreter();
     let region = parse_bedrock_region(&runtime_model.base_url)
         .or_else(|| {
             env::var("AWS_REGION")
@@ -707,121 +723,550 @@ fn send_bedrock_converse(
                 .and_then(non_empty_trimmed)
         })
         .unwrap_or_else(|| "us-east-1".to_string());
-    let payload = json!({
-        "region": region,
-        "model": runtime_model.model,
-        "messages": messages,
-        "tools": tools.iter().map(|tool| tool.openai_schema()).collect::<Vec<_>>(),
-        "max_tokens": 4096,
-    });
-    let script = r#"
-import json
-import sys
-
-from agent.bedrock_adapter import call_converse
-
-payload = json.load(sys.stdin)
-response = call_converse(
-    region=payload["region"],
-    model=payload["model"],
-    messages=payload.get("messages") or [],
-    tools=payload.get("tools") or [],
-    max_tokens=int(payload.get("max_tokens") or 4096),
-)
-choice = response.choices[0] if getattr(response, "choices", None) else None
-message = getattr(choice, "message", None)
-tool_calls = []
-for tool_call in (getattr(message, "tool_calls", None) or []):
-    function = getattr(tool_call, "function", None)
-    tool_calls.append({
-        "id": getattr(tool_call, "id", ""),
-        "name": getattr(function, "name", ""),
-        "arguments": getattr(function, "arguments", "{}"),
-    })
-usage = getattr(response, "usage", None)
-print(json.dumps({
-    "content": getattr(message, "content", None),
-    "tool_calls": tool_calls,
-    "finish_reason": getattr(choice, "finish_reason", None),
-    "usage": {
-        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-    },
-}))
-"#;
-
-    let mut command = Command::new(&python);
-    command
-        .arg("-c")
-        .arg(script)
-        .current_dir(repo_root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut pythonpath_entries = vec![repo_root()];
-    if let Some(existing) = env::var_os("PYTHONPATH") {
-        pythonpath_entries.extend(env::split_paths(&existing));
+    let client = bedrock_client(&region)?;
+    let (system, converse_messages) = bedrock_convert_messages(messages)?;
+    let inference_config = BedrockInferenceConfiguration::builder()
+        .max_tokens(4096)
+        .build();
+    let mut request = client
+        .converse()
+        .model_id(runtime_model.model.clone())
+        .set_messages(Some(converse_messages))
+        .inference_config(inference_config);
+    if let Some(system) = system {
+        request = request.set_system(Some(system));
     }
-    if let Ok(joined) = env::join_paths(pythonpath_entries) {
-        command.env("PYTHONPATH", joined);
+    if !tools.is_empty() {
+        if bedrock_model_supports_tool_use(&runtime_model.model) {
+            let tool_config = BedrockToolConfiguration::builder()
+                .set_tools(Some(bedrock_convert_tools(tools)?))
+                .build()
+                .map_err(|error| HermesError::State {
+                    action: "building bedrock tool config",
+                    detail: error.to_string(),
+                })?;
+            request = request.tool_config(tool_config);
+        } else {
+            log::warn!(
+                target: "run_agent",
+                "bedrock tools stripped for non-tool model: {}",
+                runtime_model.model
+            );
+        }
     }
 
-    let mut child = command.spawn().map_err(|error| HermesError::State {
-        action: "starting bedrock converse bridge",
-        detail: format!("{} failed: {error}", python.display()),
-    })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let bytes = serde_json::to_vec(&payload).map_err(|error| HermesError::State {
-            action: "encoding bedrock converse payload",
+    let response = bedrock_tokio_runtime()
+        .block_on(async { request.send().await })
+        .map_err(|error| HermesError::State {
+            action: "calling bedrock converse",
             detail: error.to_string(),
         })?;
-        stdin
-            .write_all(&bytes)
-            .map_err(|error| HermesError::State {
-                action: "writing bedrock converse payload",
+    normalize_bedrock_response(response)
+}
+
+fn bedrock_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bedrock tokio runtime must initialize")
+    })
+}
+
+fn cached_bedrock_clients() -> &'static Mutex<HashMap<String, BedrockClient>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, BedrockClient>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bedrock_client(region: &str) -> Result<BedrockClient, HermesError> {
+    let cache = cached_bedrock_clients();
+    if let Some(client) = cache
+        .lock()
+        .map_err(|_| HermesError::State {
+            action: "locking bedrock client cache",
+            detail: "cache lock poisoned".to_string(),
+        })?
+        .get(region)
+        .cloned()
+    {
+        return Ok(client);
+    }
+
+    let shared_config = bedrock_tokio_runtime().block_on(async {
+        aws_config::defaults(AwsBehaviorVersion::latest())
+            .region(BedrockRegion::new(region.to_string()))
+            .load()
+            .await
+    });
+    let client = BedrockClient::new(&shared_config);
+    cache
+        .lock()
+        .map_err(|_| HermesError::State {
+            action: "locking bedrock client cache",
+            detail: "cache lock poisoned".to_string(),
+        })?
+        .insert(region.to_string(), client.clone());
+    Ok(client)
+}
+
+fn bedrock_model_supports_tool_use(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    ![
+        "deepseek.r1",
+        "deepseek-r1",
+        "stability.",
+        "cohere.embed",
+        "amazon.titan-embed",
+    ]
+    .iter()
+    .any(|pattern| model_id.contains(pattern))
+}
+
+fn bedrock_convert_tools(tools: &[crate::ToolDefinition]) -> Result<Vec<BedrockTool>, HermesError> {
+    tools
+        .iter()
+        .map(|tool| {
+            let parameters = tool
+                .schema
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let input_schema =
+                BedrockToolInputSchema::Json(serde_json_to_smithy_document(&parameters));
+            let mut builder = BedrockToolSpecification::builder()
+                .name(tool.name.clone())
+                .input_schema(input_schema);
+            if !tool.description.trim().is_empty() {
+                builder = builder.description(tool.description.clone());
+            }
+            let tool_spec = builder.build().map_err(|error| HermesError::State {
+                action: "building bedrock tool spec",
                 detail: error.to_string(),
             })?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| HermesError::State {
-            action: "waiting for bedrock converse bridge",
-            detail: error.to_string(),
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!(
-                "bridge exited with code {}",
-                output.status.code().unwrap_or(-1)
-            )
-        } else {
-            stderr
-        };
-        return Err(HermesError::State {
-            action: "calling bedrock converse",
-            detail,
-        });
+            Ok(BedrockTool::ToolSpec(tool_spec))
+        })
+        .collect()
+}
+
+fn bedrock_convert_messages(
+    messages: &[Value],
+) -> Result<(Option<Vec<BedrockSystemContentBlock>>, Vec<BedrockMessage>), HermesError> {
+    let mut system_blocks = Vec::new();
+    let mut converse_messages = Vec::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let content = message.get("content");
+
+        match role {
+            "system" => {
+                if let Some(content) = content {
+                    match content {
+                        Value::String(text) => {
+                            if !text.trim().is_empty() {
+                                system_blocks.push(BedrockSystemContentBlock::Text(text.clone()));
+                            }
+                        }
+                        Value::Array(parts) => {
+                            for part in parts {
+                                match part {
+                                    Value::String(text) if !text.trim().is_empty() => {
+                                        system_blocks
+                                            .push(BedrockSystemContentBlock::Text(text.clone()));
+                                    }
+                                    Value::Object(object)
+                                        if object.get("type").and_then(Value::as_str)
+                                            == Some("text") =>
+                                    {
+                                        if let Some(text) =
+                                            object.get("text").and_then(Value::as_str)
+                                            && !text.trim().is_empty()
+                                        {
+                                            system_blocks.push(BedrockSystemContentBlock::Text(
+                                                text.to_string(),
+                                            ));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "tool" => {
+                let tool_call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if tool_call_id.is_empty() {
+                    continue;
+                }
+                let result_text = match content {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(other) => {
+                        serde_json::to_string(other).unwrap_or_else(|_| "null".to_string())
+                    }
+                    None => String::new(),
+                };
+                let tool_result = BedrockToolResultBlock::builder()
+                    .tool_use_id(tool_call_id)
+                    .content(BedrockToolResultContentBlock::Text(result_text))
+                    .build()
+                    .map_err(|error| HermesError::State {
+                        action: "building bedrock tool result",
+                        detail: error.to_string(),
+                    })?;
+                push_or_merge_bedrock_message(
+                    &mut converse_messages,
+                    BedrockConversationRole::User,
+                    vec![BedrockContentBlock::ToolResult(tool_result)],
+                )?;
+            }
+            "assistant" => {
+                let mut content_blocks = Vec::new();
+                if let Some(value) = content {
+                    content_blocks.extend(bedrock_content_blocks(value)?);
+                }
+                for tool_call in parse_tool_calls(message.get("tool_calls")) {
+                    let input = serde_json_to_smithy_document(&tool_call.json);
+                    let tool_use = aws_sdk_bedrockruntime::types::ToolUseBlock::builder()
+                        .tool_use_id(tool_call.id)
+                        .name(tool_call.name)
+                        .input(input)
+                        .build()
+                        .map_err(|error| HermesError::State {
+                            action: "building bedrock tool use",
+                            detail: error.to_string(),
+                        })?;
+                    content_blocks.push(BedrockContentBlock::ToolUse(tool_use));
+                }
+                if content_blocks.is_empty() {
+                    content_blocks.push(blank_bedrock_text_block());
+                }
+                push_or_merge_bedrock_message(
+                    &mut converse_messages,
+                    BedrockConversationRole::Assistant,
+                    content_blocks,
+                )?;
+            }
+            "user" => {
+                let content_blocks = match content {
+                    Some(value) => bedrock_content_blocks(value)?,
+                    None => vec![blank_bedrock_text_block()],
+                };
+                push_or_merge_bedrock_message(
+                    &mut converse_messages,
+                    BedrockConversationRole::User,
+                    content_blocks,
+                )?;
+            }
+            _ => {}
+        }
     }
 
-    let parsed =
-        serde_json::from_slice::<Value>(&output.stdout).map_err(|error| HermesError::State {
-            action: "decoding bedrock converse response",
-            detail: format!("{}: {}", error, String::from_utf8_lossy(&output.stdout)),
-        })?;
+    if converse_messages
+        .first()
+        .map(|message| message.role() != &BedrockConversationRole::User)
+        .unwrap_or(false)
+    {
+        converse_messages.insert(
+            0,
+            BedrockMessage::builder()
+                .role(BedrockConversationRole::User)
+                .content(blank_bedrock_text_block())
+                .build()
+                .map_err(|error| HermesError::State {
+                    action: "building bedrock message",
+                    detail: error.to_string(),
+                })?,
+        );
+    }
+    if converse_messages
+        .last()
+        .map(|message| message.role() != &BedrockConversationRole::User)
+        .unwrap_or(false)
+    {
+        converse_messages.push(
+            BedrockMessage::builder()
+                .role(BedrockConversationRole::User)
+                .content(blank_bedrock_text_block())
+                .build()
+                .map_err(|error| HermesError::State {
+                    action: "building bedrock message",
+                    detail: error.to_string(),
+                })?,
+        );
+    }
+
+    Ok((
+        (!system_blocks.is_empty()).then_some(system_blocks),
+        converse_messages,
+    ))
+}
+
+fn push_or_merge_bedrock_message(
+    messages: &mut Vec<BedrockMessage>,
+    role: BedrockConversationRole,
+    mut content: Vec<BedrockContentBlock>,
+) -> Result<(), HermesError> {
+    if let Some(last) = messages.last_mut()
+        && last.role() == &role
+    {
+        last.content.append(&mut content);
+        return Ok(());
+    }
+    messages.push(
+        BedrockMessage::builder()
+            .role(role)
+            .set_content(Some(content))
+            .build()
+            .map_err(|error| HermesError::State {
+                action: "building bedrock message",
+                detail: error.to_string(),
+            })?,
+    );
+    Ok(())
+}
+
+fn blank_bedrock_text_block() -> BedrockContentBlock {
+    BedrockContentBlock::Text(" ".to_string())
+}
+
+fn bedrock_content_blocks(content: &Value) -> Result<Vec<BedrockContentBlock>, HermesError> {
+    match content {
+        Value::Null => Ok(vec![blank_bedrock_text_block()]),
+        Value::String(text) => Ok(vec![if text.trim().is_empty() {
+            blank_bedrock_text_block()
+        } else {
+            BedrockContentBlock::Text(text.clone())
+        }]),
+        Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                match part {
+                    Value::String(text) => blocks.push(BedrockContentBlock::Text(text.clone())),
+                    Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            let text = object
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or(" ")
+                                .to_string();
+                            blocks.push(BedrockContentBlock::Text(if text.is_empty() {
+                                " ".to_string()
+                            } else {
+                                text
+                            }));
+                        }
+                        Some("image_url") => {
+                            let url = object
+                                .get("image_url")
+                                .and_then(Value::as_object)
+                                .and_then(|image| image.get("url"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            if let Some(data_url) = url.strip_prefix("data:") {
+                                let (header, encoded) =
+                                    data_url.split_once(',').unwrap_or((data_url, ""));
+                                let media_type = header.split(';').next().unwrap_or("image/jpeg");
+                                if let Ok(bytes) =
+                                    base64::engine::general_purpose::STANDARD.decode(encoded)
+                                {
+                                    let image = BedrockImageBlock::builder()
+                                        .format(bedrock_image_format(media_type))
+                                        .source(BedrockImageSource::Bytes(BedrockBlob::new(bytes)))
+                                        .build()
+                                        .map_err(|error| HermesError::State {
+                                            action: "building bedrock image block",
+                                            detail: error.to_string(),
+                                        })?;
+                                    blocks.push(BedrockContentBlock::Image(image));
+                                } else {
+                                    blocks.push(BedrockContentBlock::Text(
+                                        "[Image omitted: invalid data URL]".to_string(),
+                                    ));
+                                }
+                            } else if !url.is_empty() {
+                                blocks.push(BedrockContentBlock::Text(format!("[Image: {url}]")));
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            if blocks.is_empty() {
+                blocks.push(blank_bedrock_text_block());
+            }
+            Ok(blocks)
+        }
+        other => Ok(vec![BedrockContentBlock::Text(other.to_string())]),
+    }
+}
+
+fn bedrock_image_format(media_type: &str) -> BedrockImageFormat {
+    let subtype = media_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("jpeg")
+        .trim()
+        .to_ascii_lowercase();
+    match subtype.as_str() {
+        "gif" => BedrockImageFormat::Gif,
+        "png" => BedrockImageFormat::Png,
+        "webp" => BedrockImageFormat::Webp,
+        _ => BedrockImageFormat::Jpeg,
+    }
+}
+
+fn serde_json_to_smithy_document(value: &Value) -> SmithyDocument {
+    match value {
+        Value::Null => SmithyDocument::Null,
+        Value::Bool(boolean) => SmithyDocument::Bool(*boolean),
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                SmithyDocument::Number(SmithyNumber::PosInt(value))
+            } else if let Some(value) = number.as_i64() {
+                if value < 0 {
+                    SmithyDocument::Number(SmithyNumber::NegInt(value))
+                } else {
+                    SmithyDocument::Number(SmithyNumber::PosInt(value as u64))
+                }
+            } else {
+                SmithyDocument::Number(SmithyNumber::Float(number.as_f64().unwrap_or_default()))
+            }
+        }
+        Value::String(text) => SmithyDocument::String(text.clone()),
+        Value::Array(items) => SmithyDocument::Array(
+            items
+                .iter()
+                .map(serde_json_to_smithy_document)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(object) => SmithyDocument::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json_to_smithy_document(value)))
+                .collect::<HashMap<_, _>>(),
+        ),
+    }
+}
+
+fn smithy_document_to_json_value(value: &SmithyDocument) -> Value {
+    match value {
+        SmithyDocument::Null => Value::Null,
+        SmithyDocument::Bool(boolean) => Value::Bool(*boolean),
+        SmithyDocument::Number(number) => match number {
+            SmithyNumber::PosInt(value) => Value::Number(serde_json::Number::from(*value)),
+            SmithyNumber::NegInt(value) => Value::Number(serde_json::Number::from(*value)),
+            SmithyNumber::Float(value) => serde_json::Number::from_f64(*value)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+        },
+        SmithyDocument::String(text) => Value::String(text.clone()),
+        SmithyDocument::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(smithy_document_to_json_value)
+                .collect::<Vec<_>>(),
+        ),
+        SmithyDocument::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), smithy_document_to_json_value(value)))
+                .collect::<Map<_, _>>(),
+        ),
+    }
+}
+
+fn normalize_bedrock_response(
+    response: aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
+) -> Result<NormalizedAssistantResponse, HermesError> {
+    let output = response.output().ok_or_else(|| HermesError::State {
+        action: "parsing bedrock response",
+        detail: "response missing output".to_string(),
+    })?;
+    let BedrockConverseMessageOutput::Message(message) = output else {
+        return Err(HermesError::State {
+            action: "parsing bedrock response",
+            detail: format!("unsupported output variant: {output:?}"),
+        });
+    };
+
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in message.content() {
+        match block {
+            BedrockContentBlock::Text(text) if !text.trim().is_empty() => {
+                text_parts.push(text.clone());
+            }
+            BedrockContentBlock::ToolUse(tool_use) => {
+                let json = smithy_document_to_json_value(tool_use.input());
+                let arguments_raw =
+                    serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string());
+                if tool_use.tool_use_id().trim().is_empty() || tool_use.name().trim().is_empty() {
+                    return Err(HermesError::State {
+                        action: "parsing bedrock response",
+                        detail: "tool use block missing id or name".to_string(),
+                    });
+                }
+                tool_calls.push(PendingToolCall {
+                    id: tool_use.tool_use_id().to_string(),
+                    name: tool_use.name().to_string(),
+                    arguments_raw,
+                    json,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let has_tool_calls = !tool_calls.is_empty();
     Ok(NormalizedAssistantResponse {
-        content: extract_message_text(parsed.get("content")),
-        tool_calls: parse_bedrock_tool_calls(parsed.get("tool_calls"))?,
-        finish_reason: parsed
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
+        tool_calls,
+        finish_reason: Some(map_bedrock_finish_reason(
+            Some(response.stop_reason()),
+            has_tool_calls,
+        )),
         reasoning: None,
         reasoning_details: None,
         codex_reasoning_items: None,
         codex_message_items: None,
     })
+}
+
+fn map_bedrock_finish_reason(
+    stop_reason: Option<&BedrockStopReason>,
+    has_tool_calls: bool,
+) -> String {
+    if has_tool_calls {
+        return "tool_calls".to_string();
+    }
+    match stop_reason {
+        Some(BedrockStopReason::EndTurn | BedrockStopReason::StopSequence) => "stop".to_string(),
+        Some(BedrockStopReason::ToolUse | BedrockStopReason::MalformedToolUse) => {
+            "tool_calls".to_string()
+        }
+        Some(BedrockStopReason::MaxTokens | BedrockStopReason::ModelContextWindowExceeded) => {
+            "length".to_string()
+        }
+        Some(BedrockStopReason::ContentFiltered | BedrockStopReason::GuardrailIntervened) => {
+            "content_filter".to_string()
+        }
+        Some(other) => other.as_str().to_string(),
+        None => "stop".to_string(),
+    }
 }
 
 fn apply_chat_auth_headers(
@@ -890,44 +1335,6 @@ fn read_json_response(
         });
     }
     Ok(body)
-}
-
-fn parse_bedrock_tool_calls(value: Option<&Value>) -> Result<Vec<PendingToolCall>, HermesError> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-    let mut parsed = Vec::new();
-    for item in items {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let arguments_raw = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or("{}")
-            .to_string();
-        let json = serde_json::from_str(&arguments_raw).unwrap_or_else(|_| json!({}));
-        if id.trim().is_empty() || name.trim().is_empty() {
-            return Err(HermesError::State {
-                action: "parsing bedrock response",
-                detail: format!("Invalid tool call payload: {item}"),
-            });
-        }
-        parsed.push(PendingToolCall {
-            id,
-            name,
-            arguments_raw,
-            json,
-        });
-    }
-    Ok(parsed)
 }
 
 fn extract_choice(response: &Value) -> Result<&Value, HermesError> {
@@ -2602,45 +3009,6 @@ fn empty_google_runtime_model() -> crate::ModelRuntimeConfig {
         auth_type: "oauth_external".to_string(),
         default_headers: Vec::new(),
     }
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-        })
-}
-
-fn resolve_python_interpreter() -> PathBuf {
-    if let Some(venv) = env::var_os("VIRTUAL_ENV") {
-        let candidate = PathBuf::from(venv).join(if cfg!(windows) {
-            "Scripts/python.exe"
-        } else {
-            "bin/python"
-        });
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from(if python_command_available("python3") {
-        "python3"
-    } else {
-        "python"
-    })
-}
-
-fn python_command_available(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
 }
 
 fn responses_tools(tools: &[crate::ToolDefinition]) -> Value {
@@ -4595,110 +4963,96 @@ for raw in sys.stdin:
     }
 
     #[test]
-    fn bedrock_turn_executes_tools_and_returns_final_text() {
-        let temp = TempDir::new().unwrap();
-        let context =
-            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
-        context.ensure_hermes_home().unwrap();
-        let loaded = context.load_config_document().unwrap();
-        let pyroot = temp.path().join("pyroot");
-        fs::create_dir_all(&pyroot).unwrap();
-        fs::write(
-            pyroot.join("boto3.py"),
-            r#"
-class _Client:
-    def converse(self, **kwargs):
-        messages = kwargs.get("messages") or []
-        saw_tool_result = False
-        for message in messages:
-            for block in message.get("content", []):
-                if "toolResult" in block:
-                    saw_tool_result = True
-                    break
-            if saw_tool_result:
-                break
-        if not saw_tool_result:
-            tool_config = kwargs.get("toolConfig", {})
-            tools = tool_config.get("tools", [])
-            assert any(
-                tool.get("toolSpec", {}).get("name") == "write_file"
-                for tool in tools
-            ), kwargs
-            return {
-                "modelId": kwargs.get("modelId", ""),
-                "output": {
-                    "message": {
-                        "content": [{
-                            "toolUse": {
-                                "toolUseId": "bedrock-call-1",
-                                "name": "write_file",
-                                "input": {
-                                    "path": "bedrock.txt",
-                                    "content": "hello from bedrock tool"
-                                }
-                            }
-                        }]
+    fn bedrock_convert_messages_merges_roles_and_tool_results() {
+        let messages = vec![
+            json!({"role": "system", "content": "Follow the system prompt."}),
+            json!({"role": "user", "content": "First user turn."}),
+            json!({"role": "user", "content": [{"type": "text", "text": "Second user turn."}]}),
+            json!({
+                "role": "assistant",
+                "content": "Calling a tool.",
+                "tool_calls": [{
+                    "id": "bedrock-call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "{\"path\":\"bedrock.txt\",\"content\":\"hello from bedrock tool\"}"
                     }
-                },
-                "stopReason": "tool_use",
-                "usage": {"inputTokens": 11, "outputTokens": 7},
-            }
-        return {
-            "modelId": kwargs.get("modelId", ""),
-            "output": {
-                "message": {
-                    "content": [{
-                        "text": "Bedrock flow complete."
-                    }]
-                }
-            },
-            "stopReason": "end_turn",
-            "usage": {"inputTokens": 13, "outputTokens": 5},
-        }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "bedrock-call-1",
+                "content": "{\"success\":true}"
+            }),
+            json!({"role": "assistant", "content": "Done."}),
+        ];
 
-def client(service_name, region_name=None):
-    assert service_name == "bedrock-runtime", service_name
-    assert region_name == "us-west-2", region_name
-    return _Client()
-"#,
-        )
-        .unwrap();
-
-        let previous_pythonpath = std::env::var_os("PYTHONPATH");
-        unsafe {
-            std::env::set_var("PYTHONPATH", &pyroot);
-        }
-        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
-        let result = context
-            .run_chat_completions_turn(
-                &loaded,
-                "Create a file through bedrock mode",
-                &runtime,
-                Some(&["hermes-cli".to_string()]),
-                &ModelOverrides {
-                    model: Some("anthropic.claude-sonnet-4-6-20250514-v1:0".to_string()),
-                    provider: Some("bedrock".to_string()),
-                    base_url: Some("https://bedrock-runtime.us-west-2.amazonaws.com".to_string()),
-                    api_key: None,
-                    api_mode: Some("bedrock_converse".to_string()),
-                },
-                None,
-                None,
-            )
-            .unwrap();
-        match previous_pythonpath {
-            Some(value) => unsafe { std::env::set_var("PYTHONPATH", value) },
-            None => unsafe { std::env::remove_var("PYTHONPATH") },
-        }
-
-        assert_eq!(result.provider, "bedrock");
-        assert_eq!(result.model, "anthropic.claude-sonnet-4-6-20250514-v1:0");
-        assert_eq!(result.final_response, "Bedrock flow complete.");
-        assert_eq!(result.api_calls, 2);
-        assert_eq!(result.tool_calls, 1);
+        let (system, converted) = bedrock_convert_messages(&messages).unwrap();
         assert_eq!(
-            fs::read_to_string(temp.path().join("bedrock.txt")).unwrap(),
-            "hello from bedrock tool"
+            system,
+            Some(vec![BedrockSystemContentBlock::Text(
+                "Follow the system prompt.".to_string()
+            )])
+        );
+        assert_eq!(converted.len(), 5);
+        assert_eq!(converted[0].role(), &BedrockConversationRole::User);
+        assert_eq!(converted[1].role(), &BedrockConversationRole::Assistant);
+        assert_eq!(converted[2].role(), &BedrockConversationRole::User);
+        assert_eq!(converted[3].role(), &BedrockConversationRole::Assistant);
+        assert_eq!(converted[4].role(), &BedrockConversationRole::User);
+        assert_eq!(converted[0].content().len(), 2);
+        assert_eq!(converted[1].content().len(), 2);
+        assert!(matches!(
+            &converted[1].content()[1],
+            BedrockContentBlock::ToolUse(tool_use)
+                if tool_use.tool_use_id() == "bedrock-call-1" && tool_use.name() == "write_file"
+        ));
+        assert!(matches!(
+            &converted[2].content()[0],
+            BedrockContentBlock::ToolResult(tool_result)
+                if tool_result.tool_use_id() == "bedrock-call-1"
+        ));
+    }
+
+    #[test]
+    fn normalize_bedrock_response_extracts_tool_calls_and_finish_reason() {
+        let tool_input = serde_json_to_smithy_document(&json!({
+            "path": "bedrock.txt",
+            "content": "hello from bedrock tool"
+        }));
+        let response = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+            .output(BedrockConverseMessageOutput::Message(
+                BedrockMessage::builder()
+                    .role(BedrockConversationRole::Assistant)
+                    .content(BedrockContentBlock::Text("Calling a tool.".to_string()))
+                    .content(BedrockContentBlock::ToolUse(
+                        aws_sdk_bedrockruntime::types::ToolUseBlock::builder()
+                            .tool_use_id("bedrock-call-1")
+                            .name("write_file")
+                            .input(tool_input)
+                            .build()
+                            .unwrap(),
+                    ))
+                    .build()
+                    .unwrap(),
+            ))
+            .stop_reason(BedrockStopReason::ToolUse)
+            .build()
+            .unwrap();
+
+        let normalized = normalize_bedrock_response(response).unwrap();
+        assert_eq!(normalized.content.as_deref(), Some("Calling a tool."));
+        assert_eq!(normalized.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(normalized.tool_calls.len(), 1);
+        assert_eq!(normalized.tool_calls[0].id, "bedrock-call-1");
+        assert_eq!(normalized.tool_calls[0].name, "write_file");
+        assert_eq!(
+            normalized.tool_calls[0].json,
+            json!({
+                "path": "bedrock.txt",
+                "content": "hello from bedrock tool"
+            })
         );
     }
 
