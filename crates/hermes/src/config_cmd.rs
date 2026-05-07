@@ -309,7 +309,7 @@ fn display_yaml_value(value: &Value) -> String {
     }
 }
 
-fn read_raw_yaml_mapping(path: &Path) -> Result<Mapping, Box<dyn Error>> {
+pub(crate) fn read_raw_yaml_mapping(path: &Path) -> Result<Mapping, Box<dyn Error>> {
     if !path.exists() {
         return Ok(Mapping::new());
     }
@@ -325,7 +325,7 @@ fn read_raw_yaml_mapping(path: &Path) -> Result<Mapping, Box<dyn Error>> {
     }
 }
 
-fn write_yaml_mapping(path: &Path, mapping: &Mapping) -> Result<(), Box<dyn Error>> {
+pub(crate) fn write_yaml_mapping(path: &Path, mapping: &Mapping) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

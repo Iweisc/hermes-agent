@@ -7,6 +7,7 @@ mod doctor;
 mod dump;
 mod hooks;
 mod logs;
+mod model_cmd;
 mod webhook;
 
 use std::error::Error;
@@ -50,6 +51,10 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         command: Option<hooks::HooksCommand>,
+    },
+    Model {
+        #[command(subcommand)]
+        command: Option<model_cmd::ModelCommand>,
     },
     Webhook {
         #[command(subcommand)]
@@ -245,6 +250,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
+        Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
