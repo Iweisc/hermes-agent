@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -11,6 +11,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 
 use crate::compat_cmd::CompatArgs;
+use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
@@ -23,6 +24,7 @@ pub enum SkillsCommand {
     Install(CompatArgs),
     Inspect(CompatArgs),
     List(ListArgs),
+    Config,
     Check(CompatArgs),
     Update(CompatArgs),
     Audit(CompatArgs),
@@ -31,7 +33,6 @@ pub enum SkillsCommand {
     Publish(CompatArgs),
     Snapshot(CompatArgs),
     Tap(CompatArgs),
-    Config(CompatArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -84,6 +85,7 @@ pub fn print_skills(
         Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
         Some(SkillsCommand::Inspect(args)) => bridge_prefixed("inspect", &args.args),
         Some(SkillsCommand::List(args)) => print_list(context, args),
+        Some(SkillsCommand::Config) => configure_skills(context),
         Some(SkillsCommand::Check(args)) => bridge_prefixed("check", &args.args),
         Some(SkillsCommand::Update(args)) => bridge_prefixed("update", &args.args),
         Some(SkillsCommand::Audit(args)) => bridge_prefixed("audit", &args.args),
@@ -92,7 +94,6 @@ pub fn print_skills(
         Some(SkillsCommand::Publish(args)) => bridge_prefixed("publish", &args.args),
         Some(SkillsCommand::Snapshot(args)) => bridge_prefixed("snapshot", &args.args),
         Some(SkillsCommand::Tap(args)) => bridge_prefixed("tap", &args.args),
-        Some(SkillsCommand::Config(args)) => bridge_prefixed("config", &args.args),
     }
 }
 
@@ -297,6 +298,330 @@ fn uninstall_skill(context: &HermesContext, raw_name: &str) -> Result<(), Box<dy
     Ok(())
 }
 
+const SKILL_CONFIG_PLATFORMS: &[(&str, &str)] = &[
+    ("cli", "CLI"),
+    ("telegram", "Telegram"),
+    ("discord", "Discord"),
+    ("slack", "Slack"),
+    ("whatsapp", "WhatsApp"),
+    ("signal", "Signal"),
+    ("bluebubbles", "BlueBubbles"),
+    ("email", "Email"),
+    ("homeassistant", "Home Assistant"),
+    ("mattermost", "Mattermost"),
+    ("matrix", "Matrix"),
+    ("dingtalk", "DingTalk"),
+    ("feishu", "Feishu"),
+    ("wecom", "WeCom"),
+    ("wecom_callback", "WeCom Callback"),
+    ("weixin", "Weixin"),
+    ("qqbot", "QQBot"),
+    ("yuanbao", "Yuanbao"),
+    ("webhook", "Webhook"),
+    ("cron", "Cron"),
+];
+
+fn configure_skills(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    if !io::stdin().is_terminal() {
+        return Err("skills config requires an interactive terminal".into());
+    }
+
+    let raw_config = load_raw_config(context)?;
+    let skills = discover_all_skills(context, &raw_config)?;
+    if skills.is_empty() {
+        println!("No skills installed.");
+        return Ok(());
+    }
+
+    let platform = prompt_skill_platform()?;
+    let platform_label = skill_platform_label(platform.as_deref());
+    println!();
+    println!("Configure for: {platform_label}");
+    println!("  1. Toggle individual skills");
+    println!("  2. Toggle by category");
+    let mode = prompt_menu_choice("Select [1]: ", 2, 1)?;
+
+    let disabled = disabled_skills_for_platform(&raw_config, platform.as_deref());
+    let new_disabled = if mode == 2 {
+        toggle_skills_by_category(&skills, &disabled)?
+    } else {
+        toggle_individual_skills(&skills, &disabled, &platform_label)?
+    };
+
+    if new_disabled == disabled {
+        println!("No changes.");
+        return Ok(());
+    }
+
+    save_disabled_skills(context, platform.as_deref(), &new_disabled)?;
+    let enabled_count = skills.len().saturating_sub(new_disabled.len());
+    println!(
+        "Saved: {enabled_count} enabled, {} disabled ({platform_label}).",
+        new_disabled.len()
+    );
+    Ok(())
+}
+
+fn prompt_skill_platform() -> Result<Option<String>, Box<dyn Error>> {
+    println!();
+    println!("Configure skills for:");
+    println!("  1. All platforms (global default)");
+    for (index, (_key, label)) in SKILL_CONFIG_PLATFORMS.iter().enumerate() {
+        println!("  {}. {}", index + 2, label);
+    }
+
+    let raw = prompt_line("Select [1]: ")?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let selection = raw
+        .parse::<usize>()
+        .map_err(|_| "selection must be a number")?;
+    if selection == 1 {
+        return Ok(None);
+    }
+    let offset = selection
+        .checked_sub(2)
+        .ok_or("selection is out of range")?;
+    let Some((key, _label)) = SKILL_CONFIG_PLATFORMS.get(offset) else {
+        return Err("selection is out of range".into());
+    };
+    Ok(Some((*key).to_string()))
+}
+
+fn skill_platform_label(platform: Option<&str>) -> String {
+    match platform {
+        None => String::from("All platforms"),
+        Some(name) => SKILL_CONFIG_PLATFORMS
+            .iter()
+            .find(|(key, _label)| *key == name)
+            .map(|(_key, label)| (*label).to_string())
+            .unwrap_or_else(|| name.to_string()),
+    }
+}
+
+fn prompt_menu_choice(prompt: &str, max: usize, default: usize) -> Result<usize, Box<dyn Error>> {
+    let raw = prompt_line(prompt)?;
+    if raw.is_empty() {
+        return Ok(default);
+    }
+    let selection = raw
+        .parse::<usize>()
+        .map_err(|_| "selection must be a number")?;
+    if !(1..=max).contains(&selection) {
+        return Err("selection is out of range".into());
+    }
+    Ok(selection)
+}
+
+fn toggle_skills_by_category(
+    skills: &[SkillEntry],
+    disabled: &HashSet<String>,
+) -> Result<HashSet<String>, Box<dyn Error>> {
+    let mut categories = skills
+        .iter()
+        .map(|skill| {
+            skill
+                .category
+                .clone()
+                .unwrap_or_else(|| String::from("uncategorized"))
+        })
+        .collect::<Vec<_>>();
+    categories.sort();
+    categories.dedup();
+
+    let labels = categories
+        .iter()
+        .map(|category| {
+            let count = skills
+                .iter()
+                .filter(|skill| {
+                    skill.category.as_deref().unwrap_or("uncategorized") == category.as_str()
+                })
+                .count();
+            format!("{category} ({count} skills)")
+        })
+        .collect::<Vec<_>>();
+
+    let preselected = categories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, category)| {
+            let all_disabled = skills
+                .iter()
+                .filter(|skill| {
+                    skill.category.as_deref().unwrap_or("uncategorized") == category.as_str()
+                })
+                .all(|skill| disabled.contains(&skill.name));
+            (!all_disabled).then_some(index)
+        })
+        .collect::<BTreeSet<_>>();
+
+    let chosen = prompt_enabled_indices("Categories", &labels, &preselected)?;
+    let mut new_disabled = disabled.clone();
+    for (index, category) in categories.iter().enumerate() {
+        let category_skills = skills
+            .iter()
+            .filter(|skill| {
+                skill.category.as_deref().unwrap_or("uncategorized") == category.as_str()
+            })
+            .map(|skill| skill.name.clone())
+            .collect::<HashSet<_>>();
+        if chosen.contains(&index) {
+            new_disabled.retain(|name| !category_skills.contains(name));
+        } else {
+            new_disabled.extend(category_skills);
+        }
+    }
+    Ok(new_disabled)
+}
+
+fn toggle_individual_skills(
+    skills: &[SkillEntry],
+    disabled: &HashSet<String>,
+    platform_label: &str,
+) -> Result<HashSet<String>, Box<dyn Error>> {
+    let labels = skills
+        .iter()
+        .map(|skill| {
+            let category = skill.category.as_deref().unwrap_or("uncategorized");
+            format!("{} ({category})", skill.name)
+        })
+        .collect::<Vec<_>>();
+    let preselected = skills
+        .iter()
+        .enumerate()
+        .filter_map(|(index, skill)| (!disabled.contains(&skill.name)).then_some(index))
+        .collect::<BTreeSet<_>>();
+    let chosen = prompt_enabled_indices(
+        &format!("Skills for {platform_label}"),
+        &labels,
+        &preselected,
+    )?;
+    Ok(skills
+        .iter()
+        .enumerate()
+        .filter_map(|(index, skill)| (!chosen.contains(&index)).then_some(skill.name.clone()))
+        .collect())
+}
+
+fn prompt_enabled_indices(
+    title: &str,
+    labels: &[String],
+    preselected: &BTreeSet<usize>,
+) -> Result<BTreeSet<usize>, Box<dyn Error>> {
+    println!();
+    println!("{title}:");
+    for (index, label) in labels.iter().enumerate() {
+        let marker = if preselected.contains(&index) {
+            'x'
+        } else {
+            ' '
+        };
+        println!("  {:>2}. [{}] {}", index + 1, marker, label);
+    }
+    println!("Enter enabled numbers like 1,3-5, 'all', 'none', or press Enter to keep current.");
+    let raw = prompt_line("Enabled [keep]: ")?;
+    if raw.is_empty() {
+        return Ok(preselected.clone());
+    }
+    parse_enabled_indices(&raw, labels.len())
+}
+
+fn parse_enabled_indices(raw: &str, total: usize) -> Result<BTreeSet<usize>, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok((0..total).collect());
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut selected = BTreeSet::new();
+    for segment in trimmed.split(',') {
+        let piece = segment.trim();
+        if piece.is_empty() {
+            return Err("selection contains an empty item".into());
+        }
+        if let Some((start_raw, end_raw)) = piece.split_once('-') {
+            let start = parse_selection_index(start_raw, total)?;
+            let end = parse_selection_index(end_raw, total)?;
+            if start > end {
+                return Err("selection range must be ascending".into());
+            }
+            for index in start..=end {
+                selected.insert(index);
+            }
+        } else {
+            selected.insert(parse_selection_index(piece, total)?);
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_selection_index(raw: &str, total: usize) -> Result<usize, Box<dyn Error>> {
+    let selection = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "selection must use numeric entries")?;
+    if selection == 0 || selection > total {
+        return Err("selection is out of range".into());
+    }
+    Ok(selection - 1)
+}
+
+fn prompt_line(prompt: &str) -> Result<String, Box<dyn Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn save_disabled_skills(
+    context: &HermesContext,
+    platform: Option<&str>,
+    disabled: &HashSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let skills_entry = root
+        .entry(yaml_key("skills"))
+        .or_insert_with(|| YamlValue::Mapping(YamlMapping::new()));
+    if !matches!(skills_entry, YamlValue::Mapping(_)) {
+        *skills_entry = YamlValue::Mapping(YamlMapping::new());
+    }
+    let skills = skills_entry
+        .as_mapping_mut()
+        .ok_or("skills config must be a mapping")?;
+
+    let disabled_value = sorted_string_sequence(disabled);
+    match platform.map(str::trim).filter(|value| !value.is_empty()) {
+        None => {
+            skills.insert(yaml_key("disabled"), YamlValue::Sequence(disabled_value));
+        }
+        Some(platform) => {
+            let platform_entry = skills
+                .entry(yaml_key("platform_disabled"))
+                .or_insert_with(|| YamlValue::Mapping(YamlMapping::new()));
+            if !matches!(platform_entry, YamlValue::Mapping(_)) {
+                *platform_entry = YamlValue::Mapping(YamlMapping::new());
+            }
+            let platform_mapping = platform_entry
+                .as_mapping_mut()
+                .ok_or("skills.platform_disabled must be a mapping")?;
+            platform_mapping.insert(yaml_key(platform), YamlValue::Sequence(disabled_value));
+        }
+    }
+
+    write_yaml_mapping(&context.config_path(), &root)
+}
+
+fn sorted_string_sequence(values: &HashSet<String>) -> Vec<YamlValue> {
+    let mut items = values.iter().cloned().collect::<Vec<_>>();
+    items.sort();
+    items.into_iter().map(YamlValue::String).collect()
+}
+
 fn discover_all_skills(
     context: &HermesContext,
     raw_config: &YamlValue,
@@ -413,6 +738,17 @@ fn load_raw_config(context: &HermesContext) -> Result<YamlValue, Box<dyn Error>>
 }
 
 fn resolve_disabled_skills(raw_config: &YamlValue) -> HashSet<String> {
+    let resolved_platform = std::env::var("HERMES_PLATFORM")
+        .ok()
+        .or_else(|| std::env::var("HERMES_SESSION_PLATFORM").ok())
+        .unwrap_or_default();
+    disabled_skills_for_platform(
+        raw_config,
+        (!resolved_platform.trim().is_empty()).then_some(resolved_platform.trim()),
+    )
+}
+
+fn disabled_skills_for_platform(raw_config: &YamlValue, platform: Option<&str>) -> HashSet<String> {
     let Some(root) = raw_config.as_mapping() else {
         return HashSet::new();
     };
@@ -423,20 +759,17 @@ fn resolve_disabled_skills(raw_config: &YamlValue) -> HashSet<String> {
         return HashSet::new();
     };
 
-    let resolved_platform = std::env::var("HERMES_PLATFORM")
-        .ok()
-        .or_else(|| std::env::var("HERMES_SESSION_PLATFORM").ok())
-        .unwrap_or_default();
-    if !resolved_platform.trim().is_empty() {
-        if let Some(platform_disabled) = skills
-            .get(&yaml_key("platform_disabled"))
-            .and_then(YamlValue::as_mapping)
-            .and_then(|mapping| mapping.get(&yaml_key(resolved_platform.trim())))
-        {
-            return normalize_string_set(Some(platform_disabled));
-        }
-    }
-    normalize_string_set(skills.get(&yaml_key("disabled")))
+    let global_disabled = normalize_string_set(skills.get(&yaml_key("disabled")));
+    let Some(platform) = platform.map(str::trim).filter(|value| !value.is_empty()) else {
+        return global_disabled;
+    };
+
+    skills
+        .get(&yaml_key("platform_disabled"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|mapping| mapping.get(&yaml_key(platform)))
+        .map(|value| normalize_string_set(Some(value)))
+        .unwrap_or(global_disabled)
 }
 
 fn normalize_string_set(value: Option<&YamlValue>) -> HashSet<String> {
@@ -977,6 +1310,69 @@ mod tests {
         assert_eq!(dirs, vec![external.canonicalize().unwrap()]);
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(external);
+    }
+
+    #[test]
+    fn disabled_skills_for_platform_falls_back_to_global() {
+        let config = serde_yaml::from_str::<YamlValue>(
+            "skills:\n  disabled:\n    - global-a\n  platform_disabled:\n    cli:\n      - cli-only\n",
+        )
+        .unwrap();
+
+        let cli_disabled = disabled_skills_for_platform(&config, Some("cli"));
+        assert_eq!(cli_disabled, HashSet::from([String::from("cli-only")]));
+
+        let telegram_disabled = disabled_skills_for_platform(&config, Some("telegram"));
+        assert_eq!(telegram_disabled, HashSet::from([String::from("global-a")]));
+    }
+
+    #[test]
+    fn save_disabled_skills_writes_platform_override_without_clobbering_global() {
+        let home = temp_path("save-platform");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        if let Some(parent) = context.config_path().parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            context.config_path(),
+            "skills:\n  disabled:\n    - global-a\n",
+        )
+        .unwrap();
+
+        save_disabled_skills(
+            &context,
+            Some("telegram"),
+            &HashSet::from([String::from("tg-a"), String::from("tg-b")]),
+        )
+        .unwrap();
+
+        let saved =
+            serde_yaml::from_str::<YamlValue>(&fs::read_to_string(context.config_path()).unwrap())
+                .unwrap();
+        assert_eq!(
+            disabled_skills_for_platform(&saved, Some("telegram")),
+            HashSet::from([String::from("tg-a"), String::from("tg-b")])
+        );
+        assert_eq!(
+            disabled_skills_for_platform(&saved, Some("cli")),
+            HashSet::from([String::from("global-a")])
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn parse_enabled_indices_supports_ranges_and_keywords() {
+        assert_eq!(
+            parse_enabled_indices("1,3-4", 5).unwrap(),
+            BTreeSet::from([0, 2, 3])
+        );
+        assert_eq!(
+            parse_enabled_indices("all", 3).unwrap(),
+            BTreeSet::from([0, 1, 2])
+        );
+        assert!(parse_enabled_indices("4", 3).is_err());
+        assert!(parse_enabled_indices("3-2", 3).is_err());
     }
 
     #[test]
