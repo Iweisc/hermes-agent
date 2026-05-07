@@ -23,7 +23,7 @@ pub enum SkillsCommand {
     Browse(CompatArgs),
     Search(CompatArgs),
     Install(CompatArgs),
-    Inspect(CompatArgs),
+    Inspect(InspectArgs),
     List(ListArgs),
     Config,
     Check(CompatArgs),
@@ -59,6 +59,11 @@ pub enum SkillsSourceFilter {
 #[derive(Args, Debug, Clone)]
 pub struct UninstallArgs {
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InspectArgs {
+    pub identifier: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -108,6 +113,24 @@ struct SkillEntry {
 }
 
 #[derive(Debug, Clone)]
+struct SkillRecord {
+    entry: SkillEntry,
+    skill_md: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct NativeInspectSkill {
+    name: String,
+    description: String,
+    source: String,
+    trust: String,
+    identifier: String,
+    tags: Vec<String>,
+    preview: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 struct HubInstalledEntry {
     source: String,
     trust_level: String,
@@ -130,7 +153,7 @@ pub fn print_skills(
         Some(SkillsCommand::Browse(args)) => bridge_prefixed("browse", &args.args),
         Some(SkillsCommand::Search(args)) => bridge_prefixed("search", &args.args),
         Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
-        Some(SkillsCommand::Inspect(args)) => bridge_prefixed("inspect", &args.args),
+        Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
         Some(SkillsCommand::Check(args)) => bridge_prefixed("check", &args.args),
@@ -311,6 +334,128 @@ fn print_list(context: &HermesContext, args: ListArgs) -> Result<(), Box<dyn Err
     println!();
     println!("{summary}");
     Ok(())
+}
+
+fn inspect_skill_command(
+    context: &HermesContext,
+    raw_identifier: &str,
+) -> Result<(), Box<dyn Error>> {
+    let identifier = validate_skill_identifier(raw_identifier)?;
+    if let Some(skill) = resolve_native_inspect_skill(context, identifier)? {
+        print_native_inspect(&skill);
+        return Ok(());
+    }
+    bridge_prefixed("inspect", &[identifier.to_string()])
+}
+
+fn print_native_inspect(skill: &NativeInspectSkill) {
+    println!("Name: {}", skill.name);
+    println!("Description: {}", skill.description);
+    println!("Source: {}", skill.source);
+    println!("Trust: {}", skill.trust);
+    println!("Identifier: {}", skill.identifier);
+    if !skill.tags.is_empty() {
+        println!("Tags: {}", skill.tags.join(", "));
+    }
+    println!("Path: {}", skill.path.display());
+    println!();
+    println!("SKILL.md Preview:");
+    println!("{}", skill.preview);
+}
+
+fn resolve_native_inspect_skill(
+    context: &HermesContext,
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let raw_config = load_raw_config(context)?;
+    let hub_installed = load_hub_lock(context)?;
+    let builtin_names = load_builtin_manifest(context)?;
+    let installed = discover_skill_records(context, &raw_config)?;
+
+    let mut local_matches = installed
+        .iter()
+        .filter(|record| skill_record_matches(record, identifier))
+        .collect::<Vec<_>>();
+    if local_matches.len() == 1 {
+        return build_installed_inspect_skill(
+            local_matches.remove(0),
+            &hub_installed,
+            &builtin_names,
+        )
+        .map(Some);
+    }
+    if local_matches.len() > 1 {
+        return Ok(None);
+    }
+
+    let optional = discover_optional_skill_records()?;
+    let mut optional_matches = optional
+        .iter()
+        .filter(|record| optional_skill_matches(record, identifier))
+        .collect::<Vec<_>>();
+    if optional_matches.len() == 1 {
+        return build_optional_inspect_skill(optional_matches.remove(0)).map(Some);
+    }
+    if optional_matches.len() > 1 {
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
+fn build_installed_inspect_skill(
+    record: &SkillRecord,
+    hub_installed: &HashMap<String, HubInstalledEntry>,
+    builtin_names: &HashSet<String>,
+) -> Result<NativeInspectSkill, Box<dyn Error>> {
+    let content = fs::read_to_string(&record.skill_md)?;
+    let (frontmatter, _body) = parse_frontmatter(&content);
+    let source_info = classify_skill(&record.entry.name, hub_installed, builtin_names);
+    let identifier = hub_installed
+        .get(&record.entry.name)
+        .and_then(|entry| entry.raw.get("identifier"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(record.entry.name.as_str())
+        .to_string();
+    Ok(NativeInspectSkill {
+        name: record.entry.name.clone(),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: source_info.source_display,
+        trust: source_info.trust,
+        identifier,
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: record.skill_md.clone(),
+    })
+}
+
+fn build_optional_inspect_skill(
+    record: &SkillRecord,
+) -> Result<NativeInspectSkill, Box<dyn Error>> {
+    let content = fs::read_to_string(&record.skill_md)?;
+    let (frontmatter, _body) = parse_frontmatter(&content);
+    let optional_root = optional_skills_dir();
+    let skill_dir = record
+        .skill_md
+        .parent()
+        .ok_or("optional skill is missing a parent directory")?;
+    let rel = skill_dir
+        .strip_prefix(&optional_root)
+        .map_err(|_| "optional skill path is outside optional-skills")?;
+    Ok(NativeInspectSkill {
+        name: record.entry.name.clone(),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("official"),
+        trust: String::from("official"),
+        identifier: format!("official/{}", rel.to_string_lossy().replace('\\', "/")),
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: record.skill_md.clone(),
+    })
 }
 
 fn uninstall_skill(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn Error>> {
@@ -1169,6 +1314,16 @@ fn discover_all_skills(
     context: &HermesContext,
     raw_config: &YamlValue,
 ) -> Result<Vec<SkillEntry>, Box<dyn Error>> {
+    Ok(discover_skill_records(context, raw_config)?
+        .into_iter()
+        .map(|record| record.entry)
+        .collect())
+}
+
+fn discover_skill_records(
+    context: &HermesContext,
+    raw_config: &YamlValue,
+) -> Result<Vec<SkillRecord>, Box<dyn Error>> {
     let mut dirs = vec![context.hermes_home().join("skills")];
     dirs.extend(external_skills_dirs(context, raw_config));
 
@@ -1206,21 +1361,24 @@ fn discover_all_skills(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            skills.push(SkillEntry {
-                category: category_from_path(&dir, &skill_md),
-                name,
+            skills.push(SkillRecord {
+                entry: SkillEntry {
+                    category: category_from_path(&dir, &skill_md),
+                    name,
+                },
+                skill_md,
             });
         }
     }
 
     skills.sort_by(|left, right| {
         let left_key = (
-            left.category.as_deref().unwrap_or_default(),
-            left.name.as_str(),
+            left.entry.category.as_deref().unwrap_or_default(),
+            left.entry.name.as_str(),
         );
         let right_key = (
-            right.category.as_deref().unwrap_or_default(),
-            right.name.as_str(),
+            right.entry.category.as_deref().unwrap_or_default(),
+            right.entry.name.as_str(),
         );
         left_key.cmp(&right_key)
     });
@@ -1261,6 +1419,167 @@ fn classify_skill(
         source_display: "local".to_string(),
         trust: "local".to_string(),
     }
+}
+
+fn validate_skill_identifier(raw: &str) -> Result<&str, Box<dyn Error>> {
+    let identifier = raw.trim();
+    if identifier.is_empty() {
+        return Err("skill identifier cannot be empty".into());
+    }
+    Ok(identifier)
+}
+
+fn skill_record_matches(record: &SkillRecord, identifier: &str) -> bool {
+    let trimmed = identifier.trim();
+    if trimmed.eq_ignore_ascii_case(&record.entry.name) {
+        return true;
+    }
+    let Some(skill_dir) = record.skill_md.parent() else {
+        return false;
+    };
+    skill_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case(trimmed))
+        .unwrap_or(false)
+}
+
+fn optional_skill_matches(record: &SkillRecord, identifier: &str) -> bool {
+    let trimmed = identifier.trim();
+    if trimmed.eq_ignore_ascii_case(&record.entry.name) {
+        return true;
+    }
+    let Some(skill_dir) = record.skill_md.parent() else {
+        return false;
+    };
+    let optional_root = optional_skills_dir();
+    let rel = match skill_dir.strip_prefix(&optional_root) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => return false,
+    };
+    trimmed == format!("official/{rel}") || trimmed == rel
+}
+
+fn optional_skills_dir() -> PathBuf {
+    std::env::var_os("HERMES_OPTIONAL_SKILLS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root().join("optional-skills"))
+}
+
+fn discover_optional_skill_records() -> Result<Vec<SkillRecord>, Box<dyn Error>> {
+    let root = optional_skills_dir();
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut skill_files = Vec::new();
+    collect_skill_files(&root, &mut skill_files)?;
+    let mut skills = Vec::new();
+    for skill_md in skill_files {
+        let content = match fs::read_to_string(&skill_md) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let (frontmatter, _body) = parse_frontmatter(&content);
+        if !skill_matches_platform(&frontmatter) {
+            continue;
+        }
+        let Some(skill_dir) = skill_md.parent() else {
+            continue;
+        };
+        let fallback_name = skill_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("skill");
+        let name = frontmatter
+            .get("name")
+            .and_then(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate(value, MAX_NAME_LENGTH))
+            .unwrap_or_else(|| truncate(fallback_name, MAX_NAME_LENGTH));
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        skills.push(SkillRecord {
+            entry: SkillEntry {
+                category: category_from_path(&root, &skill_md),
+                name,
+            },
+            skill_md,
+        });
+    }
+
+    skills.sort_by(|left, right| {
+        let left_key = (
+            left.entry.category.as_deref().unwrap_or_default(),
+            left.entry.name.as_str(),
+        );
+        let right_key = (
+            right.entry.category.as_deref().unwrap_or_default(),
+            right.entry.name.as_str(),
+        );
+        left_key.cmp(&right_key)
+    });
+    Ok(skills)
+}
+
+fn frontmatter_string(frontmatter: &YamlMapping, key: &str) -> Option<String> {
+    frontmatter
+        .get(&yaml_key(key))
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_tags(frontmatter: &YamlMapping) -> Vec<String> {
+    if let Some(tags) = frontmatter
+        .get(&yaml_key("metadata"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|mapping| mapping.get(&yaml_key("hermes")))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|mapping| mapping.get(&yaml_key("tags")))
+    {
+        let collected = yaml_tags(tags);
+        if !collected.is_empty() {
+            return collected;
+        }
+    }
+    frontmatter
+        .get(&yaml_key("tags"))
+        .map(yaml_tags)
+        .unwrap_or_default()
+}
+
+fn yaml_tags(value: &YamlValue) -> Vec<String> {
+    match value {
+        YamlValue::Sequence(items) => items
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        YamlValue::String(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn preview_lines(content: &str, limit: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let visible = lines.iter().take(limit).copied().collect::<Vec<_>>();
+    let mut preview = visible.join("\n");
+    if lines.len() > limit {
+        preview.push_str(&format!("\n\n... ({} more lines)", lines.len() - limit));
+    }
+    preview
 }
 
 struct SkillSourceInfo {
@@ -2355,6 +2674,105 @@ exit 9\n",
         remove_env_var("HERMES_BUNDLED_SKILLS");
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(bundled);
+    }
+
+    #[test]
+    fn inspect_resolves_local_skill_natively() {
+        let home = temp_path("inspect-local");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skill_dir = home.join("skills").join("local-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: local-skill\ndescription: Native local skill\ntags: [alpha, beta]\n---\nline1\nline2\n",
+        )
+        .unwrap();
+
+        let inspected = resolve_native_inspect_skill(&context, "local-skill")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.name, "local-skill");
+        assert_eq!(inspected.description, "Native local skill");
+        assert_eq!(inspected.source, "local");
+        assert_eq!(inspected.trust, "local");
+        assert_eq!(inspected.identifier, "local-skill");
+        assert_eq!(
+            inspected.tags,
+            vec![String::from("alpha"), String::from("beta")]
+        );
+        assert!(inspected.preview.contains("line1"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn inspect_resolves_optional_official_skill_natively() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("inspect-optional-home");
+        let optional = temp_path("inspect-optional-src");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skill_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Optional demo\nmetadata:\n  hermes:\n    tags:\n      - optional\n      - official\n---\npreview\n",
+        )
+        .unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        let inspected = resolve_native_inspect_skill(&context, "official/research/demo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.name, "demo");
+        assert_eq!(inspected.source, "official");
+        assert_eq!(inspected.trust, "official");
+        assert_eq!(inspected.identifier, "official/research/demo");
+        assert_eq!(
+            inspected.tags,
+            vec![String::from("optional"), String::from("official")]
+        );
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inspect_bridges_when_native_resolution_misses() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("inspect-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        inspect_skill_command(&context, "owner/repo/remote-skill").unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=inspect argv=owner/repo/remote-skill"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
