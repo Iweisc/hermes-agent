@@ -145,7 +145,7 @@ fn test_server(context: &HermesContext, args: TestArgs) -> Result<(), Box<dyn Er
         println!(
             "  OAuth-configured server has no cached access token; using compatibility probe."
         );
-        return bridge_mcp("test", &[name.to_string()]);
+        return print_python_mcp_test(name);
     }
 
     let start = Instant::now();
@@ -212,7 +212,7 @@ fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn 
         println!("  No cached OAuth tokens found for '{name}'.");
     }
     println!("  Starting OAuth flow for '{name}'...");
-    bridge_mcp("test", &[name.to_string()])
+    print_python_mcp_login(name)
 }
 
 fn print_mcp_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
@@ -264,7 +264,7 @@ fn configure_server_io<R: BufRead, W: Write>(
     if is_oauth_configured(&entry.config)
         && resolve_cached_oauth_access_token(context, name).is_none()
     {
-        return bridge_mcp("configure", &[name.to_string()]);
+        return print_python_mcp_configure(name);
     }
 
     writeln!(output)?;
@@ -1201,7 +1201,11 @@ fn stdin_is_terminal() -> bool {
     }
 }
 
-fn bridge_mcp(subcommand: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+fn print_python_mcp_name_command(
+    name: &str,
+    command_name: &str,
+    bootstrap: &str,
+) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_MCP_PYTHON"))
         .ok_or("could not find a Python interpreter for mcp")?;
@@ -1210,46 +1214,48 @@ fn bridge_mcp(subcommand: &str, passthrough: &[String]) -> Result<(), Box<dyn Er
     command
         .current_dir(&root)
         .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_MCP_SUBCOMMAND", subcommand)
+        .env("HERMES_MCP_NAME", name)
         .arg("-c")
-        .arg(MCP_BOOTSTRAP)
-        .args(passthrough);
+        .arg(bootstrap);
 
     let status = command.status()?;
     if status.success() {
         return Ok(());
     }
-    Err(exit_status_message("mcp", status).into())
+    Err(exit_status_message(command_name, status).into())
 }
 
-const MCP_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
+fn print_python_mcp_test(name: &str) -> Result<(), Box<dyn Error>> {
+    print_python_mcp_name_command(name, "mcp test", MCP_TEST_BOOTSTRAP)
+}
+
+fn print_python_mcp_configure(name: &str) -> Result<(), Box<dyn Error>> {
+    print_python_mcp_name_command(name, "mcp configure", MCP_CONFIGURE_BOOTSTRAP)
+}
+
+fn print_python_mcp_login(name: &str) -> Result<(), Box<dyn Error>> {
+    print_python_mcp_name_command(name, "mcp login", MCP_LOGIN_BOOTSTRAP)
+}
+
+const MCP_TEST_BOOTSTRAP: &str = concat!(
     "import os\n",
-    "import sys\n",
-    "from hermes_cli.mcp_config import mcp_command\n",
-    "subcommand = (os.environ.get('HERMES_MCP_SUBCOMMAND') or '').strip()\n",
-    "parser = argparse.ArgumentParser(prog=f'hermes mcp {subcommand}')\n",
-    "parser.set_defaults(mcp_action=subcommand)\n",
-    "if subcommand == 'serve':\n",
-    "    parser.add_argument('-v', '--verbose', action='store_true')\n",
-    "    parser.add_argument('--accept-hooks', action='store_true', default=False)\n",
-    "elif subcommand == 'add':\n",
-    "    parser.add_argument('name')\n",
-    "    parser.add_argument('--url')\n",
-    "    parser.add_argument('--command')\n",
-    "    parser.add_argument('--args', nargs='*', default=[])\n",
-    "    parser.add_argument('--auth', choices=['oauth', 'header'])\n",
-    "    parser.add_argument('--preset')\n",
-    "    parser.add_argument('--env', nargs='*', default=[])\n",
-    "elif subcommand == 'test':\n",
-    "    parser.add_argument('name')\n",
-    "elif subcommand == 'configure':\n",
-    "    parser.add_argument('name')\n",
-    "elif subcommand == 'login':\n",
-    "    parser.add_argument('name')\n",
-    "else:\n",
-    "    raise SystemExit(f'unsupported mcp subcommand: {subcommand}')\n",
-    "mcp_command(parser.parse_args(sys.argv[1:]))\n",
+    "from argparse import Namespace\n",
+    "from hermes_cli.mcp_config import cmd_mcp_test\n",
+    "cmd_mcp_test(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
+);
+
+const MCP_CONFIGURE_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from argparse import Namespace\n",
+    "from hermes_cli.mcp_config import cmd_mcp_configure\n",
+    "cmd_mcp_configure(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
+);
+
+const MCP_LOGIN_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from argparse import Namespace\n",
+    "from hermes_cli.mcp_config import cmd_mcp_login\n",
+    "cmd_mcp_login(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
 );
 
 const MCP_SERVE_BOOTSTRAP: &str = concat!(
@@ -2206,7 +2212,7 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
 
     #[test]
     #[cfg(unix)]
-    fn oauth_http_test_bridges_without_cached_token() {
+    fn oauth_http_test_uses_python_override_without_cached_token() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("oauth-http-test-bridge");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2225,8 +2231,7 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -2248,8 +2253,7 @@ exit 9\n",
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("subcommand=test"));
-        assert!(output.contains("argv=alpha"));
+        assert!(output.contains("name=alpha"));
 
         remove_env_var("HERMES_MCP_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -2348,7 +2352,60 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn native_login_clears_tokens_and_bridges_oauth_probe() {
+    fn oauth_http_configure_uses_python_override_without_cached_token() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("oauth-http-configure-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            context.config_path(),
+            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
+        )
+        .unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+
+        let input = std::io::Cursor::new("");
+        let mut output = Vec::new();
+        configure_server_io(
+            &context,
+            &ConfigureArgs {
+                name: String::from("alpha"),
+            },
+            input,
+            &mut output,
+        )
+        .unwrap();
+
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("name=alpha"));
+
+        remove_env_var("HERMES_MCP_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_login_clears_tokens_and_uses_python_override_for_oauth_probe() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("native-login");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2369,8 +2426,7 @@ exit 9\n",
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -2394,8 +2450,7 @@ exit 9\n",
         assert!(!home.join("mcp-tokens").join("alpha.json").exists());
         assert!(!home.join("mcp-tokens").join("alpha.client.json").exists());
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("subcommand=test"));
-        assert!(output.contains("argv=alpha"));
+        assert!(output.contains("name=alpha"));
 
         remove_env_var("HERMES_MCP_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -2442,7 +2497,7 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn bridge_uses_python_override_and_passes_subcommand_and_args() {
+    fn python_login_helper_uses_python_override_and_passes_name() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -2452,8 +2507,7 @@ exit 9\n",
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'subcommand=%s argv=%s\\n' \"$HERMES_MCP_SUBCOMMAND\" \"$*\" >> '{}'\n\
+  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -2466,11 +2520,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_MCP_PYTHON", &fake_python);
-        bridge_mcp("login", &[String::from("alpha")]).unwrap();
+        print_python_mcp_login("alpha").unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("subcommand=login"));
-        assert!(output.contains("argv=alpha"));
+        assert!(output.contains("name=alpha"));
 
         remove_env_var("HERMES_MCP_PYTHON");
     }
