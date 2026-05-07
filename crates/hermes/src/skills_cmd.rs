@@ -1,0 +1,892 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+
+use clap::{Args, Subcommand, ValueEnum};
+use hermes_core::HermesContext;
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_yaml::Value as YamlValue;
+
+use crate::compat_cmd::CompatArgs;
+use crate::python_bridge::launch_python_main_command;
+
+const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
+const MAX_NAME_LENGTH: usize = 64;
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsCommand {
+    Browse(CompatArgs),
+    Search(CompatArgs),
+    Install(CompatArgs),
+    Inspect(CompatArgs),
+    List(ListArgs),
+    Check(CompatArgs),
+    Update(CompatArgs),
+    Audit(CompatArgs),
+    Uninstall(UninstallArgs),
+    Reset(CompatArgs),
+    Publish(CompatArgs),
+    Snapshot(CompatArgs),
+    Tap(CompatArgs),
+    Config(CompatArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ListArgs {
+    #[arg(long, value_enum, default_value_t = SkillsSourceFilter::All)]
+    pub source: SkillsSourceFilter,
+    #[arg(long = "enabled-only", default_value_t = false)]
+    pub enabled_only: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SkillsSourceFilter {
+    #[value(name = "all")]
+    All,
+    #[value(name = "hub")]
+    Hub,
+    #[value(name = "builtin")]
+    Builtin,
+    #[value(name = "local")]
+    Local,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UninstallArgs {
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillEntry {
+    name: String,
+    category: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HubInstalledEntry {
+    source: String,
+    trust_level: String,
+    install_path: String,
+    raw: JsonMap<String, JsonValue>,
+}
+
+pub fn print_skills(
+    context: &HermesContext,
+    command: Option<SkillsCommand>,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        None => bridge_skills(&[]),
+        Some(SkillsCommand::Browse(args)) => bridge_prefixed("browse", &args.args),
+        Some(SkillsCommand::Search(args)) => bridge_prefixed("search", &args.args),
+        Some(SkillsCommand::Install(args)) => bridge_prefixed("install", &args.args),
+        Some(SkillsCommand::Inspect(args)) => bridge_prefixed("inspect", &args.args),
+        Some(SkillsCommand::List(args)) => print_list(context, args),
+        Some(SkillsCommand::Check(args)) => bridge_prefixed("check", &args.args),
+        Some(SkillsCommand::Update(args)) => bridge_prefixed("update", &args.args),
+        Some(SkillsCommand::Audit(args)) => bridge_prefixed("audit", &args.args),
+        Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
+        Some(SkillsCommand::Reset(args)) => bridge_prefixed("reset", &args.args),
+        Some(SkillsCommand::Publish(args)) => bridge_prefixed("publish", &args.args),
+        Some(SkillsCommand::Snapshot(args)) => bridge_prefixed("snapshot", &args.args),
+        Some(SkillsCommand::Tap(args)) => bridge_prefixed("tap", &args.args),
+        Some(SkillsCommand::Config(args)) => bridge_prefixed("config", &args.args),
+    }
+}
+
+fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut argv = Vec::with_capacity(1 + passthrough.len());
+    argv.push(action.to_string());
+    argv.extend(passthrough.iter().cloned());
+    bridge_skills(&argv)
+}
+
+fn bridge_skills(argv: &[String]) -> Result<(), Box<dyn Error>> {
+    launch_python_main_command("skills", argv, Some("HERMES_SKILLS_PYTHON"), &[])
+}
+
+fn print_list(context: &HermesContext, args: ListArgs) -> Result<(), Box<dyn Error>> {
+    let raw_config = load_raw_config(context)?;
+    let disabled = resolve_disabled_skills(&raw_config);
+    let hub_installed = load_hub_lock(context)?;
+    let builtin_names = load_builtin_manifest(context)?;
+    let skills = discover_all_skills(context, &raw_config)?;
+
+    if skills.is_empty() {
+        println!("No skills installed.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<16} {:<12} {:<10} Status",
+        "Name", "Category", "Source", "Trust"
+    );
+    println!(
+        "{:<24} {:<16} {:<12} {:<10} ------",
+        "------------------------", "----------------", "------------", "----------"
+    );
+
+    let mut hub_count = 0_usize;
+    let mut builtin_count = 0_usize;
+    let mut local_count = 0_usize;
+    let mut enabled_count = 0_usize;
+    let mut disabled_count = 0_usize;
+
+    for skill in skills {
+        let source_info = classify_skill(&skill.name, &hub_installed, &builtin_names);
+        if args.source != SkillsSourceFilter::All && args.source != source_info.filter {
+            continue;
+        }
+
+        let is_enabled = !disabled.contains(&skill.name);
+        if args.enabled_only && !is_enabled {
+            continue;
+        }
+
+        match source_info.filter {
+            SkillsSourceFilter::Hub => hub_count += 1,
+            SkillsSourceFilter::Builtin => builtin_count += 1,
+            SkillsSourceFilter::Local => local_count += 1,
+            SkillsSourceFilter::All => {}
+        }
+
+        if is_enabled {
+            enabled_count += 1;
+        } else {
+            disabled_count += 1;
+        }
+
+        println!(
+            "{:<24} {:<16} {:<12} {:<10} {}",
+            truncate(&skill.name, 24),
+            truncate(skill.category.as_deref().unwrap_or(""), 16),
+            truncate(&source_info.source_display, 12),
+            truncate(&source_info.trust, 10),
+            if is_enabled { "enabled" } else { "disabled" }
+        );
+    }
+
+    let mut summary =
+        format!("{hub_count} hub-installed, {builtin_count} builtin, {local_count} local");
+    if args.enabled_only {
+        summary.push_str(&format!(" — {enabled_count} enabled shown"));
+    } else {
+        summary.push_str(&format!(
+            " — {enabled_count} enabled, {disabled_count} disabled"
+        ));
+    }
+    println!();
+    println!("{summary}");
+    Ok(())
+}
+
+fn uninstall_skill(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn Error>> {
+    let name = validate_skill_name(raw_name)?;
+    let mut installed = load_hub_lock(context)?;
+    let Some(entry) = installed.remove(name) else {
+        return Err(format!("'{}' is not a hub-installed skill (may be a builtin)", name).into());
+    };
+
+    if !confirm_prompt(&format!("Uninstall '{name}'? [y/N]: "))? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let skills_root = context.hermes_home().join("skills");
+    let install_path = validated_install_path(&skills_root, &entry.install_path)?;
+    if install_path.exists() {
+        fs::remove_dir_all(&install_path)?;
+    }
+
+    save_hub_lock(context, &installed)?;
+    append_audit_log(
+        context,
+        "UNINSTALL",
+        name,
+        &entry.source,
+        &entry.trust_level,
+        "n/a",
+        "user_request",
+    )?;
+    println!("Uninstalled '{name}' from {}", entry.install_path);
+    Ok(())
+}
+
+fn discover_all_skills(
+    context: &HermesContext,
+    raw_config: &YamlValue,
+) -> Result<Vec<SkillEntry>, Box<dyn Error>> {
+    let mut dirs = vec![context.hermes_home().join("skills")];
+    dirs.extend(external_skills_dirs(context, raw_config));
+
+    let mut seen = HashSet::new();
+    let mut skills = Vec::new();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut skill_files = Vec::new();
+        collect_skill_files(&dir, &mut skill_files)?;
+        for skill_md in skill_files {
+            let content = match fs::read_to_string(&skill_md) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let (frontmatter, _body) = parse_frontmatter(&content);
+            if !skill_matches_platform(&frontmatter) {
+                continue;
+            }
+            let Some(skill_dir) = skill_md.parent() else {
+                continue;
+            };
+            let fallback_name = skill_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("skill");
+            let name = frontmatter
+                .get("name")
+                .and_then(YamlValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate(value, MAX_NAME_LENGTH))
+                .unwrap_or_else(|| truncate(fallback_name, MAX_NAME_LENGTH));
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            skills.push(SkillEntry {
+                category: category_from_path(&dir, &skill_md),
+                name,
+            });
+        }
+    }
+
+    skills.sort_by(|left, right| {
+        let left_key = (
+            left.category.as_deref().unwrap_or_default(),
+            left.name.as_str(),
+        );
+        let right_key = (
+            right.category.as_deref().unwrap_or_default(),
+            right.name.as_str(),
+        );
+        left_key.cmp(&right_key)
+    });
+    Ok(skills)
+}
+
+fn classify_skill(
+    name: &str,
+    hub_installed: &HashMap<String, HubInstalledEntry>,
+    builtin_names: &HashSet<String>,
+) -> SkillSourceInfo {
+    if let Some(entry) = hub_installed.get(name) {
+        return SkillSourceInfo {
+            filter: SkillsSourceFilter::Hub,
+            source_display: if entry.source.trim().is_empty() {
+                "hub".to_string()
+            } else {
+                entry.source.clone()
+            },
+            trust: if entry.source == "official" {
+                "official".to_string()
+            } else if entry.trust_level.trim().is_empty() {
+                "community".to_string()
+            } else {
+                entry.trust_level.clone()
+            },
+        };
+    }
+    if builtin_names.contains(name) {
+        return SkillSourceInfo {
+            filter: SkillsSourceFilter::Builtin,
+            source_display: "builtin".to_string(),
+            trust: "builtin".to_string(),
+        };
+    }
+    SkillSourceInfo {
+        filter: SkillsSourceFilter::Local,
+        source_display: "local".to_string(),
+        trust: "local".to_string(),
+    }
+}
+
+struct SkillSourceInfo {
+    filter: SkillsSourceFilter,
+    source_display: String,
+    trust: String,
+}
+
+fn load_raw_config(context: &HermesContext) -> Result<YamlValue, Box<dyn Error>> {
+    if !context.config_path().exists() {
+        return Ok(YamlValue::Null);
+    }
+    let text = fs::read_to_string(context.config_path())?;
+    if text.trim().is_empty() {
+        return Ok(YamlValue::Null);
+    }
+    Ok(serde_yaml::from_str(&text)?)
+}
+
+fn resolve_disabled_skills(raw_config: &YamlValue) -> HashSet<String> {
+    let Some(root) = raw_config.as_mapping() else {
+        return HashSet::new();
+    };
+    let Some(skills) = root
+        .get(&yaml_key("skills"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return HashSet::new();
+    };
+
+    let resolved_platform = std::env::var("HERMES_PLATFORM")
+        .ok()
+        .or_else(|| std::env::var("HERMES_SESSION_PLATFORM").ok())
+        .unwrap_or_default();
+    if !resolved_platform.trim().is_empty() {
+        if let Some(platform_disabled) = skills
+            .get(&yaml_key("platform_disabled"))
+            .and_then(YamlValue::as_mapping)
+            .and_then(|mapping| mapping.get(&yaml_key(resolved_platform.trim())))
+        {
+            return normalize_string_set(Some(platform_disabled));
+        }
+    }
+    normalize_string_set(skills.get(&yaml_key("disabled")))
+}
+
+fn normalize_string_set(value: Option<&YamlValue>) -> HashSet<String> {
+    match value {
+        Some(YamlValue::Sequence(items)) => items
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(YamlValue::String(value)) => value
+            .trim()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
+fn external_skills_dirs(context: &HermesContext, raw_config: &YamlValue) -> Vec<PathBuf> {
+    let Some(root) = raw_config.as_mapping() else {
+        return Vec::new();
+    };
+    let Some(skills) = root
+        .get(&yaml_key("skills"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Vec::new();
+    };
+    let Some(raw_dirs) = skills.get(&yaml_key("external_dirs")) else {
+        return Vec::new();
+    };
+
+    let values = match raw_dirs {
+        YamlValue::Sequence(items) => items
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        YamlValue::String(value) => vec![value.clone()],
+        _ => return Vec::new(),
+    };
+
+    let local_skills = context.hermes_home().join("skills");
+    let local_resolved = local_skills
+        .canonicalize()
+        .unwrap_or_else(|_| local_skills.clone());
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+
+    for raw in values {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let expanded = expand_path_like(trimmed);
+        let candidate = if Path::new(&expanded).is_absolute() {
+            PathBuf::from(expanded)
+        } else {
+            context.hermes_home().join(expanded)
+        };
+        let resolved = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        if resolved == local_resolved || !resolved.is_dir() || !seen.insert(resolved.clone()) {
+            continue;
+        }
+        result.push(resolved);
+    }
+
+    result
+}
+
+fn load_builtin_manifest(context: &HermesContext) -> Result<HashSet<String>, Box<dyn Error>> {
+    let manifest = context
+        .hermes_home()
+        .join("skills")
+        .join(".bundled_manifest");
+    if !manifest.exists() {
+        return Ok(HashSet::new());
+    }
+    let mut result = HashSet::new();
+    for line in fs::read_to_string(manifest)?.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let name = trimmed
+            .split_once(':')
+            .map(|(name, _)| name.trim())
+            .unwrap_or(trimmed);
+        if !name.is_empty() {
+            result.insert(name.to_string());
+        }
+    }
+    Ok(result)
+}
+
+fn load_hub_lock(
+    context: &HermesContext,
+) -> Result<HashMap<String, HubInstalledEntry>, Box<dyn Error>> {
+    let lock_path = context
+        .hermes_home()
+        .join("skills")
+        .join(".hub")
+        .join("lock.json");
+    if !lock_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let parsed = serde_json::from_str::<JsonValue>(&fs::read_to_string(lock_path)?)?;
+    let Some(installed) = parsed.get("installed").and_then(JsonValue::as_object) else {
+        return Ok(HashMap::new());
+    };
+    let mut result = HashMap::new();
+    for (name, value) in installed {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let source = object
+            .get("source")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("hub")
+            .trim()
+            .to_string();
+        let trust_level = object
+            .get("trust_level")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("community")
+            .trim()
+            .to_string();
+        let install_path = object
+            .get("install_path")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        result.insert(
+            name.clone(),
+            HubInstalledEntry {
+                source,
+                trust_level,
+                install_path,
+                raw: object.clone(),
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn save_hub_lock(
+    context: &HermesContext,
+    installed: &HashMap<String, HubInstalledEntry>,
+) -> Result<(), Box<dyn Error>> {
+    let lock_path = context
+        .hermes_home()
+        .join("skills")
+        .join(".hub")
+        .join("lock.json");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut root = JsonMap::new();
+    root.insert("version".to_string(), JsonValue::from(1));
+    let mut installed_map = JsonMap::new();
+    let mut names = installed.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        let Some(entry) = installed.get(&name) else {
+            continue;
+        };
+        installed_map.insert(name, JsonValue::Object(entry.raw.clone()));
+    }
+    root.insert("installed".to_string(), JsonValue::Object(installed_map));
+    fs::write(
+        lock_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&JsonValue::Object(root))?
+        ),
+    )?;
+    Ok(())
+}
+
+fn append_audit_log(
+    context: &HermesContext,
+    action: &str,
+    skill_name: &str,
+    source: &str,
+    trust_level: &str,
+    verdict: &str,
+    extra: &str,
+) -> Result<(), Box<dyn Error>> {
+    let path = context
+        .hermes_home()
+        .join("skills")
+        .join(".hub")
+        .join("audit.log");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let timestamp = iso8601_now();
+    let mut line = format!("{timestamp} {action} {skill_name} {source}:{trust_level} {verdict}");
+    if !extra.trim().is_empty() {
+        line.push(' ');
+        line.push_str(extra.trim());
+    }
+    line.push('\n');
+    let mut contents = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    contents.push_str(&line);
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn validated_install_path(
+    skills_root: &Path,
+    install_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let trimmed = install_path.trim();
+    if trimmed.is_empty() {
+        return Err("hub install_path is empty".into());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("hub install_path must be relative".into());
+    }
+    for component in path.components() {
+        match component {
+            Component::CurDir | Component::Normal(_) => {}
+            Component::ParentDir => return Err("hub install_path cannot escape skills root".into()),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("hub install_path must stay within skills root".into());
+            }
+        }
+    }
+    Ok(skills_root.join(path))
+}
+
+fn collect_skill_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if path.is_dir() {
+            if EXCLUDED_SKILL_DIRS.iter().any(|excluded| *excluded == name) {
+                continue;
+            }
+            collect_skill_files(&path, output)?;
+        } else if name == "SKILL.md" {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn parse_frontmatter(content: &str) -> (YamlMapping, String) {
+    if !content.starts_with("---") {
+        return (YamlMapping::new(), content.to_string());
+    }
+    let tail = &content[3..];
+    let Some(end_offset) = tail.find("\n---\n").or_else(|| tail.find("\n---\r\n")) else {
+        return (YamlMapping::new(), content.to_string());
+    };
+    let yaml_content = &tail[..end_offset];
+    let body = tail[end_offset + 5..].to_string();
+    match serde_yaml::from_str::<YamlValue>(yaml_content) {
+        Ok(YamlValue::Mapping(mapping)) => (mapping, body),
+        _ => (YamlMapping::new(), body),
+    }
+}
+
+type YamlMapping = serde_yaml::Mapping;
+
+fn skill_matches_platform(frontmatter: &YamlMapping) -> bool {
+    let Some(platforms) = frontmatter.get(&yaml_key("platforms")) else {
+        return true;
+    };
+    let values = match platforms {
+        YamlValue::Sequence(items) => items
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        YamlValue::String(value) => vec![value.trim().to_string()],
+        _ => Vec::new(),
+    };
+    if values.is_empty() {
+        return true;
+    }
+    let current = std::env::consts::OS;
+    values
+        .into_iter()
+        .any(|platform| match platform.to_ascii_lowercase().as_str() {
+            "macos" => current == "macos",
+            "linux" => current == "linux",
+            "windows" => current == "windows",
+            other => other == current,
+        })
+}
+
+fn category_from_path(skills_root: &Path, skill_md: &Path) -> Option<String> {
+    let rel = skill_md.strip_prefix(skills_root).ok()?;
+    let mut parts = rel.components();
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if second.as_os_str() == "SKILL.md" {
+        return None;
+    }
+    match first {
+        Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+        _ => None,
+    }
+}
+
+fn validate_skill_name(raw: &str) -> Result<&str, Box<dyn Error>> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("skill name cannot be empty".into());
+    }
+    Ok(name)
+}
+
+fn truncate(value: &str, max_len: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_len {
+        return value.to_string();
+    }
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+    let prefix = chars[..max_len - 3].iter().collect::<String>();
+    format!("{prefix}...")
+}
+
+fn expand_path_like(value: &str) -> String {
+    let mut expanded = value.to_string();
+    if expanded == "~" {
+        if let Some(home) = dirs::home_dir() {
+            expanded = home.display().to_string();
+        }
+    } else if let Some(rest) = expanded.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            expanded = home.join(rest).display().to_string();
+        }
+    }
+
+    let mut rendered = String::new();
+    let mut chars = expanded.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next();
+            let mut key = String::new();
+            while let Some(next) = chars.next() {
+                if next == '}' {
+                    break;
+                }
+                key.push(next);
+            }
+            if key.is_empty() {
+                rendered.push_str("${}");
+            } else if let Ok(value) = std::env::var(&key) {
+                rendered.push_str(&value);
+            }
+        } else {
+            rendered.push(ch);
+        }
+    }
+    rendered
+}
+
+fn iso8601_now() -> String {
+    let output = std::process::Command::new("date")
+        .arg("-u")
+        .arg("+%Y-%m-%dT%H:%M:%SZ")
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "1970-01-01T00:00:00Z".to_string(),
+    }
+}
+
+fn confirm_prompt(prompt: &str) -> Result<bool, Box<dyn Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    Ok(matches!(trimmed.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn yaml_key(key: &str) -> YamlValue {
+    YamlValue::String(key.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("hermes-rs-skills-{label}-{unique}"))
+    }
+
+    #[test]
+    fn list_sees_local_builtin_hub_and_disabled_skills() {
+        let home = temp_path("list");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skills_dir = home.join("skills");
+        fs::create_dir_all(skills_dir.join("mlops").join("builtin-skill")).unwrap();
+        fs::create_dir_all(skills_dir.join("local-skill")).unwrap();
+        fs::create_dir_all(skills_dir.join("hub-skill")).unwrap();
+        fs::create_dir_all(skills_dir.join(".hub")).unwrap();
+        fs::write(
+            skills_dir
+                .join("mlops")
+                .join("builtin-skill")
+                .join("SKILL.md"),
+            "---\nname: builtin-skill\ndescription: Builtin\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(
+            skills_dir.join("local-skill").join("SKILL.md"),
+            "---\nname: local-skill\ndescription: Local\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(
+            skills_dir.join("hub-skill").join("SKILL.md"),
+            "---\nname: hub-skill\ndescription: Hub\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(skills_dir.join(".bundled_manifest"), "builtin-skill:hash\n").unwrap();
+        fs::write(
+            skills_dir.join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"hub-skill":{"source":"official","trust_level":"trusted","install_path":"hub-skill","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            context.config_path(),
+            "skills:\n  disabled:\n    - local-skill\n",
+        )
+        .unwrap();
+
+        print_list(
+            &context,
+            ListArgs {
+                source: SkillsSourceFilter::All,
+                enabled_only: false,
+            },
+        )
+        .unwrap();
+
+        let disabled = resolve_disabled_skills(&load_raw_config(&context).unwrap());
+        assert!(disabled.contains("local-skill"));
+        let builtin = load_builtin_manifest(&context).unwrap();
+        assert!(builtin.contains("builtin-skill"));
+        let hub = load_hub_lock(&context).unwrap();
+        assert!(hub.contains_key("hub-skill"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn uninstall_rejects_non_hub_skill() {
+        let home = temp_path("uninstall-miss");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let error = uninstall_skill(&context, "missing")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a hub-installed skill"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn external_dirs_are_resolved_from_config() {
+        let home = temp_path("external");
+        let external = temp_path("external-src");
+        fs::create_dir_all(&external).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        if let Some(parent) = context.config_path().parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            context.config_path(),
+            format!(
+                "skills:\n  external_dirs:\n    - {}\n    - ./missing\n",
+                external.display()
+            ),
+        )
+        .unwrap();
+        let dirs = external_skills_dirs(&context, &load_raw_config(&context).unwrap());
+        assert_eq!(dirs, vec![external.canonicalize().unwrap()]);
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(external);
+    }
+
+    #[test]
+    fn saving_hub_lock_preserves_unknown_metadata_fields() {
+        let home = temp_path("lock-preserve");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let hub_dir = home.join("skills").join(".hub");
+        fs::create_dir_all(&hub_dir).unwrap();
+        fs::write(
+            hub_dir.join("lock.json"),
+            r#"{"version":1,"installed":{"hub-skill":{"source":"official","trust_level":"trusted","install_path":"hub-skill","files":["SKILL.md"],"identifier":"owner/repo/hub-skill","metadata":{"foo":"bar"}}}}"#,
+        )
+        .unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        save_hub_lock(&context, &installed).unwrap();
+
+        let saved = fs::read_to_string(hub_dir.join("lock.json")).unwrap();
+        assert!(saved.contains("\"identifier\": \"owner/repo/hub-skill\""));
+        assert!(saved.contains("\"metadata\""));
+        assert!(saved.contains("\"foo\": \"bar\""));
+        let _ = fs::remove_dir_all(home);
+    }
+}

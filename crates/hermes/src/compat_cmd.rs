@@ -18,10 +18,6 @@ pub fn print_gateway(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("gateway", args)
 }
 
-pub fn print_skills(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("skills", args)
-}
-
 pub fn print_curator(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("curator", args)
 }

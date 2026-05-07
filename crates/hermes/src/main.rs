@@ -21,6 +21,7 @@ mod model_cmd;
 mod pairing_cmd;
 mod plugins_cmd;
 mod python_bridge;
+mod skills_cmd;
 mod slack_cmd;
 mod snapshot_cmd;
 mod update_cmd;
@@ -88,7 +89,10 @@ enum Command {
     Completion(completion::CompletionArgs),
     Dashboard(dashboard_cmd::DashboardArgs),
     Gateway(compat_cmd::CompatArgs),
-    Skills(compat_cmd::CompatArgs),
+    Skills {
+        #[command(subcommand)]
+        command: Option<skills_cmd::SkillsCommand>,
+    },
     Checkpoints {
         #[command(subcommand)]
         command: Option<checkpoints_cmd::CheckpointsCommand>,
@@ -320,7 +324,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Gateway(args) => compat_cmd::print_gateway(args)?,
-        Command::Skills(args) => compat_cmd::print_skills(args)?,
+        Command::Skills { command } => skills_cmd::print_skills(&context, command)?,
         Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
         Command::Plugins { command } => plugins_cmd::print_plugins(&context, command)?,
