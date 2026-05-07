@@ -14,8 +14,56 @@ pub fn print_setup(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("setup", args)
 }
 
+pub fn print_fallback(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("fallback", args)
+}
+
 pub fn print_gateway(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("gateway", args)
+}
+
+pub fn print_skills(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("skills", args)
+}
+
+pub fn print_snapshot(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("snapshot", args)
+}
+
+pub fn print_plugins(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("plugins", args)
+}
+
+pub fn print_curator(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("curator", args)
+}
+
+pub fn print_memory(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("memory", args)
+}
+
+pub fn print_mcp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("mcp", args)
+}
+
+pub fn print_insights(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("insights", args)
+}
+
+pub fn print_claw(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("claw", args)
+}
+
+pub fn print_migrate(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("migrate", args)
+}
+
+pub fn print_cleanup(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("cleanup", args)
+}
+
+pub fn print_acp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
+    print_passthrough("acp", args)
 }
 
 pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
