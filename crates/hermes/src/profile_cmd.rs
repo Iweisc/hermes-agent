@@ -9,10 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use clap::{Args, Subcommand};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use hermes_core::HermesContext;
 use serde_yaml::Value as YamlValue;
+use tar::{Archive, Builder, EntryType, Header};
+use tempfile::TempDir;
 
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{launch_python_main_command, project_root};
 
 const RESERVED_ALIAS_NAMES: &[&str] = &["hermes", "default", "test", "tmp", "root", "sudo"];
 const HERMES_SUBCOMMANDS: &[&str] = &[
@@ -54,11 +59,19 @@ pub enum ProfileCommand {
     Show { name: String },
     Alias(ProfileAliasArgs),
     Rename { old_name: String, new_name: String },
+    Export(ProfileExportArgs),
+    Import(ProfileImportArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct ProfileCreateArgs {
     pub name: String,
+    #[arg(long, default_value_t = false)]
+    pub clone: bool,
+    #[arg(long = "clone-all", default_value_t = false)]
+    pub clone_all: bool,
+    #[arg(long = "clone-from")]
+    pub clone_from: Option<String>,
     #[arg(long, default_value_t = false)]
     pub no_alias: bool,
 }
@@ -77,6 +90,20 @@ pub struct ProfileAliasArgs {
     pub remove: bool,
     #[arg(long = "name")]
     pub alias_name: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProfileExportArgs {
+    pub name: String,
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ProfileImportArgs {
+    pub archive: String,
+    #[arg(long = "name")]
+    pub import_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +150,8 @@ pub fn print_profile(
         Some(ProfileCommand::Rename { old_name, new_name }) => {
             rename_profile_command(context, &old_name, &new_name)
         }
+        Some(ProfileCommand::Export(args)) => export_profile_command(context, args),
+        Some(ProfileCommand::Import(args)) => import_profile_command(context, args),
     }
 }
 
@@ -201,9 +230,40 @@ fn create_profile_command(
     args: ProfileCreateArgs,
 ) -> Result<(), Box<dyn Error>> {
     let canon = hermes_core::normalize_profile_name(&args.name)?;
-    let path = context.create_profile(&canon)?;
+    if args.clone && args.clone_all {
+        return Err("--clone and --clone-all are mutually exclusive".into());
+    }
+    let clone_requested = args.clone || args.clone_all || args.clone_from.is_some();
+    let path = if args.clone_all {
+        let source = resolve_clone_source(context, args.clone_from.as_deref())?;
+        clone_profile_tree(context, &canon, &source)?
+    } else {
+        let created = context.create_profile(&canon)?;
+        let profile_context = context.clone().with_hermes_home_env(Some(created.clone()));
+        profile_context.ensure_hermes_home()?;
+        if clone_requested {
+            let source = resolve_clone_source(context, args.clone_from.as_deref())?;
+            clone_profile_config(&source, &created)?;
+        } else {
+            seed_bundled_skills(&created)?;
+        }
+        created
+    };
     println!("created={canon}");
     println!("path={}", path.display());
+    if args.clone || args.clone_all {
+        let source = args
+            .clone_from
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| context.current_profile_name());
+        println!("cloned_from={source}");
+        if args.clone_all {
+            println!("clone_mode=all");
+        } else {
+            println!("clone_mode=config");
+        }
+    }
     if !args.no_alias {
         match create_wrapper_script(context.home_dir(), &canon, &canon) {
             Ok(path) => {
@@ -389,6 +449,44 @@ fn rename_profile_command(
     Ok(())
 }
 
+fn export_profile_command(
+    context: &HermesContext,
+    args: ProfileExportArgs,
+) -> Result<(), Box<dyn Error>> {
+    let canon = hermes_core::normalize_profile_name(&args.name)?;
+    hermes_core::validate_profile_name(&canon)?;
+    let output = args.output.unwrap_or_else(|| format!("{canon}.tar.gz"));
+    let output_path = export_profile(context, &canon, &output)?;
+    println!("exported={canon}");
+    println!("archive={}", output_path.display());
+    Ok(())
+}
+
+fn import_profile_command(
+    context: &HermesContext,
+    args: ProfileImportArgs,
+) -> Result<(), Box<dyn Error>> {
+    let imported = import_profile_archive(context, &args.archive, args.import_name.as_deref())?;
+    println!(
+        "imported={}",
+        imported
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default()
+    );
+    println!("path={}", imported.display());
+    let imported_name = imported
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("imported profile path missing final name")?;
+    if check_alias_collision(context.home_dir(), imported_name)?.is_none() {
+        if let Ok(path) = create_wrapper_script(context.home_dir(), imported_name, imported_name) {
+            println!("alias_created={}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn list_profiles(context: &HermesContext) -> Result<Vec<ProfileRow>, Box<dyn Error>> {
     let mut rows = Vec::new();
     let default_home = context.default_hermes_root();
@@ -443,6 +541,409 @@ fn list_profiles(context: &HermesContext) -> Result<Vec<ProfileRow>, Box<dyn Err
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(rows)
+}
+
+fn resolve_clone_source(
+    context: &HermesContext,
+    clone_from: Option<&str>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(source) = clone_from {
+        let canon = hermes_core::normalize_profile_name(source)?;
+        let dir = context.profile_dir(&canon)?;
+        if !dir.is_dir() {
+            return Err(format!(
+                "Source profile '{canon}' does not exist at {}",
+                dir.display()
+            )
+            .into());
+        }
+        return Ok(dir);
+    }
+    let dir = context.hermes_home();
+    if !dir.is_dir() {
+        return Err(format!(
+            "Source profile 'active' does not exist at {}",
+            dir.display()
+        )
+        .into());
+    }
+    Ok(dir)
+}
+
+fn clone_profile_config(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    for name in ["config.yaml", ".env", "SOUL.md"] {
+        let src = source.join(name);
+        if src.exists() {
+            fs::copy(&src, destination.join(name))?;
+        }
+    }
+    let source_skills = source.join("skills");
+    if source_skills.is_dir() {
+        copy_dir_recursive(&source_skills, &destination.join("skills"), &|_, _| false)?;
+    }
+    for relative in ["memories/MEMORY.md", "memories/USER.md"] {
+        let src = source.join(relative);
+        if src.exists() {
+            let dest = destination.join(relative);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(src, dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn clone_profile_tree(
+    context: &HermesContext,
+    profile_name: &str,
+    source: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let dest = context.profile_dir(profile_name)?;
+    if dest.exists() {
+        return Err(format!(
+            "Profile '{profile_name}' already exists at {}",
+            dest.display()
+        )
+        .into());
+    }
+    let staging = TempDir::new()?;
+    let staged_dest = staging.path().join(profile_name);
+    copy_dir_recursive(source, &staged_dest, &|path, depth| {
+        depth == 1 && path.file_name().is_some_and(|name| name == "profiles")
+    })?;
+    for stale in ["gateway.pid", "gateway_state.json", "processes.json"] {
+        let _ = fs::remove_file(staged_dest.join(stale));
+    }
+    fs::create_dir_all(dest.parent().ok_or("profile destination missing parent")?)?;
+    fs::rename(&staged_dest, &dest)?;
+    let profile_context = context.clone().with_hermes_home_env(Some(dest.clone()));
+    profile_context.ensure_hermes_home()?;
+    Ok(dest)
+}
+
+fn seed_bundled_skills(profile_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let bundled_dir = env::var_os("HERMES_BUNDLED_SKILLS")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| project_root().join("skills"));
+    if !bundled_dir.is_dir() {
+        return Ok(());
+    }
+    copy_dir_recursive(&bundled_dir, &profile_dir.join("skills"), &|path, _| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".git" || name == ".github" || name == ".hub")
+    })
+}
+
+fn copy_dir_recursive(
+    source: &Path,
+    destination: &Path,
+    skip: &dyn Fn(&Path, usize) -> bool,
+) -> Result<(), Box<dyn Error>> {
+    fn walk(
+        source: &Path,
+        destination: &Path,
+        depth: usize,
+        skip: &dyn Fn(&Path, usize) -> bool,
+    ) -> Result<(), Box<dyn Error>> {
+        if skip(source, depth) {
+            return Ok(());
+        }
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dest = destination.join(entry.file_name());
+            if skip(&src, depth + 1) {
+                continue;
+            }
+            if src.is_dir() {
+                walk(&src, &dest, depth + 1, skip)?;
+            } else {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&src, &dest)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk(source, destination, 0, skip)
+}
+
+fn export_profile(
+    context: &HermesContext,
+    profile_name: &str,
+    output: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let profile_dir = context.profile_dir(profile_name)?;
+    if !profile_dir.is_dir() {
+        return Err(format!("Profile '{profile_name}' does not exist.").into());
+    }
+    let output_path = PathBuf::from(output);
+    if output_path.as_os_str().is_empty() {
+        return Err("profile export output cannot be empty".into());
+    }
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let file = fs::File::create(&output_path)?;
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut builder = Builder::new(encoder);
+    let root_name = if profile_name == "default" {
+        "default"
+    } else {
+        profile_name
+    };
+    append_directory_to_tar(
+        &mut builder,
+        &profile_dir,
+        Path::new(root_name),
+        profile_name == "default",
+    )?;
+    builder.finish()?;
+    Ok(output_path)
+}
+
+fn append_directory_to_tar(
+    builder: &mut Builder<GzEncoder<fs::File>>,
+    source: &Path,
+    archive_root: &Path,
+    default_profile: bool,
+) -> Result<(), Box<dyn Error>> {
+    append_dir_entry(builder, archive_root, source)?;
+    walk_export_entries(builder, source, archive_root, 0, default_profile)
+}
+
+fn walk_export_entries(
+    builder: &mut Builder<GzEncoder<fs::File>>,
+    source: &Path,
+    archive_root: &Path,
+    depth: usize,
+    default_profile: bool,
+) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if should_skip_export_entry(&name, depth, default_profile) {
+            continue;
+        }
+        let archive_path = archive_root.join(entry.file_name());
+        if path.is_dir() {
+            append_dir_entry(builder, &archive_path, &path)?;
+            walk_export_entries(builder, &path, &archive_path, depth + 1, default_profile)?;
+        } else if path.is_file() {
+            builder.append_path_with_name(&path, &archive_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_export_entry(name: &str, depth: usize, default_profile: bool) -> bool {
+    if matches!(name, "__pycache__" | "package.json" | "package-lock.json") {
+        return true;
+    }
+    if name.ends_with(".sock") || name.ends_with(".tmp") {
+        return true;
+    }
+    if default_profile && depth == 0 {
+        return matches!(
+            name,
+            "hermes-agent"
+                | ".worktrees"
+                | "profiles"
+                | "bin"
+                | "node_modules"
+                | "state.db"
+                | "state.db-shm"
+                | "state.db-wal"
+                | "hermes_state.db"
+                | "response_store.db"
+                | "response_store.db-shm"
+                | "response_store.db-wal"
+                | "gateway.pid"
+                | "gateway_state.json"
+                | "processes.json"
+                | "auth.json"
+                | ".env"
+                | "auth.lock"
+                | "active_profile"
+                | ".update_check"
+                | "errors.log"
+                | ".hermes_history"
+                | "image_cache"
+                | "audio_cache"
+                | "document_cache"
+                | "browser_screenshots"
+                | "checkpoints"
+                | "sandboxes"
+                | "logs"
+        );
+    }
+    if !default_profile && depth == 0 && matches!(name, "auth.json" | ".env") {
+        return true;
+    }
+    false
+}
+
+fn append_dir_entry(
+    builder: &mut Builder<GzEncoder<fs::File>>,
+    archive_path: &Path,
+    source: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let metadata = fs::metadata(source)?;
+    let mut header = Header::new_gnu();
+    header.set_path(archive_path)?;
+    header.set_entry_type(EntryType::Directory);
+    header.set_size(0);
+    #[cfg(unix)]
+    header.set_mode(metadata.permissions().mode());
+    #[cfg(not(unix))]
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder.append(&header, io::empty())?;
+    Ok(())
+}
+
+fn import_profile_archive(
+    context: &HermesContext,
+    archive_path: &str,
+    name: Option<&str>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let archive_path = PathBuf::from(archive_path);
+    if !archive_path.is_file() {
+        return Err(format!("Archive not found: {}", archive_path.display()).into());
+    }
+
+    let bytes = fs::read(&archive_path)?;
+    let top_dirs = inspect_archive_roots(&bytes)?;
+    let archive_root = if top_dirs.len() == 1 {
+        top_dirs.into_iter().next().unwrap()
+    } else {
+        return Err("Profile archive must contain exactly one top-level directory.".into());
+    };
+
+    let inferred = if let Some(name) = name {
+        hermes_core::normalize_profile_name(name)?
+    } else {
+        archive_root.clone()
+    };
+    hermes_core::validate_profile_name(&inferred)?;
+    if inferred == "default" {
+        return Err("Cannot import as 'default' — specify a different name with --name.".into());
+    }
+
+    let profile_dir = context.profile_dir(&inferred)?;
+    if profile_dir.exists() {
+        return Err(format!(
+            "Profile '{inferred}' already exists at {}",
+            profile_dir.display()
+        )
+        .into());
+    }
+    fs::create_dir_all(context.profiles_root())?;
+
+    let staging = TempDir::new()?;
+    extract_profile_archive(&bytes, staging.path())?;
+    let extracted = staging.path().join(&archive_root);
+    if !extracted.is_dir() {
+        return Err(format!("Profile archive root is missing or invalid: {archive_root}").into());
+    }
+
+    let final_source = if archive_root != inferred {
+        let renamed = staging.path().join(&inferred);
+        fs::rename(&extracted, &renamed)?;
+        renamed
+    } else {
+        extracted
+    };
+    fs::rename(&final_source, &profile_dir)?;
+    Ok(profile_dir)
+}
+
+fn inspect_archive_roots(
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<String>, Box<dyn Error>> {
+    let cursor = std::io::Cursor::new(bytes);
+    let decoder = GzDecoder::new(cursor);
+    let mut archive = Archive::new(decoder);
+    let mut roots = std::collections::BTreeSet::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let parts = normalize_archive_parts(&entry.path()?)?;
+        if let Some(root) = parts.first() {
+            roots.insert(root.clone());
+        }
+    }
+    Ok(roots)
+}
+
+fn extract_profile_archive(bytes: &[u8], destination: &Path) -> Result<(), Box<dyn Error>> {
+    let cursor = std::io::Cursor::new(bytes);
+    let decoder = GzDecoder::new(cursor);
+    let mut archive = Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let parts = normalize_archive_parts(&entry.path()?)?;
+        let target = parts
+            .iter()
+            .fold(destination.to_path_buf(), |acc, part| acc.join(part));
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&target)?;
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(format!(
+                "Unsupported archive member type: {}",
+                entry.path()?.display()
+            )
+            .into());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::File::create(&target)?;
+        io::copy(&mut entry, &mut file)?;
+        #[cfg(unix)]
+        if let Ok(mode) = entry.header().mode() {
+            let mut perms = fs::metadata(&target)?.permissions();
+            perms.set_mode(mode);
+            let _ = fs::set_permissions(&target, perms);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_archive_parts(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = value.to_string_lossy();
+                if value.is_empty() || value == "." {
+                    continue;
+                }
+                if value == ".." {
+                    return Err(format!("Unsafe archive member path: {}", path.display()).into());
+                }
+                parts.push(value.to_string());
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("Unsafe archive member path: {}", path.display()).into()),
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!("Unsafe archive member path: {}", path.display()).into());
+    }
+    Ok(parts)
 }
 
 fn describe_profile(context: &HermesContext, name: &str) -> Result<ProfileRow, Box<dyn Error>> {
@@ -827,17 +1328,176 @@ mod tests {
 
     #[test]
     fn create_profile_command_creates_alias_by_default() {
+        let _guard = test_env_lock().lock().unwrap();
         let (_temp, ctx) = test_context();
+        let bundled = ctx.home_dir().join("bundled");
+        fs::create_dir_all(bundled.join("demo")).unwrap();
+        fs::write(
+            bundled.join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\nbody\n",
+        )
+        .unwrap();
+        set_env_var("HERMES_BUNDLED_SKILLS", &bundled);
         create_profile_command(
             &ctx,
             ProfileCreateArgs {
                 name: "coder".to_string(),
+                clone: false,
+                clone_all: false,
+                clone_from: None,
                 no_alias: false,
             },
         )
         .unwrap();
         assert!(ctx.profile_dir("coder").unwrap().exists());
         assert!(wrapper_dir(ctx.home_dir()).join("coder").exists());
+        assert!(
+            ctx.profile_dir("coder")
+                .unwrap()
+                .join("skills")
+                .join("demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        remove_env_var("HERMES_BUNDLED_SKILLS");
+    }
+
+    #[test]
+    fn create_profile_clone_copies_config_skills_and_memory() {
+        let (_temp, ctx) = test_context();
+        let source = ctx.create_profile("source").unwrap();
+        fs::write(
+            source.join("config.yaml"),
+            "model:\n  default: test-model\n",
+        )
+        .unwrap();
+        fs::write(source.join(".env"), "OPENAI_API_KEY=test-key\n").unwrap();
+        fs::write(source.join("SOUL.md"), "custom soul").unwrap();
+        fs::create_dir_all(source.join("skills").join("team").join("demo")).unwrap();
+        fs::write(
+            source
+                .join("skills")
+                .join("team")
+                .join("demo")
+                .join("SKILL.md"),
+            "---\nname: demo\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(source.join("memories").join("MEMORY.md"), "memory").unwrap();
+        fs::write(source.join("memories").join("USER.md"), "user").unwrap();
+
+        create_profile_command(
+            &ctx,
+            ProfileCreateArgs {
+                name: "clone".to_string(),
+                clone: true,
+                clone_all: false,
+                clone_from: Some("source".to_string()),
+                no_alias: true,
+            },
+        )
+        .unwrap();
+
+        let dest = ctx.profile_dir("clone").unwrap();
+        assert_eq!(
+            fs::read_to_string(dest.join("config.yaml")).unwrap(),
+            "model:\n  default: test-model\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".env")).unwrap(),
+            "OPENAI_API_KEY=test-key\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("SOUL.md")).unwrap(),
+            "custom soul"
+        );
+        assert!(
+            dest.join("skills")
+                .join("team")
+                .join("demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("memories").join("MEMORY.md")).unwrap(),
+            "memory"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("memories").join("USER.md")).unwrap(),
+            "user"
+        );
+    }
+
+    #[test]
+    fn create_profile_clone_all_skips_nested_profiles_and_runtime_files() {
+        let (_temp, ctx) = test_context();
+        let default_root = ctx.default_hermes_root();
+        fs::create_dir_all(default_root.join("workspace")).unwrap();
+        fs::write(default_root.join("workspace").join("note.txt"), "hello").unwrap();
+        fs::write(default_root.join("gateway.pid"), "123").unwrap();
+        fs::write(default_root.join("processes.json"), "{}").unwrap();
+        fs::create_dir_all(default_root.join("profiles").join("other")).unwrap();
+        fs::write(
+            default_root
+                .join("profiles")
+                .join("other")
+                .join("marker.txt"),
+            "ignore me",
+        )
+        .unwrap();
+
+        create_profile_command(
+            &ctx,
+            ProfileCreateArgs {
+                name: "mirror".to_string(),
+                clone: false,
+                clone_all: true,
+                clone_from: None,
+                no_alias: true,
+            },
+        )
+        .unwrap();
+
+        let dest = ctx.profile_dir("mirror").unwrap();
+        assert!(dest.join("workspace").join("note.txt").exists());
+        assert!(!dest.join("gateway.pid").exists());
+        assert!(!dest.join("processes.json").exists());
+        assert!(!dest.join("profiles").exists());
+    }
+
+    #[test]
+    fn export_and_import_profile_archive_round_trips_without_credentials() {
+        let (_temp, ctx) = test_context();
+        let source = ctx.create_profile("coder").unwrap();
+        fs::write(source.join("config.yaml"), "model:\n  default: imported\n").unwrap();
+        fs::write(source.join(".env"), "SECRET=1\n").unwrap();
+        fs::write(source.join("auth.json"), "{\"token\":1}\n").unwrap();
+        fs::create_dir_all(source.join("skills").join("demo")).unwrap();
+        fs::write(
+            source.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\nbody\n",
+        )
+        .unwrap();
+
+        let archive = ctx.home_dir().join("coder.tar.gz");
+        export_profile(&ctx, "coder", archive.to_str().unwrap()).unwrap();
+        let imported =
+            import_profile_archive(&ctx, archive.to_str().unwrap(), Some("builder")).unwrap();
+
+        assert_eq!(imported, ctx.profile_dir("builder").unwrap());
+        assert_eq!(
+            fs::read_to_string(imported.join("config.yaml")).unwrap(),
+            "model:\n  default: imported\n"
+        );
+        assert!(
+            imported
+                .join("skills")
+                .join("demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        assert!(!imported.join(".env").exists());
+        assert!(!imported.join("auth.json").exists());
     }
 
     #[test]
