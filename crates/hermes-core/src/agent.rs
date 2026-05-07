@@ -18,6 +18,7 @@ use crate::{
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
 const MAX_HTTP_ERROR_BODY_CHARS: usize = 4000;
 const KANBAN_GUIDANCE: &str = "# Kanban task execution protocol\nUse kanban_show first to orient on the assigned task. Work inside HERMES_KANBAN_WORKSPACE unless the task explicitly requires otherwise. Heartbeat during long-running work, block when you need human input you cannot infer, and finish with kanban_complete(summary=..., metadata=...) or kanban_block(reason=...). Use kanban_create for real follow-up work instead of silently scope-creeping into it.";
+const COPILOT_ACP_MARKER_BASE_URL: &str = "acp://copilot";
 const GOOGLE_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_CODE_ASSIST_FALLBACK_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
@@ -497,6 +498,9 @@ fn send_chat_completion(
     tools: &[crate::ToolDefinition],
     session_id: Option<&str>,
 ) -> Result<NormalizedAssistantResponse, HermesError> {
+    if is_copilot_acp_runtime(runtime_model) {
+        return send_copilot_acp_chat_completion(runtime_model, messages, tools);
+    }
     if is_google_gemini_cli_runtime(runtime_model) {
         return send_google_gemini_chat_completion(client, runtime_model, messages, tools);
     }
@@ -1030,6 +1034,145 @@ fn is_google_gemini_cli_runtime(runtime_model: &crate::ModelRuntimeConfig) -> bo
             .trim()
             .to_ascii_lowercase()
             .starts_with("cloudcode-pa://")
+}
+
+fn is_copilot_acp_runtime(runtime_model: &crate::ModelRuntimeConfig) -> bool {
+    let normalized = runtime_model.base_url.trim().to_ascii_lowercase();
+    runtime_model.provider == "copilot-acp"
+        || normalized.starts_with(COPILOT_ACP_MARKER_BASE_URL)
+        || normalized.starts_with("acp+tcp://")
+}
+
+fn send_copilot_acp_chat_completion(
+    runtime_model: &crate::ModelRuntimeConfig,
+    messages: &[Value],
+    tools: &[crate::ToolDefinition],
+) -> Result<NormalizedAssistantResponse, HermesError> {
+    let creds = crate::resolve_copilot_acp_runtime_credentials()?;
+    let python = resolve_python_interpreter();
+    let payload = json!({
+        "model": runtime_model.model,
+        "messages": messages,
+        "tools": tools.iter().map(|tool| tool.openai_schema()).collect::<Vec<_>>(),
+        "tool_choice": if tools.is_empty() { Value::Null } else { Value::String("auto".to_string()) },
+        "api_key": runtime_model.api_key,
+        "base_url": runtime_model.base_url,
+        "command": creds.command,
+        "cwd": env::current_dir()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| String::from(".")),
+    });
+    let script = r#"
+import json
+import sys
+
+from agent.copilot_acp_client import CopilotACPClient
+
+payload = json.load(sys.stdin)
+client = CopilotACPClient(
+    api_key=payload.get("api_key"),
+    base_url=payload.get("base_url"),
+    command=payload.get("command"),
+    acp_cwd=payload.get("cwd"),
+)
+response = client.chat.completions.create(
+    model=payload.get("model"),
+    messages=payload.get("messages") or [],
+    tools=payload.get("tools") or [],
+    tool_choice=payload.get("tool_choice"),
+)
+choice = response.choices[0] if getattr(response, "choices", None) else None
+message = getattr(choice, "message", None)
+tool_calls = []
+for tool_call in (getattr(message, "tool_calls", None) or []):
+    function = getattr(tool_call, "function", None)
+    tool_calls.append({
+        "id": getattr(tool_call, "id", ""),
+        "name": getattr(function, "name", ""),
+        "arguments": getattr(function, "arguments", "{}"),
+    })
+print(json.dumps({
+    "content": getattr(message, "content", None),
+    "tool_calls": tool_calls,
+    "finish_reason": getattr(choice, "finish_reason", None),
+    "reasoning": getattr(message, "reasoning", None),
+}))
+"#;
+
+    let mut command = Command::new(&python);
+    command
+        .arg("-c")
+        .arg(script)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut pythonpath_entries = vec![repo_root()];
+    if let Some(existing) = env::var_os("PYTHONPATH") {
+        pythonpath_entries.extend(env::split_paths(&existing));
+    }
+    if let Ok(joined) = env::join_paths(pythonpath_entries) {
+        command.env("PYTHONPATH", joined);
+    }
+
+    let mut child = command.spawn().map_err(|error| HermesError::State {
+        action: "starting Copilot ACP bridge",
+        detail: format!("{} failed: {error}", python.display()),
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = serde_json::to_vec(&payload).map_err(|error| HermesError::State {
+            action: "encoding Copilot ACP payload",
+            detail: error.to_string(),
+        })?;
+        stdin
+            .write_all(&bytes)
+            .map_err(|error| HermesError::State {
+                action: "writing Copilot ACP payload",
+                detail: error.to_string(),
+            })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| HermesError::State {
+            action: "waiting for Copilot ACP bridge",
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!(
+                "bridge exited with code {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            stderr
+        };
+        return Err(HermesError::State {
+            action: "calling Copilot ACP",
+            detail,
+        });
+    }
+
+    let parsed =
+        serde_json::from_slice::<Value>(&output.stdout).map_err(|error| HermesError::State {
+            action: "decoding Copilot ACP response",
+            detail: format!("{}: {}", error, String::from_utf8_lossy(&output.stdout)),
+        })?;
+    Ok(NormalizedAssistantResponse {
+        content: extract_message_text(parsed.get("content")),
+        tool_calls: parse_bedrock_tool_calls(parsed.get("tool_calls"))?,
+        finish_reason: parsed
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        reasoning: parsed
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        reasoning_details: None,
+        codex_reasoning_items: None,
+        codex_message_items: None,
+    })
 }
 
 fn send_google_gemini_chat_completion(
@@ -2966,6 +3109,81 @@ mod tests {
             persisted["refresh"],
             json!("google-refresh|managed-proj|managed-proj")
         );
+    }
+
+    #[test]
+    fn copilot_acp_bridge_returns_text_response() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
+        let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
+
+        let temp = TempDir::new().unwrap();
+        let script = temp.path().join("fake-copilot-acp.py");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    method = message.get("method")
+    msg_id = message.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": "copilot-test"}}), flush=True)
+    elif method == "session/prompt":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"text": "Copilot ACP smoke passed."}
+                }
+            }
+        }), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {}}), flush=True)
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        unsafe {
+            env::set_var("HERMES_COPILOT_ACP_COMMAND", &script);
+            env::set_var("COPILOT_ACP_BASE_URL", "acp://copilot");
+        }
+
+        let runtime = crate::ModelRuntimeConfig {
+            model: "claude-sonnet-4.6".to_string(),
+            provider: "copilot-acp".to_string(),
+            base_url: "acp://copilot".to_string(),
+            api_key: "copilot-acp".to_string(),
+            api_mode: "chat_completions".to_string(),
+            auth_type: "external_process".to_string(),
+            default_headers: Vec::new(),
+        };
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let client = build_http_client().unwrap();
+        let result = request_model_text(&client, &runtime, &messages).unwrap();
+
+        match previous_command {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_ACP_COMMAND", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_ACP_COMMAND") },
+        }
+        match previous_base {
+            Some(value) => unsafe { env::set_var("COPILOT_ACP_BASE_URL", value) },
+            None => unsafe { env::remove_var("COPILOT_ACP_BASE_URL") },
+        }
+
+        assert_eq!(result.as_deref(), Some("Copilot ACP smoke passed."));
     }
 
     #[test]

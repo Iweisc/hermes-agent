@@ -38,10 +38,10 @@ mod yuanbao;
 
 pub use agent::AgentTurnResult;
 pub use auth::{
-    GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, QwenRuntimeCredentials,
-    codex_cloudflare_headers, resolve_codex_access_token,
-    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_qwen_runtime_credentials,
+    CopilotAcpRuntimeCredentials, GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials,
+    QwenRuntimeCredentials, codex_cloudflare_headers, resolve_codex_access_token,
+    resolve_copilot_acp_runtime_credentials, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_qwen_runtime_credentials,
 };
 pub use config::{
     AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,

@@ -9,8 +9,9 @@ use crate::{
     HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
-    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
+    resolve_copilot_acp_runtime_credentials, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_provider_api_mode,
+    resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -439,6 +440,11 @@ impl HermesContext {
             detail: format!("Provider '{provider}' is not recognized by the Rust runtime."),
         })?;
         let model = normalize_model_for_provider(&raw_model, &provider);
+        let copilot_acp = if provider == "copilot-acp" {
+            Some(resolve_copilot_acp_runtime_credentials()?)
+        } else {
+            None
+        };
         let minimax_oauth = if provider == "minimax-oauth" {
             Some(resolve_minimax_oauth_runtime_credentials(
                 &self.hermes_home(),
@@ -461,6 +467,7 @@ impl HermesContext {
 
         let base_url = explicit_base_url
             .or(config_base_url)
+            .or_else(|| copilot_acp.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| minimax_oauth.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| qwen_oauth.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| {
@@ -479,6 +486,7 @@ impl HermesContext {
 
         let mut api_key = explicit_api_key
             .or(config_api_key)
+            .or_else(|| (provider == "copilot-acp").then(|| "copilot-acp".to_string()))
             .or_else(|| {
                 minimax_oauth
                     .as_ref()
@@ -1144,6 +1152,54 @@ mod tests {
         assert_eq!(runtime.api_mode, "chat_completions");
         assert_eq!(runtime.api_key, "google-runtime-token");
         assert_eq!(runtime.base_url, "cloudcode-pa://google");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_copilot_acp_runtime_credentials() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
+        let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
+
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        let fake = ctx.hermes_home().join("copilot-fake");
+        fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&fake).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).unwrap();
+        }
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: claude-sonnet-4.6\n  provider: copilot-acp\n",
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var("HERMES_COPILOT_ACP_COMMAND", &fake);
+            env::set_var("COPILOT_ACP_BASE_URL", "acp://copilot");
+        }
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        match previous_command {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_ACP_COMMAND", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_ACP_COMMAND") },
+        }
+        match previous_base {
+            Some(value) => unsafe { env::set_var("COPILOT_ACP_BASE_URL", value) },
+            None => unsafe { env::remove_var("COPILOT_ACP_BASE_URL") },
+        }
+
+        assert_eq!(runtime.provider, "copilot-acp");
+        assert_eq!(runtime.api_mode, "chat_completions");
+        assert_eq!(runtime.api_key, "copilot-acp");
+        assert_eq!(runtime.base_url, "acp://copilot");
     }
 
     #[test]

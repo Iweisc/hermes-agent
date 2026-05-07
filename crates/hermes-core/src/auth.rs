@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,8 @@ const AUTH_STORE_VERSION: i64 = 1;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const DEFAULT_COPILOT_ACP_BASE_URL: &str = "acp://copilot";
+const DEFAULT_COPILOT_ACP_COMMAND: &str = "copilot";
 const GOOGLE_OAUTH_CLIENT_ID_ENV: &str = "HERMES_GEMINI_CLIENT_ID";
 const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -36,6 +39,12 @@ struct CodexTokens {
 pub struct MinimaxOAuthRuntimeCredentials {
     pub access_token: String,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotAcpRuntimeCredentials {
+    pub base_url: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +84,36 @@ pub fn resolve_minimax_oauth_runtime_credentials(
     hermes_home: &Path,
 ) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
     resolve_minimax_oauth_runtime_credentials_with_client(hermes_home, &Client::new())
+}
+
+pub fn resolve_copilot_acp_runtime_credentials() -> Result<CopilotAcpRuntimeCredentials, HermesError>
+{
+    let base_url = env::var("COPILOT_ACP_BASE_URL")
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| DEFAULT_COPILOT_ACP_BASE_URL.to_string());
+    let command = env::var("HERMES_COPILOT_ACP_COMMAND")
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            env::var("COPILOT_CLI_PATH")
+                .ok()
+                .as_deref()
+                .and_then(non_empty_trimmed)
+        })
+        .unwrap_or_else(|| DEFAULT_COPILOT_ACP_COMMAND.to_string());
+    let resolved = resolve_command_path(&command).ok_or_else(|| HermesError::State {
+        action: "resolving Copilot ACP runtime",
+        detail: format!(
+            "Could not find the Copilot CLI command '{command}'. Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        ),
+    })?;
+    Ok(CopilotAcpRuntimeCredentials {
+        base_url: base_url.trim_end_matches('/').to_string(),
+        command: resolved,
+    })
 }
 
 pub fn resolve_google_gemini_runtime_credentials(
@@ -233,6 +272,25 @@ fn qwen_cli_auth_path() -> Result<std::path::PathBuf, HermesError> {
         detail: "Could not determine the home directory for ~/.qwen/oauth_creds.json.".to_string(),
     })?;
     Ok(home.join(".qwen").join("oauth_creds.json"))
+}
+
+fn resolve_command_path(command: &str) -> Option<String> {
+    let candidate = command.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(candidate);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file().then(|| path.to_string_lossy().to_string());
+    }
+    let path_var = env::var_os("PATH")?;
+    for directory in env::split_paths(&path_var) {
+        let full = directory.join(candidate);
+        if full.is_file() {
+            return Some(full.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 fn google_oauth_path(hermes_home: &Path) -> std::path::PathBuf {
@@ -1184,7 +1242,10 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn jwt_with_claims(exp: i64, account_id: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1341,6 +1402,43 @@ mod tests {
         let resolved = resolve_minimax_oauth_runtime_credentials(temp.path()).unwrap();
         assert_eq!(resolved.access_token, "mini-fresh");
         assert_eq!(resolved.base_url, "https://api.minimax.io/anthropic");
+    }
+
+    #[test]
+    fn resolve_copilot_acp_runtime_credentials_reads_env_command_and_base_url() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_command = env::var_os("HERMES_COPILOT_ACP_COMMAND");
+        let previous_base = env::var_os("COPILOT_ACP_BASE_URL");
+
+        let temp = TempDir::new().unwrap();
+        let fake = temp.path().join("fake-copilot");
+        fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&fake).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake, permissions).unwrap();
+        }
+
+        unsafe {
+            env::set_var("HERMES_COPILOT_ACP_COMMAND", &fake);
+            env::set_var("COPILOT_ACP_BASE_URL", "acp://copilot");
+        }
+
+        let resolved = resolve_copilot_acp_runtime_credentials().unwrap();
+
+        match previous_command {
+            Some(value) => unsafe { env::set_var("HERMES_COPILOT_ACP_COMMAND", value) },
+            None => unsafe { env::remove_var("HERMES_COPILOT_ACP_COMMAND") },
+        }
+        match previous_base {
+            Some(value) => unsafe { env::set_var("COPILOT_ACP_BASE_URL", value) },
+            None => unsafe { env::remove_var("COPILOT_ACP_BASE_URL") },
+        }
+
+        assert_eq!(resolved.base_url, "acp://copilot");
+        assert_eq!(resolved.command, fake.to_string_lossy());
     }
 
     #[test]
