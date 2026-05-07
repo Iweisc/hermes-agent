@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
@@ -11,7 +12,7 @@ use hermes_core::{
 };
 use serde_yaml::{Mapping, Value};
 
-use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::{disabled_memory_toolsets, run_clarify_prompt};
@@ -285,11 +286,37 @@ const PLATFORMS: &[PlatformDef] = &[
     },
 ];
 
-const TOOLS_RECONFIGURE_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.config import load_config\n",
-    "from hermes_cli.tools_config import _reconfigure_tool\n",
-    "_reconfigure_tool(load_config())\n",
+const TOOLS_RECONFIGURE_TOOLSET_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from hermes_cli.config import load_config, save_config\n",
+    "from hermes_cli.tools_config import TOOL_CATEGORIES, _configure_tool_category_for_reconfig, _reconfigure_simple_requirements\n",
+    "config = load_config()\n",
+    "toolset = os.environ['HERMES_TOOLS_RECONFIGURE_TOOLSET']\n",
+    "category = TOOL_CATEGORIES.get(toolset)\n",
+    "if category:\n",
+    "    _configure_tool_category_for_reconfig(toolset, category, config)\n",
+    "else:\n",
+    "    _reconfigure_simple_requirements(toolset)\n",
+    "save_config(config)\n",
 );
+
+const RECONFIGURABLE_TOOLSETS: &[&str] = &[
+    "web",
+    "browser",
+    "vision",
+    "image_gen",
+    "moa",
+    "tts",
+    "rl",
+    "homeassistant",
+    "spotify",
+];
+
+const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &["web", "vision", "moa", "homeassistant"];
+
+const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
+const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
+const DEFAULT_SEARXNG_URL: &str = "http://localhost:8080";
 
 pub fn print_tools(
     context: &HermesContext,
@@ -433,7 +460,7 @@ pub(crate) fn run_native_tools_interactive_with_io(
     writeln!(output, "  Enable or disable built-in tools per platform.")?;
     writeln!(
         output,
-        "  Provider/API-key reconfiguration and MCP discovery stay on the narrowed compatibility path."
+        "  Some provider/API-key reconfiguration paths still use the narrowed compatibility path."
     )?;
     writeln!(output)?;
 
@@ -485,7 +512,7 @@ pub(crate) fn run_native_tools_interactive_with_io(
                 writeln!(output)?;
             }
             InteractiveToolsChoice::Reconfigure => {
-                run_python_tools_bootstrap("tools reconfigure", TOOLS_RECONFIGURE_BOOTSTRAP)?;
+                run_tools_reconfigure_with_io(context, input, output)?;
                 writeln!(output)?;
             }
             InteractiveToolsChoice::ConfigureMcp => {
@@ -497,6 +524,292 @@ pub(crate) fn run_native_tools_interactive_with_io(
     }
 
     Ok(())
+}
+
+fn run_tools_reconfigure_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let configurable = CONFIGURABLE_TOOLSETS
+        .iter()
+        .filter(|toolset| {
+            reconfigurable_toolset(toolset.name)
+                && (toolset_enabled_for_reconfigure(&root, toolset.name)
+                    || toolset_has_known_configuration(context, &root, toolset.name))
+        })
+        .collect::<Vec<_>>();
+
+    if configurable.is_empty() {
+        writeln!(output, "No configured tools to reconfigure.")?;
+        return Ok(());
+    }
+
+    let mut labels = configurable
+        .iter()
+        .map(|toolset| toolset.label)
+        .collect::<Vec<_>>();
+    labels.push("Cancel");
+    let choice = prompt_menu_choice(
+        input,
+        output,
+        "Which tool would you like to reconfigure?",
+        &labels,
+    )?;
+    if choice >= configurable.len() {
+        return Ok(());
+    }
+
+    let toolset = configurable[choice].name;
+    if native_reconfigurable_toolset(toolset) {
+        run_native_tool_reconfigure_with_io(context, toolset, input, output)
+    } else {
+        run_python_tools_reconfigure_toolset(toolset)
+    }
+}
+
+fn run_native_tool_reconfigure_with_io(
+    context: &HermesContext,
+    toolset: &str,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    match toolset {
+        "web" => reconfigure_web_with_io(context, input, output),
+        "vision" => reconfigure_simple_env_tool_with_io(
+            context,
+            input,
+            output,
+            "Vision / Image Analysis",
+            "OPENROUTER_API_KEY",
+            Some("https://openrouter.ai/keys"),
+        ),
+        "moa" => reconfigure_simple_env_tool_with_io(
+            context,
+            input,
+            output,
+            "Mixture of Agents",
+            "OPENROUTER_API_KEY",
+            Some("https://openrouter.ai/keys"),
+        ),
+        "homeassistant" => reconfigure_homeassistant_with_io(context, input, output),
+        other => run_python_tools_reconfigure_toolset(other),
+    }
+}
+
+fn reconfigure_web_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_backend = nested_string(&root, &["web", "backend"]).unwrap_or_default();
+    let current_use_gateway = nested_bool(&root, &["web", "use_gateway"]).unwrap_or(false);
+    let current_firecrawl_url = env_value_for_context(context, "FIRECRAWL_API_URL");
+    let compatibility_recommended = current_use_gateway
+        || !matches!(
+            current_backend.as_str(),
+            "" | "firecrawl" | "exa" | "parallel" | "tavily" | "searxng"
+        );
+
+    writeln!(output)?;
+    writeln!(output, "Web Search & Scraping")?;
+    let choices = [
+        "Firecrawl Cloud",
+        "Exa",
+        "Parallel",
+        "Tavily",
+        "Firecrawl Self-Hosted",
+        "SearXNG",
+        if compatibility_recommended {
+            "Use compatibility flow (recommended)"
+        } else {
+            "Use compatibility flow"
+        },
+    ];
+    let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
+    if selection == choices.len() - 1 {
+        return run_python_tools_reconfigure_toolset("web");
+    }
+
+    {
+        let web = ensure_mapping(&mut root, "web");
+        web.insert(
+            yaml_key("backend"),
+            Value::String(
+                match selection {
+                    0 | 4 => "firecrawl",
+                    1 => "exa",
+                    2 => "parallel",
+                    3 => "tavily",
+                    5 => "searxng",
+                    _ => unreachable!(),
+                }
+                .to_string(),
+            ),
+        );
+        web.insert(yaml_key("use_gateway"), Value::Bool(false));
+    }
+
+    match selection {
+        0 => {
+            writeln!(output, "Get key at: https://firecrawl.dev")?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "FIRECRAWL_API_KEY",
+                "Firecrawl API key",
+            )?;
+        }
+        1 => {
+            writeln!(output, "Get key at: https://exa.ai")?;
+            prompt_secret_env_update(context, input, output, "EXA_API_KEY", "Exa API key")?;
+        }
+        2 => {
+            writeln!(output, "Get key at: https://parallel.ai")?;
+            prompt_secret_env_update(
+                context,
+                input,
+                output,
+                "PARALLEL_API_KEY",
+                "Parallel API key",
+            )?;
+        }
+        3 => {
+            writeln!(output, "Get key at: https://app.tavily.com/home")?;
+            prompt_secret_env_update(context, input, output, "TAVILY_API_KEY", "Tavily API key")?;
+        }
+        4 => {
+            prompt_url_env_update(
+                context,
+                input,
+                output,
+                "FIRECRAWL_API_URL",
+                "Firecrawl instance URL",
+                current_firecrawl_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_FIRECRAWL_URL),
+            )?;
+        }
+        5 => {
+            let current = env_value_for_context(context, "SEARXNG_URL");
+            prompt_url_env_update(
+                context,
+                input,
+                output,
+                "SEARXNG_URL",
+                "SearXNG instance URL",
+                current.as_deref().unwrap_or(DEFAULT_SEARXNG_URL),
+            )?;
+        }
+        _ => unreachable!(),
+    }
+
+    write_yaml_mapping(&context.config_path(), &root)?;
+    writeln!(
+        output,
+        "Saved web backend: {}",
+        nested_string(&root, &["web", "backend"]).unwrap_or_default()
+    )?;
+    Ok(())
+}
+
+fn reconfigure_homeassistant_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "Smart Home")?;
+    prompt_secret_env_update(
+        context,
+        input,
+        output,
+        "HASS_TOKEN",
+        "Home Assistant Long-Lived Access Token",
+    )?;
+    let current =
+        env_value_for_context(context, "HASS_URL").unwrap_or_else(|| DEFAULT_HASS_URL.to_string());
+    prompt_url_env_update(
+        context,
+        input,
+        output,
+        "HASS_URL",
+        "Home Assistant URL",
+        &current,
+    )?;
+    writeln!(output, "Home Assistant settings updated.")?;
+    Ok(())
+}
+
+fn reconfigure_simple_env_tool_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    label: &str,
+    key: &str,
+    url: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "{label}")?;
+    if let Some(url) = url {
+        writeln!(output, "Get key at: {url}")?;
+    }
+    prompt_secret_env_update(context, input, output, key, key)?;
+    writeln!(output, "{label} updated.")?;
+    Ok(())
+}
+
+fn prompt_secret_env_update(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    key: &str,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(existing) = env_value_for_context(context, key) {
+        writeln!(
+            output,
+            "{key}: configured ({})",
+            masked_secret_preview(&existing)
+        )?;
+    }
+    let value = prompt_line(input, output, &format!("{label} (Enter to keep current)"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        writeln!(output, "Kept current.")?;
+        return Ok(());
+    }
+    save_env_value(context.env_path(), key, trimmed)?;
+    writeln!(output, "Updated {key}.")?;
+    Ok(())
+}
+
+fn prompt_url_env_update(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    key: &str,
+    label: &str,
+    current: &str,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        let value = prompt_line(input, output, &format!("{label} [{current}]"))?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            writeln!(output, "Kept current.")?;
+            return Ok(());
+        }
+        if !looks_like_http_url(trimmed) {
+            writeln!(output, "{key} must start with http:// or https://.")?;
+            continue;
+        }
+        save_env_value(context.env_path(), key, trimmed)?;
+        writeln!(output, "Updated {key}.")?;
+        return Ok(());
+    }
 }
 
 fn configure_mcp_tools_interactive_with_io(
@@ -778,20 +1091,21 @@ fn print_toolset_delta(
     Ok(())
 }
 
-fn run_python_tools_bootstrap(command_name: &str, bootstrap: &str) -> Result<(), Box<dyn Error>> {
+fn run_python_tools_reconfigure_toolset(toolset: &str) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_TOOLS_PYTHON"))
         .ok_or("could not find a Python interpreter for tools")?;
     let status = Command::new(&python)
         .current_dir(&root)
         .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_TOOLS_RECONFIGURE_TOOLSET", toolset)
         .arg("-c")
-        .arg(bootstrap)
+        .arg(TOOLS_RECONFIGURE_TOOLSET_BOOTSTRAP)
         .status()?;
     if status.success() {
         return Ok(());
     }
-    Err(exit_status_message(command_name, status).into())
+    Err(exit_status_message(&format!("tools reconfigure {toolset}"), status).into())
 }
 
 fn render_tools_summary(root: &Mapping) -> String {
@@ -1082,6 +1396,71 @@ fn configured_mcp_server_names(root: &Mapping) -> Vec<String> {
         .collect()
 }
 
+fn reconfigurable_toolset(toolset: &str) -> bool {
+    RECONFIGURABLE_TOOLSETS
+        .iter()
+        .any(|value| value == &toolset)
+}
+
+fn native_reconfigurable_toolset(toolset: &str) -> bool {
+    NATIVE_RECONFIGURABLE_TOOLSETS
+        .iter()
+        .any(|value| value == &toolset)
+}
+
+fn toolset_enabled_for_reconfigure(root: &Mapping, toolset: &str) -> bool {
+    enabled_platforms().iter().any(|platform| {
+        toolset_allowed_for_platform(toolset, platform.name)
+            && enabled_builtin_toolsets(root, platform.name).contains(toolset)
+    })
+}
+
+fn toolset_has_known_configuration(context: &HermesContext, root: &Mapping, toolset: &str) -> bool {
+    match toolset {
+        "web" => {
+            nested_mapping(root, &["web"]).is_some()
+                || [
+                    "FIRECRAWL_API_KEY",
+                    "FIRECRAWL_API_URL",
+                    "EXA_API_KEY",
+                    "PARALLEL_API_KEY",
+                    "TAVILY_API_KEY",
+                    "SEARXNG_URL",
+                ]
+                .into_iter()
+                .any(|key| env_value_for_context(context, key).is_some())
+        }
+        "browser" => {
+            nested_mapping(root, &["browser"]).is_some()
+                || [
+                    "BROWSER_USE_API_KEY",
+                    "BROWSERBASE_API_KEY",
+                    "BROWSERBASE_PROJECT_ID",
+                    "FIRECRAWL_API_KEY",
+                    "CAMOFOX_URL",
+                ]
+                .into_iter()
+                .any(|key| env_value_for_context(context, key).is_some())
+        }
+        "tts" => nested_mapping(root, &["tts"]).is_some(),
+        "image_gen" => {
+            nested_mapping(root, &["image_gen"]).is_some()
+                || env_value_for_context(context, "FAL_KEY").is_some()
+        }
+        "homeassistant" => {
+            env_value_for_context(context, "HASS_TOKEN").is_some()
+                || env_value_for_context(context, "HASS_URL").is_some()
+        }
+        "vision" | "moa" => env_value_for_context(context, "OPENROUTER_API_KEY").is_some(),
+        "spotify" => nested_string(root, &["auth", "type"]).is_some(),
+        "rl" => {
+            env_value_for_context(context, "TINKER_API_KEY").is_some()
+                || env_value_for_context(context, "WANDB_API_KEY").is_some()
+        }
+        _ => false,
+    }
+}
+
 fn mcp_server_enabled(config: &Mapping) -> bool {
     match config.get(yaml_key("enabled")) {
         None => true,
@@ -1092,6 +1471,85 @@ fn mcp_server_enabled(config: &Mapping) -> bool {
         ),
         Some(Value::Number(number)) => number.as_i64().unwrap_or(1) != 0,
         _ => true,
+    }
+}
+
+fn env_value_for_context(context: &HermesContext, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_env_file_value(&context.env_path(), key))
+}
+
+fn read_env_file_value(path: &PathBuf, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((entry_key, entry_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if entry_key.trim() == key {
+            let value = entry_value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn masked_secret_preview(value: &str) -> String {
+    let preview = value.chars().take(8).collect::<String>();
+    if value.chars().count() > 8 {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn looks_like_http_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("http://") || normalized.starts_with("https://")
+}
+
+fn nested_mapping<'a>(root: &'a Mapping, path: &[&str]) -> Option<&'a Mapping> {
+    let mut current = root;
+    for segment in path {
+        current = current.get(yaml_key(segment))?.as_mapping()?;
+    }
+    Some(current)
+}
+
+fn nested_string(root: &Mapping, path: &[&str]) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let (parents, last) = path.split_at(path.len() - 1);
+    nested_mapping(root, parents)?
+        .get(yaml_key(last[0]))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn nested_bool(root: &Mapping, path: &[&str]) -> Option<bool> {
+    if path.is_empty() {
+        return None;
+    }
+    let (parents, last) = path.split_at(path.len() - 1);
+    let value = nested_mapping(root, parents)?.get(yaml_key(last[0]))?;
+    match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1509,17 +1967,50 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
-    fn tools_reconfigure_bootstrap_uses_python_override() {
+    fn tools_reconfigure_updates_web_backend_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-web");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - web\nweb:\n  backend: exa\n",
+        );
+        fs::write(context.env_path(), "EXA_API_KEY=old-exa-key\n").unwrap();
+
+        let mut input = Cursor::new(b"1\n1\nnew-firecrawl-key\n".to_vec());
+        let mut output = Vec::new();
+        run_tools_reconfigure_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: firecrawl"));
+        assert!(saved.contains("use_gateway: false"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("EXA_API_KEY=old-exa-key"));
+        assert!(env_text.contains("FIRECRAWL_API_KEY=new-firecrawl-key"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Which tool would you like to reconfigure?"));
+        assert!(rendered.contains("Saved web backend: firecrawl"));
+    }
+
+    #[test]
+    fn tools_reconfigure_browser_uses_python_override() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let root = project_root();
         let temp = temp_path("bridge");
         let log_path = temp.join("tools-bridge.log");
         let python = temp.join("python3");
+        let home = temp_path("reconfigure-browser");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - browser\n",
+        );
         fs::create_dir_all(&temp).unwrap();
         fs::write(
             &python,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+                "#!/bin/sh\nprintf 'toolset=%s\\n' \"$HERMES_TOOLS_RECONFIGURE_TOOLSET\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
                 log_path.display()
             ),
         )
@@ -1533,13 +2024,16 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         }
 
         unsafe { std::env::set_var("HERMES_TOOLS_PYTHON", &python) };
-        let result = run_python_tools_bootstrap("tools reconfigure", TOOLS_RECONFIGURE_BOOTSTRAP);
+        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        let result = run_tools_reconfigure_with_io(&context, &mut input, &mut output);
         unsafe { std::env::remove_var("HERMES_TOOLS_PYTHON") };
 
         result.unwrap();
         let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("toolset=browser"));
         assert!(logged.contains("-c"));
-        assert!(logged.contains("_reconfigure_tool"));
+        assert!(logged.contains("_configure_tool_category_for_reconfig"));
         assert!(root.exists());
     }
 
