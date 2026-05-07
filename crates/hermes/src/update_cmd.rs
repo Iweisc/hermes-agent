@@ -189,10 +189,9 @@ fn print_update_apply_native(
 
     println!();
     println!("✓ Update complete!");
-    println!("  Remaining Python-only update behavior: gateway-mode watcher handoff.");
-    println!("  Restart running gateways or dashboards manually if needed.");
-    println!("    hermes gateway restart");
-    println!("    hermes dashboard --port <port>");
+    for note in post_update_messages(args.gateway) {
+        println!("  {note}");
+    }
 
     Ok(())
 }
@@ -387,6 +386,16 @@ fn restart_gateways_after_update_native(context: &HermesContext) -> Result<(), B
 fn stop_stale_dashboards_after_update() -> Result<(), Box<dyn Error>> {
     let _ = stop_stale_dashboard_processes("code updated")?;
     Ok(())
+}
+
+fn post_update_messages(gateway_mode: bool) -> Vec<String> {
+    let mut messages = Vec::new();
+    if gateway_mode {
+        messages.push(String::from(
+            "Remaining Python-only update behavior: gateway-mode watcher handoff.",
+        ));
+    }
+    messages
 }
 
 fn collect_profile_homes(
@@ -1087,6 +1096,21 @@ exit 0\n",
         remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
         remove_env_var("HERMES_UPDATE_GIT");
         remove_env_var("HERMES_UPDATE_UV");
+    }
+
+    #[test]
+    fn post_update_messages_are_empty_for_plain_native_update() {
+        assert!(post_update_messages(false).is_empty());
+    }
+
+    #[test]
+    fn post_update_messages_include_gateway_note_only() {
+        let messages = post_update_messages(true);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0],
+            "Remaining Python-only update behavior: gateway-mode watcher handoff."
+        );
     }
 
     #[test]
