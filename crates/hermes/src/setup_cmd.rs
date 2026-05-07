@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
 use hermes_core::{HermesContext, get_auth_status_summary};
+use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
@@ -590,17 +591,6 @@ fn run_native_terminal_setup(
     }
 
     let selected_backend = choices[selected_index - 1].0;
-    if matches!(selected_backend, "modal") {
-        ui.line("Falling back to Python setup for this backend.")?;
-        return print_setup_python(SetupArgs {
-            section: Some(SetupSection::Terminal),
-            non_interactive: false,
-            reset: false,
-            reconfigure: false,
-            quick: false,
-        });
-    }
-
     let terminal = ensure_mapping(&mut root, "terminal");
     terminal.insert(
         yaml_key("backend"),
@@ -610,6 +600,7 @@ fn run_native_terminal_setup(
     match selected_backend {
         "local" => configure_local_terminal(context, ui, terminal)?,
         "docker" => configure_docker_terminal(context, ui, terminal)?,
+        "modal" => configure_modal_terminal(context, ui, terminal)?,
         "singularity" => configure_singularity_terminal(context, ui, terminal)?,
         "ssh" => configure_ssh_terminal(context, ui)?,
         "daytona" => configure_daytona_terminal(context, ui, terminal)?,
@@ -626,6 +617,11 @@ fn run_native_terminal_setup(
     if selected_backend == "daytona" {
         if let Some(image) = mapping_string(terminal, "daytona_image") {
             save_env_value(context.env_path(), "TERMINAL_DAYTONA_IMAGE", &image)?;
+        }
+    }
+    if selected_backend == "modal" {
+        if let Some(mode) = mapping_string(terminal, "modal_mode") {
+            save_env_value(context.env_path(), "TERMINAL_MODAL_MODE", &mode)?;
         }
     }
     write_yaml_mapping(&context.config_path(), &root)?;
@@ -677,6 +673,101 @@ fn configure_docker_terminal(
     let image = prompt_with_default(ui, "  Docker image", &current_image)?;
     terminal.insert(yaml_key("docker_image"), Value::String(image.clone()));
     save_env_value(context.env_path(), "TERMINAL_DOCKER_IMAGE", &image)?;
+    prompt_container_resources(ui, terminal)
+}
+
+fn configure_modal_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: Modal")?;
+    ui.line("Serverless cloud sandboxes. Each session gets its own container.")?;
+
+    let current_mode = normalize_modal_mode(
+        mapping_string(terminal, "modal_mode")
+            .or_else(|| env_value("TERMINAL_MODAL_MODE"))
+            .as_deref(),
+    );
+    let managed_available = managed_modal_available(context);
+    let use_managed = if managed_available {
+        ui.line("Choose how Modal execution should be billed.")?;
+        let default_choice = match current_mode.as_str() {
+            "managed" => 1,
+            "direct" => 2,
+            _ => {
+                if env_value("MODAL_TOKEN_ID").is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
+        prompt_menu_choice(
+            ui,
+            "Select how Modal execution should be billed: ",
+            2,
+            default_choice,
+        )? == 1
+    } else {
+        false
+    };
+
+    if use_managed {
+        terminal.insert(yaml_key("modal_mode"), Value::String("managed".to_string()));
+        ui.line(
+            "Modal execution will use the managed Nous gateway and bill to your subscription.",
+        )?;
+        if env_value("MODAL_TOKEN_ID").is_some() || env_value("MODAL_TOKEN_SECRET").is_some() {
+            ui.line("Direct Modal credentials are still configured, but this backend is pinned to managed mode.")?;
+        }
+    } else {
+        terminal.insert(yaml_key("modal_mode"), Value::String("direct".to_string()));
+        ui.line("Requires a Modal account: https://modal.com")?;
+        if !python_module_installed("modal")? {
+            ui.line("modal SDK not detected; attempting install...")?;
+            if install_python_package(&["modal"])? {
+                ui.line("modal SDK installed")?;
+            } else {
+                ui.line("Install failed — run manually: pip install modal")?;
+            }
+        }
+
+        ui.blank()?;
+        ui.line("Modal authentication:")?;
+        ui.line("  Get your token at: https://modal.com/settings")?;
+        if env_value("MODAL_TOKEN_ID").is_some() {
+            ui.line("  Modal token: already configured")?;
+            if prompt_yes_no(ui, "  Update Modal credentials? [y/N]: ", false)? {
+                let token_id = ui.prompt_secret("    Modal Token ID: ")?;
+                let token_secret = ui.prompt_secret("    Modal Token Secret: ")?;
+                if !token_id.trim().is_empty() {
+                    save_env_value(context.env_path(), "MODAL_TOKEN_ID", token_id.trim())?;
+                }
+                if !token_secret.trim().is_empty() {
+                    save_env_value(
+                        context.env_path(),
+                        "MODAL_TOKEN_SECRET",
+                        token_secret.trim(),
+                    )?;
+                }
+            }
+        } else {
+            let token_id = ui.prompt_secret("    Modal Token ID: ")?;
+            let token_secret = ui.prompt_secret("    Modal Token Secret: ")?;
+            if !token_id.trim().is_empty() {
+                save_env_value(context.env_path(), "MODAL_TOKEN_ID", token_id.trim())?;
+            }
+            if !token_secret.trim().is_empty() {
+                save_env_value(
+                    context.env_path(),
+                    "MODAL_TOKEN_SECRET",
+                    token_secret.trim(),
+                )?;
+            }
+        }
+    }
+
     prompt_container_resources(ui, terminal)
 }
 
@@ -956,6 +1047,40 @@ fn env_value(key: &str) -> Option<String> {
 fn nous_auth_present(context: &HermesContext) -> bool {
     get_auth_status_summary(&context.hermes_home(), "nous")
         .map(|status| status.logged_in)
+        .unwrap_or(false)
+}
+
+fn normalize_modal_mode(value: Option<&str>) -> String {
+    let normalized = value.unwrap_or("auto").trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "direct" | "managed" | "auto" => normalized,
+        _ => "auto".to_string(),
+    }
+}
+
+fn managed_modal_available(context: &HermesContext) -> bool {
+    if !nous_auth_present(context) {
+        return false;
+    }
+    if env_value("TOOL_GATEWAY_USER_TOKEN").is_some() {
+        return true;
+    }
+
+    let path = context.hermes_home().join("auth.json");
+    let Ok(payload) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<JsonValue>(&payload)
+        .ok()
+        .and_then(|json| {
+            json.get("providers")
+                .and_then(|providers| providers.get("nous"))
+                .and_then(|provider| provider.get("access_token"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(|_| true)
+        })
         .unwrap_or(false)
 }
 
@@ -1456,6 +1581,76 @@ exit 9\n",
     }
 
     #[test]
+    #[cfg(unix)]
+    fn native_terminal_setup_writes_modal_direct_backend() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "terminal:\n  backend: local\n").unwrap();
+
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nif [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then exit 0; fi\nexit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+
+        let mut ui = TestUi::new(&["3", "modal-id", "modal-secret", "yes", "2", "4096", "20480"]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: modal"));
+        assert!(saved.contains("modal_mode: direct"));
+        assert!(saved.contains("container_persistent: true"));
+        assert!(saved.contains("container_cpu: 2.0"));
+        assert!(saved.contains("container_memory: 4096"));
+        assert!(saved.contains("container_disk: 20480"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TERMINAL_ENV=modal"));
+        assert!(env_text.contains("TERMINAL_MODAL_MODE=direct"));
+        assert!(env_text.contains("MODAL_TOKEN_ID=modal-id"));
+        assert!(env_text.contains("MODAL_TOKEN_SECRET=modal-secret"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    fn native_terminal_setup_writes_modal_managed_backend() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "terminal:\n  backend: local\n").unwrap();
+        fs::write(
+            context.hermes_home().join("auth.json"),
+            r#"{"providers":{"nous":{"access_token":"nous-access-token"}}}"#,
+        )
+        .unwrap();
+
+        let mut ui = TestUi::new(&["3", "1", "no", "1.5", "2048", "51200"]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: modal"));
+        assert!(saved.contains("modal_mode: managed"));
+        assert!(saved.contains("container_persistent: false"));
+        assert!(saved.contains("container_cpu: 1.5"));
+        assert!(saved.contains("container_memory: 2048"));
+        assert!(saved.contains("container_disk: 51200"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TERMINAL_ENV=modal"));
+        assert!(env_text.contains("TERMINAL_MODAL_MODE=managed"));
+        assert!(!env_text.contains("MODAL_TOKEN_ID="));
+        assert!(!env_text.contains("MODAL_TOKEN_SECRET="));
+    }
+
+    #[test]
     fn native_terminal_setup_writes_vercel_backend() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -1615,42 +1810,6 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("section=tts"));
-        remove_env_var("HERMES_SETUP_PYTHON");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn terminal_setup_cloud_backend_falls_back_to_python() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'section=%s\\n' \"$HERMES_SETUP_SECTION\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
-        let context = HermesContext::new(temp.path());
-        fs::create_dir_all(context.hermes_home()).unwrap();
-
-        let mut ui = TestUi::new(&["3"]);
-        run_native_terminal_setup(&context, &mut ui).unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("section=terminal"));
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 }
