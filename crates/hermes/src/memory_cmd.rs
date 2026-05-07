@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::{HermesContext, LoadedConfig};
+use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping, Value};
 
@@ -69,14 +70,17 @@ enum FieldKind {
 
 #[derive(Debug, Clone)]
 struct SetupField {
-    key: &'static str,
-    description: &'static str,
+    key: String,
+    description: String,
     kind: FieldKind,
     default: Option<String>,
     secret: bool,
-    env_var: Option<&'static str>,
-    url: Option<&'static str>,
+    env_var: Option<String>,
+    url: Option<String>,
     required: bool,
+    choices: Vec<String>,
+    when: BTreeMap<String, String>,
+    default_from: Option<DefaultFrom>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +90,7 @@ struct SetupProvider {
     hint: String,
     mode: SetupMode,
     fields: Vec<SetupField>,
+    bridge_save_config: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,11 +101,79 @@ enum SetupValue {
     Float(f64),
 }
 
+#[derive(Debug, Clone)]
+struct DefaultFrom {
+    field: String,
+    map: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgedProviderMetadata {
+    #[serde(default)]
+    has_post_setup: bool,
+    #[serde(default)]
+    has_save_config: bool,
+    #[serde(default)]
+    schema: Vec<BridgedSchemaField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgedSchemaField {
+    key: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default: Option<JsonValue>,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    env_var: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    choices: Vec<String>,
+    #[serde(default)]
+    when: BTreeMap<String, JsonValue>,
+    #[serde(default)]
+    default_from: Option<BridgedDefaultFrom>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgedDefaultFrom {
+    field: String,
+    #[serde(default)]
+    map: BTreeMap<String, String>,
+}
+
 impl SetupField {
-    fn default_value(&self) -> Option<SetupValue> {
+    fn default_value(
+        &self,
+        current_values: &BTreeMap<String, SetupValue>,
+        existing_values: &BTreeMap<String, SetupValue>,
+    ) -> Option<SetupValue> {
+        if let Some(default_from) = &self.default_from
+            && let Some(reference) =
+                merged_setup_value_display(current_values, existing_values, &default_from.field)
+            && let Some(mapped) = default_from.map.get(reference.as_str())
+        {
+            return parse_setup_value(self.kind, mapped).ok();
+        }
         self.default
             .as_deref()
             .and_then(|raw| parse_setup_value(self.kind, raw).ok())
+    }
+
+    fn applies_to(
+        &self,
+        current_values: &BTreeMap<String, SetupValue>,
+        existing_values: &BTreeMap<String, SetupValue>,
+    ) -> bool {
+        self.when.iter().all(|(key, expected)| {
+            merged_setup_value_display(current_values, existing_values, key)
+                .is_some_and(|actual| actual == *expected)
+        })
     }
 }
 
@@ -221,216 +294,281 @@ fn discover_memory_setup_providers(context: &HermesContext) -> Vec<SetupProvider
 
 fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> SetupProvider {
     let display_home = context.display_hermes_home();
-    let (mode, fields) = match provider.name.as_str() {
+    let (mode, fields, bridge_save_config) = match provider.name.as_str() {
         "byterover" => (
             SetupMode::NativeGeneric,
             vec![SetupField {
-                key: "api_key",
-                description: "ByteRover API key (optional, for cloud sync)",
+                key: String::from("api_key"),
+                description: String::from("ByteRover API key (optional, for cloud sync)"),
                 kind: FieldKind::String,
                 default: None,
                 secret: true,
-                env_var: Some("BRV_API_KEY"),
-                url: Some("https://app.byterover.dev"),
+                env_var: Some(String::from("BRV_API_KEY")),
+                url: Some(String::from("https://app.byterover.dev")),
                 required: false,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
             }],
+            false,
         ),
         "holographic" => (
             SetupMode::NativeGeneric,
             vec![
                 SetupField {
-                    key: "db_path",
-                    description: "SQLite database path",
+                    key: String::from("db_path"),
+                    description: String::from("SQLite database path"),
                     kind: FieldKind::String,
                     default: Some(format!("{display_home}/memory_store.db")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "auto_extract",
-                    description: "Auto-extract facts at session end",
+                    key: String::from("auto_extract"),
+                    description: String::from("Auto-extract facts at session end"),
                     kind: FieldKind::Bool,
                     default: Some(String::from("false")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "default_trust",
-                    description: "Default trust score for new facts",
+                    key: String::from("default_trust"),
+                    description: String::from("Default trust score for new facts"),
                     kind: FieldKind::Float,
                     default: Some(String::from("0.5")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "hrr_dim",
-                    description: "HRR vector dimensions",
+                    key: String::from("hrr_dim"),
+                    description: String::from("HRR vector dimensions"),
                     kind: FieldKind::Integer,
                     default: Some(String::from("1024")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
             ],
+            false,
         ),
         "mem0" => (
             SetupMode::NativeGeneric,
             vec![
                 SetupField {
-                    key: "api_key",
-                    description: "Mem0 Platform API key",
+                    key: String::from("api_key"),
+                    description: String::from("Mem0 Platform API key"),
                     kind: FieldKind::String,
                     default: None,
                     secret: true,
-                    env_var: Some("MEM0_API_KEY"),
-                    url: Some("https://app.mem0.ai"),
+                    env_var: Some(String::from("MEM0_API_KEY")),
+                    url: Some(String::from("https://app.mem0.ai")),
                     required: true,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "user_id",
-                    description: "User identifier",
+                    key: String::from("user_id"),
+                    description: String::from("User identifier"),
                     kind: FieldKind::String,
                     default: Some(String::from("hermes-user")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "agent_id",
-                    description: "Agent identifier",
+                    key: String::from("agent_id"),
+                    description: String::from("Agent identifier"),
                     kind: FieldKind::String,
                     default: Some(String::from("hermes")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "rerank",
-                    description: "Enable reranking for recall",
+                    key: String::from("rerank"),
+                    description: String::from("Enable reranking for recall"),
                     kind: FieldKind::Bool,
                     default: Some(String::from("true")),
                     secret: false,
                     env_var: None,
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
             ],
+            false,
         ),
         "openviking" => (
             SetupMode::NativeGeneric,
             vec![
                 SetupField {
-                    key: "endpoint",
-                    description: "OpenViking server URL",
+                    key: String::from("endpoint"),
+                    description: String::from("OpenViking server URL"),
                     kind: FieldKind::String,
                     default: Some(String::from("https://app.openviking.ai")),
                     secret: false,
-                    env_var: Some("OPENVIKING_ENDPOINT"),
+                    env_var: Some(String::from("OPENVIKING_ENDPOINT")),
                     url: None,
                     required: true,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "api_key",
-                    description: "OpenViking API key (leave blank for local dev mode)",
+                    key: String::from("api_key"),
+                    description: String::from(
+                        "OpenViking API key (leave blank for local dev mode)",
+                    ),
                     kind: FieldKind::String,
                     default: None,
                     secret: true,
-                    env_var: Some("OPENVIKING_API_KEY"),
+                    env_var: Some(String::from("OPENVIKING_API_KEY")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "account",
-                    description: "OpenViking tenant account ID",
+                    key: String::from("account"),
+                    description: String::from("OpenViking tenant account ID"),
                     kind: FieldKind::String,
                     default: Some(String::from("default")),
                     secret: false,
-                    env_var: Some("OPENVIKING_ACCOUNT"),
+                    env_var: Some(String::from("OPENVIKING_ACCOUNT")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "user",
-                    description: "OpenViking user ID within the account",
+                    key: String::from("user"),
+                    description: String::from("OpenViking user ID within the account"),
                     kind: FieldKind::String,
                     default: Some(String::from("default")),
                     secret: false,
-                    env_var: Some("OPENVIKING_USER"),
+                    env_var: Some(String::from("OPENVIKING_USER")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "agent",
-                    description: "OpenViking agent ID within the account",
+                    key: String::from("agent"),
+                    description: String::from("OpenViking agent ID within the account"),
                     kind: FieldKind::String,
                     default: Some(String::from("hermes")),
                     secret: false,
-                    env_var: Some("OPENVIKING_AGENT"),
+                    env_var: Some(String::from("OPENVIKING_AGENT")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
             ],
+            false,
         ),
         "retaindb" => (
             SetupMode::NativeGeneric,
             vec![
                 SetupField {
-                    key: "api_key",
-                    description: "RetainDB API key",
+                    key: String::from("api_key"),
+                    description: String::from("RetainDB API key"),
                     kind: FieldKind::String,
                     default: None,
                     secret: true,
-                    env_var: Some("RETAINDB_API_KEY"),
-                    url: Some("https://retaindb.com"),
+                    env_var: Some(String::from("RETAINDB_API_KEY")),
+                    url: Some(String::from("https://retaindb.com")),
                     required: true,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "base_url",
-                    description: "API endpoint",
+                    key: String::from("base_url"),
+                    description: String::from("API endpoint"),
                     kind: FieldKind::String,
                     default: Some(String::from("https://api.retaindb.com")),
                     secret: false,
-                    env_var: Some("RETAINDB_BASE_URL"),
+                    env_var: Some(String::from("RETAINDB_BASE_URL")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
                 SetupField {
-                    key: "project",
-                    description: "Project identifier",
+                    key: String::from("project"),
+                    description: String::from("Project identifier"),
                     kind: FieldKind::String,
                     default: Some(String::new()),
                     secret: false,
-                    env_var: Some("RETAINDB_PROJECT"),
+                    env_var: Some(String::from("RETAINDB_PROJECT")),
                     url: None,
                     required: false,
+                    choices: Vec::new(),
+                    when: BTreeMap::new(),
+                    default_from: None,
                 },
             ],
+            false,
         ),
         "supermemory" => (
             SetupMode::NativeGeneric,
             vec![SetupField {
-                key: "api_key",
-                description: "Supermemory API key",
+                key: String::from("api_key"),
+                description: String::from("Supermemory API key"),
                 kind: FieldKind::String,
                 default: None,
                 secret: true,
-                env_var: Some("SUPERMEMORY_API_KEY"),
-                url: Some("https://supermemory.ai"),
+                env_var: Some(String::from("SUPERMEMORY_API_KEY")),
+                url: Some(String::from("https://supermemory.ai")),
                 required: true,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
             }],
+            false,
         ),
-        "honcho" => (SetupMode::NativeHoncho, Vec::new()),
-        "hindsight" => (SetupMode::NativeHindsight, Vec::new()),
-        _ => (SetupMode::PythonHook, Vec::new()),
+        "honcho" => (SetupMode::NativeHoncho, Vec::new(), false),
+        "hindsight" => (SetupMode::NativeHindsight, Vec::new(), false),
+        _ => match load_bridged_provider_spec(context, &provider.name) {
+            Ok(bridged) => (bridged.mode, bridged.fields, bridged.bridge_save_config),
+            Err(_) => (SetupMode::PythonHook, Vec::new(), false),
+        },
     };
 
     let hint = if mode == SetupMode::PythonHook {
@@ -445,6 +583,7 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
         hint,
         mode,
         fields,
+        bridge_save_config,
     }
 }
 
@@ -460,6 +599,128 @@ fn render_setup_hint(fields: &[SetupField]) -> String {
     } else {
         String::from("local")
     }
+}
+
+fn load_bridged_provider_spec(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<SetupProvider, Box<dyn Error>> {
+    let metadata = load_bridged_provider_metadata(context, provider_name)?;
+    if metadata.has_post_setup {
+        return Ok(SetupProvider {
+            name: provider_name.to_string(),
+            description: String::new(),
+            hint: String::from("custom setup"),
+            mode: SetupMode::PythonHook,
+            fields: Vec::new(),
+            bridge_save_config: false,
+        });
+    }
+
+    let fields = metadata
+        .schema
+        .into_iter()
+        .map(bridged_schema_field_to_setup_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    let hint = render_setup_hint(&fields);
+
+    Ok(SetupProvider {
+        name: provider_name.to_string(),
+        description: String::new(),
+        hint,
+        mode: SetupMode::NativeGeneric,
+        fields,
+        bridge_save_config: metadata.has_save_config,
+    })
+}
+
+fn load_bridged_provider_metadata(
+    _context: &HermesContext,
+    provider_name: &str,
+) -> Result<BridgedProviderMetadata, Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
+        .ok_or("could not find a Python interpreter for memory setup")?;
+
+    let output = Command::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_MEMORY_PROVIDER", provider_name)
+        .arg("-c")
+        .arg(MEMORY_SETUP_METADATA_BOOTSTRAP)
+        .output()?;
+    if !output.status.success() {
+        return Err(exit_status_message("memory metadata", output.status).into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    serde_json::from_str::<BridgedProviderMetadata>(stdout.trim()).map_err(|error| {
+        format!("invalid memory provider metadata for {provider_name}: {error}").into()
+    })
+}
+
+fn bridged_schema_field_to_setup_field(
+    field: BridgedSchemaField,
+) -> Result<SetupField, Box<dyn Error>> {
+    if field.key.trim().is_empty() {
+        return Err("memory setup field key cannot be empty".into());
+    }
+    let when = field
+        .when
+        .into_iter()
+        .map(|(key, value)| (key, json_value_to_string(value)))
+        .collect::<BTreeMap<_, _>>();
+
+    Ok(SetupField {
+        key: field.key.clone(),
+        description: field.description.unwrap_or_else(|| field.key.clone()),
+        kind: infer_field_kind(&field.default, &field.choices),
+        default: field.default.and_then(json_value_to_string_option),
+        secret: field.secret,
+        env_var: field.env_var,
+        url: field.url,
+        required: field.required,
+        choices: field.choices,
+        when,
+        default_from: field.default_from.map(|value| DefaultFrom {
+            field: value.field,
+            map: value.map,
+        }),
+    })
+}
+
+fn infer_field_kind(default: &Option<JsonValue>, choices: &[String]) -> FieldKind {
+    if let Some(default) = default {
+        match default {
+            JsonValue::Bool(_) => return FieldKind::Bool,
+            JsonValue::Number(number) if number.is_i64() || number.is_u64() => {
+                return FieldKind::Integer;
+            }
+            JsonValue::Number(_) => return FieldKind::Float,
+            _ => {}
+        }
+    }
+    if !choices.is_empty()
+        && choices
+            .iter()
+            .all(|choice| parse_bool_value(choice).is_ok())
+    {
+        return FieldKind::Bool;
+    }
+    FieldKind::String
+}
+
+fn json_value_to_string_option(value: JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Null => None,
+        JsonValue::Bool(boolean) => Some(boolean.to_string()),
+        JsonValue::Number(number) => Some(number.to_string()),
+        JsonValue::String(text) => Some(text),
+        other => Some(other.to_string()),
+    }
+}
+
+fn json_value_to_string(value: JsonValue) -> String {
+    json_value_to_string_option(value).unwrap_or_default()
 }
 
 fn prompt_provider_selection(
@@ -533,12 +794,16 @@ fn run_native_provider_setup(
     }
 
     for field in &provider.fields {
+        if !field.applies_to(&provider_values, &existing) {
+            continue;
+        }
         let existing_value = existing
-            .get(field.key)
+            .get(field.key.as_str())
             .cloned()
             .or_else(|| load_existing_env_value(field));
+        let default_value = field.default_value(&provider_values, &existing);
 
-        let Some(value) = prompt_setup_field(field, existing_value.clone())? else {
+        let Some(value) = prompt_setup_field(field, existing_value.clone(), default_value)? else {
             println!("  Cancelled.\n");
             return Ok(());
         };
@@ -546,24 +811,27 @@ fn run_native_provider_setup(
         if field.secret {
             let rendered = value.env_string();
             if !rendered.trim().is_empty() {
-                if let Some(env_var) = field.env_var {
-                    env_updates.insert(env_var.to_string(), rendered);
+                if let Some(env_var) = &field.env_var {
+                    env_updates.insert(env_var.clone(), rendered);
                 }
             }
             continue;
         }
 
-        provider_values.insert(field.key.to_string(), value.clone());
+        provider_values.insert(field.key.clone(), value.clone());
         let rendered = value.env_string();
-        if let Some(env_var) = field.env_var {
+        if let Some(env_var) = &field.env_var {
             if !rendered.trim().is_empty() {
-                env_updates.insert(env_var.to_string(), rendered);
+                env_updates.insert(env_var.clone(), rendered);
             }
         }
     }
 
     save_provider_activation(context, &provider.name, &provider_values)?;
     persist_native_provider_state(context, &provider.name, &provider_values)?;
+    if provider.bridge_save_config && !provider_values.is_empty() {
+        bridge_memory_save_config(context, &provider.name, &provider_values)?;
+    }
     for (key, value) in &env_updates {
         save_env_value(context.env_path(), key, value)?;
     }
@@ -1043,9 +1311,13 @@ fn run_honcho_provider_setup(
 fn prompt_setup_field(
     field: &SetupField,
     existing_value: Option<SetupValue>,
+    default_value: Option<SetupValue>,
 ) -> Result<Option<SetupValue>, Box<dyn Error>> {
+    if !field.choices.is_empty() && !field.secret {
+        return prompt_setup_choice_field(field, existing_value, default_value).map(Some);
+    }
     loop {
-        let prompt = field_prompt_label(field, existing_value.as_ref());
+        let prompt = field_prompt_label(field, existing_value.as_ref(), default_value.as_ref());
         let input = if field.secret {
             read_secret_line(&prompt)?
         } else {
@@ -1056,7 +1328,7 @@ fn prompt_setup_field(
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            if let Some(value) = existing_value.clone().or_else(|| field.default_value()) {
+            if let Some(value) = existing_value.clone().or_else(|| default_value.clone()) {
                 return Ok(Some(value));
             }
             if field.required {
@@ -1072,6 +1344,25 @@ fn prompt_setup_field(
             }
         }
     }
+}
+
+fn prompt_setup_choice_field(
+    field: &SetupField,
+    existing_value: Option<SetupValue>,
+    default_value: Option<SetupValue>,
+) -> Result<SetupValue, Box<dyn Error>> {
+    let current = existing_value
+        .as_ref()
+        .or(default_value.as_ref())
+        .map(SetupValue::display)
+        .unwrap_or_else(|| field.choices[0].clone());
+    let choice = prompt_dynamic_choice(
+        format!("  {}", field.description).as_str(),
+        &field.choices,
+        current.as_str(),
+    )?;
+    parse_setup_value(field.kind, choice.as_str())
+        .map_err(|error| format!("invalid choice for {}: {error}", field.key).into())
 }
 
 fn prompt_choice(
@@ -1213,7 +1504,11 @@ fn prompt_secret_with_existing(
     Ok(trimmed.to_string())
 }
 
-fn field_prompt_label(field: &SetupField, existing_value: Option<&SetupValue>) -> String {
+fn field_prompt_label(
+    field: &SetupField,
+    existing_value: Option<&SetupValue>,
+    default_value: Option<&SetupValue>,
+) -> String {
     if field.secret {
         if let Some(value) = existing_value {
             return format!(
@@ -1222,7 +1517,7 @@ fn field_prompt_label(field: &SetupField, existing_value: Option<&SetupValue>) -
                 mask_secret(&value.env_string())
             );
         }
-        if let Some(url) = field.url {
+        if let Some(url) = field.url.as_deref() {
             println!("  Get yours at {url}");
         }
         return format!("  {}: ", field.description);
@@ -1231,10 +1526,54 @@ fn field_prompt_label(field: &SetupField, existing_value: Option<&SetupValue>) -
     if let Some(value) = existing_value {
         return format!("  {} [{}]: ", field.description, value.display());
     }
-    if let Some(value) = field.default_value() {
+    if let Some(value) = default_value {
         return format!("  {} [{}]: ", field.description, value.display());
     }
     format!("  {}: ", field.description)
+}
+
+fn prompt_dynamic_choice(
+    label: &str,
+    options: &[String],
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    println!("{label}:");
+    let default_index = options
+        .iter()
+        .position(|value| value.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
+    for (index, value) in options.iter().enumerate() {
+        let active = if index == default_index {
+            " ← current"
+        } else {
+            ""
+        };
+        println!("    {}) {}{}", index + 1, value, active);
+    }
+
+    loop {
+        let prompt = format!("  Select [{}]: ", default_index + 1);
+        let Some(input) = read_prompt_line(&prompt)? else {
+            return Err("setup cancelled".into());
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(options[default_index].clone());
+        }
+        if let Ok(index) = trimmed.parse::<usize>()
+            && index >= 1
+            && index <= options.len()
+        {
+            return Ok(options[index - 1].clone());
+        }
+        if let Some(value) = options
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(trimmed))
+        {
+            return Ok(value.clone());
+        }
+        println!("  Invalid selection.");
+    }
 }
 
 fn read_prompt_line(prompt: &str) -> Result<Option<String>, Box<dyn Error>> {
@@ -1304,13 +1643,24 @@ fn parse_bool_value(raw: &str) -> Result<bool, String> {
 }
 
 fn load_existing_env_value(field: &SetupField) -> Option<SetupValue> {
-    let env_var = field.env_var?;
+    let env_var = field.env_var.as_ref()?;
     let raw = std::env::var(env_var).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     parse_setup_value(field.kind, trimmed).ok()
+}
+
+fn merged_setup_value_display(
+    current_values: &BTreeMap<String, SetupValue>,
+    existing_values: &BTreeMap<String, SetupValue>,
+    key: &str,
+) -> Option<String> {
+    current_values
+        .get(key)
+        .or_else(|| existing_values.get(key))
+        .map(SetupValue::display)
 }
 
 fn load_simple_env(path: PathBuf) -> BTreeMap<String, String> {
@@ -1793,10 +2143,82 @@ fn bridge_memory_setup_provider(provider_name: &str) -> Result<(), Box<dyn Error
     Err(exit_status_message("memory", status).into())
 }
 
+fn bridge_memory_save_config(
+    context: &HermesContext,
+    provider_name: &str,
+    provider_values: &BTreeMap<String, SetupValue>,
+) -> Result<(), Box<dyn Error>> {
+    let trimmed = provider_name.trim();
+    if trimmed.is_empty() {
+        return Err("memory provider name cannot be empty".into());
+    }
+
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
+        .ok_or("could not find a Python interpreter for memory setup")?;
+    let values_json = serde_json::to_string(&setup_values_to_json_object(provider_values))?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_MEMORY_PROVIDER", trimmed)
+        .env("HERMES_MEMORY_PROVIDER_VALUES_JSON", values_json)
+        .env(
+            "HERMES_MEMORY_HOME",
+            context.hermes_home().display().to_string(),
+        )
+        .arg("-c")
+        .arg(MEMORY_SAVE_CONFIG_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("memory save-config", status).into())
+}
+
+fn setup_values_to_json_object(values: &BTreeMap<String, SetupValue>) -> JsonValue {
+    let mut root = JsonMap::new();
+    for (key, value) in values {
+        root.insert(key.clone(), value.to_json());
+    }
+    JsonValue::Object(root)
+}
+
+const MEMORY_SETUP_METADATA_BOOTSTRAP: &str = concat!(
+    "import json\n",
+    "import os\n",
+    "from plugins.memory import load_memory_provider\n",
+    "provider = load_memory_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
+    "if provider is None:\n",
+    "    raise SystemExit(2)\n",
+    "payload = {\n",
+    "    'has_post_setup': hasattr(provider, 'post_setup'),\n",
+    "    'has_save_config': hasattr(provider, 'save_config'),\n",
+    "    'schema': provider.get_config_schema() if hasattr(provider, 'get_config_schema') else [],\n",
+    "}\n",
+    "print(json.dumps(payload, default=str))\n",
+);
+
 const MEMORY_SETUP_PROVIDER_BOOTSTRAP: &str = concat!(
     "import os\n",
     "from hermes_cli.memory_setup import cmd_setup_provider\n",
     "cmd_setup_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
+);
+
+const MEMORY_SAVE_CONFIG_BOOTSTRAP: &str = concat!(
+    "import json\n",
+    "import os\n",
+    "from plugins.memory import load_memory_provider\n",
+    "provider = load_memory_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
+    "if provider is None:\n",
+    "    raise SystemExit(2)\n",
+    "if hasattr(provider, 'save_config'):\n",
+    "    provider.save_config(\n",
+    "        json.loads(os.environ['HERMES_MEMORY_PROVIDER_VALUES_JSON']),\n",
+    "        os.environ['HERMES_MEMORY_HOME'],\n",
+    "    )\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -2200,6 +2622,46 @@ mod tests {
     }
 
     #[test]
+    fn setup_field_uses_default_from_and_when_matches_existing_values() {
+        let field = SetupField {
+            key: String::from("llm_model"),
+            description: String::from("LLM model"),
+            kind: FieldKind::String,
+            default: Some(String::from("gpt-4o-mini")),
+            secret: false,
+            env_var: None,
+            url: None,
+            required: false,
+            choices: vec![String::from("gpt-4o-mini"), String::from("qwen/qwen3.5-9b")],
+            when: BTreeMap::from([(String::from("mode"), String::from("local"))]),
+            default_from: Some(DefaultFrom {
+                field: String::from("llm_provider"),
+                map: BTreeMap::from([(
+                    String::from("openrouter"),
+                    String::from("qwen/qwen3.5-9b"),
+                )]),
+            }),
+        };
+        let current = BTreeMap::new();
+        let existing = BTreeMap::from([
+            (
+                String::from("mode"),
+                SetupValue::String(String::from("local")),
+            ),
+            (
+                String::from("llm_provider"),
+                SetupValue::String(String::from("openrouter")),
+            ),
+        ]);
+
+        assert!(field.applies_to(&current, &existing));
+        assert_eq!(
+            field.default_value(&current, &existing),
+            Some(SetupValue::String(String::from("qwen/qwen3.5-9b")))
+        );
+    }
+
+    #[test]
     fn save_provider_activation_and_state_write_native_files() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join(".hermes");
@@ -2375,6 +2837,138 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("provider=hindsight"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_provider_spec_loads_dynamic_metadata_for_schema_only_provider() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  cat <<'EOF'\n\
+{\"has_post_setup\": false, \"has_save_config\": true, \"schema\": [{\"key\": \"mode\", \"description\": \"Mode\", \"default\": \"cloud\", \"choices\": [\"cloud\", \"local\"]}, {\"key\": \"token\", \"description\": \"Access token\", \"secret\": true, \"env_var\": \"CUSTOM_TOKEN\"}]}\n\
+EOF\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        let provider = setup_provider_spec(
+            &context,
+            ProviderInfo {
+                name: String::from("custom"),
+                description: String::from("Custom"),
+            },
+        );
+
+        assert_eq!(provider.mode, SetupMode::NativeGeneric);
+        assert!(provider.bridge_save_config);
+        assert_eq!(provider.fields.len(), 2);
+        assert_eq!(provider.fields[0].choices, vec!["cloud", "local"]);
+        assert_eq!(provider.fields[1].env_var.as_deref(), Some("CUSTOM_TOKEN"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_provider_spec_keeps_post_setup_providers_on_python_hook() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        fs::write(
+            &fake_python,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf '%s\\n' '{\"has_post_setup\": true, \"has_save_config\": true, \"schema\": [{\"key\": \"token\"}]}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        let provider = setup_provider_spec(
+            &context,
+            ProviderInfo {
+                name: String::from("custom"),
+                description: String::from("Custom"),
+            },
+        );
+
+        assert_eq!(provider.mode, SetupMode::PythonHook);
+        assert!(provider.fields.is_empty());
+        assert!(!provider.bridge_save_config);
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_memory_save_config_uses_python_override() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'provider=%s\\n' \"$HERMES_MEMORY_PROVIDER\" >> '{}'\n\
+  printf 'home=%s\\n' \"$HERMES_MEMORY_HOME\" >> '{}'\n\
+  printf 'values=%s\\n' \"$HERMES_MEMORY_PROVIDER_VALUES_JSON\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display(),
+                log.display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let mut values = BTreeMap::new();
+        values.insert(
+            String::from("workspace"),
+            SetupValue::String(String::from("alpha")),
+        );
+        values.insert(String::from("enabled"), SetupValue::Bool(true));
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        bridge_memory_save_config(&context, "custom", &values).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("provider=custom"));
+        assert!(output.contains(format!("home={}", home.display()).as_str()));
+        assert!(output.contains("\"workspace\":\"alpha\""));
+        assert!(output.contains("\"enabled\":true"));
 
         remove_env_var("HERMES_MEMORY_PYTHON");
     }
