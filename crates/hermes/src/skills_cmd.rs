@@ -161,6 +161,14 @@ struct GitHubSkillSummary {
 }
 
 #[derive(Debug, Clone)]
+struct LobeHubSkillSummary {
+    name: String,
+    description: String,
+    identifier: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct InstallArgsParsed {
     identifier: String,
     category: String,
@@ -483,6 +491,49 @@ fn browse_skills_command(
         println!();
         return Ok(());
     }
+    if source == "lobehub" {
+        let skills = collect_lobehub_skill_summaries()?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        let total = skills.len();
+        let total_pages = ((total + page_size - 1) / page_size).max(1);
+        let page = page.clamp(1, total_pages);
+        let start = (page - 1) * page_size;
+        let end = (start + page_size).min(total);
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills[start..end] {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "lobehub",
+                "community",
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page}/{total_pages} — {total} lobehub skill(s)");
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("browse", passthrough);
     }
@@ -576,6 +627,59 @@ fn search_skills_command(
                 truncate(&skill.name, 24),
                 "github",
                 truncate(&skill.trust, 10),
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
+    if source == "lobehub" {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return bridge_prefixed("search", passthrough);
+        }
+        let matches = collect_lobehub_skill_summaries()?
+            .into_iter()
+            .filter(|skill| {
+                let searchable = format!(
+                    "{} {} {}",
+                    skill.name,
+                    skill.description,
+                    skill.tags.join(" ")
+                )
+                .to_ascii_lowercase();
+                searchable.contains(&needle)
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "lobehub",
+                "community",
                 truncate(&skill.identifier, 30),
                 truncate(&skill.description, 60),
             );
@@ -785,6 +889,21 @@ fn install_github_skill_command(
     passthrough: &[String],
     args: &InstallArgsParsed,
 ) -> Result<(), Box<dyn Error>> {
+    if let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_lobehub_bundle_to_tempdir(&args.identifier)?
+    {
+        return install_remote_skill_bundle(
+            context,
+            args,
+            bundle_dir,
+            skill_name,
+            trust_level,
+            identifier,
+            "lobehub",
+            "LobeHub",
+        );
+    }
+
     if !args.name_override.trim().is_empty() {
         return bridge_prefixed("install", passthrough);
     }
@@ -798,6 +917,28 @@ fn install_github_skill_command(
         return bridge_prefixed("install", passthrough);
     };
 
+    install_remote_skill_bundle(
+        context,
+        args,
+        bundle_dir,
+        skill_name,
+        trust_level,
+        identifier,
+        "github",
+        "GitHub",
+    )
+}
+
+fn install_remote_skill_bundle(
+    context: &HermesContext,
+    args: &InstallArgsParsed,
+    bundle_dir: tempfile::TempDir,
+    skill_name: String,
+    trust_level: String,
+    identifier: String,
+    source: &str,
+    prompt_source: &str,
+) -> Result<(), Box<dyn Error>> {
     let category = if args.category.trim().is_empty() {
         String::new()
     } else {
@@ -830,8 +971,8 @@ fn install_github_skill_command(
     if !args.force
         && !args.yes
         && !confirm_prompt(&format!(
-            "Install third-party skill '{}' from GitHub? [y/N]: ",
-            skill_name
+            "Install third-party skill '{}' from {}? [y/N]: ",
+            skill_name, prompt_source
         ))?
     {
         println!("Installation cancelled.");
@@ -856,10 +997,7 @@ fn install_github_skill_command(
         .replace('\\', "/");
 
     let mut raw = JsonMap::new();
-    raw.insert(
-        "source".to_string(),
-        JsonValue::String(String::from("github")),
-    );
+    raw.insert("source".to_string(), JsonValue::String(source.to_string()));
     raw.insert(
         "identifier".to_string(),
         JsonValue::String(identifier.clone()),
@@ -888,7 +1026,7 @@ fn install_github_skill_command(
     installed.insert(
         skill_name.clone(),
         HubInstalledEntry {
-            source: String::from("github"),
+            source: source.to_string(),
             trust_level: trust_level.clone(),
             install_path: relative_install.clone(),
             raw,
@@ -899,7 +1037,7 @@ fn install_github_skill_command(
         context,
         "INSTALL",
         &skill_name,
-        "github",
+        source,
         &trust_level,
         scan_result.verdict,
         &hash,
@@ -1130,7 +1268,7 @@ fn check_skills_command(
 
     if targets
         .iter()
-        .any(|(_, source)| source != "official" && source != "github")
+        .any(|(_, source)| source != "official" && source != "github" && source != "lobehub")
     {
         return bridge_prefixed("check", passthrough);
     }
@@ -1165,7 +1303,7 @@ fn update_skills_command(
             println!();
             return Ok(());
         };
-        if entry.source != "official" && entry.source != "github" {
+        if entry.source != "official" && entry.source != "github" && entry.source != "lobehub" {
             return bridge_prefixed("update", passthrough);
         }
         if entry.source == "github"
@@ -1181,10 +1319,9 @@ fn update_skills_command(
             println!();
             return Ok(());
         }
-        if installed
-            .values()
-            .any(|entry| entry.source != "official" && entry.source != "github")
-        {
+        if installed.values().any(|entry| {
+            entry.source != "official" && entry.source != "github" && entry.source != "lobehub"
+        }) {
             return bridge_prefixed("update", passthrough);
         }
         if installed.values().any(|entry| entry.source == "github")
@@ -1551,6 +1688,26 @@ fn github_raw_headers(
     Ok(headers)
 }
 
+fn slugify_catalog_name(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        String::from("skill")
+    } else {
+        slug
+    }
+}
+
 fn github_branch_slug(value: &str) -> String {
     let slug = value
         .chars()
@@ -1709,6 +1866,26 @@ fn collect_official_skill_candidates(
                 },
                 Some(bundle_dir),
             )
+        } else if entry.source == "lobehub" {
+            let Some((bundle_dir, _bundle_name, resolved_trust, _resolved_identifier)) =
+                fetch_lobehub_bundle_to_tempdir(&identifier)?
+            else {
+                continue;
+            };
+            let source_dir = bundle_dir.path().to_path_buf();
+            let files = collect_bundle_file_paths(&source_dir)?;
+            let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
+            (
+                source_dir,
+                files,
+                latest_hash,
+                if entry.trust_level.trim().is_empty() {
+                    resolved_trust
+                } else {
+                    entry.trust_level.clone()
+                },
+                Some(bundle_dir),
+            )
         } else {
             let record = records_by_identifier
                 .get(&identifier)
@@ -1772,7 +1949,7 @@ fn apply_official_updates(
     for update in updates {
         println!("Updating: {}", update.name);
         let install_path = validated_install_path(&skills_root, &update.install_path)?;
-        let scan_verdict = if update.source == "github" {
+        let scan_verdict = if update.source == "github" || update.source == "lobehub" {
             scan_skill(&update.source_dir, &update.identifier)
                 .verdict
                 .to_string()
@@ -1944,6 +2121,9 @@ fn resolve_native_inspect_skill(
     if let Some(skill) = fetch_remote_github_inspect_skill(identifier)? {
         return Ok(Some(skill));
     }
+    if let Some(skill) = fetch_remote_lobehub_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
 
     Ok(None)
 }
@@ -1998,6 +2178,162 @@ fn fetch_remote_github_inspect_skill(
         preview: preview_lines(&content, 50),
         path: PathBuf::from(format!("github/{repo}/{skill_md_path}")),
     }))
+}
+
+fn fetch_remote_lobehub_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let Some(agent_id) = parse_lobehub_identifier(identifier) else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(agent_data) = fetch_lobehub_agent(&client, &agent_id)? else {
+        return Ok(None);
+    };
+    let content = render_lobehub_skill_md(&agent_id, &agent_data)?;
+    let (frontmatter, _body) = parse_frontmatter(&content);
+
+    Ok(Some(NativeInspectSkill {
+        name: frontmatter_string(&frontmatter, "name").unwrap_or_else(|| agent_id.clone()),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("lobehub"),
+        trust: String::from("community"),
+        identifier: format!("lobehub/{agent_id}"),
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: PathBuf::from(format!("lobehub/{agent_id}.json")),
+    }))
+}
+
+fn parse_lobehub_identifier(identifier: &str) -> Option<String> {
+    let trimmed = identifier.trim();
+    let trimmed = trimmed
+        .strip_prefix("lobehub/")
+        .or_else(|| trimmed.strip_prefix("lobehub:"))
+        .unwrap_or(trimmed);
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || matches!(trimmed, "." | "..")
+        || trimmed.contains('\\')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn lobehub_base_url() -> String {
+    std::env::var("HERMES_LOBEHUB_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("https://chat-agents.lobehub.com"))
+}
+
+fn fetch_lobehub_index(client: &reqwest::blocking::Client) -> Result<JsonValue, Box<dyn Error>> {
+    let response = client
+        .get(format!("{}/index.json", lobehub_base_url()))
+        .send()?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("Failed to fetch LobeHub index: {}", response.status()).into());
+    }
+    Ok(response.json::<JsonValue>()?)
+}
+
+fn fetch_lobehub_agent(
+    client: &reqwest::blocking::Client,
+    agent_id: &str,
+) -> Result<Option<JsonValue>, Box<dyn Error>> {
+    let response = client
+        .get(format!("{}/{}.json", lobehub_base_url(), agent_id))
+        .send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() != StatusCode::OK {
+        return Err(format!(
+            "Failed to fetch LobeHub agent '{}': {}",
+            agent_id,
+            response.status()
+        )
+        .into());
+    }
+    Ok(Some(response.json::<JsonValue>()?))
+}
+
+fn render_lobehub_skill_md(
+    agent_id: &str,
+    agent_data: &JsonValue,
+) -> Result<String, Box<dyn Error>> {
+    let meta = agent_data
+        .get("meta")
+        .and_then(JsonValue::as_object)
+        .or_else(|| agent_data.as_object())
+        .ok_or("LobeHub agent payload must be a JSON object")?;
+    let title = meta
+        .get("title")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(agent_id);
+    let description = meta
+        .get("description")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let tags = meta
+        .get("tags")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let system_role = agent_data
+        .get("config")
+        .and_then(JsonValue::as_object)
+        .and_then(|config| config.get("systemRole"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("(No system role defined)");
+
+    let mut frontmatter = YamlMapping::new();
+    frontmatter.insert(yaml_key("name"), YamlValue::String(agent_id.to_string()));
+    frontmatter.insert(
+        yaml_key("description"),
+        YamlValue::String(description.chars().take(500).collect()),
+    );
+
+    let mut metadata = YamlMapping::new();
+    let mut hermes = YamlMapping::new();
+    hermes.insert(
+        yaml_key("tags"),
+        YamlValue::Sequence(tags.iter().cloned().map(YamlValue::String).collect()),
+    );
+    metadata.insert(yaml_key("hermes"), YamlValue::Mapping(hermes));
+
+    let mut lobehub = YamlMapping::new();
+    lobehub.insert(
+        yaml_key("source"),
+        YamlValue::String(String::from("lobehub")),
+    );
+    metadata.insert(yaml_key("lobehub"), YamlValue::Mapping(lobehub));
+    frontmatter.insert(yaml_key("metadata"), YamlValue::Mapping(metadata));
+
+    let yaml = serde_yaml::to_string(&YamlValue::Mapping(frontmatter))?;
+    Ok(format!(
+        "---\n{}---\n\n# {}\n\n{}\n\n## Instructions\n\n{}\n",
+        yaml, title, description, system_role
+    ))
 }
 
 fn parse_github_inspect_identifier(identifier: &str) -> Option<(String, String, String, String)> {
@@ -2084,6 +2420,33 @@ fn fetch_github_bundle_to_tempdir(
         .to_string();
     let trust = resolve_trust_level(&normalized_identifier).to_string();
     Ok(Some((bundle_dir, skill_name, trust, normalized_identifier)))
+}
+
+fn fetch_lobehub_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, String, String, String)>, Box<dyn Error>> {
+    let Some(agent_id) = parse_lobehub_identifier(identifier) else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(agent_data) = fetch_lobehub_agent(&client, &agent_id)? else {
+        return Ok(None);
+    };
+
+    let bundle_dir = tempfile::TempDir::new()?;
+    fs::write(
+        bundle_dir.path().join("SKILL.md"),
+        render_lobehub_skill_md(&agent_id, &agent_data)?,
+    )?;
+    Ok(Some((
+        bundle_dir,
+        agent_id.clone(),
+        String::from("community"),
+        format!("lobehub/{agent_id}"),
+    )))
 }
 
 fn download_github_directory_recursive(
@@ -3396,6 +3759,70 @@ fn collect_github_skill_summaries(
     Ok(summaries)
 }
 
+fn collect_lobehub_skill_summaries() -> Result<Vec<LobeHubSkillSummary>, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let index = fetch_lobehub_index(&client)?;
+    let agents = index
+        .get("agents")
+        .and_then(JsonValue::as_array)
+        .or_else(|| index.as_array())
+        .ok_or("LobeHub index must be a JSON array or an object with an 'agents' array")?;
+
+    let mut summaries = Vec::new();
+    for agent in agents {
+        let meta = agent
+            .get("meta")
+            .and_then(JsonValue::as_object)
+            .or_else(|| agent.as_object());
+        let Some(meta) = meta else {
+            continue;
+        };
+        let identifier = agent
+            .get("identifier")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                meta.get("title")
+                    .and_then(JsonValue::as_str)
+                    .map(slugify_catalog_name)
+                    .filter(|value| !value.is_empty())
+            });
+        let Some(identifier) = identifier else {
+            continue;
+        };
+        let description = meta
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        let tags = meta
+            .get("tags")
+            .and_then(JsonValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        summaries.push(LobeHubSkillSummary {
+            name: identifier.clone(),
+            description: description.to_string(),
+            identifier: format!("lobehub/{identifier}"),
+            tags,
+        });
+    }
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(summaries)
+}
+
 fn resolve_single_catalog_skill_identifier(
     context: &HermesContext,
     raw: &str,
@@ -3416,6 +3843,17 @@ fn resolve_single_catalog_skill_identifier(
     }
     if exact_official_matches.len() > 1 {
         return Ok(None);
+    }
+
+    let mut exact_lobehub_matches = collect_lobehub_skill_summaries()?
+        .into_iter()
+        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+    exact_lobehub_matches.sort();
+    exact_lobehub_matches.dedup();
+    if exact_lobehub_matches.len() == 1 {
+        return Ok(exact_lobehub_matches.into_iter().next());
     }
 
     let mut exact_github_matches = collect_github_skill_summaries(context)?
@@ -5006,6 +5444,34 @@ exit 9\n",
     }
 
     #[test]
+    fn resolve_single_catalog_skill_identifier_resolves_unique_lobehub_match() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("short-lobehub-resolve-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_lobehub_server(requests.clone());
+        let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
+
+        let resolved = resolve_single_catalog_skill_identifier(&context, "deploy-guide").unwrap();
+        assert_eq!(resolved.as_deref(), Some("lobehub/deploy-guide"));
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /index.json "))
+        );
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn browse_bridges_when_source_is_not_official() {
         let _guard = test_env_lock().lock().unwrap();
@@ -5191,6 +5657,49 @@ exit 9\n",
         match old_github_token {
             Some(value) => set_env_var("GITHUB_TOKEN", value),
             None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn install_native_lobehub_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-lobehub-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_lobehub_server(requests.clone());
+        let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
+
+        install_skill_command(
+            &context,
+            &[String::from("lobehub/deploy-guide"), String::from("--yes")],
+        )
+        .unwrap();
+
+        let install_dir = home.join("skills").join("deploy-guide");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: deploy-guide"));
+        assert!(skill_md.contains("# Deploy Guide"));
+        assert!(skill_md.contains("Use shell carefully."));
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-guide").unwrap();
+        assert_eq!(entry.source, "lobehub");
+        assert_eq!(entry.trust_level, "community");
+        assert_eq!(entry.install_path, "deploy-guide");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("lobehub/deploy-guide")
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /deploy-guide.json "));
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
         }
         let _ = fs::remove_dir_all(home);
     }
@@ -5419,6 +5928,37 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_lobehub_skill_summaries_reads_index() {
+        let _guard = test_env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_lobehub_server(requests.clone());
+        let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
+
+        let summaries = collect_lobehub_skill_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        let deploy = summaries
+            .iter()
+            .find(|skill| skill.name == "deploy-guide")
+            .unwrap();
+        assert_eq!(deploy.identifier, "lobehub/deploy-guide");
+        assert_eq!(
+            deploy.tags,
+            vec![String::from("ops"), String::from("deploy")]
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /index.json "));
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
+        }
+    }
+
+    #[test]
     fn update_native_official_skill_restores_files_and_lock_hash() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("official-update-home");
@@ -5532,6 +6072,54 @@ exit 9\n",
         match old_github_token {
             Some(value) => set_env_var("GITHUB_TOKEN", value),
             None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn update_native_lobehub_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("lobehub-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("deploy-guide");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: deploy-guide\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"deploy-guide":{"source":"lobehub","identifier":"lobehub/deploy-guide","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"deploy-guide","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_lobehub_server(requests);
+        let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
+        set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-guide").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: deploy-guide"));
+        assert!(skill_md.contains("Use shell carefully."));
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        match old_base {
+            Some(value) => set_env_var("HERMES_LOBEHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_LOBEHUB_BASE_URL"),
         }
         let _ = fs::remove_dir_all(home);
     }
@@ -5914,6 +6502,65 @@ exit 9\n",
                     body
                 );
                 stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn spawn_lobehub_server(requests: Arc<Mutex<Vec<String>>>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /index.json ")
+                        {
+                            (
+                                    "HTTP/1.1 200 OK",
+                                    r#"{"agents":[{"identifier":"deploy-guide","meta":{"title":"Deploy Guide","description":"Deployment helper","tags":["ops","deploy"]}},{"identifier":"research-wizard","meta":{"title":"Research Wizard","description":"Research helper","tags":["research"]}}]}"#.to_string(),
+                                    "application/json",
+                                )
+                        } else if first_line.starts_with("GET /deploy-guide.json ") {
+                            (
+                                    "HTTP/1.1 200 OK",
+                                    r#"{"identifier":"deploy-guide","meta":{"title":"Deploy Guide","description":"Deployment helper","tags":["ops","deploy"]},"config":{"systemRole":"Use shell carefully."}}"#.to_string(),
+                                    "application/json",
+                                )
+                        } else if first_line.starts_with("GET /research-wizard.json ") {
+                            (
+                                    "HTTP/1.1 200 OK",
+                                    r#"{"identifier":"research-wizard","meta":{"title":"Research Wizard","description":"Research helper","tags":["research"]},"config":{"systemRole":"Think deeply."}}"#.to_string(),
+                                    "application/json",
+                                )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("lobehub test server accept failed: {error}"),
+                }
             }
         });
         (format!("http://{addr}"), handle)
