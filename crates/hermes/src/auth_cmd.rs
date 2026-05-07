@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::{
     AuthStatusSummary, HermesContext, LoadedConfig, OPENROUTER_BASE_URL, clear_provider_auth_state,
-    get_active_auth_provider, get_auth_status_summary,
+    get_active_auth_provider, get_auth_status_summary, get_provider_profile,
+    normalize_provider_alias,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;
@@ -38,9 +39,44 @@ const SPOTIFY_AUTH_LOGIN_BOOTSTRAP: &str = concat!(
     "login_spotify_command(args)\n",
 );
 
+const AUTH_ADD_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from types import SimpleNamespace\n",
+    "from hermes_cli.auth_commands import auth_add_command\n",
+    "raw_timeout = os.environ.get('HERMES_AUTH_ADD_TIMEOUT', '').strip()\n",
+    "args = SimpleNamespace(\n",
+    "    provider=os.environ.get('HERMES_AUTH_ADD_PROVIDER', ''),\n",
+    "    auth_type=(os.environ.get('HERMES_AUTH_ADD_TYPE', '').strip() or None),\n",
+    "    label=(os.environ.get('HERMES_AUTH_ADD_LABEL', '').strip() or None),\n",
+    "    api_key=(os.environ.get('HERMES_AUTH_ADD_API_KEY', '').strip() or None),\n",
+    "    portal_url=(os.environ.get('HERMES_AUTH_ADD_PORTAL_URL', '').strip() or None),\n",
+    "    inference_url=(os.environ.get('HERMES_AUTH_ADD_INFERENCE_URL', '').strip() or None),\n",
+    "    client_id=(os.environ.get('HERMES_AUTH_ADD_CLIENT_ID', '').strip() or None),\n",
+    "    scope=(os.environ.get('HERMES_AUTH_ADD_SCOPE', '').strip() or None),\n",
+    "    no_browser=(os.environ.get('HERMES_AUTH_ADD_NO_BROWSER', '0') == '1'),\n",
+    "    timeout=(float(raw_timeout) if raw_timeout else None),\n",
+    "    insecure=(os.environ.get('HERMES_AUTH_ADD_INSECURE', '0') == '1'),\n",
+    "    ca_bundle=(os.environ.get('HERMES_AUTH_ADD_CA_BUNDLE', '').strip() or None),\n",
+    ")\n",
+    "auth_add_command(args)\n",
+);
+
+const AUTH_REMOVE_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from types import SimpleNamespace\n",
+    "from hermes_cli.auth_commands import auth_remove_command\n",
+    "args = SimpleNamespace(\n",
+    "    provider=os.environ.get('HERMES_AUTH_REMOVE_PROVIDER', ''),\n",
+    "    target=os.environ.get('HERMES_AUTH_REMOVE_TARGET', ''),\n",
+    ")\n",
+    "auth_remove_command(args)\n",
+);
+
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
+    Add(AuthAddArgs),
     List { provider: Option<String> },
+    Remove(AuthRemoveArgs),
     Reset { provider: String },
     Status { provider: String },
     Logout { provider: String },
@@ -51,6 +87,39 @@ pub enum AuthCommand {
 pub struct LogoutArgs {
     #[arg(long)]
     pub provider: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct AuthAddArgs {
+    pub provider: String,
+    #[arg(long = "type", value_parser = ["oauth", "api-key", "api_key"])]
+    pub auth_type: Option<String>,
+    #[arg(long)]
+    pub label: Option<String>,
+    #[arg(long = "api-key")]
+    pub api_key: Option<String>,
+    #[arg(long = "portal-url")]
+    pub portal_url: Option<String>,
+    #[arg(long = "inference-url")]
+    pub inference_url: Option<String>,
+    #[arg(long = "client-id")]
+    pub client_id: Option<String>,
+    #[arg(long)]
+    pub scope: Option<String>,
+    #[arg(long = "no-browser", default_value_t = false)]
+    pub no_browser: bool,
+    #[arg(long)]
+    pub timeout: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    pub insecure: bool,
+    #[arg(long = "ca-bundle")]
+    pub ca_bundle: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct AuthRemoveArgs {
+    pub provider: String,
+    pub target: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Default)]
@@ -83,8 +152,14 @@ pub fn print_auth(
     command: Option<AuthCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
+        Some(AuthCommand::Add(args)) => {
+            print_auth_add(context, &args)?;
+        }
         Some(AuthCommand::List { provider }) => {
             print_auth_list(context, provider.as_deref())?;
+        }
+        Some(AuthCommand::Remove(args)) => {
+            print_auth_remove(context, &args)?;
         }
         Some(AuthCommand::Reset { provider }) => {
             print_auth_reset(context, &provider)?;
@@ -103,7 +178,9 @@ pub fn print_auth(
             print_auth_spotify(context, loaded, args)?;
         }
         None => {
-            return Err("auth requires a subcommand: list|reset|status|logout|spotify".into());
+            return Err(
+                "auth requires a subcommand: add|list|remove|reset|status|logout|spotify".into(),
+            );
         }
     }
     Ok(())
@@ -115,6 +192,13 @@ pub fn print_logout(
     args: LogoutArgs,
 ) -> Result<(), Box<dyn Error>> {
     logout_provider(context, loaded, args.provider.as_deref())
+}
+
+fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
+    if should_use_native_auth_add(args) {
+        return native_auth_add_api_key(context, args);
+    }
+    run_python_auth_add(args)
 }
 
 fn print_auth_list(
@@ -189,6 +273,43 @@ fn print_auth_reset(context: &HermesContext, provider: &str) -> Result<(), Box<d
     Ok(())
 }
 
+fn print_auth_remove(context: &HermesContext, args: &AuthRemoveArgs) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth remove openrouter 1`.")?;
+    let target = args.target.trim();
+    if target.is_empty() {
+        return Err("credential target is required".into());
+    }
+    let pool = load_credential_pool(context.hermes_home().as_path())?;
+    let entries = pool.get(&provider).cloned().unwrap_or_default();
+    let (index, matched, error) = resolve_auth_remove_target(&entries, target);
+    let Some(entry) = matched else {
+        return Err(format!(
+            "{} Provider: {}.",
+            error.unwrap_or("No credential target provided.".to_string()),
+            provider
+        )
+        .into());
+    };
+    let Some(index) = index else {
+        return Err(format!(
+            "{} Provider: {}.",
+            error.unwrap_or("No credential target provided.".to_string()),
+            provider
+        )
+        .into());
+    };
+    if entry_source_is_manual(&entry.source) {
+        remove_manual_auth_entry(context.hermes_home().as_path(), &provider, index)?;
+        println!(
+            "Removed {} credential #{} ({})",
+            provider, index, entry.label
+        );
+        return Ok(());
+    }
+    run_python_auth_remove(&provider, target)
+}
+
 fn print_auth_spotify(
     context: &HermesContext,
     loaded: &LoadedConfig,
@@ -210,6 +331,199 @@ fn print_auth_spotify(
 
 pub(crate) fn run_default_spotify_login() -> Result<(), Box<dyn Error>> {
     run_python_spotify_login(&SpotifyAuthArgs::default())
+}
+
+fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
+    let provider = normalize_provider_name(&args.provider)
+        .unwrap_or_else(|| normalize_provider_alias(&args.provider));
+    let Some(profile) = get_provider_profile(&provider) else {
+        return false;
+    };
+    if profile.name == "custom" || profile.auth_type != "api_key" {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") => false,
+        Some("api_key") | None => {
+            args.api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
+                && !args.no_browser
+                && args.timeout.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn native_auth_add_api_key(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add openrouter --api-key ...`.")?;
+    let profile =
+        get_provider_profile(&provider).ok_or_else(|| format!("Unknown provider: {provider}"))?;
+    let api_key = args
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("No API key provided.")?;
+    let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let (entry_count, label) = {
+        let root = auth_store
+            .as_object_mut()
+            .ok_or("auth store is not a JSON object")?;
+        if !root.contains_key("version") {
+            root.insert("version".to_string(), JsonValue::from(1));
+        }
+        if !root.contains_key("providers") {
+            root.insert(
+                "providers".to_string(),
+                JsonValue::Object(Default::default()),
+            );
+        }
+        let pool = ensure_json_object(root, "credential_pool")?;
+        let provider_entries = pool
+            .entry(provider.clone())
+            .or_insert_with(|| JsonValue::Array(Vec::new()));
+        let provider_entries = provider_entries
+            .as_array_mut()
+            .ok_or("credential_pool entry is not an array")?;
+        let existing = provider_entries
+            .iter()
+            .filter_map(parse_pool_entry)
+            .collect::<Vec<_>>();
+        let next_index = existing.len() + 1;
+        let priority = existing
+            .iter()
+            .map(|entry| entry.priority)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+        let label = requested_label
+            .clone()
+            .unwrap_or_else(|| format!("api-key-{next_index}"));
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".to_string(), JsonValue::String(generate_short_id()));
+        entry.insert("label".to_string(), JsonValue::String(label.clone()));
+        entry.insert(
+            "auth_type".to_string(),
+            JsonValue::String("api_key".to_string()),
+        );
+        entry.insert("priority".to_string(), JsonValue::from(priority));
+        entry.insert(
+            "source".to_string(),
+            JsonValue::String("manual".to_string()),
+        );
+        entry.insert(
+            "access_token".to_string(),
+            JsonValue::String(api_key.to_string()),
+        );
+        if !profile.base_url.trim().is_empty() {
+            entry.insert(
+                "base_url".to_string(),
+                JsonValue::String(profile.base_url.to_string()),
+            );
+        }
+        provider_entries.push(JsonValue::Object(entry));
+        (provider_entries.len(), label)
+    };
+    save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
+    println!(
+        "Added {} credential #{}: \"{}\"",
+        provider, entry_count, label
+    );
+    Ok(())
+}
+
+fn run_python_auth_add(args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_AUTH_PYTHON"))
+        .ok_or("could not find a Python interpreter for auth")?;
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_AUTH_ADD_PROVIDER", args.provider.trim())
+        .env(
+            "HERMES_AUTH_ADD_TYPE",
+            args.auth_type.as_deref().unwrap_or(""),
+        )
+        .env("HERMES_AUTH_ADD_LABEL", args.label.as_deref().unwrap_or(""))
+        .env(
+            "HERMES_AUTH_ADD_API_KEY",
+            args.api_key.as_deref().unwrap_or(""),
+        )
+        .env(
+            "HERMES_AUTH_ADD_PORTAL_URL",
+            args.portal_url.as_deref().unwrap_or(""),
+        )
+        .env(
+            "HERMES_AUTH_ADD_INFERENCE_URL",
+            args.inference_url.as_deref().unwrap_or(""),
+        )
+        .env(
+            "HERMES_AUTH_ADD_CLIENT_ID",
+            args.client_id.as_deref().unwrap_or(""),
+        )
+        .env("HERMES_AUTH_ADD_SCOPE", args.scope.as_deref().unwrap_or(""))
+        .env(
+            "HERMES_AUTH_ADD_NO_BROWSER",
+            if args.no_browser { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_AUTH_ADD_TIMEOUT",
+            args.timeout
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        )
+        .env(
+            "HERMES_AUTH_ADD_INSECURE",
+            if args.insecure { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_AUTH_ADD_CA_BUNDLE",
+            args.ca_bundle.as_deref().unwrap_or(""),
+        )
+        .arg("-c")
+        .arg(AUTH_ADD_BOOTSTRAP);
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("auth add", status).into())
+}
+
+fn run_python_auth_remove(provider: &str, target: &str) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_AUTH_PYTHON"))
+        .ok_or("could not find a Python interpreter for auth")?;
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_AUTH_REMOVE_PROVIDER", provider)
+        .env("HERMES_AUTH_REMOVE_TARGET", target)
+        .arg("-c")
+        .arg(AUTH_REMOVE_BOOTSTRAP);
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("auth remove", status).into())
 }
 
 fn run_python_spotify_login(args: &SpotifyAuthArgs) -> Result<(), Box<dyn Error>> {
@@ -533,14 +847,11 @@ fn parse_pool_entry(value: &JsonValue) -> Option<PoolEntry> {
 }
 
 fn normalize_provider_name(provider: &str) -> Option<String> {
-    let trimmed = provider.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
+    let normalized = normalize_provider_alias(provider);
+    if normalized.trim().is_empty() {
         return None;
     }
-    match trimmed.as_str() {
-        "or" | "open-router" => Some("openrouter".to_string()),
-        _ => Some(trimmed),
-    }
+    Some(normalized)
 }
 
 fn peek_entry_id(entries: &[PoolEntry]) -> Option<String> {
@@ -679,6 +990,148 @@ fn format_duration(seconds: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn normalize_auth_type(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("api-key" | "api_key") => Some("api_key"),
+        Some("oauth") => Some("oauth"),
+        Some(_) => None,
+        None => None,
+    }
+}
+
+fn load_auth_store_json(hermes_home: &Path) -> Result<JsonValue, Box<dyn Error>> {
+    let auth_path = hermes_home.join("auth.json");
+    if !auth_path.exists() {
+        return Ok(serde_json::json!({
+            "version": 1,
+            "providers": {}
+        }));
+    }
+    let raw = fs::read_to_string(auth_path)?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({
+            "version": 1,
+            "providers": {}
+        }));
+    }
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn save_auth_store_json(hermes_home: &Path, value: &JsonValue) -> Result<(), Box<dyn Error>> {
+    let auth_path = hermes_home.join("auth.json");
+    let rendered = serde_json::to_string_pretty(value)?;
+    atomic_write(&auth_path, rendered.as_bytes())
+}
+
+fn ensure_json_object<'a>(
+    root: &'a mut serde_json::Map<String, JsonValue>,
+    key: &str,
+) -> Result<&'a mut serde_json::Map<String, JsonValue>, Box<dyn Error>> {
+    let value = root
+        .entry(key.to_string())
+        .or_insert_with(|| JsonValue::Object(Default::default()));
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{key} is not a JSON object").into())
+}
+
+fn generate_short_id() -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let hex = format!("{unique:x}");
+    if hex.len() <= 6 {
+        hex
+    } else {
+        hex[hex.len() - 6..].to_string()
+    }
+}
+
+fn resolve_auth_remove_target<'a>(
+    entries: &'a [PoolEntry],
+    target: &str,
+) -> (Option<usize>, Option<&'a PoolEntry>, Option<String>) {
+    let raw = target.trim();
+    if raw.is_empty() {
+        return (
+            None,
+            None,
+            Some("No credential target provided.".to_string()),
+        );
+    }
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.id == raw {
+            return (Some(idx + 1), Some(entry), None);
+        }
+    }
+    let label_matches = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.label.trim().eq_ignore_ascii_case(raw))
+        .collect::<Vec<_>>();
+    if label_matches.len() == 1 {
+        let (idx, entry) = label_matches[0];
+        return (Some(idx + 1), Some(entry), None);
+    }
+    if label_matches.len() > 1 {
+        return (
+            None,
+            None,
+            Some(format!(
+                "Ambiguous credential label \"{}\". Use the numeric index or entry id instead.",
+                raw
+            )),
+        );
+    }
+    if let Ok(index) = raw.parse::<usize>() {
+        if (1..=entries.len()).contains(&index) {
+            return (Some(index), entries.get(index - 1), None);
+        }
+        return (None, None, Some(format!("No credential #{}.", index)));
+    }
+    (
+        None,
+        None,
+        Some(format!("No credential matching \"{}\".", raw)),
+    )
+}
+
+fn entry_source_is_manual(source: &str) -> bool {
+    let normalized = source.trim().to_ascii_lowercase();
+    normalized == "manual" || normalized.starts_with("manual:")
+}
+
+fn remove_manual_auth_entry(
+    hermes_home: &Path,
+    provider: &str,
+    index: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let root = auth_store
+        .as_object_mut()
+        .ok_or("auth store is not a JSON object")?;
+    let Some(pool) = root
+        .get_mut("credential_pool")
+        .and_then(JsonValue::as_object_mut)
+    else {
+        return Err(format!("No credential #{}.", index).into());
+    };
+    let Some(entries) = pool.get_mut(provider).and_then(JsonValue::as_array_mut) else {
+        return Err(format!("No credential #{}.", index).into());
+    };
+    if index == 0 || index > entries.len() {
+        return Err(format!("No credential #{}.", index).into());
+    }
+    entries.remove(index - 1);
+    for (priority, entry) in entries.iter_mut().enumerate() {
+        if let Some(mapping) = entry.as_object_mut() {
+            mapping.insert("priority".to_string(), JsonValue::from(priority as i64));
+        }
+    }
+    save_auth_store_json(hermes_home, &auth_store)
 }
 
 #[cfg(test)]
@@ -871,6 +1324,201 @@ mod tests {
         assert!(entry["last_error_reason"].is_null());
         assert!(entry["last_error_message"].is_null());
         assert!(entry["last_error_reset_at"].is_null());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_api_key_saves_native_pool_entry() {
+        let home = temp_path("auth-add");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        native_auth_add_api_key(
+            &context,
+            &AuthAddArgs {
+                provider: "or".to_string(),
+                auth_type: Some("api-key".to_string()),
+                label: Some("primary".to_string()),
+                api_key: Some("sk-openrouter".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["openrouter"][0];
+        assert_eq!(entry["label"], "primary");
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["source"], "manual");
+        assert_eq!(entry["access_token"], "sk-openrouter");
+        assert_eq!(entry["base_url"], OPENROUTER_BASE_URL);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_oauth_uses_python_fallback() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = temp_path("auth-add-python");
+        let log_path = temp.join("auth-add.log");
+        let python = temp.join("python3");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf 'provider=%s\\ntype=%s\\nclient_id=%s\\n' \"$HERMES_AUTH_ADD_PROVIDER\" \"$HERMES_AUTH_ADD_TYPE\" \"$HERMES_AUTH_ADD_CLIENT_ID\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        let result = run_python_auth_add(&AuthAddArgs {
+            provider: "openai-codex".to_string(),
+            auth_type: Some("oauth".to_string()),
+            client_id: Some("client-abc".to_string()),
+            ..AuthAddArgs::default()
+        });
+        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+
+        result.unwrap();
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("provider=openai-codex"));
+        assert!(logged.contains("type=oauth"));
+        assert!(logged.contains("client_id=client-abc"));
+        assert!(logged.contains("-c"));
+        assert!(logged.contains("auth_add_command"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn auth_remove_manual_entry_stays_native() {
+        let home = temp_path("auth-remove-native");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "a1",
+                            "label": "primary",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "manual",
+                            "access_token": "sk-a"
+                        },
+                        {
+                            "id": "b2",
+                            "label": "backup",
+                            "auth_type": "api_key",
+                            "priority": 1,
+                            "source": "manual",
+                            "access_token": "sk-b"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "openrouter".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entries = persisted["credential_pool"]["openrouter"]
+            .as_array()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["label"], "backup");
+        assert_eq!(entries[0]["priority"], 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_non_manual_uses_python_fallback() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = temp_path("auth-remove-python");
+        let log_path = temp.join("auth-remove.log");
+        let python = temp.join("python3");
+        let home = temp_path("auth-remove-home");
+        fs::create_dir_all(&temp).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "env1",
+                            "label": "OPENROUTER_API_KEY",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "env:OPENROUTER_API_KEY",
+                            "access_token": "sk-env"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf 'provider=%s\\ntarget=%s\\n' \"$HERMES_AUTH_REMOVE_PROVIDER\" \"$HERMES_AUTH_REMOVE_TARGET\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        let result = print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "openrouter".to_string(),
+                target: "1".to_string(),
+            },
+        );
+        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+
+        result.unwrap();
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("provider=openrouter"));
+        assert!(logged.contains("target=1"));
+        assert!(logged.contains("-c"));
+        assert!(logged.contains("auth_remove_command"));
+        let _ = fs::remove_dir_all(temp);
         let _ = fs::remove_dir_all(home);
     }
 }
