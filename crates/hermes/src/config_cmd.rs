@@ -602,7 +602,7 @@ pub(crate) fn write_yaml_mapping(path: &Path, mapping: &Mapping) -> Result<(), B
     atomic_write(path, rendered.as_bytes())
 }
 
-fn save_env_value(path: PathBuf, key: &str, value: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn save_env_value(path: PathBuf, key: &str, value: &str) -> Result<(), Box<dyn Error>> {
     let sanitized = sanitize_env_value(key, value)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
