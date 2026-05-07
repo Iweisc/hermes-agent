@@ -313,8 +313,15 @@ const RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "spotify",
 ];
 
-const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] =
-    &["web", "vision", "moa", "homeassistant", "tts", "image_gen"];
+const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &[
+    "web",
+    "vision",
+    "moa",
+    "homeassistant",
+    "tts",
+    "image_gen",
+    "rl",
+];
 
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
@@ -601,6 +608,7 @@ fn run_native_tool_reconfigure_with_io(
         "homeassistant" => reconfigure_homeassistant_with_io(context, input, output),
         "tts" => reconfigure_tts_with_io(context, input, output),
         "image_gen" => reconfigure_image_gen_with_io(context, input, output),
+        "rl" => reconfigure_rl_with_io(context, input, output),
         other => run_python_tools_reconfigure_toolset(other),
     }
 }
@@ -860,6 +868,24 @@ fn reconfigure_image_gen_with_io(
     }
 
     write_yaml_mapping(&context.config_path(), &root)?;
+    Ok(())
+}
+
+fn reconfigure_rl_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "RL Training")?;
+    writeln!(
+        output,
+        "Get key at: https://tinker-console.thinkingmachines.ai/keys"
+    )?;
+    prompt_secret_env_update(context, input, output, "TINKER_API_KEY", "Tinker API key")?;
+    writeln!(output, "Get key at: https://wandb.ai/authorize")?;
+    prompt_secret_env_update(context, input, output, "WANDB_API_KEY", "WandB API key")?;
+    writeln!(output, "RL training settings updated.")?;
     Ok(())
 }
 
@@ -2179,6 +2205,28 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Image Generation"));
         assert!(rendered.contains("Image generation provider set to OpenAI"));
+    }
+
+    #[test]
+    fn tools_reconfigure_rl_updates_keys_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-rl");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - rl\n",
+        );
+
+        let mut input = Cursor::new(b"tk-test-key\nwb-test-key\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_rl_with_io(&context, &mut input, &mut output).unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TINKER_API_KEY=tk-test-key"));
+        assert!(env_text.contains("WANDB_API_KEY=wb-test-key"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("RL Training"));
+        assert!(rendered.contains("RL training settings updated."));
     }
 
     #[test]
