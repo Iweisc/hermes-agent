@@ -418,6 +418,18 @@ fn inspect_skill_command(
         print_native_inspect(&skill);
         return Ok(());
     }
+    if !identifier.contains('/')
+        && let Some(resolved) = resolve_single_catalog_skill_identifier(context, identifier)?
+    {
+        if resolved != identifier {
+            println!("Resolved to: {resolved}");
+            println!();
+        }
+        if let Some(skill) = resolve_native_inspect_skill(context, &resolved)? {
+            print_native_inspect(&skill);
+            return Ok(());
+        }
+    }
     bridge_prefixed("inspect", &[identifier.to_string()])
 }
 
@@ -636,9 +648,18 @@ fn install_skill_command(
     context: &HermesContext,
     passthrough: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    let Some(args) = parse_install_args(passthrough)? else {
+    let Some(mut args) = parse_install_args(passthrough)? else {
         return bridge_prefixed("install", passthrough);
     };
+    if !args.identifier.contains('/')
+        && let Some(resolved) = resolve_single_catalog_skill_identifier(context, &args.identifier)?
+    {
+        if resolved != args.identifier {
+            println!("Resolved to: {resolved}");
+            println!();
+        }
+        args.identifier = resolved;
+    }
     if !args.identifier.starts_with("official/") {
         return install_github_skill_command(context, passthrough, &args);
     }
@@ -3375,6 +3396,42 @@ fn collect_github_skill_summaries(
     Ok(summaries)
 }
 
+fn resolve_single_catalog_skill_identifier(
+    context: &HermesContext,
+    raw: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let needle = raw.trim();
+    if needle.is_empty() || needle.contains('/') {
+        return Ok(None);
+    }
+
+    let exact_official_matches = collect_official_skill_summaries()?
+        .into_iter()
+        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+
+    if exact_official_matches.len() == 1 {
+        return Ok(exact_official_matches.into_iter().next());
+    }
+    if exact_official_matches.len() > 1 {
+        return Ok(None);
+    }
+
+    let mut exact_github_matches = collect_github_skill_summaries(context)?
+        .into_iter()
+        .filter(|skill| skill.name.eq_ignore_ascii_case(needle))
+        .map(|skill| skill.identifier)
+        .collect::<Vec<_>>();
+    exact_github_matches.sort();
+    exact_github_matches.dedup();
+
+    if exact_github_matches.len() == 1 {
+        return Ok(exact_github_matches.into_iter().next());
+    }
+    Ok(None)
+}
+
 fn github_skill_taps(context: &HermesContext) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let mut seen = HashSet::new();
     let mut taps = Vec::new();
@@ -4915,6 +4972,40 @@ exit 9\n",
     }
 
     #[test]
+    fn resolve_single_catalog_skill_identifier_resolves_unique_github_match() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("short-github-resolve-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_browse_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let resolved = resolve_single_catalog_skill_identifier(&context, "shipit").unwrap();
+        assert_eq!(resolved.as_deref(), Some("openai/skills/skills/shipit"));
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /repos/openai/skills/contents/skills "))
+        );
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn browse_bridges_when_source_is_not_official() {
         let _guard = test_env_lock().lock().unwrap();
@@ -4982,6 +5073,48 @@ exit 9\n",
             ],
         )
         .unwrap();
+
+        let install_dir = home.join("skills").join("research").join("demo");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            fs::read_to_string(source_dir.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("demo").unwrap();
+        assert_eq!(entry.source, "official");
+        assert_eq!(entry.trust_level, "builtin");
+        assert_eq!(entry.install_path, "research/demo");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("official/research/demo")
+        );
+
+        remove_env_var("HERMES_OPTIONAL_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(optional);
+    }
+
+    #[test]
+    fn install_native_official_short_name_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-official-short-home");
+        let optional = temp_path("install-official-short-src");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let source_dir = optional.join("research").join("demo");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo helper\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(source_dir.join("notes.txt"), "hello\n").unwrap();
+
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
+        install_skill_command(&context, &[String::from("demo"), String::from("--yes")]).unwrap();
 
         let install_dir = home.join("skills").join("research").join("demo");
         assert_eq!(
