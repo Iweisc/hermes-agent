@@ -1,3 +1,4 @@
+mod config_cmd;
 mod dump;
 mod logs;
 
@@ -32,6 +33,10 @@ enum Command {
     Paths,
     Version,
     Dump(dump::DumpArgs),
+    Config {
+        #[command(subcommand)]
+        command: Option<config_cmd::ConfigCommand>,
+    },
     Profile {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
@@ -205,6 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Paths => print_paths(&context, &config, &logging),
         Command::Version => dump::print_version(),
         Command::Dump(args) => dump::print_dump(&context, &config, args)?,
+        Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
         Command::Profile { command } => print_profile(&context, command)?,
         Command::Chat {
             prompt,
