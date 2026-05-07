@@ -12,6 +12,7 @@ use serde_yaml::Value as YamlValue;
 use crate::backup::{create_pre_update_backup, create_quick_snapshot, format_size};
 use crate::config_cmd::{migrate_config, read_raw_yaml_mapping};
 use crate::dashboard_cmd::ensure_dashboard_web_ui;
+use crate::memory_cmd::sync_honcho_profiles;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::skills_cmd::sync_bundled_skills;
 
@@ -194,6 +195,7 @@ fn print_update_apply_native(
     }
 
     sync_bundled_skills_after_update(context)?;
+    sync_honcho_profiles_after_update(context)?;
 
     println!();
     println!("→ Checking configuration for new options...");
@@ -201,9 +203,7 @@ fn print_update_apply_native(
 
     println!();
     println!("✓ Update complete!");
-    println!(
-        "  Remaining Python-only update behavior: gateway restart flow and Honcho profile sync."
-    );
+    println!("  Remaining Python-only update behavior: gateway restart flow.");
     println!("  Restart running gateways or dashboards manually if needed.");
     println!("    hermes gateway restart");
     println!("    hermes dashboard --port <port>");
@@ -370,6 +370,16 @@ fn sync_bundled_skills_after_update(context: &HermesContext) -> Result<(), Box<d
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn sync_honcho_profiles_after_update(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let synced = sync_honcho_profiles(context)?;
+    if synced > 0 {
+        println!();
+        println!("→ Syncing Honcho profiles...");
+        println!("  ✓ Synced {synced} profile(s)");
     }
     Ok(())
 }
@@ -1232,6 +1242,126 @@ exit 0\n",
         remove_env_var("HERMES_UPDATE_GIT");
         remove_env_var("HERMES_UPDATE_UV");
         remove_env_var("HERMES_BUNDLED_SKILLS");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_update_syncs_honcho_host_blocks_to_profiles() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(home.join("profiles").join("coder")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+
+        let honcho = serde_json::json!({
+            "apiKey": "test-key",
+            "workspace": "shared-root",
+            "peerName": "alice",
+            "hosts": {
+                "hermes": {
+                    "workspace": "shared-memory",
+                    "peerName": "alice",
+                    "enabled": true,
+                    "writeFrequency": "session",
+                    "recallMode": "hybrid"
+                }
+            }
+        });
+        fs::write(
+            home.join("honcho.json"),
+            format!("{}\n", serde_json::to_string_pretty(&honcho).unwrap()),
+        )
+        .unwrap();
+
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&fake_git, &fake_uv] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+
+        print_update(
+            &context,
+            UpdateArgs {
+                gateway: false,
+                check: false,
+                no_backup: false,
+                backup: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        let saved = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(home.join("honcho.json")).unwrap(),
+        )
+        .unwrap();
+        let coder = saved
+            .get("hosts")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|hosts| hosts.get("hermes.coder"))
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert_eq!(
+            coder.get("aiPeer").and_then(serde_json::Value::as_str),
+            Some("coder")
+        );
+        assert_eq!(
+            coder.get("workspace").and_then(serde_json::Value::as_str),
+            Some("shared-memory")
+        );
+        assert_eq!(
+            coder.get("peerName").and_then(serde_json::Value::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            coder
+                .get("writeFrequency")
+                .and_then(serde_json::Value::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            coder.get("enabled").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
     }
 
     #[test]

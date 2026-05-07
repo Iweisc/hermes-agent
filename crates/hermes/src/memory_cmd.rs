@@ -1930,6 +1930,54 @@ fn load_honcho_setup_config(context: &HermesContext) -> BTreeMap<String, serde_j
     BTreeMap::new()
 }
 
+pub(crate) fn sync_honcho_profiles(context: &HermesContext) -> Result<usize, Box<dyn Error>> {
+    let mut config = load_honcho_setup_config(context);
+    let has_key = honcho_api_key(&config).is_some()
+        || std::env::var("HONCHO_API_KEY")
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    let default_block = config
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|hosts| hosts.get("hermes"))
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if default_block.is_empty() && !has_key {
+        return Ok(0);
+    }
+
+    let profiles_root = context.profiles_root();
+    if !profiles_root.is_dir() {
+        return Ok(0);
+    }
+
+    let mut created = 0usize;
+    let mut entries = fs::read_dir(&profiles_root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if hermes_core::validate_profile_name(&name).is_err() {
+            continue;
+        }
+        if clone_honcho_host_block(&mut config, &name) {
+            created += 1;
+        }
+    }
+
+    if created > 0 {
+        save_honcho_config(context, &config)?;
+    }
+    Ok(created)
+}
+
 fn honcho_config_candidates(context: &HermesContext) -> Vec<PathBuf> {
     let mut paths = vec![context.hermes_home().join("honcho.json")];
     if let Some(home) = dirs::home_dir() {
@@ -1992,6 +2040,80 @@ fn ensure_honcho_host_block<'a>(
         *entry = serde_json::Value::Object(serde_json::Map::new());
     }
     entry.as_object_mut().expect("host object")
+}
+
+fn clone_honcho_host_block(
+    config: &mut BTreeMap<String, serde_json::Value>,
+    profile_name: &str,
+) -> bool {
+    let host_key = format!("hermes.{profile_name}");
+    let hosts = config
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if hosts.contains_key(&host_key) {
+        return false;
+    }
+
+    let default_block = hosts
+        .get("hermes")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut new_block = serde_json::Map::new();
+    for key in [
+        "recallMode",
+        "writeFrequency",
+        "sessionStrategy",
+        "sessionPeerPrefix",
+        "contextTokens",
+        "dialecticReasoningLevel",
+        "dialecticDynamic",
+        "dialecticMaxChars",
+        "messageMaxChars",
+        "dialecticMaxInputChars",
+        "saveMessages",
+        "observation",
+    ] {
+        if let Some(value) = default_block.get(key)
+            && !value.is_null()
+        {
+            new_block.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(peer_name) = default_block
+        .get("peerName")
+        .or_else(|| config.get("peerName"))
+        .filter(|value| !value.is_null())
+    {
+        new_block.insert(String::from("peerName"), peer_name.clone());
+    }
+
+    new_block.insert(
+        String::from("aiPeer"),
+        serde_json::Value::String(profile_name.to_string()),
+    );
+    new_block.insert(
+        String::from("workspace"),
+        default_block
+            .get("workspace")
+            .or_else(|| config.get("workspace"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(String::from("hermes"))),
+    );
+    new_block.insert(
+        String::from("enabled"),
+        default_block
+            .get("enabled")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(true)),
+    );
+
+    ensure_honcho_host_block(config, &host_key).extend(new_block);
+    true
 }
 
 fn honcho_base_url(config: &BTreeMap<String, serde_json::Value>) -> Option<String> {
