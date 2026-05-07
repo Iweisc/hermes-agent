@@ -13,6 +13,7 @@ use crate::backup::{create_pre_update_backup, create_quick_snapshot, format_size
 use crate::config_cmd::{migrate_config, read_raw_yaml_mapping};
 use crate::dashboard_cmd::ensure_dashboard_web_ui;
 use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::skills_cmd::sync_bundled_skills;
 
 #[derive(Args, Debug, Clone)]
 pub struct UpdateArgs {
@@ -192,6 +193,8 @@ fn print_update_apply_native(
         println!("  ⚠ Web UI build skipped: {error}");
     }
 
+    sync_bundled_skills_after_update(context)?;
+
     println!();
     println!("→ Checking configuration for new options...");
     migrate_config(context)?;
@@ -199,7 +202,7 @@ fn print_update_apply_native(
     println!();
     println!("✓ Update complete!");
     println!(
-        "  Remaining Python-only update behavior: gateway restart flow and bundled skill/profile sync."
+        "  Remaining Python-only update behavior: gateway restart flow and Honcho profile sync."
     );
     println!("  Restart running gateways or dashboards manually if needed.");
     println!("    hermes gateway restart");
@@ -316,6 +319,85 @@ fn maybe_run_pre_update_backup(
         }
     }
     Ok(())
+}
+
+fn sync_bundled_skills_after_update(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    println!();
+    println!("→ Syncing bundled skills...");
+    let result = sync_bundled_skills(context, true)?;
+    if !result.copied.is_empty() {
+        println!(
+            "  + {} new: {}",
+            result.copied.len(),
+            result.copied.join(", ")
+        );
+    }
+    if !result.updated.is_empty() {
+        println!(
+            "  ↑ {} updated: {}",
+            result.updated.len(),
+            result.updated.join(", ")
+        );
+    }
+    if result.copied.is_empty() && result.updated.is_empty() {
+        println!("  ✓ Skills are up to date");
+    }
+
+    let profile_homes = collect_profile_homes(context)?;
+    if !profile_homes.is_empty() {
+        println!();
+        println!("→ Syncing bundled skills to all profiles...");
+        for (name, home) in profile_homes {
+            let profile_context = context.clone().with_hermes_home_env(Some(home));
+            match sync_bundled_skills(&profile_context, true) {
+                Ok(result) => {
+                    let mut parts = Vec::new();
+                    if !result.copied.is_empty() {
+                        parts.push(format!("+{} new", result.copied.len()));
+                    }
+                    if !result.updated.is_empty() {
+                        parts.push(format!("↑{} updated", result.updated.len()));
+                    }
+                    let status = if parts.is_empty() {
+                        String::from("up to date")
+                    } else {
+                        parts.join(", ")
+                    };
+                    println!("  {name}: {status}");
+                }
+                Err(error) => {
+                    println!("  {name}: error ({error})");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_profile_homes(
+    context: &HermesContext,
+) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
+    let mut homes = Vec::new();
+    let default_home = context.default_hermes_root();
+    if default_home.is_dir() {
+        homes.push((String::from("default"), default_home));
+    }
+    let profiles_root = context.profiles_root();
+    if profiles_root.is_dir() {
+        let mut entries = fs::read_dir(&profiles_root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            homes.push((name, path));
+        }
+    }
+    Ok(homes)
 }
 
 fn read_update_backup_settings(context: &HermesContext) -> Result<(bool, usize), Box<dyn Error>> {
@@ -1048,6 +1130,108 @@ exit 0\n",
         remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
         remove_env_var("HERMES_UPDATE_GIT");
         remove_env_var("HERMES_UPDATE_UV");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_update_syncs_bundled_skills_to_profiles() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        let home = temp.path().join("home");
+        let bundled = temp.path().join("bundled");
+        let bin = temp.path().join("bin");
+        let fake_git = bin.join("git");
+        let fake_uv = bin.join("uv");
+        let skill_dir = bundled.join("dev").join("demo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(home.join("profiles").join("coder")).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\nbody\n",
+        )
+        .unwrap();
+
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  fetch) exit 0 ;;\n\
+  rev-parse)\n\
+    if [ \"$2\" = \"--abbrev-ref\" ]; then\n\
+      printf 'main\\n'\n\
+    else\n\
+      printf 'deadbeef\\n'\n\
+    fi\n\
+    exit 0 ;;\n\
+  status) exit 0 ;;\n\
+  rev-list) printf '1\\n'; exit 0 ;;\n\
+  pull) exit 0 ;;\n\
+  stash) exit 0 ;;\n\
+  ls-files) exit 0 ;;\n\
+  diff) exit 0 ;;\n\
+  checkout) exit 0 ;;\n\
+  reset) exit 0 ;;\n\
+esac\n\
+exit 0\n",
+        )
+        .unwrap();
+        fs::write(&fake_uv, "#!/bin/sh\nexit 0\n").unwrap();
+        for path in [&fake_git, &fake_uv] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
+        set_env_var("HERMES_UPDATE_GIT", &fake_git);
+        set_env_var("HERMES_UPDATE_UV", &fake_uv);
+        set_env_var("HERMES_BUNDLED_SKILLS", &bundled);
+
+        print_update(
+            &context,
+            UpdateArgs {
+                gateway: false,
+                check: false,
+                no_backup: false,
+                backup: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            home.join("skills")
+                .join("dev")
+                .join("demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        assert!(
+            home.join("profiles")
+                .join("coder")
+                .join("skills")
+                .join("dev")
+                .join("demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        assert!(home.join("skills").join(".bundled_manifest").exists());
+        assert!(
+            home.join("profiles")
+                .join("coder")
+                .join("skills")
+                .join(".bundled_manifest")
+                .exists()
+        );
+
+        remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
+        remove_env_var("HERMES_UPDATE_GIT");
+        remove_env_var("HERMES_UPDATE_UV");
+        remove_env_var("HERMES_BUNDLED_SKILLS");
     }
 
     #[test]

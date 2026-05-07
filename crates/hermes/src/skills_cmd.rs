@@ -3465,9 +3465,9 @@ fn uninstall_skill(context: &HermesContext, raw_name: &str) -> Result<(), Box<dy
 }
 
 #[derive(Debug)]
-struct BundledSyncResult {
-    copied: Vec<String>,
-    updated: Vec<String>,
+pub(crate) struct BundledSyncResult {
+    pub(crate) copied: Vec<String>,
+    pub(crate) updated: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -3571,7 +3571,7 @@ fn reset_bundled_skill(
     })
 }
 
-fn sync_bundled_skills(
+pub(crate) fn sync_bundled_skills(
     context: &HermesContext,
     quiet: bool,
 ) -> Result<BundledSyncResult, Box<dyn Error>> {
