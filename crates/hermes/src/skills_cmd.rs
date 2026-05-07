@@ -368,91 +368,91 @@ fn print_python_skills_command(
 const SKILLS_BROWSE_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_browse\n",
     "parser = argparse.ArgumentParser(prog='hermes skills browse')\n",
-    "parser.set_defaults(skills_action='browse')\n",
     "parser.add_argument('--page', type=int, default=1)\n",
     "parser.add_argument('--size', type=int, default=20)\n",
     "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_browse(page=args.page, page_size=args.size, source=args.source)\n",
 );
 
 const SKILLS_SEARCH_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_search\n",
     "parser = argparse.ArgumentParser(prog='hermes skills search')\n",
-    "parser.set_defaults(skills_action='search')\n",
     "parser.add_argument('query')\n",
     "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
     "parser.add_argument('--limit', type=int, default=10)\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_search(args.query, source=args.source, limit=args.limit)\n",
 );
 
 const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_install\n",
     "parser = argparse.ArgumentParser(prog='hermes skills install')\n",
-    "parser.set_defaults(skills_action='install')\n",
     "parser.add_argument('identifier')\n",
     "parser.add_argument('--category', default='')\n",
     "parser.add_argument('--name', default='')\n",
     "parser.add_argument('--force', action='store_true')\n",
     "parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_install(args.identifier, category=args.category, force=args.force, skip_confirm=getattr(args, 'yes', False), name_override=getattr(args, 'name', '') or '')\n",
 );
 
 const SKILLS_INSPECT_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_inspect\n",
     "parser = argparse.ArgumentParser(prog='hermes skills inspect')\n",
-    "parser.set_defaults(skills_action='inspect')\n",
     "parser.add_argument('identifier')\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_inspect(args.identifier)\n",
 );
 
 const SKILLS_CHECK_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_check\n",
     "parser = argparse.ArgumentParser(prog='hermes skills check')\n",
-    "parser.set_defaults(skills_action='check')\n",
     "parser.add_argument('name', nargs='?')\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_check(name=args.name)\n",
 );
 
 const SKILLS_UPDATE_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_update\n",
     "parser = argparse.ArgumentParser(prog='hermes skills update')\n",
-    "parser.set_defaults(skills_action='update')\n",
     "parser.add_argument('name', nargs='?')\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_update(name=args.name)\n",
 );
 
 const SKILLS_AUDIT_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_audit\n",
     "parser = argparse.ArgumentParser(prog='hermes skills audit')\n",
-    "parser.set_defaults(skills_action='audit')\n",
     "parser.add_argument('name', nargs='?')\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_audit(name=args.name)\n",
 );
 
 const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
     "import argparse\n",
     "import sys\n",
-    "from hermes_cli.skills_hub import skills_command\n",
+    "from hermes_cli.skills_hub import do_publish\n",
     "parser = argparse.ArgumentParser(prog='hermes skills publish')\n",
-    "parser.set_defaults(skills_action='publish')\n",
     "parser.add_argument('skill_path')\n",
     "parser.add_argument('--to', default='github', choices=['github', 'clawhub'])\n",
     "parser.add_argument('--repo', default='')\n",
-    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+    "args = parser.parse_args(sys.argv[1:])\n",
+    "do_publish(args.skill_path, target=getattr(args, 'to', 'github'), repo=getattr(args, 'repo', ''))\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
