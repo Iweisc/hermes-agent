@@ -7,6 +7,7 @@ use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::HermesContext;
+use md5::Context as Md5Context;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 
@@ -29,7 +30,7 @@ pub enum SkillsCommand {
     Update(CompatArgs),
     Audit(CompatArgs),
     Uninstall(UninstallArgs),
-    Reset(CompatArgs),
+    Reset(SkillResetArgs),
     Publish(CompatArgs),
     Snapshot(SkillSnapshotArgs),
     Tap(SkillTapArgs),
@@ -58,6 +59,15 @@ pub enum SkillsSourceFilter {
 #[derive(Args, Debug, Clone)]
 pub struct UninstallArgs {
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SkillResetArgs {
+    pub name: String,
+    #[arg(long, default_value_t = false)]
+    pub restore: bool,
+    #[arg(short = 'y', long, default_value_t = false)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -127,7 +137,7 @@ pub fn print_skills(
         Some(SkillsCommand::Update(args)) => bridge_prefixed("update", &args.args),
         Some(SkillsCommand::Audit(args)) => bridge_prefixed("audit", &args.args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
-        Some(SkillsCommand::Reset(args)) => bridge_prefixed("reset", &args.args),
+        Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
         Some(SkillsCommand::Publish(args)) => bridge_prefixed("publish", &args.args),
         Some(SkillsCommand::Snapshot(args)) => print_snapshot(context, args),
         Some(SkillsCommand::Tap(args)) => print_taps(context, args),
@@ -333,6 +343,219 @@ fn uninstall_skill(context: &HermesContext, raw_name: &str) -> Result<(), Box<dy
     )?;
     println!("Uninstalled '{name}' from {}", entry.install_path);
     Ok(())
+}
+
+#[derive(Debug)]
+struct BundledSyncResult {
+    copied: Vec<String>,
+    updated: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ResetSkillResult {
+    ok: bool,
+    message: String,
+    synced: Option<BundledSyncResult>,
+}
+
+fn reset_skill(context: &HermesContext, args: SkillResetArgs) -> Result<(), Box<dyn Error>> {
+    let name = validate_skill_name(&args.name)?.to_string();
+    if args.restore
+        && !args.yes
+        && !confirm_prompt(&format!(
+            "Restore '{name}' from bundled source? This will replace your current copy. [y/N]: "
+        ))?
+    {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let result = reset_bundled_skill(context, &name, args.restore)?;
+    if !result.ok {
+        return Err(result.message.into());
+    }
+
+    println!("{}", result.message);
+    if let Some(synced) = result.synced {
+        if !synced.copied.is_empty() {
+            println!("Copied: {}", synced.copied.join(", "));
+        }
+        if !synced.updated.is_empty() {
+            println!("Updated: {}", synced.updated.join(", "));
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn reset_bundled_skill(
+    context: &HermesContext,
+    name: &str,
+    restore: bool,
+) -> Result<ResetSkillResult, Box<dyn Error>> {
+    let mut manifest = read_bundled_manifest(context)?;
+    let bundled_dir = bundled_skills_dir();
+    let bundled_skills = discover_bundled_skills(&bundled_dir)?;
+    let bundled_by_name = bundled_skills.into_iter().collect::<HashMap<_, _>>();
+
+    let in_manifest = manifest.contains_key(name);
+    let bundled_path = bundled_by_name.get(name).cloned();
+    if !in_manifest && bundled_path.is_none() {
+        return Ok(ResetSkillResult {
+            ok: false,
+            message: format!(
+                "'{name}' is not a tracked bundled skill. Nothing to reset. (Hub-installed skills use `hermes skills uninstall`.)"
+            ),
+            synced: None,
+        });
+    }
+
+    manifest.remove(name);
+    write_bundled_manifest(context, &manifest)?;
+
+    let deleted_user_copy = if restore {
+        let Some(skill_dir) = bundled_path.as_ref() else {
+            return Ok(ResetSkillResult {
+                ok: false,
+                message: format!(
+                    "'{name}' has no bundled source — manifest entry cleared but cannot restore from bundled (skill was removed upstream)."
+                ),
+                synced: None,
+            });
+        };
+        let dest = bundled_skill_dest(context, &bundled_dir, skill_dir)?;
+        if dest.exists() {
+            fs::remove_dir_all(&dest)?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let synced = sync_bundled_skills(context, true)?;
+    let message = if restore && deleted_user_copy {
+        format!("Restored '{name}' from bundled source.")
+    } else if restore {
+        format!("Restored '{name}' (no prior user copy, re-copied from bundled).")
+    } else {
+        format!(
+            "Cleared manifest entry for '{name}'. Future `hermes update` runs will re-baseline against your current copy and accept upstream changes."
+        )
+    };
+
+    Ok(ResetSkillResult {
+        ok: true,
+        message,
+        synced: Some(synced),
+    })
+}
+
+fn sync_bundled_skills(
+    context: &HermesContext,
+    quiet: bool,
+) -> Result<BundledSyncResult, Box<dyn Error>> {
+    let bundled_dir = bundled_skills_dir();
+    if !bundled_dir.exists() {
+        return Ok(BundledSyncResult {
+            copied: Vec::new(),
+            updated: Vec::new(),
+        });
+    }
+
+    let skills_root = context.hermes_home().join("skills");
+    fs::create_dir_all(&skills_root)?;
+    let mut manifest = read_bundled_manifest(context)?;
+    let bundled_skills = discover_bundled_skills(&bundled_dir)?;
+    let bundled_names = bundled_skills
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+
+    let mut copied = Vec::new();
+    let mut updated = Vec::new();
+    let mut user_modified = Vec::new();
+
+    for (skill_name, skill_src) in &bundled_skills {
+        let dest = bundled_skill_dest(context, &bundled_dir, skill_src)?;
+        let bundled_hash = dir_hash(skill_src)?;
+
+        if !manifest.contains_key(skill_name) {
+            if dest.exists() {
+                if dir_hash(&dest)? == bundled_hash {
+                    manifest.insert(skill_name.clone(), bundled_hash);
+                } else if !quiet {
+                    println!(
+                        "  ⚠ {skill_name}: bundled version shipped but a local skill with this name already exists — keeping yours"
+                    );
+                }
+            } else {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                copy_dir_all(skill_src, &dest)?;
+                copied.push(skill_name.clone());
+                manifest.insert(skill_name.clone(), bundled_hash);
+            }
+            continue;
+        }
+
+        if !dest.exists() {
+            continue;
+        }
+
+        let origin_hash = manifest.get(skill_name).cloned().unwrap_or_default();
+        let user_hash = dir_hash(&dest)?;
+        if origin_hash.is_empty() {
+            manifest.insert(skill_name.clone(), user_hash.clone());
+            continue;
+        }
+        if user_hash != origin_hash {
+            user_modified.push(skill_name.clone());
+            if !quiet {
+                println!("  ~ {skill_name} (user-modified, skipping)");
+            }
+            continue;
+        }
+        if bundled_hash == origin_hash {
+            continue;
+        }
+
+        let backup = dest.with_extension("bak");
+        if backup.exists() {
+            fs::remove_dir_all(&backup)?;
+        }
+        fs::rename(&dest, &backup)?;
+        let update_result = (|| -> Result<(), Box<dyn Error>> {
+            copy_dir_all(skill_src, &dest)?;
+            manifest.insert(skill_name.clone(), bundled_hash);
+            updated.push(skill_name.clone());
+            fs::remove_dir_all(&backup)?;
+            Ok(())
+        })();
+        if let Err(error) = update_result {
+            if backup.exists() && !dest.exists() {
+                fs::rename(&backup, &dest)?;
+            }
+            return Err(error);
+        }
+    }
+
+    let mut cleaned = manifest
+        .keys()
+        .filter(|name| !bundled_names.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    for name in &cleaned {
+        manifest.remove(name);
+    }
+
+    copy_bundled_descriptions(&bundled_dir, &skills_root)?;
+    write_bundled_manifest(context, &manifest)?;
+
+    Ok(BundledSyncResult { copied, updated })
 }
 
 fn print_snapshot(context: &HermesContext, args: SkillSnapshotArgs) -> Result<(), Box<dyn Error>> {
@@ -1044,6 +1267,185 @@ struct SkillSourceInfo {
     filter: SkillsSourceFilter,
     source_display: String,
     trust: String,
+}
+
+fn bundled_skills_dir() -> PathBuf {
+    std::env::var_os("HERMES_BUNDLED_SKILLS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root().join("skills"))
+}
+
+fn bundled_manifest_path(context: &HermesContext) -> PathBuf {
+    context
+        .hermes_home()
+        .join("skills")
+        .join(".bundled_manifest")
+}
+
+fn read_bundled_manifest(
+    context: &HermesContext,
+) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    let path = bundled_manifest_path(context);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let mut manifest = HashMap::new();
+    for line in fs::read_to_string(path)?.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((name, hash)) = trimmed.split_once(':') {
+            manifest.insert(name.trim().to_string(), hash.trim().to_string());
+        } else {
+            manifest.insert(trimmed.to_string(), String::new());
+        }
+    }
+    Ok(manifest)
+}
+
+fn write_bundled_manifest(
+    context: &HermesContext,
+    manifest: &HashMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    let path = bundled_manifest_path(context);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut names = manifest.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut rendered = String::new();
+    for name in names {
+        rendered.push_str(&format!(
+            "{}:{}\n",
+            name,
+            manifest.get(&name).map(String::as_str).unwrap_or("")
+        ));
+    }
+    fs::write(path, rendered)?;
+    Ok(())
+}
+
+fn discover_bundled_skills(bundled_dir: &Path) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
+    if !bundled_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut skill_files = Vec::new();
+    collect_skill_files(bundled_dir, &mut skill_files)?;
+    let mut result = Vec::new();
+    for skill_md in skill_files {
+        let Some(skill_dir) = skill_md.parent() else {
+            continue;
+        };
+        let content = fs::read_to_string(&skill_md).unwrap_or_default();
+        let (frontmatter, _body) = parse_frontmatter(&content);
+        let fallback = skill_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("skill");
+        let name = frontmatter
+            .get(&yaml_key("name"))
+            .and_then(YamlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback)
+            .to_string();
+        result.push((name, skill_dir.to_path_buf()));
+    }
+    Ok(result)
+}
+
+fn bundled_skill_dest(
+    context: &HermesContext,
+    bundled_dir: &Path,
+    skill_dir: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let rel = skill_dir.strip_prefix(bundled_dir)?;
+    Ok(context.hermes_home().join("skills").join(rel))
+}
+
+fn dir_hash(path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut files = Vec::new();
+    collect_all_files(path, path, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Md5Context::new();
+    for (relative, file) in files {
+        hasher.consume(relative.as_bytes());
+        hasher.consume(fs::read(file)?);
+    }
+    Ok(format!("{:x}", hasher.compute()))
+}
+
+fn collect_all_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Box<dyn Error>> {
+    if !current.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_all_files(root, &path, output)?;
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            output.push((relative, path));
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_bundled_descriptions(bundled_dir: &Path, skills_root: &Path) -> Result<(), Box<dyn Error>> {
+    if !bundled_dir.exists() {
+        return Ok(());
+    }
+    let mut stack = vec![bundled_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if entry.file_name().to_string_lossy() != "DESCRIPTION.md" {
+                continue;
+            }
+            let rel = path.strip_prefix(bundled_dir)?;
+            let dest = skills_root.join(rel);
+            if dest.exists() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(path, dest)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_raw_config(context: &HermesContext) -> Result<YamlValue, Box<dyn Error>> {
@@ -1909,6 +2311,50 @@ exit 9\n",
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn reset_restore_recopies_bundled_skill() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("reset-restore-home");
+        let bundled = temp_path("reset-restore-bundled");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let bundled_skill = bundled.join("dev").join("demo");
+        fs::create_dir_all(&bundled_skill).unwrap();
+        fs::write(
+            bundled_skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: Bundled\n---\nBundled\n",
+        )
+        .unwrap();
+
+        let local_skill = home.join("skills").join("dev").join("demo");
+        fs::create_dir_all(&local_skill).unwrap();
+        fs::write(
+            local_skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: Local\n---\nLocal\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("skills").join(".bundled_manifest"),
+            "demo:stalehash\n",
+        )
+        .unwrap();
+
+        set_env_var("HERMES_BUNDLED_SKILLS", &bundled);
+        let result = reset_bundled_skill(&context, "demo", true).unwrap();
+        assert!(result.ok);
+        assert!(result.message.contains("Restored 'demo'"));
+        let restored = fs::read_to_string(local_skill.join("SKILL.md")).unwrap();
+        assert!(restored.contains("Bundled"));
+        let manifest = read_bundled_manifest(&context).unwrap();
+        assert_eq!(
+            manifest.get("demo").cloned().unwrap(),
+            dir_hash(&bundled_skill).unwrap()
+        );
+
+        remove_env_var("HERMES_BUNDLED_SKILLS");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(bundled);
     }
 
     #[test]

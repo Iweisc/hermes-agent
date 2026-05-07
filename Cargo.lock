@@ -649,6 +649,7 @@ dependencies = [
  "hmac",
  "libc",
  "log",
+ "md5",
  "regex",
  "reqwest",
  "rusqlite",
