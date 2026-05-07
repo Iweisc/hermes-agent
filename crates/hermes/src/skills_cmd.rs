@@ -152,10 +152,11 @@ struct InstallArgsParsed {
     yes: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct OfficialSkillCandidate {
     name: String,
     source: String,
+    identifier: String,
     trust_level: String,
     scan_verdict: String,
     install_path: String,
@@ -163,6 +164,7 @@ struct OfficialSkillCandidate {
     current_hash: String,
     latest_hash: String,
     files: Vec<String>,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -986,7 +988,16 @@ fn check_skills_command(
         return Ok(());
     }
 
-    if targets.iter().any(|(_, source)| source != "official") {
+    if targets
+        .iter()
+        .any(|(_, source)| source != "official" && source != "github")
+    {
+        return bridge_prefixed("check", passthrough);
+    }
+    if targets.iter().any(|(_, source)| source == "github")
+        && github_app_auth_configured()
+        && resolve_github_publish_token().is_none()
+    {
         return bridge_prefixed("check", passthrough);
     }
 
@@ -1014,7 +1025,13 @@ fn update_skills_command(
             println!();
             return Ok(());
         };
-        if entry.source != "official" {
+        if entry.source != "official" && entry.source != "github" {
+            return bridge_prefixed("update", passthrough);
+        }
+        if entry.source == "github"
+            && github_app_auth_configured()
+            && resolve_github_publish_token().is_none()
+        {
             return bridge_prefixed("update", passthrough);
         }
         vec![name.to_string()]
@@ -1024,7 +1041,16 @@ fn update_skills_command(
             println!();
             return Ok(());
         }
-        if installed.values().any(|entry| entry.source != "official") {
+        if installed
+            .values()
+            .any(|entry| entry.source != "official" && entry.source != "github")
+        {
+            return bridge_prefixed("update", passthrough);
+        }
+        if installed.values().any(|entry| entry.source == "github")
+            && github_app_auth_configured()
+            && resolve_github_publish_token().is_none()
+        {
             return bridge_prefixed("update", passthrough);
         }
         let mut names = installed.keys().cloned().collect::<Vec<_>>();
@@ -1520,18 +1546,50 @@ fn collect_official_skill_candidates(
             .get("identifier")
             .and_then(JsonValue::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let record = identifier
-            .and_then(|value| records_by_identifier.get(value).copied())
-            .or_else(|| records_by_name.get(name).copied());
-        let Some(record) = record else {
-            continue;
+            .filter(|value| !value.is_empty())
+            .unwrap_or(entry.source.as_str())
+            .to_string();
+        let (source_dir, files, latest_hash, trust_level, temp_dir) = if entry.source == "github" {
+            let Some((bundle_dir, _bundle_name, resolved_trust, _resolved_identifier)) =
+                fetch_github_bundle_to_tempdir(&identifier)?
+            else {
+                continue;
+            };
+            let source_dir = bundle_dir.path().to_path_buf();
+            let files = collect_bundle_file_paths(&source_dir)?;
+            let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
+            (
+                source_dir,
+                files,
+                latest_hash,
+                if entry.trust_level.trim().is_empty() {
+                    resolved_trust
+                } else {
+                    entry.trust_level.clone()
+                },
+                Some(bundle_dir),
+            )
+        } else {
+            let record = records_by_identifier
+                .get(&identifier)
+                .copied()
+                .or_else(|| records_by_name.get(name).copied());
+            let Some(record) = record else {
+                continue;
+            };
+            let Some(source_dir) = record.skill_md.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            let files = collect_bundle_file_paths(&source_dir)?;
+            let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
+            (
+                source_dir,
+                files,
+                latest_hash,
+                entry.trust_level.clone(),
+                None,
+            )
         };
-        let Some(source_dir) = record.skill_md.parent().map(Path::to_path_buf) else {
-            continue;
-        };
-        let files = collect_bundle_file_paths(&source_dir)?;
-        let latest_hash = bundle_content_hash_from_dir(&source_dir)?;
         let current_hash = entry
             .raw
             .get("content_hash")
@@ -1544,7 +1602,8 @@ fn collect_official_skill_candidates(
             OfficialSkillCandidate {
                 name: name.clone(),
                 source: entry.source.clone(),
-                trust_level: entry.trust_level.clone(),
+                identifier,
+                trust_level,
                 scan_verdict: entry
                     .raw
                     .get("scan_verdict")
@@ -1556,6 +1615,7 @@ fn collect_official_skill_candidates(
                 current_hash,
                 latest_hash,
                 files,
+                _temp_dir: temp_dir,
             },
         );
     }
@@ -1572,6 +1632,13 @@ fn apply_official_updates(
     for update in updates {
         println!("Updating: {}", update.name);
         let install_path = validated_install_path(&skills_root, &update.install_path)?;
+        let scan_verdict = if update.source == "github" {
+            scan_skill(&update.source_dir, &update.identifier)
+                .verdict
+                .to_string()
+        } else {
+            update.scan_verdict.clone()
+        };
         install_official_bundle(&update.source_dir, &install_path)?;
 
         let Some(entry) = installed.get_mut(&update.name) else {
@@ -1592,16 +1659,21 @@ fn apply_official_updates(
                     .collect(),
             ),
         );
+        entry.raw.insert(
+            "scan_verdict".to_string(),
+            JsonValue::String(scan_verdict.clone()),
+        );
         entry
             .raw
             .insert("updated_at".to_string(), JsonValue::String(iso8601_now()));
+        entry.trust_level = update.trust_level.clone();
         append_audit_log(
             context,
             "UPDATE",
             &update.name,
             &update.source,
             &update.trust_level,
-            &update.scan_verdict,
+            &scan_verdict,
             &update.latest_hash,
         )?;
     }
@@ -4855,6 +4927,51 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_candidates_detects_github_updates() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("github-check-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"shipit":{"source":"github","identifier":"openai/skills/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests);
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let installed = load_hub_lock(&context).unwrap();
+        let candidates =
+            collect_official_skill_candidates(&installed, &[String::from("shipit")]).unwrap();
+        let candidate = candidates.get("shipit").unwrap();
+        assert_eq!(candidate.source, "github");
+        assert_eq!(candidate.identifier, "openai/skills/shipit");
+        assert_eq!(candidate.trust_level, "trusted");
+        assert_eq!(candidate.current_hash, "sha256:stale");
+        assert_ne!(candidate.latest_hash, candidate.current_hash);
+        assert_eq!(
+            candidate.files,
+            vec![String::from("SKILL.md"), String::from("notes.txt")]
+        );
+
+        handle.join().unwrap();
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn update_native_official_skill_restores_files_and_lock_hash() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("official-update-home");
@@ -4914,6 +5031,65 @@ exit 9\n",
     }
 
     #[test]
+    fn update_native_github_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("github-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("shipit");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: shipit\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"shipit":{"source":"github","identifier":"openai/skills/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_install_server(requests);
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn check_bridges_when_non_official_sources_are_present() {
         let _guard = test_env_lock().lock().unwrap();
@@ -4943,7 +5119,7 @@ exit 9\n",
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"github","identifier":"owner/repo/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"demo":{"source":"clawhub","identifier":"clawhub/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
 
@@ -4987,7 +5163,7 @@ exit 9\n",
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"github","identifier":"owner/repo/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"demo":{"source":"clawhub","identifier":"clawhub/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
 
