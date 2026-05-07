@@ -18,6 +18,7 @@ mod logs;
 mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
+mod plugins_cmd;
 mod python_bridge;
 mod slack_cmd;
 mod snapshot_cmd;
@@ -94,7 +95,10 @@ enum Command {
         #[command(subcommand)]
         command: Option<snapshot_cmd::SnapshotCommand>,
     },
-    Plugins(compat_cmd::CompatArgs),
+    Plugins {
+        #[command(subcommand)]
+        command: Option<plugins_cmd::PluginsCommand>,
+    },
     Curator(compat_cmd::CompatArgs),
     Memory {
         #[command(subcommand)]
@@ -314,7 +318,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Skills(args) => compat_cmd::print_skills(args)?,
         Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
-        Command::Plugins(args) => compat_cmd::print_plugins(args)?,
+        Command::Plugins { command } => plugins_cmd::print_plugins(&context, command)?,
         Command::Curator(args) => compat_cmd::print_curator(args)?,
         Command::Memory { command } => memory_cmd::print_memory(&context, &config, command)?,
         Command::Mcp(args) => compat_cmd::print_mcp(args)?,
