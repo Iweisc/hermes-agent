@@ -25,7 +25,7 @@ libc = "0.2.177"
 log = "0.4.28"
 md5 = "0.7.0"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
@@ -34,3 +34,4 @@ sha2 = "0.10.9"
 tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots"] }
 unicode-normalization = "0.1.24"
 url = "2.5.7"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

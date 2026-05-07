@@ -1,4 +1,5 @@
 mod auth_cmd;
+mod backup;
 mod config_cmd;
 mod doctor;
 mod dump;
@@ -45,6 +46,8 @@ enum Command {
         #[command(subcommand)]
         command: Option<config_cmd::ConfigCommand>,
     },
+    Backup(backup::BackupArgs),
+    Import(backup::ImportArgs),
     Profile {
         #[command(subcommand)]
         command: Option<ProfileCommand>,
@@ -224,6 +227,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
+        Command::Backup(args) => backup::print_backup(&context, args)?,
+        Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => print_profile(&context, command)?,
         Command::Chat {
             prompt,
