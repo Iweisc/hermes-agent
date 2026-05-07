@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -1058,130 +1060,787 @@ fn send_copilot_acp_chat_completion(
     tools: &[crate::ToolDefinition],
 ) -> Result<NormalizedAssistantResponse, HermesError> {
     let creds = crate::resolve_copilot_acp_runtime_credentials()?;
-    let python = resolve_python_interpreter();
-    let payload = json!({
-        "model": runtime_model.model,
-        "messages": messages,
-        "tools": tools.iter().map(|tool| tool.openai_schema()).collect::<Vec<_>>(),
-        "tool_choice": if tools.is_empty() { Value::Null } else { Value::String("auto".to_string()) },
-        "api_key": runtime_model.api_key,
-        "base_url": runtime_model.base_url,
-        "command": creds.command,
-        "cwd": env::current_dir()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|_| String::from(".")),
-    });
-    let script = r#"
-import json
-import sys
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let prompt_text = format_copilot_acp_prompt(
+        messages,
+        &runtime_model.model,
+        tools,
+        (!tools.is_empty()).then(|| Value::String(String::from("auto"))),
+    );
+    let timeout = Duration::from_secs(900);
 
-from agent.copilot_acp_client import CopilotACPClient
-
-payload = json.load(sys.stdin)
-client = CopilotACPClient(
-    api_key=payload.get("api_key"),
-    base_url=payload.get("base_url"),
-    command=payload.get("command"),
-    acp_cwd=payload.get("cwd"),
-)
-response = client.chat.completions.create(
-    model=payload.get("model"),
-    messages=payload.get("messages") or [],
-    tools=payload.get("tools") or [],
-    tool_choice=payload.get("tool_choice"),
-)
-choice = response.choices[0] if getattr(response, "choices", None) else None
-message = getattr(choice, "message", None)
-tool_calls = []
-for tool_call in (getattr(message, "tool_calls", None) or []):
-    function = getattr(tool_call, "function", None)
-    tool_calls.append({
-        "id": getattr(tool_call, "id", ""),
-        "name": getattr(function, "name", ""),
-        "arguments": getattr(function, "arguments", "{}"),
-    })
-print(json.dumps({
-    "content": getattr(message, "content", None),
-    "tool_calls": tool_calls,
-    "finish_reason": getattr(choice, "finish_reason", None),
-    "reasoning": getattr(message, "reasoning", None),
-}))
-"#;
-
-    let mut command = Command::new(&python);
+    let mut command = Command::new(&creds.command);
     command
-        .arg("-c")
-        .arg(script)
-        .current_dir(repo_root())
+        .args(resolve_copilot_acp_args())
+        .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut pythonpath_entries = vec![repo_root()];
-    if let Some(existing) = env::var_os("PYTHONPATH") {
-        pythonpath_entries.extend(env::split_paths(&existing));
-    }
-    if let Ok(joined) = env::join_paths(pythonpath_entries) {
-        command.env("PYTHONPATH", joined);
-    }
-
+        .stderr(Stdio::piped())
+        .env("HOME", copilot_acp_subprocess_home());
     let mut child = command.spawn().map_err(|error| HermesError::State {
-        action: "starting Copilot ACP bridge",
-        detail: format!("{} failed: {error}", python.display()),
+        action: "starting Copilot ACP runtime",
+        detail: format!("{} failed: {error}", creds.command),
     })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let bytes = serde_json::to_vec(&payload).map_err(|error| HermesError::State {
-            action: "encoding Copilot ACP payload",
-            detail: error.to_string(),
-        })?;
-        stdin
-            .write_all(&bytes)
-            .map_err(|error| HermesError::State {
-                action: "writing Copilot ACP payload",
-                detail: error.to_string(),
+
+    let mut stdin = child.stdin.take().ok_or_else(|| HermesError::State {
+        action: "starting Copilot ACP runtime",
+        detail: "stdin pipe was not available".to_string(),
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| HermesError::State {
+        action: "starting Copilot ACP runtime",
+        detail: "stdout pipe was not available".to_string(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| HermesError::State {
+        action: "starting Copilot ACP runtime",
+        detail: "stderr pipe was not available".to_string(),
+    })?;
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(40)));
+    let stderr_tail_reader = Arc::clone(&stderr_tail);
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let mut tail = stderr_tail_reader.lock().expect("stderr tail lock");
+            if tail.len() == 40 {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+    });
+
+    let result = (|| {
+        let mut next_id = 0_u64;
+        let _ = copilot_acp_request(
+            &mut stdin,
+            &mut child,
+            &rx,
+            &stderr_tail,
+            &mut next_id,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true,
+                    }
+                },
+                "clientInfo": {
+                    "name": "hermes-agent",
+                    "title": "Hermes Agent",
+                    "version": "0.0.0",
+                },
+            }),
+            &cwd,
+            None,
+            None,
+            timeout,
+        )?;
+        let session = copilot_acp_request(
+            &mut stdin,
+            &mut child,
+            &rx,
+            &stderr_tail,
+            &mut next_id,
+            "session/new",
+            json!({
+                "cwd": cwd.to_string_lossy().to_string(),
+                "mcpServers": [],
+            }),
+            &cwd,
+            None,
+            None,
+            timeout,
+        )?;
+        let session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| HermesError::State {
+                action: "calling Copilot ACP",
+                detail: "Copilot ACP did not return a sessionId.".to_string(),
             })?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| HermesError::State {
-            action: "waiting for Copilot ACP bridge",
-            detail: error.to_string(),
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!(
-                "bridge exited with code {}",
-                output.status.code().unwrap_or(-1)
-            )
+
+        let mut text_chunks = Vec::new();
+        let mut reasoning_chunks = Vec::new();
+        let _ = copilot_acp_request(
+            &mut stdin,
+            &mut child,
+            &rx,
+            &stderr_tail,
+            &mut next_id,
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": prompt_text,
+                }],
+            }),
+            &cwd,
+            Some(&mut text_chunks),
+            Some(&mut reasoning_chunks),
+            timeout,
+        )?;
+
+        let response_text = text_chunks.concat();
+        let reasoning = reasoning_chunks.concat();
+        let (tool_calls, content) = extract_copilot_acp_tool_calls(&response_text)?;
+        let finish_reason = if tool_calls.is_empty() {
+            String::from("stop")
         } else {
-            stderr
+            String::from("tool_calls")
         };
-        return Err(HermesError::State {
-            action: "calling Copilot ACP",
-            detail,
-        });
+        Ok(NormalizedAssistantResponse {
+            content: (!content.trim().is_empty()).then_some(content),
+            tool_calls,
+            finish_reason: Some(finish_reason),
+            reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+        })
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+    result
+}
+
+fn resolve_copilot_acp_args() -> Vec<String> {
+    match env::var("HERMES_COPILOT_ACP_ARGS") {
+        Ok(raw) if !raw.trim().is_empty() => shell_words::split(&raw)
+            .unwrap_or_else(|_| raw.split_whitespace().map(str::to_string).collect()),
+        _ => vec![String::from("--acp"), String::from("--stdio")],
+    }
+}
+
+fn copilot_acp_subprocess_home() -> PathBuf {
+    if let Some(hermes_home) = env::var_os("HERMES_HOME").map(PathBuf::from) {
+        let profile_home = hermes_home.join("home");
+        if profile_home.is_dir() {
+            return profile_home;
+        }
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn format_copilot_acp_prompt(
+    messages: &[Value],
+    model: &str,
+    tools: &[crate::ToolDefinition],
+    tool_choice: Option<Value>,
+) -> String {
+    let mut sections = vec![
+        String::from("You are being used as the active ACP agent backend for Hermes."),
+        String::from("Use ACP capabilities to complete tasks."),
+        String::from(
+            "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+        ),
+        String::from("If no tool is needed, answer normally."),
+    ];
+    if !model.trim().is_empty() {
+        sections.push(format!("Hermes requested model hint: {model}"));
     }
 
-    let parsed =
-        serde_json::from_slice::<Value>(&output.stdout).map_err(|error| HermesError::State {
-            action: "decoding Copilot ACP response",
-            detail: format!("{}: {}", error, String::from_utf8_lossy(&output.stdout)),
-        })?;
-    Ok(NormalizedAssistantResponse {
-        content: extract_message_text(parsed.get("content")),
-        tool_calls: parse_bedrock_tool_calls(parsed.get("tool_calls"))?,
-        finish_reason: parsed
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        reasoning: parsed
-            .get("reasoning")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        reasoning_details: None,
-        codex_reasoning_items: None,
-        codex_message_items: None,
+    if !tools.is_empty() {
+        let tool_specs = tools
+            .iter()
+            .filter_map(|tool| {
+                let schema = tool.openai_schema();
+                let function = schema.get("function")?.as_object()?;
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?;
+                Some(json!({
+                    "name": name,
+                    "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
+                    "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !tool_specs.is_empty() {
+            sections.push(format!(
+                "Available tools (OpenAI function schema). When using a tool, emit ONLY <tool_call>{{...}}</tool_call> with one JSON object containing id/type/function{{name,arguments}}. arguments must be a JSON string.\n{}",
+                serde_json::to_string(&tool_specs).unwrap_or_else(|_| String::from("[]"))
+            ));
+        }
+    }
+
+    if let Some(choice) = tool_choice {
+        sections.push(format!(
+            "Tool choice hint: {}",
+            serde_json::to_string(&choice).unwrap_or_else(|_| String::from("null"))
+        ));
+    }
+
+    let transcript = messages
+        .iter()
+        .filter_map(|message| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .trim()
+                .to_ascii_lowercase();
+            let label = match role.as_str() {
+                "system" => "System",
+                "user" => "User",
+                "assistant" => "Assistant",
+                "tool" => "Tool",
+                _ => "Context",
+            };
+            let rendered = render_copilot_acp_message_content(message.get("content"))?;
+            Some(format!("{label}:\n{rendered}"))
+        })
+        .collect::<Vec<_>>();
+    if !transcript.is_empty() {
+        sections.push(format!(
+            "Conversation transcript:\n\n{}",
+            transcript.join("\n\n")
+        ));
+    }
+    sections.push(String::from(
+        "Continue the conversation from the latest user request.",
+    ));
+    sections.join("\n\n")
+}
+
+fn render_copilot_acp_message_content(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(Value::Object(map)) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            if let Some(text) = map.get("content").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            serde_json::to_string(map).ok()
+        }
+        Some(Value::Array(items)) => {
+            let parts = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    }
+                    Value::Object(map) => {
+                        map.get("text").and_then(Value::as_str).and_then(|text| {
+                            let trimmed = text.trim();
+                            (!trimmed.is_empty()).then(|| trimmed.to_string())
+                        })
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn extract_copilot_acp_tool_calls(
+    text: &str,
+) -> Result<(Vec<PendingToolCall>, String), HermesError> {
+    let mut tool_calls = Vec::new();
+    let mut spans = Vec::new();
+    let mut cursor = 0_usize;
+
+    while let Some(start_offset) = text[cursor..].find("<tool_call>") {
+        let start = cursor + start_offset;
+        let body_start = start + "<tool_call>".len();
+        let Some(end_offset) = text[body_start..].find("</tool_call>") else {
+            break;
+        };
+        let end = body_start + end_offset + "</tool_call>".len();
+        let raw_json = text[body_start..body_start + end_offset].trim();
+        if let Some(call) = parse_copilot_acp_tool_call(raw_json, tool_calls.len() + 1)? {
+            tool_calls.push(call);
+            spans.push((start, end));
+        }
+        cursor = end;
+    }
+
+    if spans.is_empty() {
+        let cleaned = text.trim().to_string();
+        return Ok((tool_calls, cleaned));
+    }
+
+    let mut cleaned_parts = Vec::new();
+    let mut last = 0_usize;
+    for (start, end) in spans {
+        if last < start {
+            let chunk = text[last..start].trim();
+            if !chunk.is_empty() {
+                cleaned_parts.push(chunk.to_string());
+            }
+        }
+        last = end;
+    }
+    if last < text.len() {
+        let chunk = text[last..].trim();
+        if !chunk.is_empty() {
+            cleaned_parts.push(chunk.to_string());
+        }
+    }
+    Ok((tool_calls, cleaned_parts.join("\n")))
+}
+
+fn parse_copilot_acp_tool_call(
+    raw_json: &str,
+    index: usize,
+) -> Result<Option<PendingToolCall>, HermesError> {
+    let Ok(value) = serde_json::from_str::<Value>(raw_json) else {
+        return Ok(None);
+    };
+    let Some(function) = value.get("function").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(name) = function
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let arguments_raw = match function.get("arguments") {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_else(|_| String::from("{}")),
+        None => String::from("{}"),
+    };
+    let json = serde_json::from_str(&arguments_raw).unwrap_or_else(|_| json!({}));
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("acp_call_{index}"));
+    Ok(Some(PendingToolCall {
+        id,
+        name: name.to_string(),
+        arguments_raw,
+        json,
+    }))
+}
+
+fn copilot_acp_request(
+    stdin: &mut ChildStdin,
+    child: &mut Child,
+    rx: &mpsc::Receiver<Value>,
+    stderr_tail: &Arc<Mutex<VecDeque<String>>>,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+    cwd: &Path,
+    text_chunks: Option<&mut Vec<String>>,
+    reasoning_chunks: Option<&mut Vec<String>>,
+    timeout: Duration,
+) -> Result<Value, HermesError> {
+    *next_id += 1;
+    let request_id = *next_id;
+    write_copilot_acp_line(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }),
+        "writing Copilot ACP request",
+    )?;
+
+    let deadline = Instant::now() + timeout;
+    let mut text_chunks = text_chunks;
+    let mut reasoning_chunks = reasoning_chunks;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(status) = child.try_wait().map_err(|error| HermesError::State {
+            action: "waiting for Copilot ACP response",
+            detail: error.to_string(),
+        })? {
+            let stderr = stderr_tail
+                .lock()
+                .expect("stderr tail lock")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            let detail = if stderr.is_empty() {
+                format!(
+                    "Copilot ACP process exited with code {} while handling {method}",
+                    exit_code_or_default(status)
+                )
+            } else {
+                format!("Copilot ACP process exited early: {stderr}")
+            };
+            return Err(HermesError::State {
+                action: "calling Copilot ACP",
+                detail,
+            });
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(100));
+        let Ok(message) = rx.recv_timeout(wait) else {
+            continue;
+        };
+        let text_target = text_chunks.as_mut().map(|chunks| &mut **chunks);
+        let reasoning_target = reasoning_chunks.as_mut().map(|chunks| &mut **chunks);
+        if handle_copilot_acp_server_message(&message, stdin, cwd, text_target, reasoning_target)? {
+            continue;
+        }
+        if message.get("id").and_then(Value::as_u64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| error.as_str().unwrap_or("unknown Copilot ACP error"));
+            return Err(HermesError::State {
+                action: "calling Copilot ACP",
+                detail: format!("Copilot ACP {method} failed: {detail}"),
+            });
+        }
+        return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+    }
+
+    Err(HermesError::State {
+        action: "calling Copilot ACP",
+        detail: format!("Timed out waiting for Copilot ACP response to {method}."),
     })
+}
+
+fn write_copilot_acp_line(
+    stdin: &mut ChildStdin,
+    payload: &Value,
+    action: &'static str,
+) -> Result<(), HermesError> {
+    let encoded = serde_json::to_string(payload).map_err(|error| HermesError::State {
+        action,
+        detail: error.to_string(),
+    })?;
+    stdin
+        .write_all(encoded.as_bytes())
+        .and_then(|_| stdin.write_all(b"\n"))
+        .and_then(|_| stdin.flush())
+        .map_err(|error| HermesError::State {
+            action,
+            detail: error.to_string(),
+        })
+}
+
+fn handle_copilot_acp_server_message(
+    message: &Value,
+    stdin: &mut ChildStdin,
+    cwd: &Path,
+    text_chunks: Option<&mut Vec<String>>,
+    reasoning_chunks: Option<&mut Vec<String>>,
+) -> Result<bool, HermesError> {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+
+    if method == "session/update" {
+        let kind = message
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let chunk_text = message
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(|update| update.get("content"))
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !chunk_text.is_empty() {
+            if kind == "agent_message_chunk" {
+                if let Some(chunks) = text_chunks {
+                    chunks.push(chunk_text);
+                }
+            } else if kind == "agent_thought_chunk"
+                && let Some(chunks) = reasoning_chunks
+            {
+                chunks.push(chunk_text);
+            }
+        }
+        return Ok(true);
+    }
+
+    let message_id = message.get("id").cloned().unwrap_or(Value::Null);
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let response = match method {
+        "session/request_permission" => json!({
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {
+                "outcome": {
+                    "outcome": "cancelled",
+                }
+            }
+        }),
+        "fs/read_text_file" => match handle_copilot_acp_read_text_file(&params, cwd) {
+            Ok(content) => json!({
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "content": content,
+                }
+            }),
+            Err(detail) => json!({
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32602,
+                    "message": detail,
+                }
+            }),
+        },
+        "fs/write_text_file" => match handle_copilot_acp_write_text_file(&params, cwd) {
+            Ok(()) => json!({
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": Value::Null,
+            }),
+            Err(detail) => json!({
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32602,
+                    "message": detail,
+                }
+            }),
+        },
+        _ => json!({
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "error": {
+                "code": -32601,
+                "message": format!("ACP client method '{method}' is not supported by Hermes yet."),
+            }
+        }),
+    };
+    write_copilot_acp_line(stdin, &response, "writing Copilot ACP response")?;
+    Ok(true)
+}
+
+fn handle_copilot_acp_read_text_file(params: &Value, cwd: &Path) -> Result<String, String> {
+    let path_text = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| String::from("ACP file-system paths must be absolute."))?;
+    let path = ensure_copilot_acp_path_within_cwd(path_text, cwd)?;
+    if let Some(detail) = copilot_acp_read_block_error(&path) {
+        return Err(detail);
+    }
+    let mut content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let line = params.get("line").and_then(Value::as_u64);
+    let limit = params.get("limit").and_then(Value::as_u64);
+    if let Some(line) = line.filter(|line| *line > 1) {
+        let lines = content.lines().collect::<Vec<_>>();
+        let start = (line.saturating_sub(1)) as usize;
+        let end = limit
+            .filter(|limit| *limit > 0)
+            .map(|limit| start.saturating_add(limit as usize))
+            .unwrap_or(lines.len())
+            .min(lines.len());
+        content = lines[start.min(lines.len())..end].join("\n");
+    }
+    Ok(content)
+}
+
+fn handle_copilot_acp_write_text_file(params: &Value, cwd: &Path) -> Result<(), String> {
+    let path_text = params
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| String::from("ACP file-system paths must be absolute."))?;
+    let path = ensure_copilot_acp_path_within_cwd(path_text, cwd)?;
+    if copilot_acp_is_write_denied(&path) {
+        return Err(format!(
+            "Write denied: '{}' is a protected system/credential file.",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let content = params
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    fs::write(path, content).map_err(|error| error.to_string())
+}
+
+fn ensure_copilot_acp_path_within_cwd(path_text: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(path_text);
+    if !candidate.is_absolute() {
+        return Err(String::from("ACP file-system paths must be absolute."));
+    }
+    let root = cwd
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve session cwd '{}': {error}", cwd.display()))?;
+    let resolved = if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|error| format!("Could not resolve '{}': {error}", candidate.display()))?
+    } else {
+        let parent = candidate.parent().ok_or_else(|| {
+            format!(
+                "Path '{}' must have an existing parent directory.",
+                candidate.display()
+            )
+        })?;
+        let resolved_parent = parent
+            .canonicalize()
+            .map_err(|error| format!("Could not resolve '{}': {error}", parent.display()))?;
+        let name = candidate.file_name().ok_or_else(|| {
+            format!(
+                "Path '{}' must point to a file inside the session cwd.",
+                candidate.display()
+            )
+        })?;
+        resolved_parent.join(name)
+    };
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "Path '{}' is outside the session cwd '{}'.",
+            resolved.display(),
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn copilot_acp_read_block_error(path: &Path) -> Option<String> {
+    let hermes_home = env::var_os("HERMES_HOME").map(PathBuf::from)?;
+    let resolved = path.canonicalize().ok()?;
+    let blocked_dirs = [
+        hermes_home.join("skills").join(".hub").join("index-cache"),
+        hermes_home.join("skills").join(".hub"),
+    ];
+    for blocked in blocked_dirs {
+        if resolved.starts_with(&blocked) {
+            return Some(format!(
+                "Access denied: {} is an internal Hermes cache file and cannot be read directly to prevent prompt injection. Use the skills_list or skill_view tools instead.",
+                path.display()
+            ));
+        }
+    }
+    None
+}
+
+fn copilot_acp_is_write_denied(path: &Path) -> bool {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|value| !value.as_os_str().is_empty())
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let hermes_home = env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".hermes"));
+
+    let denied_exact = [
+        home.join(".ssh").join("authorized_keys"),
+        home.join(".ssh").join("id_rsa"),
+        home.join(".ssh").join("id_ed25519"),
+        home.join(".ssh").join("config"),
+        hermes_home.join(".env"),
+        home.join(".bashrc"),
+        home.join(".zshrc"),
+        home.join(".profile"),
+        home.join(".bash_profile"),
+        home.join(".zprofile"),
+        home.join(".netrc"),
+        home.join(".pgpass"),
+        home.join(".npmrc"),
+        home.join(".pypirc"),
+        PathBuf::from("/etc/sudoers"),
+        PathBuf::from("/etc/passwd"),
+        PathBuf::from("/etc/shadow"),
+    ];
+    if denied_exact.iter().any(|candidate| path == candidate) {
+        return true;
+    }
+
+    let denied_prefixes = [
+        home.join(".ssh"),
+        home.join(".aws"),
+        home.join(".gnupg"),
+        home.join(".kube"),
+        PathBuf::from("/etc/sudoers.d"),
+        PathBuf::from("/etc/systemd"),
+        home.join(".docker"),
+        home.join(".azure"),
+        home.join(".config").join("gh"),
+    ];
+    if denied_prefixes
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return true;
+    }
+
+    if let Some(root) = env::var_os("HERMES_WRITE_SAFE_ROOT").map(PathBuf::from)
+        && !root.as_os_str().is_empty()
+        && path != root
+        && !path.starts_with(&root)
+    {
+        return true;
+    }
+    false
+}
+
+fn exit_code_or_default(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(-1)
 }
 
 fn send_google_gemini_chat_completion(
@@ -3191,6 +3850,24 @@ for raw in sys.stdin:
         }
 
         assert_eq!(result.as_deref(), Some("Copilot ACP smoke passed."));
+    }
+
+    #[test]
+    fn extract_copilot_acp_tool_calls_removes_xml_blocks() {
+        let input = concat!(
+            "Planning...\n",
+            "<tool_call>{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"todo\",\"arguments\":\"{\\\"action\\\":\\\"read\\\"}\"}}</tool_call>\n",
+            "Done."
+        );
+
+        let (tool_calls, content) = extract_copilot_acp_tool_calls(input).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "todo");
+        assert_eq!(tool_calls[0].arguments_raw, "{\"action\":\"read\"}");
+        assert_eq!(tool_calls[0].json, json!({"action": "read"}));
+        assert_eq!(content, "Planning...\nDone.");
     }
 
     #[test]

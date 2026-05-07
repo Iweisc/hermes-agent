@@ -619,6 +619,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
+ "shell-words",
  "tempfile",
  "tungstenite",
  "unicode-normalization",
