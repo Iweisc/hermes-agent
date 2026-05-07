@@ -2,6 +2,7 @@ mod auth_cmd;
 mod backup;
 mod completion;
 mod config_cmd;
+mod dashboard_cmd;
 mod debug;
 mod doctor;
 mod dump;
@@ -68,6 +69,7 @@ enum Command {
         command: Option<webhook::WebhookCommand>,
     },
     Completion(completion::CompletionArgs),
+    Dashboard(dashboard_cmd::DashboardArgs),
     Logout(auth_cmd::LogoutArgs),
     Auth {
         #[command(subcommand)]
@@ -259,6 +261,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
         Command::Login(args) => login_cmd::print_login(args)?,
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
+        Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Slack { command } => slack_cmd::print_slack(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
