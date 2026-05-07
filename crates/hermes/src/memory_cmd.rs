@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -54,6 +54,7 @@ struct MemoryFile {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SetupMode {
     NativeGeneric,
+    NativeHindsight,
     PythonHook,
 }
 
@@ -196,6 +197,7 @@ fn print_memory_setup(
                 .ok_or("invalid memory provider selection")?;
             match provider.mode {
                 SetupMode::NativeGeneric => run_native_provider_setup(context, provider),
+                SetupMode::NativeHindsight => run_hindsight_provider_setup(context, provider),
                 SetupMode::PythonHook => {
                     println!(
                         "\n  Handing off to the provider-specific setup for {}.\n",
@@ -424,7 +426,8 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                 required: true,
             }],
         ),
-        "honcho" | "hindsight" => (SetupMode::PythonHook, Vec::new()),
+        "hindsight" => (SetupMode::NativeHindsight, Vec::new()),
+        "honcho" => (SetupMode::PythonHook, Vec::new()),
         _ => (SetupMode::PythonHook, Vec::new()),
     };
 
@@ -575,6 +578,199 @@ fn run_native_provider_setup(
     Ok(())
 }
 
+fn run_hindsight_provider_setup(
+    context: &HermesContext,
+    provider: &SetupProvider,
+) -> Result<(), Box<dyn Error>> {
+    let existing_values = load_existing_provider_values(context, &provider.name)?;
+    let existing_env = load_simple_env(context.env_path());
+
+    println!("\n  Configuring {}:\n", provider.name);
+
+    let mode = prompt_choice(
+        "  Select mode",
+        &[
+            ("cloud", "Hindsight Cloud API"),
+            ("local_embedded", "Run Hindsight locally"),
+            ("local_external", "Existing Hindsight instance"),
+        ],
+        existing_string_value(&existing_values, "mode")
+            .as_deref()
+            .unwrap_or("cloud"),
+    )?;
+
+    ensure_hindsight_dependencies(&mode)?;
+
+    let mut provider_values = BTreeMap::new();
+    let mut env_updates = BTreeMap::new();
+    provider_values.insert(String::from("mode"), SetupValue::String(mode.clone()));
+
+    match mode.as_str() {
+        "cloud" => {
+            let api_url = prompt_string_value(
+                "  API URL",
+                existing_string_value(&existing_values, "api_url")
+                    .as_deref()
+                    .unwrap_or("https://api.hindsight.vectorize.io"),
+            )?;
+            provider_values.insert(String::from("api_url"), SetupValue::String(api_url));
+
+            let api_key = prompt_secret_with_existing(
+                "  API key",
+                existing_env.get("HINDSIGHT_API_KEY").map(String::as_str),
+                false,
+            )?;
+            if !api_key.trim().is_empty() {
+                env_updates.insert(String::from("HINDSIGHT_API_KEY"), api_key);
+            }
+        }
+        "local_external" => {
+            let api_url = prompt_string_value(
+                "  Hindsight API URL",
+                existing_string_value(&existing_values, "api_url")
+                    .as_deref()
+                    .unwrap_or("http://localhost:8888"),
+            )?;
+            provider_values.insert(String::from("api_url"), SetupValue::String(api_url));
+
+            let api_key = prompt_secret_with_existing(
+                "  API key (optional)",
+                existing_env.get("HINDSIGHT_API_KEY").map(String::as_str),
+                true,
+            )?;
+            if !api_key.trim().is_empty() {
+                env_updates.insert(String::from("HINDSIGHT_API_KEY"), api_key);
+            }
+        }
+        "local_embedded" => {
+            let llm_provider = prompt_choice(
+                "  Select LLM provider",
+                &[
+                    ("openai", "default model: gpt-4o-mini"),
+                    ("anthropic", "default model: claude-haiku-4-5"),
+                    ("gemini", "default model: gemini-2.5-flash"),
+                    ("groq", "default model: openai/gpt-oss-120b"),
+                    ("openrouter", "default model: qwen/qwen3.5-9b"),
+                    ("minimax", "default model: MiniMax-M2.7"),
+                    ("ollama", "default model: gemma3:12b"),
+                    ("lmstudio", "default model: local-model"),
+                    ("openai_compatible", "custom OpenAI-compatible endpoint"),
+                ],
+                existing_string_value(&existing_values, "llm_provider")
+                    .as_deref()
+                    .unwrap_or("openai"),
+            )?;
+            provider_values.insert(
+                String::from("llm_provider"),
+                SetupValue::String(llm_provider.clone()),
+            );
+
+            if llm_provider == "openai_compatible" {
+                let base_url = prompt_string_value(
+                    "  LLM endpoint URL",
+                    existing_string_value(&existing_values, "llm_base_url")
+                        .as_deref()
+                        .unwrap_or("http://127.0.0.1:8080/v1"),
+                )?;
+                provider_values.insert(String::from("llm_base_url"), SetupValue::String(base_url));
+            } else if llm_provider == "openrouter" {
+                provider_values.insert(
+                    String::from("llm_base_url"),
+                    SetupValue::String(String::from("https://openrouter.ai/api/v1")),
+                );
+            }
+
+            let default_model = hindsight_default_model(&llm_provider);
+            let llm_model = prompt_string_value(
+                "  LLM model",
+                existing_string_value(&existing_values, "llm_model")
+                    .as_deref()
+                    .unwrap_or(default_model),
+            )?;
+            provider_values.insert(String::from("llm_model"), SetupValue::String(llm_model));
+
+            let llm_api_key = prompt_secret_with_existing(
+                "  LLM API key",
+                existing_env
+                    .get("HINDSIGHT_LLM_API_KEY")
+                    .map(String::as_str),
+                false,
+            )?;
+            if !llm_api_key.trim().is_empty() {
+                env_updates.insert(String::from("HINDSIGHT_LLM_API_KEY"), llm_api_key);
+            } else if let Some(existing) = existing_env.get("HINDSIGHT_LLM_API_KEY") {
+                env_updates.insert(String::from("HINDSIGHT_LLM_API_KEY"), existing.clone());
+            }
+        }
+        _ => return Err(format!("unsupported hindsight mode: {mode}").into()),
+    }
+
+    let bank_id = prompt_string_value(
+        "  Memory bank name",
+        existing_string_value(&existing_values, "bank_id")
+            .as_deref()
+            .unwrap_or("hermes"),
+    )?;
+    provider_values.insert(String::from("bank_id"), SetupValue::String(bank_id));
+
+    let recall_budget = prompt_choice(
+        "  Recall budget",
+        &[
+            ("low", "lightweight"),
+            ("mid", "balanced"),
+            ("high", "thorough"),
+        ],
+        existing_string_value(&existing_values, "recall_budget")
+            .as_deref()
+            .unwrap_or("mid"),
+    )?;
+    provider_values.insert(
+        String::from("recall_budget"),
+        SetupValue::String(recall_budget),
+    );
+
+    let timeout = prompt_integer_value(
+        "  Timeout seconds",
+        existing_integer_value(&existing_values, "timeout").unwrap_or(120),
+    )?;
+    provider_values.insert(String::from("timeout"), SetupValue::Integer(timeout));
+    env_updates.insert(String::from("HINDSIGHT_TIMEOUT"), timeout.to_string());
+
+    if mode == "local_embedded" {
+        let idle_timeout = prompt_integer_value(
+            "  Idle timeout seconds",
+            existing_integer_value(&existing_values, "idle_timeout").unwrap_or(300),
+        )?;
+        provider_values.insert(
+            String::from("idle_timeout"),
+            SetupValue::Integer(idle_timeout),
+        );
+        env_updates.insert(
+            String::from("HINDSIGHT_IDLE_TIMEOUT"),
+            idle_timeout.to_string(),
+        );
+    }
+
+    save_provider_activation(context, &provider.name, &provider_values)?;
+    persist_native_provider_state(context, &provider.name, &provider_values)?;
+    for (key, value) in &env_updates {
+        save_env_value(context.env_path(), key, value)?;
+    }
+
+    if mode == "local_embedded" {
+        materialize_hindsight_embedded_profile_env(context, &provider_values, &env_updates)?;
+    }
+
+    println!("\n  Memory provider: {}", provider.name);
+    println!("  Activation saved to config.yaml");
+    println!("  Provider config saved");
+    if !env_updates.is_empty() {
+        println!("  API keys saved to .env");
+    }
+    println!("\n  Start a new session to activate.\n");
+    Ok(())
+}
+
 fn prompt_setup_field(
     field: &SetupField,
     existing_value: Option<SetupValue>,
@@ -607,6 +803,106 @@ fn prompt_setup_field(
             }
         }
     }
+}
+
+fn prompt_choice(
+    label: &str,
+    options: &[(&str, &str)],
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    println!("{label}:");
+    let default_index = options
+        .iter()
+        .position(|(value, _)| value.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
+    for (index, (value, description)) in options.iter().enumerate() {
+        let active = if index == default_index {
+            " ← current"
+        } else {
+            ""
+        };
+        println!("    {}) {} — {}{}", index + 1, value, description, active);
+    }
+
+    loop {
+        let prompt = format!("  Select [{}]: ", default_index + 1);
+        let Some(input) = read_prompt_line(&prompt)? else {
+            return Err("setup cancelled".into());
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(options[default_index].0.to_string());
+        }
+        if let Ok(index) = trimmed.parse::<usize>()
+            && index >= 1
+            && index <= options.len()
+        {
+            return Ok(options[index - 1].0.to_string());
+        }
+        if let Some((value, _)) = options
+            .iter()
+            .find(|(value, _)| value.eq_ignore_ascii_case(trimmed))
+        {
+            return Ok((*value).to_string());
+        }
+        println!("  Invalid selection.");
+    }
+}
+
+fn prompt_string_value(label: &str, current: &str) -> Result<String, Box<dyn Error>> {
+    let prompt = format!("  {} [{}]: ", label, current);
+    let Some(input) = read_prompt_line(&prompt)? else {
+        return Err("setup cancelled".into());
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(current.to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn prompt_integer_value(label: &str, current: i64) -> Result<i64, Box<dyn Error>> {
+    loop {
+        let prompt = format!("  {} [{}]: ", label, current);
+        let Some(input) = read_prompt_line(&prompt)? else {
+            return Err("setup cancelled".into());
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(current);
+        }
+        match trimmed.parse::<i64>() {
+            Ok(value) => return Ok(value),
+            Err(_) => println!("  expected an integer"),
+        }
+    }
+}
+
+fn prompt_secret_with_existing(
+    label: &str,
+    existing: Option<&str>,
+    allow_blank: bool,
+) -> Result<String, Box<dyn Error>> {
+    let prompt = if let Some(existing) = existing.filter(|value| !value.trim().is_empty()) {
+        format!(
+            "  {} (current: {}, blank to keep): ",
+            label,
+            mask_secret(existing)
+        )
+    } else {
+        format!("  {}: ", label)
+    };
+    let Some(input) = read_secret_line(&prompt)? else {
+        return Err("setup cancelled".into());
+    };
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        if allow_blank {
+            return Ok(String::new());
+        }
+        return Ok(existing.unwrap_or_default().to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn field_prompt_label(field: &SetupField, existing_value: Option<&SetupValue>) -> String {
@@ -709,6 +1005,23 @@ fn load_existing_env_value(field: &SetupField) -> Option<SetupValue> {
     parse_setup_value(field.kind, trimmed).ok()
 }
 
+fn load_simple_env(path: PathBuf) -> BTreeMap<String, String> {
+    if !path.exists() {
+        return BTreeMap::new();
+    }
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 fn load_existing_provider_values(
     context: &HermesContext,
     provider_name: &str,
@@ -768,6 +1081,10 @@ fn persist_native_provider_state(
     provider_values: &BTreeMap<String, SetupValue>,
 ) -> Result<(), Box<dyn Error>> {
     match provider_name {
+        "hindsight" => write_json_config(
+            &context.hermes_home().join("hindsight").join("config.json"),
+            provider_values,
+        ),
         "mem0" => write_json_config(&context.hermes_home().join("mem0.json"), provider_values),
         "supermemory" => write_json_config(
             &context.hermes_home().join("supermemory.json"),
@@ -802,6 +1119,123 @@ fn write_json_config(
         path,
         serde_json::to_string_pretty(&JsonValue::Object(root))?,
     )?;
+    Ok(())
+}
+
+fn ensure_hindsight_dependencies(mode: &str) -> Result<(), Box<dyn Error>> {
+    let dependency = if mode == "local_embedded" {
+        "hindsight-all"
+    } else {
+        "hindsight-client>=0.4.22"
+    };
+    let Some(uv_path) = resolve_binary("uv") else {
+        println!("  uv not found — skipping automatic dependency install");
+        return Ok(());
+    };
+
+    let status = Command::new(uv_path)
+        .args([
+            "pip",
+            "install",
+            "--python",
+            &std::env::current_exe()
+                .ok()
+                .and_then(|_| std::env::var("PYTHON").ok())
+                .unwrap_or_else(|| String::from("python3")),
+            "--quiet",
+            "--upgrade",
+            dependency,
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => println!("  Dependencies up to date"),
+        Ok(_) => println!("  Dependency install failed — continue manually if needed"),
+        Err(error) => println!("  Dependency install failed: {error}"),
+    }
+    Ok(())
+}
+
+fn resolve_binary(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let path = dir.join(name);
+            path.is_file().then_some(path)
+        })
+    })
+}
+
+fn hindsight_default_model(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "claude-haiku-4-5",
+        "gemini" => "gemini-2.5-flash",
+        "groq" => "openai/gpt-oss-120b",
+        "openrouter" => "qwen/qwen3.5-9b",
+        "minimax" => "MiniMax-M2.7",
+        "ollama" => "gemma3:12b",
+        "lmstudio" => "local-model",
+        "openai_compatible" => "your-model-name",
+        _ => "gpt-4o-mini",
+    }
+}
+
+fn existing_string_value(values: &BTreeMap<String, SetupValue>, key: &str) -> Option<String> {
+    match values.get(key) {
+        Some(SetupValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn existing_integer_value(values: &BTreeMap<String, SetupValue>, key: &str) -> Option<i64> {
+    match values.get(key) {
+        Some(SetupValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn materialize_hindsight_embedded_profile_env(
+    context: &HermesContext,
+    provider_values: &BTreeMap<String, SetupValue>,
+    env_updates: &BTreeMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    let home = dirs::home_dir().unwrap_or_else(|| context.home_dir().to_path_buf());
+    let profile_env = home.join(".hindsight").join("profiles").join("hermes.env");
+    if let Some(parent) = profile_env.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let llm_provider = existing_string_value(provider_values, "llm_provider")
+        .unwrap_or_else(|| String::from("openai"));
+    let daemon_provider = if matches!(llm_provider.as_str(), "openai_compatible" | "openrouter") {
+        "openai".to_string()
+    } else {
+        llm_provider.clone()
+    };
+    let mut lines = vec![
+        format!("HINDSIGHT_API_LLM_PROVIDER={daemon_provider}"),
+        format!(
+            "HINDSIGHT_API_LLM_API_KEY={}",
+            env_updates
+                .get("HINDSIGHT_LLM_API_KEY")
+                .cloned()
+                .unwrap_or_default()
+        ),
+        format!(
+            "HINDSIGHT_API_LLM_MODEL={}",
+            existing_string_value(provider_values, "llm_model").unwrap_or_default()
+        ),
+        String::from("HINDSIGHT_API_LOG_LEVEL=info"),
+    ];
+    if let Some(base_url) = existing_string_value(provider_values, "llm_base_url")
+        && !base_url.trim().is_empty()
+    {
+        lines.push(format!("HINDSIGHT_API_LLM_BASE_URL={base_url}"));
+    }
+    if let Some(idle_timeout) = existing_integer_value(provider_values, "idle_timeout") {
+        lines.push(format!(
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT={idle_timeout}"
+        ));
+    }
+    fs::write(profile_env, format!("{}\n", lines.join("\n")))?;
     Ok(())
 }
 
@@ -1283,7 +1717,7 @@ mod tests {
             },
         );
 
-        assert_eq!(hindsight.mode, SetupMode::PythonHook);
+        assert_eq!(hindsight.mode, SetupMode::NativeHindsight);
         assert_eq!(mem0.mode, SetupMode::NativeGeneric);
         assert!(mem0.fields.iter().any(|field| field.key == "api_key"));
     }
@@ -1317,6 +1751,87 @@ mod tests {
         let json_text = fs::read_to_string(home.join("mem0.json")).unwrap();
         assert!(json_text.contains("\"user_id\": \"alice\""));
         assert!(json_text.contains("\"rerank\": false"));
+    }
+
+    #[test]
+    fn persist_hindsight_state_writes_profile_config() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            String::from("mode"),
+            SetupValue::String(String::from("local_embedded")),
+        );
+        values.insert(
+            String::from("llm_provider"),
+            SetupValue::String(String::from("openrouter")),
+        );
+        values.insert(
+            String::from("llm_model"),
+            SetupValue::String(String::from("qwen/qwen3.5-9b")),
+        );
+        values.insert(String::from("idle_timeout"), SetupValue::Integer(300));
+
+        persist_native_provider_state(&context, "hindsight", &values).unwrap();
+
+        let json_text = fs::read_to_string(home.join("hindsight").join("config.json")).unwrap();
+        assert!(json_text.contains("\"mode\": \"local_embedded\""));
+        assert!(json_text.contains("\"llm_provider\": \"openrouter\""));
+    }
+
+    #[test]
+    fn materialize_hindsight_embedded_profile_env_writes_expected_vars() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        let old_home = env::var_os("HOME");
+        set_env_var("HOME", temp.path());
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            String::from("llm_provider"),
+            SetupValue::String(String::from("openrouter")),
+        );
+        values.insert(
+            String::from("llm_model"),
+            SetupValue::String(String::from("qwen/qwen3.5-9b")),
+        );
+        values.insert(
+            String::from("llm_base_url"),
+            SetupValue::String(String::from("https://openrouter.ai/api/v1")),
+        );
+        values.insert(String::from("idle_timeout"), SetupValue::Integer(300));
+
+        let mut env_updates = BTreeMap::new();
+        env_updates.insert(
+            String::from("HINDSIGHT_LLM_API_KEY"),
+            String::from("secret-key"),
+        );
+
+        materialize_hindsight_embedded_profile_env(&context, &values, &env_updates).unwrap();
+
+        let env_text = fs::read_to_string(
+            temp.path()
+                .join(".hindsight")
+                .join("profiles")
+                .join("hermes.env"),
+        )
+        .unwrap();
+        assert!(env_text.contains("HINDSIGHT_API_LLM_PROVIDER=openai"));
+        assert!(env_text.contains("HINDSIGHT_API_LLM_API_KEY=secret-key"));
+        assert!(env_text.contains("HINDSIGHT_API_LLM_MODEL=qwen/qwen3.5-9b"));
+        assert!(env_text.contains("HINDSIGHT_API_LLM_BASE_URL=https://openrouter.ai/api/v1"));
+        assert!(env_text.contains("HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=300"));
+
+        match old_home {
+            Some(value) => set_env_var("HOME", value),
+            None => remove_env_var("HOME"),
+        }
     }
 
     #[test]
