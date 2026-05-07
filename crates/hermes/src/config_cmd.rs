@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Subcommand;
-use hermes_core::{HermesContext, LoadedConfig};
+use hermes_core::{EnvLoadReport, HermesConfig, HermesContext, LoadedConfig, ModelOverrides};
 use serde_yaml::{Mapping, Number, Sequence, Value};
 
 const API_KEYS: &[(&str, &str)] = &[
@@ -63,6 +64,8 @@ const CONFIG_TO_ENV_SYNC: &[(&str, &str)] = &[
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
     Show,
+    Edit,
+    Check,
     Set {
         key: String,
         value: String,
@@ -74,12 +77,19 @@ pub enum ConfigCommand {
 
 pub fn print_config(
     context: &HermesContext,
+    env_report: &EnvLoadReport,
     loaded: &LoadedConfig,
     command: Option<ConfigCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command.unwrap_or(ConfigCommand::Show) {
         ConfigCommand::Show => {
             println!("{}", render_config(context, loaded));
+        }
+        ConfigCommand::Edit => {
+            edit_config(context)?;
+        }
+        ConfigCommand::Check => {
+            println!("{}", render_config_check(context, env_report, loaded));
         }
         ConfigCommand::Set { key, value } => {
             set_config_value(context, &key, &value)?;
@@ -185,9 +195,108 @@ fn render_config(context: &HermesContext, loaded: &LoadedConfig) -> String {
     }
     lines.push(String::new());
     lines.push(String::from("Commands"));
+    lines.push(String::from("  hermes config edit"));
     lines.push(String::from("  hermes config set <key> <value>"));
+    lines.push(String::from("  hermes config check"));
     lines.push(String::from("  hermes config path"));
     lines.push(String::from("  hermes config env-path"));
+    lines.join("\n")
+}
+
+fn render_config_check(
+    context: &HermesContext,
+    env_report: &EnvLoadReport,
+    loaded: &LoadedConfig,
+) -> String {
+    let mut issues = Vec::new();
+    let mut lines = Vec::new();
+    let config_exists = context.config_path().exists();
+    let env_exists = context.env_path().exists();
+    let runtime = context.resolve_model_runtime(loaded, &ModelOverrides::default());
+    let configured_keys = API_KEYS
+        .iter()
+        .filter(|(env_var, _)| {
+            std::env::var(env_var)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+        .count();
+
+    lines.push(String::from("=== Hermes Config Check ==="));
+    lines.push(String::new());
+    lines.push(String::from("Files"));
+    lines.push(format!(
+        "  config:       {} ({})",
+        status_label(config_exists, "present", "missing"),
+        context.config_path().display()
+    ));
+    lines.push(format!(
+        "  env:          {} ({})",
+        status_label(env_exists, "present", "missing"),
+        context.env_path().display()
+    ));
+
+    if !config_exists {
+        issues.push(format!("missing {}", context.config_path().display()));
+    }
+    if !env_exists {
+        issues.push(format!("missing {}", context.env_path().display()));
+    }
+
+    lines.push(String::new());
+    lines.push(String::from("Warnings"));
+    if loaded.warnings.is_empty() && env_report.warnings.is_empty() {
+        lines.push(String::from("  status:       none"));
+    } else {
+        for warning in &loaded.warnings {
+            lines.push(format!("  config:       {warning}"));
+            issues.push(warning.clone());
+        }
+        for warning in &env_report.warnings {
+            lines.push(format!("  env:          {warning}"));
+            issues.push(warning.clone());
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(String::from("Model Runtime"));
+    match runtime {
+        Ok(runtime) => {
+            lines.push(String::from("  status:       ok"));
+            lines.push(format!("  provider:     {}", runtime.provider));
+            lines.push(format!("  model:        {}", runtime.model));
+            lines.push(format!("  api_mode:     {}", runtime.api_mode));
+        }
+        Err(error) => {
+            lines.push(String::from("  status:       fail"));
+            lines.push(format!("  detail:       {error}"));
+            issues.push(format!("model runtime resolution failed: {error}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(String::from("Credentials"));
+    lines.push(format!(
+        "  api_keys:     {configured_keys}/{}",
+        API_KEYS.len()
+    ));
+    if configured_keys == 0 {
+        lines.push(String::from("  note:         no known API keys are loaded"));
+    }
+
+    lines.push(String::new());
+    lines.push(String::from("Summary"));
+    if issues.is_empty() {
+        lines.push(String::from("  status:       ok"));
+        lines.push(String::from("  detail:       configuration looks healthy"));
+    } else {
+        lines.push(String::from("  status:       issues"));
+        lines.push(format!("  count:        {}", issues.len()));
+        for issue in issues {
+            lines.push(format!("  - {issue}"));
+        }
+    }
+
     lines.join("\n")
 }
 
@@ -213,6 +322,86 @@ fn redact_secret(value: &str) -> String {
     let prefix = chars[..4].iter().collect::<String>();
     let suffix = chars[chars.len() - 4..].iter().collect::<String>();
     format!("{prefix}...{suffix}")
+}
+
+fn edit_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    ensure_config_file(&context.config_path())?;
+    let Some(command) = resolve_editor_command()? else {
+        println!("No editor found. Config file is at:");
+        println!("  {}", context.config_path().display());
+        return Ok(());
+    };
+
+    let display = command.join(" ");
+    println!(
+        "Opening {} in {}...",
+        context.config_path().display(),
+        display
+    );
+
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]).arg(context.config_path());
+    let status = process.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("editor exited with status {:?}", status.code()).into())
+}
+
+fn ensure_config_file(path: &Path) -> Result<bool, Box<dyn Error>> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let rendered = serde_yaml::to_string(&HermesConfig::default())?;
+    atomic_write(path, rendered.as_bytes())?;
+    Ok(true)
+}
+
+fn resolve_editor_command() -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    for key in ["EDITOR", "VISUAL"] {
+        let Some(raw) = std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let parsed = shell_words::split(&raw)?;
+        if parsed.is_empty() {
+            continue;
+        }
+        if command_exists(&parsed[0]) || Path::new(&parsed[0]).is_file() {
+            return Ok(Some(parsed));
+        }
+    }
+
+    for candidate in ["nano", "vim", "vi", "code", "notepad"] {
+        if command_exists(candidate) {
+            return Ok(Some(vec![candidate.to_string()]));
+        }
+    }
+    Ok(None)
+}
+
+fn command_exists(command: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        let full = dir.join(command);
+        full.is_file() || cfg!(windows) && full.with_extension("exe").is_file()
+    })
+}
+
+fn status_label(ok: bool, ok_text: &str, missing_text: &str) -> String {
+    if ok {
+        ok_text.to_string()
+    } else {
+        missing_text.to_string()
+    }
 }
 
 fn set_config_value(
@@ -507,6 +696,16 @@ fn ensure_sequence_len(sequence: &mut Sequence, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(test)]
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -576,6 +775,71 @@ mod tests {
         let env_file = fs::read_to_string(home.join(".env")).unwrap();
         assert!(config.contains("backend: docker"));
         assert!(env_file.contains("TERMINAL_ENV=docker"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn edit_config_creates_defaults_and_launches_editor() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("edit-home");
+        let fake_bin = home.join("bin");
+        let fake_editor = fake_bin.join("editor");
+        let log = home.join("editor.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::write(
+            &fake_editor,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$1\" >> \"{}\"\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_editor).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_editor, perms).unwrap();
+        }
+
+        let original_path = env::var("PATH").unwrap_or_default();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        unsafe {
+            env::set_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+            env::set_var("EDITOR", "editor");
+        }
+
+        edit_config(&context).unwrap();
+
+        let written = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(written.contains("toolsets:"));
+        let opened = fs::read_to_string(log).unwrap();
+        assert!(opened.contains(&home.join("config.yaml").display().to_string()));
+
+        unsafe {
+            env::remove_var("EDITOR");
+            env::set_var("PATH", original_path);
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn render_config_check_reports_missing_files() {
+        let home = temp_path("check-home");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: context.config_path(),
+            raw: Value::Mapping(Mapping::new()),
+            config: HermesConfig::default(),
+            warnings: Vec::new(),
+        };
+        let report = EnvLoadReport::default();
+
+        let rendered = render_config_check(&context, &report, &loaded);
+        assert!(rendered.contains("config:       missing"));
+        assert!(rendered.contains("env:          missing"));
+        assert!(rendered.contains("status:       issues"));
+
         let _ = fs::remove_dir_all(home);
     }
 }
