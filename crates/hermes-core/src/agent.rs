@@ -69,8 +69,28 @@ impl HermesContext {
         session_hint: Option<&str>,
         session_store: Option<&SessionStore>,
     ) -> Result<AgentTurnResult, HermesError> {
-        let trimmed_prompt = prompt.trim();
-        if trimmed_prompt.is_empty() {
+        self.run_chat_turn_with_user_content(
+            loaded,
+            Value::String(prompt.trim().to_string()),
+            runtime,
+            enabled_toolsets,
+            overrides,
+            session_hint,
+            session_store,
+        )
+    }
+
+    pub fn run_chat_turn_with_user_content(
+        &self,
+        loaded: &LoadedConfig,
+        user_content: Value,
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        session_hint: Option<&str>,
+        session_store: Option<&SessionStore>,
+    ) -> Result<AgentTurnResult, HermesError> {
+        if !content_has_meaningful_user_input(&user_content) {
             return Err(HermesError::State {
                 action: "running agent turn",
                 detail: "Prompt must not be empty.".to_string(),
@@ -137,7 +157,7 @@ impl HermesContext {
         }
         messages.push(json!({
             "role": "user",
-            "content": trimmed_prompt,
+            "content": user_content.clone(),
         }));
 
         if let Some(store) = session_store {
@@ -164,7 +184,7 @@ impl HermesContext {
                     session_id,
                     &MessageAppend {
                         role: "user".to_string(),
-                        content: Some(Value::String(trimmed_prompt.to_string())),
+                        content: Some(user_content.clone()),
                         tool_call_id: None,
                         tool_calls: None,
                         tool_name: None,
@@ -319,6 +339,44 @@ impl HermesContext {
                 loaded.config.agent.max_turns
             ),
         })
+    }
+}
+
+fn content_has_meaningful_user_input(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(parts) => parts.iter().any(content_part_is_meaningful),
+        Value::Object(object) => content_part_is_meaningful(&Value::Object(object.clone())),
+        _ => false,
+    }
+}
+
+fn content_part_is_meaningful(part: &Value) -> bool {
+    let Some(object) = part.as_object() else {
+        return false;
+    };
+    match object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "text" | "input_text" | "output_text" => object
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        "image_url" => object
+            .get("image_url")
+            .and_then(|value| match value {
+                Value::String(url) => Some(url.as_str()),
+                Value::Object(image) => image.get("url").and_then(Value::as_str),
+                _ => None,
+            })
+            .is_some_and(|url| !url.trim().is_empty()),
+        "input_image" => object
+            .get("image_url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty()),
+        _ => false,
     }
 }
 
@@ -1755,6 +1813,111 @@ mod tests {
             fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
             "hello from tool"
         );
+    }
+
+    #[test]
+    fn chat_turn_with_user_content_sends_multimodal_payload_and_persists_it() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /chat/completions HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let messages = payload["messages"].as_array().unwrap();
+            let user = messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap();
+            let content = user["content"].as_array().unwrap();
+            assert_eq!(content[0]["type"], json!("text"));
+            assert_eq!(content[0]["text"], json!("What is in this image?"));
+            assert_eq!(content[1]["type"], json!("image_url"));
+            assert_eq!(
+                content[1]["image_url"]["url"],
+                json!("data:image/png;base64,aGVsbG8=")
+            );
+
+            let response = json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "The multimodal payload arrived."
+                    }
+                }]
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        fs::write(
+            context.config_path(),
+            format!(
+                "model:\n  default: test-model\n  provider: custom\n  base_url: http://{}\n  api_key: test-key\n  api_mode: chat_completions\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_turn_with_user_content(
+                &loaded,
+                json!([
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ]),
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides::default(),
+                None,
+                Some(&store),
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "The multimodal payload arrived.");
+        let session_id = result.session_id.as_deref().unwrap();
+        let messages = store.get_messages(session_id).unwrap();
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(
+            messages[0].content.as_ref().unwrap(),
+            &json!([
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ])
+        );
+        join.join().unwrap();
     }
 
     #[test]

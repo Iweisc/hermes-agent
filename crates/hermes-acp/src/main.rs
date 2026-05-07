@@ -40,6 +40,13 @@ struct AcpSessionState {
     config_options: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone)]
+struct PromptInput {
+    user_content: Value,
+    display_text: String,
+    plain_text: Option<String>,
+}
+
 impl AcpSessionState {
     fn new(cwd: PathBuf) -> Self {
         Self {
@@ -283,7 +290,7 @@ impl<'a> AcpServer<'a> {
                 "promptCapabilities": {
                     "audio": false,
                     "embeddedContext": false,
-                    "image": false,
+                    "image": true,
                 },
                 "sessionCapabilities": {
                     "close": {},
@@ -525,7 +532,7 @@ impl<'a> AcpServer<'a> {
                 return write_jsonrpc_result(writer, id, result).map_err(|error| error.to_string());
             }
         };
-        let prompt_text = match extract_prompt_text(prompt) {
+        let prompt_input = match extract_prompt_input(prompt) {
             Ok(value) => value,
             Err(error) => {
                 self.send_text_update(writer, &session_id, "agent_message_chunk", &error)?;
@@ -536,7 +543,15 @@ impl<'a> AcpServer<'a> {
                 return write_jsonrpc_result(writer, id, result).map_err(|error| error.to_string());
             }
         };
-        if prompt_text.trim().is_empty() {
+        if !prompt_input.display_text.trim().is_empty() {
+            self.send_text_update(
+                writer,
+                &session_id,
+                "user_message_chunk",
+                &prompt_input.display_text,
+            )?;
+        }
+        if !has_meaningful_prompt_content(&prompt_input.user_content) {
             let result = json!({
                 "stopReason": "end_turn",
                 "userMessageId": message_id,
@@ -544,10 +559,10 @@ impl<'a> AcpServer<'a> {
             return write_jsonrpc_result(writer, id, result).map_err(|error| error.to_string());
         }
 
-        self.send_text_update(writer, &session_id, "user_message_chunk", &prompt_text)?;
-
-        if let Some(local_response) = self.handle_slash_command(&session_id, &prompt_text)? {
-            self.append_text_message(&session_id, "user", &prompt_text)?;
+        if let Some(prompt_text) = prompt_input.plain_text.as_deref()
+            && let Some(local_response) = self.handle_slash_command(&session_id, prompt_text)?
+        {
+            self.append_text_message(&session_id, "user", prompt_text)?;
             self.append_text_message(&session_id, "assistant", &local_response)?;
             self.send_text_update(writer, &session_id, "agent_message_chunk", &local_response)?;
             let result = json!({
@@ -561,9 +576,9 @@ impl<'a> AcpServer<'a> {
             .with_hermes_home(self.context.hermes_home())
             .with_current_session_id(Some(session_id.clone()));
         let enabled_toolsets = vec![String::from("hermes-acp")];
-        let result = self.context.run_chat_completions_turn(
+        let result = self.context.run_chat_turn_with_user_content(
             self.config,
-            &prompt_text,
+            prompt_input.user_content,
             &runtime,
             Some(&enabled_toolsets),
             &state.overrides,
@@ -997,11 +1012,13 @@ fn apply_model_selection(state: &mut AcpSessionState, raw: &str) {
     state.overrides.model = Some(trimmed.to_string());
 }
 
-fn extract_prompt_text(prompt: &Value) -> Result<String, String> {
+fn extract_prompt_input(prompt: &Value) -> Result<PromptInput, String> {
     let items = prompt
         .as_array()
         .ok_or_else(|| "prompt must be an array".to_string())?;
-    let mut parts = Vec::new();
+    let mut display_parts = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut content_parts = Vec::new();
     for item in items {
         let Some(kind) = item.get("type").and_then(Value::as_str) else {
             continue;
@@ -1011,7 +1028,13 @@ fn extract_prompt_text(prompt: &Value) -> Result<String, String> {
                 if let Some(text) = item.get("text").and_then(Value::as_str)
                     && !text.trim().is_empty()
                 {
-                    parts.push(text.trim().to_string());
+                    let trimmed = text.trim().to_string();
+                    display_parts.push(trimmed.clone());
+                    text_parts.push(trimmed.clone());
+                    content_parts.push(json!({
+                        "type": "text",
+                        "text": trimmed,
+                    }));
                 }
             }
             "resource_link" => {
@@ -1019,14 +1042,16 @@ fn extract_prompt_text(prompt: &Value) -> Result<String, String> {
                 let uri = item.get("uri").and_then(Value::as_str);
                 let name = item.get("name").and_then(Value::as_str);
                 let label = title.or(name).or(uri).unwrap_or("resource");
-                parts.push(format!("[Resource: {label}]"));
+                display_parts.push(format!("[Resource: {label}]"));
             }
             "resource" => {
                 if let Some(resource) = item.get("resource").and_then(Value::as_object) {
                     if let Some(text) = resource.get("text").and_then(Value::as_str)
                         && !text.trim().is_empty()
                     {
-                        parts.push(text.trim().to_string());
+                        let trimmed = text.trim().to_string();
+                        display_parts.push(trimmed.clone());
+                        text_parts.push(trimmed);
                         continue;
                     }
                     let label = resource
@@ -1034,23 +1059,105 @@ fn extract_prompt_text(prompt: &Value) -> Result<String, String> {
                         .and_then(Value::as_str)
                         .or_else(|| resource.get("mimeType").and_then(Value::as_str))
                         .unwrap_or("embedded resource");
-                    parts.push(format!("[Resource: {label}]"));
+                    display_parts.push(format!("[Resource: {label}]"));
                 }
             }
             "image" => {
-                return Err(
-                    "Image prompts are not supported by the Rust ACP runtime yet.".to_string(),
-                );
+                let image_part = extract_image_prompt_part(item)?;
+                if let Some(image_part) = image_part {
+                    display_parts.push("[Image attachment]".to_string());
+                    content_parts.push(image_part);
+                }
             }
             "audio" => {
                 return Err(
                     "Audio prompts are not supported by the Rust ACP runtime yet.".to_string(),
                 );
             }
-            other => parts.push(format!("[Unsupported content block: {other}]")),
+            other => display_parts.push(format!("[Unsupported content block: {other}]")),
         }
     }
-    Ok(parts.join("\n"))
+    let user_content = if content_parts.is_empty() {
+        Value::String(String::new())
+    } else if content_parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        Value::String(text_parts.join("\n"))
+    } else {
+        Value::Array(content_parts)
+    };
+    let plain_text = (!text_parts.is_empty() && matches!(user_content, Value::String(_)))
+        .then(|| text_parts.join("\n"));
+    Ok(PromptInput {
+        user_content,
+        display_text: display_parts.join("\n"),
+        plain_text,
+    })
+}
+
+fn extract_image_prompt_part(item: &Value) -> Result<Option<Value>, String> {
+    let data = item
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mime_type = item
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("mime_type").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image/png");
+
+    let Some(url) = data
+        .map(|value| {
+            if value.starts_with("data:") {
+                value.to_string()
+            } else {
+                format!("data:{mime_type};base64,{value}")
+            }
+        })
+        .or_else(|| uri.map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": url,
+        }
+    })))
+}
+
+fn has_meaningful_prompt_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(parts) => parts.iter().any(|part| {
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            match kind {
+                "text" => part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "image_url" => part
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .and_then(|image| image.get("url"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| !url.trim().is_empty()),
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
 }
 
 fn message_display_text(message: &MessageRecord) -> String {
@@ -1061,13 +1168,15 @@ fn message_display_text(message: &MessageRecord) -> String {
         Value::String(text) => text.trim().to_string(),
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::String(text) => Some(text.trim().to_string()),
-                Value::Object(map) => map
+            .filter_map(|item| match item.as_object() {
+                Some(map) if map.get("type").and_then(Value::as_str) == Some("image_url") => {
+                    Some("[Image attachment]".to_string())
+                }
+                Some(map) => map
                     .get("text")
                     .and_then(Value::as_str)
                     .map(|text| text.trim().to_string()),
-                _ => None,
+                None => item.as_str().map(|text| text.trim().to_string()),
             })
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
@@ -1219,18 +1328,75 @@ fn emit_warnings(env_report: &EnvLoadReport, config: &LoadedConfig) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
-    fn extract_prompt_text_supports_text_and_resources() {
+    fn extract_prompt_input_supports_text_resources_and_images() {
         let prompt = json!([
             {"type": "text", "text": "hello"},
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
             {"type": "resource_link", "uri": "file:///tmp/a.txt", "name": "a.txt"},
             {"type": "resource", "resource": {"text": "embedded", "uri": "mem://1"}}
         ]);
-        let text = extract_prompt_text(&prompt).unwrap();
-        assert!(text.contains("hello"));
-        assert!(text.contains("[Resource: a.txt]"));
-        assert!(text.contains("embedded"));
+        let parsed = extract_prompt_input(&prompt).unwrap();
+        assert!(parsed.display_text.contains("hello"));
+        assert!(parsed.display_text.contains("[Image attachment]"));
+        assert!(parsed.display_text.contains("[Resource: a.txt]"));
+        assert!(parsed.display_text.contains("embedded"));
+        assert!(parsed.plain_text.is_none());
+        assert_eq!(
+            parsed.user_content,
+            json!([
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ])
+        );
+    }
+
+    #[test]
+    fn initialize_advertises_image_prompt_capability() {
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let server = AcpServer::new(&context, &config, &store);
+
+        let initialize = server.handle_initialize();
+        assert_eq!(
+            initialize["agentCapabilities"]["promptCapabilities"]["image"],
+            json!(true)
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn message_display_text_uses_image_placeholder_for_multimodal_messages() {
+        let message = MessageRecord {
+            id: 1,
+            session_id: "acp_test".to_string(),
+            role: "user".to_string(),
+            content: Some(json!([
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ])),
+            tool_call_id: None,
+            tool_calls: None,
+            tool_name: None,
+            timestamp: 0.0,
+            token_count: None,
+            finish_reason: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+        };
+        assert_eq!(message_display_text(&message), "look\n[Image attachment]");
     }
 
     #[test]
@@ -1304,6 +1470,122 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert!(message_display_text(&messages[1]).contains("Hermes Agent v"));
 
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn image_prompt_runs_end_to_end_through_acp() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /chat/completions HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let messages = payload["messages"].as_array().unwrap();
+            let user = messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap();
+            let content = user["content"].as_array().unwrap();
+            assert_eq!(content[0]["text"], json!("What is this?"));
+            assert_eq!(
+                content[1]["image_url"]["url"],
+                json!("data:image/png;base64,aGVsbG8=")
+            );
+
+            let response = json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "ACP image prompt ok."
+                    }
+                }]
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            format!(
+                "model:\n  default: test-model\n  provider: custom\n  base_url: http://{}\n  api_key: test-key\n  api_mode: chat_completions\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = AcpServer::new(&context, &config, &store);
+
+        let created = server
+            .handle_new_session(&json!({"cwd": home.display().to_string()}))
+            .unwrap();
+        let session_id = created
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let mut writer = Vec::new();
+        server
+            .handle_prompt(
+                json!(1),
+                &json!({
+                    "sessionId": session_id,
+                    "prompt": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+                    ],
+                }),
+                &mut writer,
+            )
+            .unwrap();
+
+        let messages = store.get_messages(&session_id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].content.as_ref().unwrap(),
+            &json!([
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+            ])
+        );
+        assert_eq!(
+            message_display_text(&messages[0]),
+            "What is this?\n[Image attachment]"
+        );
+        assert!(message_display_text(&messages[1]).contains("ACP image prompt ok."));
+        join.join().unwrap();
         let _ = fs::remove_dir_all(&home);
     }
 }
