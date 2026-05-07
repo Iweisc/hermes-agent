@@ -15,6 +15,7 @@ mod hooks;
 mod insights_cmd;
 mod login_cmd;
 mod logs;
+mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
 mod python_bridge;
@@ -95,7 +96,10 @@ enum Command {
     },
     Plugins(compat_cmd::CompatArgs),
     Curator(compat_cmd::CompatArgs),
-    Memory(compat_cmd::CompatArgs),
+    Memory {
+        #[command(subcommand)]
+        command: Option<memory_cmd::MemoryCommand>,
+    },
     Mcp(compat_cmd::CompatArgs),
     Insights(insights_cmd::InsightsArgs),
     Claw {
@@ -312,7 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
         Command::Plugins(args) => compat_cmd::print_plugins(args)?,
         Command::Curator(args) => compat_cmd::print_curator(args)?,
-        Command::Memory(args) => compat_cmd::print_memory(args)?,
+        Command::Memory { command } => memory_cmd::print_memory(&context, &config, command)?,
         Command::Mcp(args) => compat_cmd::print_mcp(args)?,
         Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
         Command::Claw { command } => claw_cmd::print_claw(command)?,
