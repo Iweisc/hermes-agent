@@ -6,6 +6,7 @@ mod claw_cmd;
 mod compat_cmd;
 mod completion;
 mod config_cmd;
+mod curator_cmd;
 mod dashboard_cmd;
 mod debug;
 mod doctor;
@@ -105,7 +106,10 @@ enum Command {
         #[command(subcommand)]
         command: Option<plugins_cmd::PluginsCommand>,
     },
-    Curator(compat_cmd::CompatArgs),
+    Curator {
+        #[command(subcommand)]
+        command: Option<curator_cmd::CuratorCommand>,
+    },
     Memory {
         #[command(subcommand)]
         command: Option<memory_cmd::MemoryCommand>,
@@ -328,7 +332,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
         Command::Plugins { command } => plugins_cmd::print_plugins(&context, command)?,
-        Command::Curator(args) => compat_cmd::print_curator(args)?,
+        Command::Curator { command } => curator_cmd::print_curator(&context, command)?,
         Command::Memory { command } => memory_cmd::print_memory(&context, &config, command)?,
         Command::Mcp { command } => mcp_cmd::print_mcp(&context, command)?,
         Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
