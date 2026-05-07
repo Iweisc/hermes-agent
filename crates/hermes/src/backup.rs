@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -7,10 +8,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use clap::Args;
 use hermes_core::HermesContext;
 use rusqlite::{Connection, DatabaseName, OpenFlags};
+use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -25,11 +27,30 @@ const EXCLUDED_DIRS: &[&str] = &[
 const EXCLUDED_SUFFIXES: &[&str] = &[".pyc", ".pyo", ".db-wal", ".db-shm", ".db-journal"];
 const EXCLUDED_NAMES: &[&str] = &["gateway.pid", "cron.pid"];
 const SECRET_FILE_NAMES: &[&str] = &[".env", "auth.json", "state.db"];
+const QUICK_STATE_FILES: &[&str] = &[
+    "state.db",
+    "config.yaml",
+    ".env",
+    "auth.json",
+    "cron/jobs.json",
+    "gateway_state.json",
+    "channel_directory.json",
+    "processes.json",
+    "pairing",
+    "platforms/pairing",
+    "feishu_comment_pairing.json",
+];
+const QUICK_SNAPSHOTS_DIR: &str = "state-snapshots";
+pub(crate) const QUICK_DEFAULT_KEEP: usize = 20;
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[arg(long, short = 'q')]
+    pub quick: bool,
+    #[arg(long, short = 'l')]
+    pub label: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -39,7 +60,20 @@ pub struct ImportArgs {
     pub force: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickSnapshotManifest {
+    pub id: String,
+    pub timestamp: String,
+    pub label: Option<String>,
+    pub file_count: usize,
+    pub total_size: u64,
+    pub files: BTreeMap<String, u64>,
+}
+
 pub fn print_backup(context: &HermesContext, args: BackupArgs) -> Result<(), Box<dyn Error>> {
+    if args.quick {
+        return print_quick_backup(context, args.label.as_deref());
+    }
     let root = context.default_hermes_root();
     if !root.is_dir() {
         return Err(format!("Hermes home directory not found at {}", root.display()).into());
@@ -139,6 +173,27 @@ pub fn print_backup(context: &HermesContext, args: BackupArgs) -> Result<(), Box
     }
 
     println!("\nRestore with: hermes import {}", out_path.display());
+    Ok(())
+}
+
+pub fn print_quick_backup(
+    context: &HermesContext,
+    label: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let snap_id = create_quick_snapshot(context, label)?;
+    if let Some(id) = snap_id {
+        println!("State snapshot created: {id}");
+        let snapshots = list_quick_snapshots(context, QUICK_DEFAULT_KEEP)?;
+        println!(
+            "  {} snapshot(s) stored in {}/{}",
+            snapshots.len(),
+            display_path(context, &context.hermes_home()),
+            QUICK_SNAPSHOTS_DIR
+        );
+        println!("  Restore with: hermes snapshot restore {id}");
+    } else {
+        println!("No state files found to snapshot.");
+    }
     Ok(())
 }
 
@@ -242,6 +297,183 @@ pub fn print_import(context: &HermesContext, args: ImportArgs) -> Result<(), Box
     Ok(())
 }
 
+pub fn create_quick_snapshot(
+    context: &HermesContext,
+    label: Option<&str>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let home = context.hermes_home();
+    let root = quick_snapshot_root(context);
+    fs::create_dir_all(&root)?;
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let label = validate_snapshot_label(label)?;
+    let snapshot_id = label
+        .as_deref()
+        .map(|value| format!("{timestamp}-{value}"))
+        .unwrap_or(timestamp.clone());
+    let snapshot_dir = root.join(&snapshot_id);
+    fs::create_dir_all(&snapshot_dir)?;
+
+    let mut manifest_files = BTreeMap::new();
+    for relative in QUICK_STATE_FILES {
+        let source = home.join(relative);
+        if !source.exists() {
+            continue;
+        }
+        if source.is_dir() {
+            copy_quick_snapshot_dir(&home, &source, &snapshot_dir, &mut manifest_files)?;
+            continue;
+        }
+        if !source.is_file() {
+            continue;
+        }
+        quick_snapshot_copy_file(&home, &source, &snapshot_dir, &mut manifest_files)?;
+    }
+
+    if manifest_files.is_empty() {
+        fs::remove_dir_all(&snapshot_dir)?;
+        return Ok(None);
+    }
+
+    let manifest = QuickSnapshotManifest {
+        id: snapshot_id.clone(),
+        timestamp,
+        label,
+        file_count: manifest_files.len(),
+        total_size: manifest_files.values().sum(),
+        files: manifest_files,
+    };
+    let manifest_path = snapshot_dir.join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+
+    let _ = prune_quick_snapshots(context, QUICK_DEFAULT_KEEP);
+    Ok(Some(snapshot_id))
+}
+
+pub fn list_quick_snapshots(
+    context: &HermesContext,
+    limit: usize,
+) -> Result<Vec<QuickSnapshotManifest>, Box<dyn Error>> {
+    let root = quick_snapshot_root(context);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.reverse();
+
+    let mut snapshots = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        let fallback_id = entry.file_name().to_string_lossy().to_string();
+        let manifest = match fs::read(&manifest_path) {
+            Ok(bytes) => serde_json::from_slice::<QuickSnapshotManifest>(&bytes).unwrap_or(
+                QuickSnapshotManifest {
+                    id: fallback_id,
+                    timestamp: String::new(),
+                    label: None,
+                    file_count: 0,
+                    total_size: 0,
+                    files: BTreeMap::new(),
+                },
+            ),
+            Err(_) => QuickSnapshotManifest {
+                id: fallback_id,
+                timestamp: String::new(),
+                label: None,
+                file_count: 0,
+                total_size: 0,
+                files: BTreeMap::new(),
+            },
+        };
+        snapshots.push(manifest);
+        if snapshots.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(snapshots)
+}
+
+pub fn restore_quick_snapshot(
+    context: &HermesContext,
+    snapshot_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let snapshot_id = validate_snapshot_id(snapshot_id)?;
+    let home = context.hermes_home();
+    let manifest_path = quick_snapshot_root(context)
+        .join(&snapshot_id)
+        .join("manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(false);
+    }
+
+    let manifest: QuickSnapshotManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let snapshot_dir = manifest_path
+        .parent()
+        .ok_or("snapshot manifest has no parent directory")?;
+    let mut restored = 0_usize;
+
+    for relative in manifest.files.keys() {
+        let source = snapshot_dir.join(relative);
+        if !source.exists() {
+            continue;
+        }
+        let target = home.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if target
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("db"))
+        {
+            let temp = unique_temp_path("snapshot-restore", "db");
+            fs::copy(&source, &temp)?;
+            let _ = fs::remove_file(&target);
+            fs::rename(&temp, &target)?;
+        } else {
+            fs::copy(&source, &target)?;
+        }
+        if is_secret_file(&target) {
+            tighten_secret_permissions(&target)?;
+        }
+        restored += 1;
+    }
+
+    Ok(restored > 0)
+}
+
+pub fn prune_quick_snapshots(
+    context: &HermesContext,
+    keep: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let root = quick_snapshot_root(context);
+    if !root.is_dir() {
+        return Ok(0);
+    }
+
+    let mut entries = fs::read_dir(root)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.reverse();
+
+    let mut deleted = 0_usize;
+    for entry in entries.into_iter().skip(keep) {
+        fs::remove_dir_all(entry.path())?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
 fn collect_backup_files(
     root: &Path,
     current: &Path,
@@ -276,6 +508,86 @@ fn collect_backup_files(
         }
     }
     Ok(())
+}
+
+fn quick_snapshot_root(context: &HermesContext) -> PathBuf {
+    context.hermes_home().join(QUICK_SNAPSHOTS_DIR)
+}
+
+fn copy_quick_snapshot_dir(
+    home: &Path,
+    source_dir: &Path,
+    snapshot_dir: &Path,
+    manifest_files: &mut BTreeMap<String, u64>,
+) -> Result<(), Box<dyn Error>> {
+    for entry in source_dir.read_dir()? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            copy_quick_snapshot_dir(home, &path, snapshot_dir, manifest_files)?;
+            continue;
+        }
+        if path.is_file() {
+            quick_snapshot_copy_file(home, &path, snapshot_dir, manifest_files)?;
+        }
+    }
+    Ok(())
+}
+
+fn quick_snapshot_copy_file(
+    home: &Path,
+    source: &Path,
+    snapshot_dir: &Path,
+    manifest_files: &mut BTreeMap<String, u64>,
+) -> Result<(), Box<dyn Error>> {
+    let relative = source.strip_prefix(home)?;
+    let target = snapshot_dir.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("db"))
+    {
+        safe_copy_db(source, &target).map_err(io::Error::other)?;
+    } else {
+        fs::copy(source, &target)?;
+    }
+    let key = relative.to_string_lossy().replace('\\', "/");
+    let size = fs::metadata(&target)?.len();
+    manifest_files.insert(key, size);
+    Ok(())
+}
+
+fn validate_snapshot_label(label: Option<&str>) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(label) = label.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if label.contains(['/', '\\']) {
+        return Err("snapshot label cannot contain path separators".into());
+    }
+    if label == "." || label == ".." {
+        return Err("snapshot label cannot be '.' or '..'".into());
+    }
+    if label.chars().any(char::is_control) {
+        return Err("snapshot label cannot contain control characters".into());
+    }
+    Ok(Some(label.to_string()))
+}
+
+fn validate_snapshot_id(snapshot_id: &str) -> Result<String, Box<dyn Error>> {
+    let snapshot_id = snapshot_id.trim();
+    if snapshot_id.is_empty() {
+        return Err("snapshot id cannot be empty".into());
+    }
+    if snapshot_id.contains(['/', '\\']) {
+        return Err("snapshot id cannot contain path separators".into());
+    }
+    if snapshot_id == "." || snapshot_id == ".." {
+        return Err("snapshot id is invalid".into());
+    }
+    Ok(snapshot_id.to_string())
 }
 
 fn should_exclude(relative: &Path) -> bool {
@@ -488,7 +800,7 @@ fn unique_temp_path(label: &str, extension: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hermes-rs-{label}-{unique}.{extension}"))
 }
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     let mut size = bytes as f64;
     for unit in ["B", "KB", "MB", "GB"] {
         if size < 1024.0 || unit == "GB" {
@@ -567,6 +879,8 @@ mod tests {
             &source_context,
             BackupArgs {
                 output: Some(archive.clone()),
+                quick: false,
+                label: None,
             },
         )
         .unwrap();
@@ -607,6 +921,64 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn quick_snapshot_create_list_restore_and_prune() {
+        let home = TempDir::new().unwrap();
+        let context = HermesContext::new(home.path());
+        let root = context.hermes_home().to_path_buf();
+        fs::create_dir_all(root.join("cron")).unwrap();
+        fs::create_dir_all(root.join("platforms/pairing")).unwrap();
+        fs::write(root.join("config.yaml"), "model:\n  provider: auto\n").unwrap();
+        fs::write(root.join(".env"), "OPENAI_API_KEY=one\n").unwrap();
+        fs::write(root.join("cron/jobs.json"), "{\"jobs\":[]}\n").unwrap();
+        fs::write(root.join("platforms/pairing/demo.json"), "{\"ok\":true}\n").unwrap();
+        Connection::open(root.join("state.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE demo (id INTEGER PRIMARY KEY, value TEXT); INSERT INTO demo (value) VALUES ('before');")
+            .unwrap();
+
+        let snapshot_id = create_quick_snapshot(&context, Some("base"))
+            .unwrap()
+            .unwrap();
+        let snapshots = list_quick_snapshots(&context, 20).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, snapshot_id);
+        assert_eq!(snapshots[0].label.as_deref(), Some("base"));
+        assert!(snapshots[0].files.contains_key("config.yaml"));
+        assert!(snapshots[0].files.contains_key("state.db"));
+
+        fs::write(root.join("config.yaml"), "model:\n  provider: changed\n").unwrap();
+        fs::write(root.join(".env"), "OPENAI_API_KEY=two\n").unwrap();
+        Connection::open(root.join("state.db"))
+            .unwrap()
+            .execute_batch("DELETE FROM demo; INSERT INTO demo (value) VALUES ('after');")
+            .unwrap();
+
+        assert!(restore_quick_snapshot(&context, &snapshot_id).unwrap());
+        assert_eq!(
+            fs::read_to_string(root.join("config.yaml")).unwrap(),
+            "model:\n  provider: auto\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(".env")).unwrap(),
+            "OPENAI_API_KEY=one\n"
+        );
+        let db = Connection::open(root.join("state.db")).unwrap();
+        let value: String = db
+            .query_row("SELECT value FROM demo LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "before");
+
+        for label in ["1", "2", "3"] {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            create_quick_snapshot(&context, Some(label)).unwrap();
+        }
+        let deleted = prune_quick_snapshots(&context, 2).unwrap();
+        assert!(deleted >= 2);
+        let remaining = list_quick_snapshots(&context, 20).unwrap();
+        assert_eq!(remaining.len(), 2);
     }
 
     #[test]

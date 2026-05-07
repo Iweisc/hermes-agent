@@ -15,6 +15,7 @@ mod logs;
 mod model_cmd;
 mod python_bridge;
 mod slack_cmd;
+mod snapshot_cmd;
 mod webhook;
 
 use std::error::Error;
@@ -80,7 +81,10 @@ enum Command {
     Dashboard(dashboard_cmd::DashboardArgs),
     Gateway(compat_cmd::CompatArgs),
     Skills(compat_cmd::CompatArgs),
-    Snapshot(compat_cmd::CompatArgs),
+    Snapshot {
+        #[command(subcommand)]
+        command: Option<snapshot_cmd::SnapshotCommand>,
+    },
     Plugins(compat_cmd::CompatArgs),
     Curator(compat_cmd::CompatArgs),
     Memory(compat_cmd::CompatArgs),
@@ -291,7 +295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Gateway(args) => compat_cmd::print_gateway(args)?,
         Command::Skills(args) => compat_cmd::print_skills(args)?,
-        Command::Snapshot(args) => compat_cmd::print_snapshot(args)?,
+        Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
         Command::Plugins(args) => compat_cmd::print_plugins(args)?,
         Command::Curator(args) => compat_cmd::print_curator(args)?,
         Command::Memory(args) => compat_cmd::print_memory(args)?,

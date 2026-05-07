@@ -22,10 +22,6 @@ pub fn print_skills(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("skills", args)
 }
 
-pub fn print_snapshot(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("snapshot", args)
-}
-
 pub fn print_plugins(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("plugins", args)
 }
