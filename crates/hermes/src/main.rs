@@ -6,6 +6,7 @@ mod debug;
 mod doctor;
 mod dump;
 mod hooks;
+mod login_cmd;
 mod logs;
 mod model_cmd;
 mod webhook;
@@ -52,6 +53,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<hooks::HooksCommand>,
     },
+    Login(login_cmd::LoginArgs),
     Model {
         #[command(subcommand)]
         command: Option<model_cmd::ModelCommand>,
@@ -250,6 +252,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
+        Command::Login(args) => login_cmd::print_login(args)?,
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
