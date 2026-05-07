@@ -13,6 +13,13 @@ const AUTH_STORE_VERSION: i64 = 1;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const GOOGLE_OAUTH_CLIENT_ID_ENV: &str = "HERMES_GEMINI_CLIENT_ID";
+const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
+const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
+const GOOGLE_DEFAULT_CLIENT_ID: &str =
+    "000000000000-hermes-placeholder.apps.googleusercontent.com";
+const GOOGLE_DEFAULT_CLIENT_SECRET: &str = "hermes-placeholder-google-client-secret";
 const MINIMAX_OAUTH_REFRESH_SKEW_SECONDS: i64 = 60;
 const DEFAULT_QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
 const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
@@ -29,6 +36,15 @@ struct CodexTokens {
 pub struct MinimaxOAuthRuntimeCredentials {
     pub access_token: String,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleGeminiRuntimeCredentials {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub project_id: String,
+    pub managed_project_id: String,
+    pub email: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +75,16 @@ pub fn resolve_minimax_oauth_runtime_credentials(
     hermes_home: &Path,
 ) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
     resolve_minimax_oauth_runtime_credentials_with_client(hermes_home, &Client::new())
+}
+
+pub fn resolve_google_gemini_runtime_credentials(
+    hermes_home: &Path,
+) -> Result<GoogleGeminiRuntimeCredentials, HermesError> {
+    resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
+        hermes_home,
+        &Client::new(),
+        GOOGLE_OAUTH_TOKEN_URL,
+    )
 }
 
 pub fn resolve_qwen_runtime_credentials() -> Result<QwenRuntimeCredentials, HermesError> {
@@ -209,6 +235,10 @@ fn qwen_cli_auth_path() -> Result<std::path::PathBuf, HermesError> {
     Ok(home.join(".qwen").join("oauth_creds.json"))
 }
 
+fn google_oauth_path(hermes_home: &Path) -> std::path::PathBuf {
+    hermes_home.join("auth").join("google_oauth.json")
+}
+
 fn persist_codex_tokens(
     auth_path: &Path,
     auth_store: &mut Value,
@@ -339,6 +369,26 @@ fn persist_qwen_tokens(auth_path: &Path, tokens: &Value) -> Result<(), HermesErr
         action: "serializing Qwen OAuth credentials",
         detail: error.to_string(),
     })?;
+    if let Some(parent) = auth_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| HermesError::Io {
+            action: "creating",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(auth_path, format!("{payload}\n")).map_err(|source| HermesError::Io {
+        action: "writing",
+        path: auth_path.to_path_buf(),
+        source,
+    })
+}
+
+fn persist_google_state(auth_path: &Path, state: &GoogleOAuthState) -> Result<(), HermesError> {
+    let payload =
+        serde_json::to_string_pretty(&state.to_json()).map_err(|error| HermesError::State {
+            action: "serializing Google OAuth credentials",
+            detail: error.to_string(),
+        })?;
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent).map_err(|source| HermesError::Io {
             action: "creating",
@@ -565,6 +615,289 @@ fn refresh_minimax_oauth_state(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoogleRefreshParts {
+    refresh_token: String,
+    project_id: String,
+    managed_project_id: String,
+}
+
+impl GoogleRefreshParts {
+    fn parse(packed: &str) -> Self {
+        if packed.trim().is_empty() {
+            return Self {
+                refresh_token: String::new(),
+                project_id: String::new(),
+                managed_project_id: String::new(),
+            };
+        }
+        let mut parts = packed.splitn(3, '|');
+        Self {
+            refresh_token: parts.next().unwrap_or_default().trim().to_string(),
+            project_id: parts.next().unwrap_or_default().trim().to_string(),
+            managed_project_id: parts.next().unwrap_or_default().trim().to_string(),
+        }
+    }
+
+    fn format(&self) -> String {
+        if self.refresh_token.trim().is_empty() {
+            return String::new();
+        }
+        if self.project_id.trim().is_empty() && self.managed_project_id.trim().is_empty() {
+            return self.refresh_token.clone();
+        }
+        format!(
+            "{}|{}|{}",
+            self.refresh_token, self.project_id, self.managed_project_id
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoogleOAuthState {
+    access_token: String,
+    refresh_token: String,
+    expires_ms: i64,
+    email: String,
+    project_id: String,
+    managed_project_id: String,
+}
+
+impl GoogleOAuthState {
+    fn from_json(value: &Value) -> Result<Self, HermesError> {
+        let object = value.as_object().ok_or_else(|| HermesError::State {
+            action: "parsing Google OAuth credentials",
+            detail: "google_oauth.json does not contain a JSON object.".to_string(),
+        })?;
+        let refresh = GoogleRefreshParts::parse(
+            object
+                .get("refresh")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        Ok(Self {
+            access_token: object
+                .get("access")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            refresh_token: refresh.refresh_token,
+            expires_ms: object
+                .get("expires")
+                .and_then(value_to_i64)
+                .unwrap_or_default(),
+            email: object
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            project_id: refresh.project_id,
+            managed_project_id: refresh.managed_project_id,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "refresh": GoogleRefreshParts {
+                refresh_token: self.refresh_token.clone(),
+                project_id: self.project_id.clone(),
+                managed_project_id: self.managed_project_id.clone(),
+            }
+            .format(),
+            "access": self.access_token,
+            "expires": self.expires_ms,
+            "email": self.email,
+        })
+    }
+}
+
+fn resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
+    hermes_home: &Path,
+    client: &Client,
+    refresh_url: &str,
+) -> Result<GoogleGeminiRuntimeCredentials, HermesError> {
+    let auth_path = google_oauth_path(hermes_home);
+    let mut state = load_google_state(&auth_path)?;
+    if google_access_token_needs_refresh(&state) {
+        state = refresh_google_state(client, &auth_path, &state, refresh_url)?;
+    }
+    if state.access_token.trim().is_empty() {
+        return Err(HermesError::State {
+            action: "resolving Google Gemini OAuth auth",
+            detail: format!(
+                "{} is missing an access token. Run `hermes auth add google-gemini-cli` in the Python runtime first.",
+                auth_path.display()
+            ),
+        });
+    }
+    Ok(GoogleGeminiRuntimeCredentials {
+        access_token: state.access_token,
+        refresh_token: state.refresh_token,
+        project_id: state.project_id,
+        managed_project_id: state.managed_project_id,
+        email: state.email,
+    })
+}
+
+pub(crate) fn persist_google_gemini_project_ids(
+    hermes_home: &Path,
+    project_id: &str,
+    managed_project_id: &str,
+) -> Result<(), HermesError> {
+    let auth_path = google_oauth_path(hermes_home);
+    let mut state = load_google_state(&auth_path)?;
+    let project_id = project_id.trim();
+    let managed_project_id = managed_project_id.trim();
+    if project_id.is_empty() && managed_project_id.is_empty() {
+        return Ok(());
+    }
+    if !project_id.is_empty() {
+        state.project_id = project_id.to_string();
+    }
+    if !managed_project_id.is_empty() {
+        state.managed_project_id = managed_project_id.to_string();
+    }
+    persist_google_state(&auth_path, &state)
+}
+
+fn load_google_state(auth_path: &Path) -> Result<GoogleOAuthState, HermesError> {
+    if !auth_path.exists() {
+        return Err(HermesError::State {
+            action: "resolving Google Gemini OAuth auth",
+            detail: format!(
+                "Google OAuth credentials not found at {}. Run `hermes auth add google-gemini-cli` in the Python runtime first.",
+                auth_path.display()
+            ),
+        });
+    }
+    let raw = fs::read_to_string(auth_path).map_err(|source| HermesError::Io {
+        action: "reading",
+        path: auth_path.to_path_buf(),
+        source,
+    })?;
+    let parsed = serde_json::from_str::<Value>(&raw).map_err(|error| HermesError::State {
+        action: "parsing Google OAuth credentials",
+        detail: format!("{}: {error}", auth_path.display()),
+    })?;
+    GoogleOAuthState::from_json(&parsed)
+}
+
+fn google_access_token_needs_refresh(state: &GoogleOAuthState) -> bool {
+    if state.access_token.trim().is_empty() || state.expires_ms <= 0 {
+        return true;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    now_ms >= state.expires_ms - (GOOGLE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS * 1000)
+}
+
+fn refresh_google_state(
+    client: &Client,
+    auth_path: &Path,
+    state: &GoogleOAuthState,
+    refresh_url: &str,
+) -> Result<GoogleOAuthState, HermesError> {
+    if state.refresh_token.trim().is_empty() {
+        return Err(HermesError::State {
+            action: "refreshing Google Gemini OAuth auth",
+            detail:
+                "Google OAuth refresh token missing. Run `hermes auth add google-gemini-cli` in the Python runtime again."
+                    .to_string(),
+        });
+    }
+    let client_id = std::env::var(GOOGLE_OAUTH_CLIENT_ID_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| GOOGLE_DEFAULT_CLIENT_ID.to_string());
+    let client_secret = std::env::var(GOOGLE_OAUTH_CLIENT_SECRET_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| GOOGLE_DEFAULT_CLIENT_SECRET.to_string());
+
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", state.refresh_token.as_str()),
+        ("client_id", client_id.as_str()),
+    ];
+    if !client_secret.trim().is_empty() {
+        form.push(("client_secret", client_secret.as_str()));
+    }
+
+    let response = client
+        .post(refresh_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .map_err(|error| HermesError::State {
+            action: "refreshing Google Gemini OAuth auth",
+            detail: error.to_string(),
+        })?;
+    let status = response.status();
+    let body = response.text().map_err(|error| HermesError::State {
+        action: "reading Google Gemini OAuth refresh response",
+        detail: error.to_string(),
+    })?;
+    if !status.is_success() {
+        let detail = body.trim();
+        return Err(HermesError::State {
+            action: "refreshing Google Gemini OAuth auth",
+            detail: if detail.is_empty() {
+                "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli` in the Python runtime."
+                    .to_string()
+            } else {
+                format!(
+                    "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli` in the Python runtime. Response: {detail}"
+                )
+            },
+        });
+    }
+    let payload = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Google Gemini OAuth refresh response",
+        detail: format!("{error}: {body}"),
+    })?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HermesError::State {
+            action: "refreshing Google Gemini OAuth auth",
+            detail: "Google OAuth refresh response was missing access_token.".to_string(),
+        })?;
+    let expires_in_seconds = payload
+        .get("expires_in")
+        .and_then(value_to_i64)
+        .filter(|value| *value > 0)
+        .unwrap_or(3600);
+    let refreshed = GoogleOAuthState {
+        access_token: access_token.to_string(),
+        refresh_token: payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&state.refresh_token)
+            .to_string(),
+        expires_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0)
+            + expires_in_seconds * 1000,
+        email: state.email.clone(),
+        project_id: state.project_id.clone(),
+        managed_project_id: state.managed_project_id.clone(),
+    };
+    persist_google_state(auth_path, &refreshed)?;
+    Ok(refreshed)
+}
+
 fn resolve_qwen_runtime_credentials_from_path(
     auth_path: &Path,
     client: &Client,
@@ -787,6 +1120,11 @@ fn value_to_i64(value: &Value) -> Option<i64> {
         })
 }
 
+fn non_empty_trimmed(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn token_expiry(access_token: &str) -> Option<i64> {
     decode_jwt_claims(access_token)
         .and_then(|claims| claims.get("exp").and_then(Value::as_i64))
@@ -1003,6 +1341,109 @@ mod tests {
         let resolved = resolve_minimax_oauth_runtime_credentials(temp.path()).unwrap();
         assert_eq!(resolved.access_token, "mini-fresh");
         assert_eq!(resolved.base_url, "https://api.minimax.io/anthropic");
+    }
+
+    #[test]
+    fn resolve_google_gemini_runtime_credentials_reads_fresh_state() {
+        let temp = TempDir::new().unwrap();
+        let auth_dir = temp.path().join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh|proj-123|managed-456",
+                "access": "google-fresh",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = resolve_google_gemini_runtime_credentials(temp.path()).unwrap();
+        assert_eq!(resolved.access_token, "google-fresh");
+        assert_eq!(resolved.refresh_token, "google-refresh");
+        assert_eq!(resolved.project_id, "proj-123");
+        assert_eq!(resolved.managed_project_id, "managed-456");
+        assert_eq!(resolved.email, "dev@example.com");
+    }
+
+    #[test]
+    fn resolve_google_gemini_runtime_credentials_refreshes_expired_state() {
+        let temp = TempDir::new().unwrap();
+        let auth_dir = temp.path().join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh-old|proj-old|managed-old",
+                "access": "google-old",
+                "expires": 1,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=google-refresh-old"));
+            assert!(request_text.contains(&format!("client_id={GOOGLE_DEFAULT_CLIENT_ID}")));
+            assert!(request_text.contains(&format!("client_secret={GOOGLE_DEFAULT_CLIENT_SECRET}")));
+
+            let body = json!({
+                "access_token": "google-new",
+                "refresh_token": "google-refresh-new",
+                "expires_in": 7200,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
+            temp.path(),
+            &client,
+            &format!("http://{addr}/token"),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.access_token, "google-new");
+        assert_eq!(resolved.refresh_token, "google-refresh-new");
+        assert_eq!(resolved.project_id, "proj-old");
+        assert_eq!(resolved.managed_project_id, "managed-old");
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_dir.join("google_oauth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["access"], "google-new");
+        assert_eq!(
+            persisted["refresh"],
+            "google-refresh-new|proj-old|managed-old"
+        );
     }
 
     #[test]

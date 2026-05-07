@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -17,6 +18,17 @@ use crate::{
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
 const MAX_HTTP_ERROR_BODY_CHARS: usize = 4000;
 const KANBAN_GUIDANCE: &str = "# Kanban task execution protocol\nUse kanban_show first to orient on the assigned task. Work inside HERMES_KANBAN_WORKSPACE unless the task explicitly requires otherwise. Heartbeat during long-running work, block when you need human input you cannot infer, and finish with kanban_complete(summary=..., metadata=...) or kanban_block(reason=...). Use kanban_create for real follow-up work instead of silently scope-creeping into it.";
+const GOOGLE_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_CODE_ASSIST_FALLBACK_ENDPOINTS: &[&str] = &[
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://autopush-cloudcode-pa.sandbox.googleapis.com",
+];
+const GOOGLE_CODE_ASSIST_BASE_URL_ENV: &str = "HERMES_GOOGLE_CODE_ASSIST_BASE_URL";
+const GOOGLE_CODE_ASSIST_CONTROL_USER_AGENT: &str = "google-api-nodejs-client/9.15.1 (gzip)";
+const GOOGLE_CODE_ASSIST_CONTROL_API_CLIENT: &str = "gl-node/24.0.0";
+const GOOGLE_CODE_ASSIST_INFERENCE_USER_AGENT: &str = "hermes-agent (gemini-cli-compat)";
+const GOOGLE_CODE_ASSIST_INFERENCE_API_CLIENT: &str = "gl-python/hermes";
+const GOOGLE_CODE_ASSIST_FREE_TIER_ID: &str = "free-tier";
 const QWEN_CODE_VERSION: &str = "0.14.1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +497,9 @@ fn send_chat_completion(
     tools: &[crate::ToolDefinition],
     session_id: Option<&str>,
 ) -> Result<NormalizedAssistantResponse, HermesError> {
+    if is_google_gemini_cli_runtime(runtime_model) {
+        return send_google_gemini_chat_completion(client, runtime_model, messages, tools);
+    }
     let qwen_messages = prepare_qwen_messages(messages);
     let request_messages = if is_qwen_portal_runtime(runtime_model) {
         &qwen_messages
@@ -999,6 +1014,782 @@ fn normalize_qwen_content(content: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GoogleProjectContext {
+    project_id: String,
+    managed_project_id: String,
+}
+
+fn is_google_gemini_cli_runtime(runtime_model: &crate::ModelRuntimeConfig) -> bool {
+    runtime_model.provider == "google-gemini-cli"
+        || runtime_model
+            .base_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("cloudcode-pa://")
+}
+
+fn send_google_gemini_chat_completion(
+    client: &Client,
+    runtime_model: &crate::ModelRuntimeConfig,
+    messages: &[Value],
+    tools: &[crate::ToolDefinition],
+) -> Result<NormalizedAssistantResponse, HermesError> {
+    let creds = google_gemini_request_credentials(runtime_model)?;
+    let access_token = if !creds.access_token.trim().is_empty() {
+        creds.access_token.clone()
+    } else {
+        runtime_model.api_key.trim().to_string()
+    };
+    if access_token.trim().is_empty() {
+        return Err(HermesError::State {
+            action: "calling Google Code Assist",
+            detail:
+                "No Google OAuth access token resolved. Run `hermes auth add google-gemini-cli` in the Python runtime first."
+                    .to_string(),
+        });
+    }
+
+    let project_context =
+        resolve_google_project_context(client, runtime_model, &access_token, &creds)?;
+    let request = build_google_gemini_request(messages, tools);
+    let wrapped = json!({
+        "project": project_context.project_id,
+        "model": runtime_model.model,
+        "user_prompt_id": format!("{:x}", unix_ts_nanos()),
+        "request": request,
+    });
+    let url = format!(
+        "{}/v1internal:generateContent",
+        google_code_assist_primary_base_url().trim_end_matches('/')
+    );
+    let response = client.post(&url).json(&wrapped);
+    let response = apply_google_code_assist_headers(
+        response,
+        runtime_model,
+        &access_token,
+        &runtime_model.model,
+        false,
+    )?
+    .send()
+    .map_err(|error| HermesError::State {
+        action: "calling Google Code Assist",
+        detail: error.to_string(),
+    })?;
+    let body = read_json_response(response, "calling Google Code Assist")?;
+    let parsed = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Google Code Assist response",
+        detail: format!("{error}: {body}"),
+    })?;
+    normalize_google_gemini_response(&parsed)
+}
+
+fn google_gemini_request_credentials(
+    runtime_model: &crate::ModelRuntimeConfig,
+) -> Result<crate::GoogleGeminiRuntimeCredentials, HermesError> {
+    let hermes_home = crate::HermesContext::detect().hermes_home();
+    match crate::resolve_google_gemini_runtime_credentials(&hermes_home) {
+        Ok(creds) => Ok(creds),
+        Err(error) if !runtime_model.api_key.trim().is_empty() => {
+            log::warn!(target: "run_agent", "google oauth state unavailable, falling back to runtime token: {error}");
+            Ok(crate::GoogleGeminiRuntimeCredentials {
+                access_token: runtime_model.api_key.clone(),
+                refresh_token: String::new(),
+                project_id: String::new(),
+                managed_project_id: String::new(),
+                email: String::new(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_google_project_context(
+    client: &Client,
+    runtime_model: &crate::ModelRuntimeConfig,
+    access_token: &str,
+    creds: &crate::GoogleGeminiRuntimeCredentials,
+) -> Result<GoogleProjectContext, HermesError> {
+    if let Some(project_id) = google_project_id_from_env() {
+        return Ok(GoogleProjectContext {
+            project_id,
+            managed_project_id: String::new(),
+        });
+    }
+    if !creds.project_id.trim().is_empty() {
+        return Ok(GoogleProjectContext {
+            project_id: creds.project_id.clone(),
+            managed_project_id: creds.managed_project_id.clone(),
+        });
+    }
+
+    let mut last_error = None;
+    for endpoint in google_code_assist_probe_base_urls() {
+        match load_google_code_assist(client, &endpoint, access_token, &runtime_model.model) {
+            Ok((tier_id, project_id)) => {
+                let context = if project_id.trim().is_empty() && tier_id.trim().is_empty() {
+                    onboard_google_code_assist(
+                        client,
+                        &endpoint,
+                        access_token,
+                        &runtime_model.model,
+                    )?
+                } else {
+                    GoogleProjectContext {
+                        project_id: project_id.clone(),
+                        managed_project_id: if tier_id == GOOGLE_CODE_ASSIST_FREE_TIER_ID {
+                            project_id
+                        } else {
+                            String::new()
+                        },
+                    }
+                };
+                if !context.project_id.trim().is_empty()
+                    || !context.managed_project_id.trim().is_empty()
+                {
+                    let hermes_home = crate::HermesContext::detect().hermes_home();
+                    if let Err(error) = crate::auth::persist_google_gemini_project_ids(
+                        &hermes_home,
+                        &context.project_id,
+                        &context.managed_project_id,
+                    ) {
+                        log::warn!(target: "run_agent", "google project persistence skipped: {error}");
+                    }
+                }
+                return Ok(context);
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| HermesError::State {
+        action: "resolving Google Code Assist project",
+        detail: "Code Assist project discovery failed.".to_string(),
+    }))
+}
+
+fn google_project_id_from_env() -> Option<String> {
+    for key in [
+        "HERMES_GEMINI_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_PROJECT_ID",
+    ] {
+        if let Some(value) = env::var(key).ok().as_deref().and_then(non_empty_trimmed) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn google_code_assist_primary_base_url() -> String {
+    env::var(GOOGLE_CODE_ASSIST_BASE_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| GOOGLE_CODE_ASSIST_ENDPOINT.to_string())
+}
+
+fn google_code_assist_probe_base_urls() -> Vec<String> {
+    if let Some(override_url) = env::var(GOOGLE_CODE_ASSIST_BASE_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+    {
+        return vec![override_url];
+    }
+    let mut urls = Vec::with_capacity(1 + GOOGLE_CODE_ASSIST_FALLBACK_ENDPOINTS.len());
+    urls.push(GOOGLE_CODE_ASSIST_ENDPOINT.to_string());
+    urls.extend(
+        GOOGLE_CODE_ASSIST_FALLBACK_ENDPOINTS
+            .iter()
+            .map(|endpoint| (*endpoint).to_string()),
+    );
+    urls
+}
+
+fn google_code_assist_metadata(project_id: &str) -> Value {
+    json!({
+        "duetProject": project_id,
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    })
+}
+
+fn load_google_code_assist(
+    client: &Client,
+    endpoint: &str,
+    access_token: &str,
+    model: &str,
+) -> Result<(String, String), HermesError> {
+    let payload = json!({
+        "metadata": google_code_assist_metadata(""),
+    });
+    let response = client
+        .post(format!(
+            "{}/v1internal:loadCodeAssist",
+            endpoint.trim_end_matches('/')
+        ))
+        .json(&payload);
+    let response = apply_google_code_assist_headers(
+        response,
+        &empty_google_runtime_model(),
+        access_token,
+        model,
+        true,
+    )?
+    .send()
+    .map_err(|error| HermesError::State {
+        action: "loading Google Code Assist account state",
+        detail: error.to_string(),
+    })?;
+    let body = read_json_response(response, "loading Google Code Assist account state")?;
+    let parsed = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Google Code Assist account state",
+        detail: format!("{error}: {body}"),
+    })?;
+    let tier_id = parsed
+        .get("currentTier")
+        .and_then(Value::as_object)
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let project_id = parsed
+        .get("cloudaicompanionProject")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok((tier_id, project_id))
+}
+
+fn onboard_google_code_assist(
+    client: &Client,
+    endpoint: &str,
+    access_token: &str,
+    model: &str,
+) -> Result<GoogleProjectContext, HermesError> {
+    let payload = json!({
+        "tierId": GOOGLE_CODE_ASSIST_FREE_TIER_ID,
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        },
+    });
+    let response = client
+        .post(format!(
+            "{}/v1internal:onboardUser",
+            endpoint.trim_end_matches('/')
+        ))
+        .json(&payload);
+    let response = apply_google_code_assist_headers(
+        response,
+        &empty_google_runtime_model(),
+        access_token,
+        model,
+        true,
+    )?
+    .send()
+    .map_err(|error| HermesError::State {
+        action: "onboarding Google Code Assist account",
+        detail: error.to_string(),
+    })?;
+    let body = read_json_response(response, "onboarding Google Code Assist account")?;
+    let parsed = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+        action: "decoding Google Code Assist onboarding response",
+        detail: format!("{error}: {body}"),
+    })?;
+    let project_id = parsed
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("cloudaicompanionProject"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(GoogleProjectContext {
+        managed_project_id: project_id.clone(),
+        project_id,
+    })
+}
+
+fn build_google_gemini_request(messages: &[Value], tools: &[crate::ToolDefinition]) -> Value {
+    let (contents, system_instruction) = build_google_gemini_contents(messages);
+    let mut request = json!({
+        "contents": contents,
+    });
+    if let Some(system_instruction) = system_instruction {
+        request["systemInstruction"] = system_instruction;
+    }
+    let translated_tools = translate_google_gemini_tools(tools);
+    if !translated_tools.is_empty() {
+        request["tools"] = Value::Array(translated_tools);
+        request["toolConfig"] = json!({
+            "functionCallingConfig": {
+                "mode": "AUTO",
+            }
+        });
+    }
+    request
+}
+
+fn build_google_gemini_contents(messages: &[Value]) -> (Vec<Value>, Option<Value>) {
+    let mut system_parts = Vec::new();
+    let mut contents = Vec::new();
+    let mut tool_call_names = HashMap::<String, String>::new();
+
+    for message in messages {
+        let Some(object) = message.as_object() else {
+            continue;
+        };
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .trim();
+
+        if role == "system" {
+            let text = coerce_google_gemini_text(object.get("content"));
+            if !text.is_empty() {
+                system_parts.push(text);
+            }
+            continue;
+        }
+
+        if role == "tool" || role == "function" {
+            let tool_call_id = object
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                })
+                .map(ToOwned::to_owned)
+                .or_else(|| tool_call_names.get(tool_call_id).cloned())
+                .unwrap_or_else(|| {
+                    if tool_call_id.is_empty() {
+                        "tool".to_string()
+                    } else {
+                        tool_call_id.to_string()
+                    }
+                });
+            let content = coerce_google_gemini_text(object.get("content"));
+            let response = parse_google_tool_result_payload(&content);
+            contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": name,
+                        "response": response,
+                    }
+                }]
+            }));
+            continue;
+        }
+
+        let mut parts = Vec::new();
+        let text = coerce_google_gemini_text(object.get("content"));
+        if !text.is_empty() {
+            parts.push(json!({ "text": text }));
+        }
+        if role == "assistant"
+            && let Some(tool_calls) = object.get("tool_calls").and_then(Value::as_array)
+        {
+            for tool_call in tool_calls {
+                let Some(tool_object) = tool_call.as_object() else {
+                    continue;
+                };
+                let function = tool_object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(tool_id) = tool_object.get("id").and_then(Value::as_str)
+                    && !tool_id.trim().is_empty()
+                {
+                    tool_call_names.insert(tool_id.trim().to_string(), name.clone());
+                }
+                let arguments = function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .map(parse_google_tool_arguments)
+                    .unwrap_or_else(|| json!({}));
+                parts.push(json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": arguments,
+                    },
+                    "thoughtSignature": "skip_thought_signature_validator",
+                }));
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        contents.push(json!({
+            "role": if role == "assistant" { "model" } else { "user" },
+            "parts": parts,
+        }));
+    }
+
+    let system_instruction = (!system_parts.is_empty()).then(|| {
+        json!({
+            "role": "system",
+            "parts": [{
+                "text": system_parts.join("\n"),
+            }]
+        })
+    });
+    (contents, system_instruction)
+}
+
+fn coerce_google_gemini_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(parts) => {
+            let mut pieces = Vec::new();
+            for part in parts {
+                match part {
+                    Value::String(text) => {
+                        if !text.trim().is_empty() {
+                            pieces.push(text.trim().to_string());
+                        }
+                    }
+                    Value::Object(object) => {
+                        let part_type = object
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if matches!(part_type, "text" | "input_text" | "output_text")
+                            && let Some(text) = object.get("text").and_then(Value::as_str)
+                            && !text.trim().is_empty()
+                        {
+                            pieces.push(text.trim().to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            pieces.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn parse_google_tool_arguments(arguments_raw: &str) -> Value {
+    let parsed = serde_json::from_str::<Value>(arguments_raw).unwrap_or_else(|_| json!({}));
+    if parsed.is_object() {
+        parsed
+    } else {
+        json!({ "_value": parsed })
+    }
+}
+
+fn parse_google_tool_result_payload(content: &str) -> Value {
+    let trimmed = content.trim();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+        && parsed.is_object()
+    {
+        return parsed;
+    }
+    json!({ "output": content })
+}
+
+fn translate_google_gemini_tools(tools: &[crate::ToolDefinition]) -> Vec<Value> {
+    let mut declarations = Vec::new();
+    for tool in tools {
+        let mut declaration = Map::new();
+        declaration.insert("name".to_string(), Value::String(tool.name.clone()));
+        if !tool.description.trim().is_empty() {
+            declaration.insert(
+                "description".to_string(),
+                Value::String(tool.description.clone()),
+            );
+        }
+        let parameters = tool
+            .schema
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+        declaration.insert(
+            "parameters".to_string(),
+            sanitize_google_gemini_schema(&parameters),
+        );
+        declarations.push(Value::Object(declaration));
+    }
+    if declarations.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "functionDeclarations": declarations })]
+    }
+}
+
+fn sanitize_google_gemini_schema(schema: &Value) -> Value {
+    const ALLOWED_KEYS: &[&str] = &[
+        "type",
+        "format",
+        "title",
+        "description",
+        "nullable",
+        "enum",
+        "maxItems",
+        "minItems",
+        "properties",
+        "required",
+        "minProperties",
+        "maxProperties",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "example",
+        "anyOf",
+        "propertyOrdering",
+        "default",
+        "items",
+        "minimum",
+        "maximum",
+    ];
+    let Some(object) = schema.as_object() else {
+        return json!({ "type": "object", "properties": {} });
+    };
+    let mut cleaned = Map::new();
+    for (key, value) in object {
+        if !ALLOWED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        match key.as_str() {
+            "properties" => {
+                let Some(properties) = value.as_object() else {
+                    continue;
+                };
+                let mut nested = Map::new();
+                for (prop_name, prop_schema) in properties {
+                    nested.insert(
+                        prop_name.clone(),
+                        sanitize_google_gemini_schema(prop_schema),
+                    );
+                }
+                cleaned.insert(key.clone(), Value::Object(nested));
+            }
+            "items" => {
+                cleaned.insert(key.clone(), sanitize_google_gemini_schema(value));
+            }
+            "anyOf" => {
+                let Some(items) = value.as_array() else {
+                    continue;
+                };
+                cleaned.insert(
+                    key.clone(),
+                    Value::Array(
+                        items
+                            .iter()
+                            .filter(|item| item.is_object())
+                            .map(sanitize_google_gemini_schema)
+                            .collect(),
+                    ),
+                );
+            }
+            _ => {
+                cleaned.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let drop_enum = cleaned
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "integer" | "number" | "boolean"))
+        && cleaned
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| !item.is_string()));
+    if drop_enum {
+        cleaned.remove("enum");
+    }
+    if cleaned.is_empty() {
+        json!({ "type": "object", "properties": {} })
+    } else {
+        Value::Object(cleaned)
+    }
+}
+
+fn normalize_google_gemini_response(
+    response: &Value,
+) -> Result<NormalizedAssistantResponse, HermesError> {
+    let inner = response.get("response").unwrap_or(response);
+    let candidate = inner
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .ok_or_else(|| HermesError::State {
+            action: "parsing Google Code Assist response",
+            detail: format!("Response missing candidates[0]: {response}"),
+        })?;
+
+    let parts = candidate
+        .get("content")
+        .and_then(Value::as_object)
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = Vec::new();
+    let mut reasoning = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for (index, part) in parts.iter().enumerate() {
+        let Some(object) = part.as_object() else {
+            continue;
+        };
+        if object.get("thought").and_then(Value::as_bool) == Some(true) {
+            if let Some(value) = object.get("text").and_then(Value::as_str)
+                && !value.trim().is_empty()
+            {
+                reasoning.push(value.to_string());
+            }
+            continue;
+        }
+        if let Some(value) = object.get("text").and_then(Value::as_str)
+            && !value.trim().is_empty()
+        {
+            text.push(value.to_string());
+        }
+        let Some(function_call) = object.get("functionCall").and_then(Value::as_object) else {
+            continue;
+        };
+        let name = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let args = function_call
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let arguments_raw = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+        tool_calls.push(PendingToolCall {
+            id: format!("call_{:x}_{index}", unix_ts_nanos()),
+            name,
+            arguments_raw,
+            json: if args.is_object() {
+                args
+            } else {
+                json!({ "_value": args })
+            },
+        });
+    }
+
+    let has_tool_calls = !tool_calls.is_empty();
+    Ok(NormalizedAssistantResponse {
+        content: (!text.is_empty()).then(|| text.join("")),
+        tool_calls,
+        finish_reason: Some(map_google_gemini_finish_reason(
+            candidate
+                .get("finishReason")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            has_tool_calls,
+        )),
+        reasoning: (!reasoning.is_empty()).then(|| reasoning.join("")),
+        reasoning_details: None,
+        codex_reasoning_items: None,
+        codex_message_items: None,
+    })
+}
+
+fn map_google_gemini_finish_reason(reason: &str, has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        return "tool_calls".to_string();
+    }
+    match reason.trim().to_ascii_uppercase().as_str() {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        "SAFETY" | "RECITATION" => "content_filter".to_string(),
+        other if !other.is_empty() => other.to_ascii_lowercase(),
+        _ => "stop".to_string(),
+    }
+}
+
+fn apply_google_code_assist_headers(
+    mut request: reqwest::blocking::RequestBuilder,
+    runtime_model: &crate::ModelRuntimeConfig,
+    access_token: &str,
+    model: &str,
+    control_plane: bool,
+) -> Result<reqwest::blocking::RequestBuilder, HermesError> {
+    let user_agent = if control_plane {
+        format!("{GOOGLE_CODE_ASSIST_CONTROL_USER_AGENT} model/{model}")
+    } else {
+        GOOGLE_CODE_ASSIST_INFERENCE_USER_AGENT.to_string()
+    };
+    request = request
+        .header("Content-Type", "application/json")
+        .header(
+            "Accept",
+            if control_plane {
+                "application/json"
+            } else {
+                "application/json"
+            },
+        )
+        .bearer_auth(access_token)
+        .header("User-Agent", user_agent)
+        .header(
+            "X-Goog-Api-Client",
+            if control_plane {
+                GOOGLE_CODE_ASSIST_CONTROL_API_CLIENT
+            } else {
+                GOOGLE_CODE_ASSIST_INFERENCE_API_CLIENT
+            },
+        )
+        .header(
+            "x-activity-request-id",
+            format!("hermes-{:x}", unix_ts_nanos()),
+        );
+    for (name, value) in &runtime_model.default_headers {
+        request = request.header(name, value);
+    }
+    Ok(request)
+}
+
+fn empty_google_runtime_model() -> crate::ModelRuntimeConfig {
+    crate::ModelRuntimeConfig {
+        model: String::new(),
+        provider: "google-gemini-cli".to_string(),
+        base_url: "cloudcode-pa://google".to_string(),
+        api_key: String::new(),
+        api_mode: "chat_completions".to_string(),
+        auth_type: "oauth_external".to_string(),
+        default_headers: Vec::new(),
     }
 }
 
@@ -1734,11 +2525,13 @@ mod tests {
 
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1975,6 +2768,204 @@ mod tests {
         let result = request_model_text(&client, &runtime, &messages).unwrap();
         server.join().unwrap();
         assert_eq!(result.as_deref(), Some("Qwen portal smoke passed."));
+    }
+
+    #[test]
+    fn google_gemini_cli_requests_code_assist_payload_and_persists_project() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_base = env::var_os(GOOGLE_CODE_ASSIST_BASE_URL_ENV);
+
+        let temp = TempDir::new().unwrap();
+        let hermes_home = temp.path().join("hermes-home");
+        fs::create_dir_all(hermes_home.join("auth")).unwrap();
+        fs::write(
+            hermes_home.join("auth").join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh",
+                "access": "google-token",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+
+                let mut content_length = 0usize;
+                let mut auth = String::new();
+                let mut user_agent = String::new();
+                let mut goog_client = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let lower = trimmed.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    } else if lower.starts_with("authorization:") {
+                        auth = trimmed
+                            .split_once(':')
+                            .map(|(_, value)| value.trim().to_string())
+                            .unwrap_or_default();
+                    } else if lower.starts_with("user-agent:") {
+                        user_agent = trimmed
+                            .split_once(':')
+                            .map(|(_, value)| value.trim().to_string())
+                            .unwrap_or_default();
+                    } else if lower.starts_with("x-goog-api-client:") {
+                        goog_client = trimmed
+                            .split_once(':')
+                            .map(|(_, value)| value.trim().to_string())
+                            .unwrap_or_default();
+                    }
+                }
+
+                let mut body = vec![0_u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let payload = serde_json::from_slice::<Value>(&body).unwrap();
+                assert_eq!(auth, "Bearer google-token");
+
+                let response_body = match request_index {
+                    0 => {
+                        assert!(request_line.starts_with("POST /v1internal:loadCodeAssist "));
+                        assert!(user_agent.starts_with(
+                            "google-api-nodejs-client/9.15.1 (gzip) model/gemini-2.5-pro"
+                        ));
+                        assert_eq!(goog_client, "gl-node/24.0.0");
+                        assert_eq!(payload["metadata"]["pluginType"], json!("GEMINI"));
+                        json!({
+                            "currentTier": {},
+                            "cloudaicompanionProject": ""
+                        })
+                    }
+                    1 => {
+                        assert!(request_line.starts_with("POST /v1internal:onboardUser "));
+                        assert!(user_agent.starts_with(
+                            "google-api-nodejs-client/9.15.1 (gzip) model/gemini-2.5-pro"
+                        ));
+                        assert_eq!(goog_client, "gl-node/24.0.0");
+                        assert_eq!(payload["tierId"], json!("free-tier"));
+                        json!({
+                            "response": {
+                                "cloudaicompanionProject": "managed-proj"
+                            }
+                        })
+                    }
+                    _ => {
+                        assert!(request_line.starts_with("POST /v1internal:generateContent "));
+                        assert_eq!(user_agent, "hermes-agent (gemini-cli-compat)");
+                        assert_eq!(goog_client, "gl-python/hermes");
+                        assert_eq!(payload["project"], json!("managed-proj"));
+                        assert_eq!(payload["model"], json!("gemini-2.5-pro"));
+                        assert_eq!(
+                            payload["request"]["systemInstruction"]["parts"][0]["text"],
+                            json!("Be helpful")
+                        );
+                        assert_eq!(payload["request"]["contents"][0]["role"], json!("user"));
+                        assert_eq!(
+                            payload["request"]["contents"][0]["parts"][0]["text"],
+                            json!("hello")
+                        );
+                        assert_eq!(
+                            payload["request"]["tools"][0]["functionDeclarations"][0]["name"],
+                            json!("todo")
+                        );
+                        json!({
+                            "response": {
+                                "candidates": [{
+                                    "content": {
+                                        "parts": [{"text": "Gemini CLI smoke passed."}]
+                                    },
+                                    "finishReason": "STOP"
+                                }]
+                            }
+                        })
+                    }
+                }
+                .to_string();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        unsafe {
+            env::set_var("HERMES_HOME", &hermes_home);
+            env::set_var(GOOGLE_CODE_ASSIST_BASE_URL_ENV, format!("http://{addr}"));
+        }
+
+        let client = build_http_client().unwrap();
+        let runtime = crate::ModelRuntimeConfig {
+            model: "gemini-2.5-pro".to_string(),
+            provider: "google-gemini-cli".to_string(),
+            base_url: "cloudcode-pa://google".to_string(),
+            api_key: "google-token".to_string(),
+            api_mode: "chat_completions".to_string(),
+            auth_type: "oauth_external".to_string(),
+            default_headers: Vec::new(),
+        };
+        let messages = vec![
+            json!({"role": "system", "content": "Be helpful"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let tools = vec![crate::ToolDefinition {
+            name: "todo".to_string(),
+            toolset: "todo".to_string(),
+            description: "Manage a todo list.".to_string(),
+            emoji: "x".to_string(),
+            schema: json!({
+                "name": "todo",
+                "description": "Manage a todo list.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["read", "write"]},
+                        "count": {"type": "integer", "enum": [1, 2]},
+                    }
+                }
+            }),
+        }];
+
+        let result = send_model_request(&client, &runtime, &messages, &tools, None).unwrap();
+        server.join().unwrap();
+
+        match previous_home {
+            Some(value) => unsafe { env::set_var("HERMES_HOME", value) },
+            None => unsafe { env::remove_var("HERMES_HOME") },
+        }
+        match previous_base {
+            Some(value) => unsafe { env::set_var(GOOGLE_CODE_ASSIST_BASE_URL_ENV, value) },
+            None => unsafe { env::remove_var(GOOGLE_CODE_ASSIST_BASE_URL_ENV) },
+        }
+
+        assert_eq!(result.content.as_deref(), Some("Gemini CLI smoke passed."));
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(hermes_home.join("auth").join("google_oauth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["refresh"],
+            json!("google-refresh|managed-proj|managed-proj")
+        );
     }
 
     #[test]

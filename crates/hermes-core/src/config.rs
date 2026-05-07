@@ -9,8 +9,8 @@ use crate::{
     HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
-    resolve_minimax_oauth_runtime_credentials, resolve_provider_api_mode,
-    resolve_qwen_runtime_credentials,
+    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
+    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -446,6 +446,13 @@ impl HermesContext {
         } else {
             None
         };
+        let google_gemini = if provider == "google-gemini-cli" {
+            Some(resolve_google_gemini_runtime_credentials(
+                &self.hermes_home(),
+            )?)
+        } else {
+            None
+        };
         let qwen_oauth = if provider == "qwen-oauth" {
             Some(resolve_qwen_runtime_credentials()?)
         } else {
@@ -474,6 +481,11 @@ impl HermesContext {
             .or(config_api_key)
             .or_else(|| {
                 minimax_oauth
+                    .as_ref()
+                    .map(|creds| creds.access_token.clone())
+            })
+            .or_else(|| {
+                google_gemini
                     .as_ref()
                     .map(|creds| creds.access_token.clone())
             })
@@ -1099,6 +1111,39 @@ mod tests {
         assert_eq!(runtime.api_mode, "anthropic_messages");
         assert_eq!(runtime.api_key, "mini-runtime-token");
         assert_eq!(runtime.base_url, "https://api.minimaxi.com/anthropic");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_google_gemini_oauth_credentials() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::create_dir_all(ctx.hermes_home().join("auth")).expect("auth dir");
+        fs::write(
+            ctx.hermes_home().join("auth").join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh|proj-123|managed-123",
+                "access": "google-runtime-token",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: gemini-2.5-pro\n  provider: google-gemini-cli\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.provider, "google-gemini-cli");
+        assert_eq!(runtime.api_mode, "chat_completions");
+        assert_eq!(runtime.api_key, "google-runtime-token");
+        assert_eq!(runtime.base_url, "cloudcode-pa://google");
     }
 
     #[test]
