@@ -156,7 +156,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
             print_gateway_install(context, args.accept_hooks, install)
         }
         Some(GatewayCommand::Uninstall(args2)) => print_gateway_uninstall(context, args2),
-        Some(GatewayCommand::Setup) => bridge_gateway(args.accept_hooks, &[String::from("setup")]),
+        Some(GatewayCommand::Setup) => print_gateway_setup(args.accept_hooks),
         Some(GatewayCommand::MigrateLegacy(args2)) => print_gateway_migrate_legacy(context, args2),
     }
 }
@@ -607,6 +607,32 @@ const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     "    quiet=os.environ.get('HERMES_GATEWAY_QUIET') == '1',\n",
     "    replace=os.environ.get('HERMES_GATEWAY_REPLACE') == '1',\n",
     ")\n",
+);
+
+fn print_gateway_setup(accept_hooks: bool) -> Result<(), Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
+        .ok_or("could not find a Python interpreter for gateway setup")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string());
+    if accept_hooks {
+        command.env("HERMES_ACCEPT_HOOKS", "1");
+    }
+    command.arg("-c").arg(GATEWAY_SETUP_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("gateway", status).into())
+}
+
+const GATEWAY_SETUP_BOOTSTRAP: &str = concat!(
+    "from hermes_cli.gateway import gateway_setup\n",
+    "gateway_setup()\n",
 );
 
 fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
@@ -1979,6 +2005,41 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("accept=1 verbose=2 quiet=1 replace=1"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_setup_uses_python_override_and_accept_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'setup accept=%s\\n' \"$HERMES_ACCEPT_HOOKS\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        print_gateway_setup(true).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("setup accept=1"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
