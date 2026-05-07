@@ -1,5 +1,6 @@
 mod auth_cmd;
 mod backup;
+mod completion;
 mod config_cmd;
 mod debug;
 mod doctor;
@@ -28,6 +29,8 @@ use hermes_core::{
 #[derive(Parser, Debug)]
 #[command(name = "hermes", version, about = "Hermes Rust bootstrap")]
 struct Cli {
+    #[arg(short = 'p', long = "profile", global = true)]
+    _profile: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -42,6 +45,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<debug::DebugCommand>,
     },
+    Completion(completion::CompletionArgs),
     Logout(auth_cmd::LogoutArgs),
     Auth {
         #[command(subcommand)]
@@ -230,6 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             doctor::print_doctor(&context, &env_report, &config, &session_store, args)?
         }
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
+        Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
