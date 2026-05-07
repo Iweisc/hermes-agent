@@ -368,7 +368,7 @@ fn ensure_dashboard_python_dependencies(
     Err("dashboard dependencies are missing".into())
 }
 
-fn ensure_dashboard_web_ui(project_root: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn ensure_dashboard_web_ui(project_root: &Path) -> Result<(), Box<dyn Error>> {
     if env::var_os("HERMES_WEB_DIST").is_some() {
         return Ok(());
     }

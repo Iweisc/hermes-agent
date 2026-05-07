@@ -353,7 +353,7 @@ fn edit_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     Err(format!("editor exited with status {:?}", status.code()).into())
 }
 
-fn migrate_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+pub(crate) fn migrate_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     let created_env = ensure_env_file(&context.env_path())?;
     let created_config = ensure_config_file(&context.config_path())?;
     let mut user_config = read_raw_yaml_mapping(&context.config_path())?;
