@@ -235,7 +235,7 @@ pub fn browser_cdp_schema() -> Value {
                 },
                 "frame_id": {
                     "type": "string",
-                    "description": "Reserved for future supervisor-based iframe routing. Not yet supported in the Rust runtime."
+                    "description": "Optional OOPIF frame target id. When provided, the tool attaches to that iframe target and sends the method on the resulting child session. Do not combine with target_id."
                 },
                 "timeout": {
                     "type": "number",
@@ -747,10 +747,8 @@ pub fn handle_browser_cdp(args: &Value, runtime: &ToolRuntime) -> String {
         Ok(value) => value,
         Err(error) => return browser_error(error),
     };
-    if frame_id.is_some() {
-        return browser_error(
-            "frame_id routing is not ported in the Rust runtime yet. Use target_id with a top-level tab or omit frame_id.",
-        );
+    if target_id.is_some() && frame_id.is_some() {
+        return browser_error("Provide either target_id or frame_id, not both.");
     }
     let timeout_secs = match optional_timeout_seconds(args, "timeout") {
         Ok(value) => value.unwrap_or(DEFAULT_CDP_TIMEOUT_SECS),
@@ -773,11 +771,12 @@ pub fn handle_browser_cdp(args: &Value, runtime: &ToolRuntime) -> String {
         ));
     }
 
+    let attach_target_id = target_id.as_deref().or(frame_id.as_deref());
     let result = match run_cdp_call(
         &endpoint,
         &method,
         Value::Object(params.clone()),
-        target_id.as_deref(),
+        attach_target_id,
         timeout_secs,
     ) {
         Ok(value) => value,
@@ -793,6 +792,11 @@ pub fn handle_browser_cdp(args: &Value, runtime: &ToolRuntime) -> String {
         && let Some(object) = payload.as_object_mut()
     {
         object.insert("target_id".to_string(), Value::String(target_id));
+    }
+    if let Some(frame_id) = frame_id
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("frame_id".to_string(), Value::String(frame_id));
     }
     tool_result(payload)
 }
@@ -1943,6 +1947,107 @@ esac
             None => unsafe { env::remove_var("BROWSER_CDP_URL") },
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn browser_cdp_calls_websocket_endpoint_with_frame_attach() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+
+            let attach = websocket.read().unwrap().into_text().unwrap();
+            let attach_json: Value = serde_json::from_str(&attach).unwrap();
+            assert_eq!(attach_json["method"], json!("Target.attachToTarget"));
+            assert_eq!(attach_json["params"]["targetId"], json!("oopif-frame-1"));
+            let attach_id = attach_json["id"].as_i64().unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": attach_id,
+                        "result": {
+                            "sessionId": "frame-session-1"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+
+            let call = websocket.read().unwrap().into_text().unwrap();
+            let call_json: Value = serde_json::from_str(&call).unwrap();
+            assert_eq!(call_json["method"], json!("Runtime.evaluate"));
+            assert_eq!(call_json["sessionId"], json!("frame-session-1"));
+            assert_eq!(call_json["params"]["expression"], json!("window.origin"));
+            let call_id = call_json["id"].as_i64().unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": call_id,
+                        "result": {
+                            "value": "https://iframe.example"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+        });
+
+        let old_cdp = env::var_os("BROWSER_CDP_URL");
+        unsafe {
+            env::set_var(
+                "BROWSER_CDP_URL",
+                format!("ws://{}/devtools/browser/test", addr),
+            );
+        }
+
+        let runtime = ToolRuntime::default();
+        let result = handle_browser_cdp(
+            &json!({
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": "window.origin"
+                },
+                "frame_id": "oopif-frame-1",
+                "timeout": 5
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["method"], json!("Runtime.evaluate"));
+        assert_eq!(parsed["frame_id"], json!("oopif-frame-1"));
+        assert_eq!(parsed["result"]["value"], json!("https://iframe.example"));
+
+        match old_cdp {
+            Some(value) => unsafe { env::set_var("BROWSER_CDP_URL", value) },
+            None => unsafe { env::remove_var("BROWSER_CDP_URL") },
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn browser_cdp_rejects_target_id_and_frame_id_together() {
+        let runtime = ToolRuntime::default();
+        let result = handle_browser_cdp(
+            &json!({
+                "method": "Runtime.evaluate",
+                "target_id": "page-1",
+                "frame_id": "oopif-frame-1"
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(false));
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("either target_id or frame_id")
+        );
     }
 
     #[test]
