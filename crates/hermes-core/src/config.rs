@@ -1369,6 +1369,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_model_runtime_routes_copilot_claude_to_anthropic_mode() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: anthropic/claude-sonnet-4.6\n  provider: copilot\n  api_key: test-key\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.provider, "copilot");
+        assert_eq!(runtime.model, "claude-sonnet-4.6");
+        assert_eq!(runtime.api_key, "test-key");
+        assert_eq!(runtime.api_mode, "anthropic_messages");
+    }
+
+    #[test]
     fn resolve_model_runtime_reads_qwen_oauth_credentials() {
         let _guard = crate::test_env_lock().lock().expect("env lock");
         let previous_home = env::var_os("HOME");

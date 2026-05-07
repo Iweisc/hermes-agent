@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
@@ -542,6 +543,10 @@ pub fn normalize_model_for_provider(model_input: &str, target_provider: &str) ->
         return bare;
     }
 
+    if provider == "copilot" {
+        return normalize_for_copilot(name);
+    }
+
     if DOT_TO_HYPHEN_PROVIDERS.contains(&provider.as_str()) {
         let bare = strip_matching_provider_prefix(name, &provider);
         if bare.contains('/') {
@@ -603,15 +608,18 @@ fn normalize_for_deepseek(model_name: &str) -> String {
 }
 
 fn copilot_model_api_mode(model_input: &str) -> &'static str {
-    if should_use_copilot_responses_api(model_input) {
+    let normalized = normalize_for_copilot(model_input).to_ascii_lowercase();
+    if should_use_copilot_responses_api(&normalized) {
         "codex_responses"
+    } else if normalized.starts_with("claude-") {
+        "anthropic_messages"
     } else {
         "chat_completions"
     }
 }
 
 fn should_use_copilot_responses_api(model_input: &str) -> bool {
-    let normalized = normalize_model_for_provider(model_input, "copilot").to_ascii_lowercase();
+    let normalized = normalize_for_copilot(model_input).to_ascii_lowercase();
     let Some(rest) = normalized.strip_prefix("gpt-") else {
         return false;
     };
@@ -623,6 +631,78 @@ fn should_use_copilot_responses_api(model_input: &str) -> bool {
         return false;
     };
     major >= 5 && !normalized.starts_with("gpt-5-mini")
+}
+
+fn normalize_for_copilot(model_name: &str) -> String {
+    let raw = model_name.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    if let Some(alias) = copilot_model_alias(raw) {
+        return alias.to_string();
+    }
+
+    let mut candidates = Vec::with_capacity(4);
+    candidates.push(raw.to_string());
+    if let Some((_, tail)) = raw.split_once('/') {
+        let trimmed = tail.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+    for suffix in ["-mini", "-nano", "-chat"] {
+        if let Some(stripped) = raw.strip_suffix(suffix)
+            && !stripped.trim().is_empty()
+        {
+            candidates.push(stripped.trim().to_string());
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if let Some(alias) = copilot_model_alias(&candidate) {
+            return alias.to_string();
+        }
+    }
+
+    raw.split_once('/')
+        .map(|(_, tail)| tail.trim().to_string())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn copilot_model_alias(model_name: &str) -> Option<&'static str> {
+    match model_name {
+        "openai/gpt-5" | "openai/gpt-5-chat" | "openai/gpt-5-mini" | "openai/gpt-5-nano" => {
+            Some("gpt-5-mini")
+        }
+        "openai/gpt-4.1" | "openai/gpt-4.1-mini" | "openai/gpt-4.1-nano" => Some("gpt-4.1"),
+        "openai/gpt-4o" => Some("gpt-4o"),
+        "openai/gpt-4o-mini" => Some("gpt-4o-mini"),
+        "openai/o1" | "openai/o1-preview" => Some("gpt-5.2"),
+        "openai/o1-mini" | "openai/o3-mini" | "openai/o4-mini" => Some("gpt-5-mini"),
+        "openai/o3" => Some("gpt-5.3-codex"),
+        "anthropic/claude-opus-4.6" | "anthropic/claude-opus-4-6" | "claude-opus-4-6" => {
+            Some("claude-opus-4.6")
+        }
+        "anthropic/claude-sonnet-4.6" | "anthropic/claude-sonnet-4-6" | "claude-sonnet-4-6" => {
+            Some("claude-sonnet-4.6")
+        }
+        "anthropic/claude-sonnet-4" | "anthropic/claude-sonnet-4-0" | "claude-sonnet-4-0" => {
+            Some("claude-sonnet-4")
+        }
+        "anthropic/claude-sonnet-4.5" | "anthropic/claude-sonnet-4-5" | "claude-sonnet-4-5" => {
+            Some("claude-sonnet-4.5")
+        }
+        "anthropic/claude-haiku-4.5" | "anthropic/claude-haiku-4-5" | "claude-haiku-4-5" => {
+            Some("claude-haiku-4.5")
+        }
+        _ => None,
+    }
 }
 
 fn azure_foundry_model_api_mode(model_input: &str) -> Option<&'static str> {
@@ -784,6 +864,14 @@ mod tests {
             normalize_model_for_provider("MiMo-V2.5-Pro", "xiaomi"),
             "mimo-v2.5-pro"
         );
+        assert_eq!(
+            normalize_model_for_provider("anthropic/claude-sonnet-4-6", "copilot"),
+            "claude-sonnet-4.6"
+        );
+        assert_eq!(
+            normalize_model_for_provider("openai/o3", "copilot"),
+            "gpt-5.3-codex"
+        );
     }
 
     #[test]
@@ -812,6 +900,14 @@ mod tests {
         assert_eq!(
             resolve_provider_api_mode("copilot", "gpt-5-mini"),
             Some("chat_completions")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("copilot", "anthropic/claude-sonnet-4.6"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("copilot", "claude-haiku-4-5"),
+            Some("anthropic_messages")
         );
         assert_eq!(
             resolve_provider_api_mode("azure-foundry", "openai/gpt-5.4"),
