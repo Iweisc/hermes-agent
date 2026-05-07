@@ -1,9 +1,12 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +30,639 @@ const SNAPSHOT_TRUNCATE_CHARS: usize = 8_000;
 const SCROLL_PIXELS: u64 = 500;
 const DEFAULT_CDP_TIMEOUT_SECS: u64 = 30;
 const MAX_CDP_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Clone)]
+struct PendingDialog {
+    id: String,
+    dialog_type: String,
+    message: String,
+    default_prompt: String,
+    opened_at: f64,
+    cdp_session_id: Option<String>,
+    target_id: Option<String>,
+}
+
+impl PendingDialog {
+    fn to_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("id".to_string(), Value::String(self.id.clone()));
+        object.insert("type".to_string(), Value::String(self.dialog_type.clone()));
+        object.insert("message".to_string(), Value::String(self.message.clone()));
+        object.insert(
+            "default_prompt".to_string(),
+            Value::String(self.default_prompt.clone()),
+        );
+        object.insert("opened_at".to_string(), json!(self.opened_at));
+        if let Some(target_id) = self.target_id.as_ref() {
+            object.insert("target_id".to_string(), Value::String(target_id.clone()));
+        }
+        Value::Object(object)
+    }
+}
+
+#[derive(Debug, Default)]
+struct BrowserSupervisorState {
+    active: bool,
+    pending_dialogs: Vec<PendingDialog>,
+}
+
+enum BrowserSupervisorCommand {
+    Respond {
+        dialog_id: String,
+        accept: bool,
+        prompt_text: String,
+        result_tx: mpsc::Sender<Result<PendingDialog, String>>,
+    },
+    Stop,
+}
+
+struct BrowserSupervisorHandle {
+    endpoint: String,
+    state: Arc<Mutex<BrowserSupervisorState>>,
+    command_tx: mpsc::Sender<BrowserSupervisorCommand>,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl BrowserSupervisorHandle {
+    fn snapshot(&self) -> (bool, Vec<PendingDialog>) {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (guard.active, guard.pending_dialogs.clone())
+    }
+
+    fn respond_dialog(
+        &self,
+        dialog_id: &str,
+        accept: bool,
+        prompt_text: &str,
+        timeout_secs: u64,
+    ) -> Result<PendingDialog, String> {
+        let (result_tx, result_rx) = mpsc::channel();
+        self.command_tx
+            .send(BrowserSupervisorCommand::Respond {
+                dialog_id: dialog_id.to_string(),
+                accept,
+                prompt_text: prompt_text.to_string(),
+                result_tx,
+            })
+            .map_err(|_| "Browser dialog supervisor is not running.".to_string())?;
+        result_rx
+            .recv_timeout(Duration::from_secs(timeout_secs.max(1)))
+            .map_err(|_| "Timed out waiting for browser dialog response.".to_string())?
+    }
+
+    fn stop(&self) {
+        let _ = self.command_tx.send(BrowserSupervisorCommand::Stop);
+        if let Some(join) = self
+            .join
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = join.join();
+        }
+    }
+}
+
+static BROWSER_SUPERVISORS: OnceLock<
+    Mutex<std::collections::HashMap<String, Arc<BrowserSupervisorHandle>>>,
+> = OnceLock::new();
+
+fn browser_supervisors()
+-> &'static Mutex<std::collections::HashMap<String, Arc<BrowserSupervisorHandle>>> {
+    BROWSER_SUPERVISORS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn ensure_browser_supervisor(
+    runtime: &ToolRuntime,
+    endpoint: &str,
+) -> Result<Arc<BrowserSupervisorHandle>, String> {
+    let key = browser_session_name(runtime);
+    let mut stale = None;
+    {
+        let mut supervisors = browser_supervisors()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = supervisors.get(&key).cloned() {
+            let (active, _) = existing.snapshot();
+            if active && existing.endpoint == endpoint {
+                return Ok(existing);
+            }
+            stale = supervisors.remove(&key);
+        }
+    }
+    if let Some(handle) = stale {
+        handle.stop();
+    }
+
+    let state = Arc::new(Mutex::new(BrowserSupervisorState::default()));
+    let (command_tx, command_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let endpoint_text = endpoint.to_string();
+    let state_clone = state.clone();
+    let join = thread::spawn(move || {
+        run_browser_supervisor_loop(&endpoint_text, &state_clone, command_rx, ready_tx);
+    });
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = join.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = join.join();
+            return Err("Timed out starting browser dialog supervisor.".to_string());
+        }
+    }
+
+    let handle = Arc::new(BrowserSupervisorHandle {
+        endpoint: endpoint.to_string(),
+        state,
+        command_tx,
+        join: Mutex::new(Some(join)),
+    });
+    let mut supervisors = browser_supervisors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(existing) = supervisors.get(&key).cloned() {
+        drop(supervisors);
+        handle.stop();
+        return Ok(existing);
+    }
+    supervisors.insert(key, handle.clone());
+    Ok(handle)
+}
+
+fn lookup_browser_supervisor(runtime: &ToolRuntime) -> Option<Arc<BrowserSupervisorHandle>> {
+    let key = browser_session_name(runtime);
+    browser_supervisors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+fn run_browser_supervisor_loop(
+    endpoint: &str,
+    state: &Arc<Mutex<BrowserSupervisorState>>,
+    command_rx: mpsc::Receiver<BrowserSupervisorCommand>,
+    ready_tx: mpsc::Sender<Result<(), String>>,
+) {
+    let mut ready_sent = false;
+    let result =
+        run_browser_supervisor_inner(endpoint, state, &command_rx, &mut ready_sent, &ready_tx);
+    if let Err(error) = result
+        && !ready_sent
+    {
+        let _ = ready_tx.send(Err(error));
+    }
+    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    guard.active = false;
+    guard.pending_dialogs.clear();
+}
+
+fn run_browser_supervisor_inner(
+    endpoint: &str,
+    state: &Arc<Mutex<BrowserSupervisorState>>,
+    command_rx: &mpsc::Receiver<BrowserSupervisorCommand>,
+    ready_sent: &mut bool,
+    ready_tx: &mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let _ = Url::parse(endpoint).map_err(|error| format!("Invalid CDP endpoint: {error}"))?;
+    let (mut socket, _) =
+        connect(endpoint).map_err(|error| format!("Connecting to CDP endpoint failed: {error}"))?;
+    set_cdp_timeouts(&mut socket, Duration::from_millis(200));
+
+    let browser_scoped = endpoint.to_ascii_lowercase().contains("/devtools/browser/");
+    let mut next_id = 1_i64;
+    let mut dialog_seq = 0_u64;
+    let mut session_targets = std::collections::HashMap::<String, String>::new();
+
+    if browser_scoped {
+        send_supervisor_request(
+            &mut socket,
+            &mut next_id,
+            state,
+            &mut dialog_seq,
+            &mut session_targets,
+            "Target.setDiscoverTargets",
+            json!({ "discover": true }),
+            None,
+        )?;
+        send_supervisor_request(
+            &mut socket,
+            &mut next_id,
+            state,
+            &mut dialog_seq,
+            &mut session_targets,
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": false,
+                "flatten": true,
+            }),
+            None,
+        )?;
+        let targets = send_supervisor_request(
+            &mut socket,
+            &mut next_id,
+            state,
+            &mut dialog_seq,
+            &mut session_targets,
+            "Target.getTargets",
+            json!({}),
+            None,
+        )?;
+        if let Some(items) = targets.get("targetInfos").and_then(Value::as_array) {
+            for item in items {
+                let target_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                if !matches!(target_type, "page" | "iframe") {
+                    continue;
+                }
+                if item
+                    .get("attached")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(target_id) = item.get("targetId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let attached = send_supervisor_request(
+                    &mut socket,
+                    &mut next_id,
+                    state,
+                    &mut dialog_seq,
+                    &mut session_targets,
+                    "Target.attachToTarget",
+                    json!({
+                        "targetId": target_id,
+                        "flatten": true,
+                    }),
+                    None,
+                )?;
+                let Some(session_id) = attached
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                session_targets.insert(session_id.clone(), target_id.to_string());
+                send_supervisor_request(
+                    &mut socket,
+                    &mut next_id,
+                    state,
+                    &mut dialog_seq,
+                    &mut session_targets,
+                    "Page.enable",
+                    json!({}),
+                    Some(session_id.as_str()),
+                )?;
+            }
+        }
+    } else {
+        send_supervisor_request(
+            &mut socket,
+            &mut next_id,
+            state,
+            &mut dialog_seq,
+            &mut session_targets,
+            "Page.enable",
+            json!({}),
+            None,
+        )?;
+    }
+
+    {
+        let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        guard.active = true;
+    }
+    let _ = ready_tx.send(Ok(()));
+    *ready_sent = true;
+
+    'outer: loop {
+        loop {
+            match command_rx.try_recv() {
+                Ok(BrowserSupervisorCommand::Respond {
+                    dialog_id,
+                    accept,
+                    prompt_text,
+                    result_tx,
+                }) => {
+                    let result = respond_to_supervisor_dialog(
+                        &mut socket,
+                        &mut next_id,
+                        state,
+                        &mut dialog_seq,
+                        &mut session_targets,
+                        &dialog_id,
+                        accept,
+                        &prompt_text,
+                    );
+                    let _ = result_tx.send(result);
+                }
+                Ok(BrowserSupervisorCommand::Stop) => break 'outer,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break 'outer,
+            }
+        }
+
+        match read_supervisor_message(&mut socket)? {
+            Some(message) => handle_supervisor_message(
+                &mut socket,
+                &message,
+                &mut next_id,
+                state,
+                &mut dialog_seq,
+                &mut session_targets,
+            )?,
+            None => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn respond_to_supervisor_dialog(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    next_id: &mut i64,
+    state: &Arc<Mutex<BrowserSupervisorState>>,
+    dialog_seq: &mut u64,
+    session_targets: &mut std::collections::HashMap<String, String>,
+    dialog_id: &str,
+    accept: bool,
+    prompt_text: &str,
+) -> Result<PendingDialog, String> {
+    let dialog = {
+        let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(dialog) = guard
+            .pending_dialogs
+            .iter()
+            .find(|item| item.id == dialog_id)
+            .cloned()
+        else {
+            if guard.pending_dialogs.is_empty() {
+                return Err("No dialog is currently open.".to_string());
+            }
+            let known = guard
+                .pending_dialogs
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "dialog_id '{dialog_id}' not found (known: {known:?})"
+            ));
+        };
+        dialog
+    };
+
+    let mut params = json!({ "accept": accept });
+    if dialog.dialog_type == "prompt"
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert(
+            "promptText".to_string(),
+            Value::String(prompt_text.to_string()),
+        );
+    }
+    send_supervisor_request(
+        socket,
+        next_id,
+        state,
+        dialog_seq,
+        session_targets,
+        "Page.handleJavaScriptDialog",
+        params,
+        dialog.cdp_session_id.as_deref(),
+    )?;
+
+    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    guard.pending_dialogs.retain(|item| item.id != dialog.id);
+    Ok(dialog)
+}
+
+fn send_supervisor_request(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    next_id: &mut i64,
+    state: &Arc<Mutex<BrowserSupervisorState>>,
+    dialog_seq: &mut u64,
+    session_targets: &mut std::collections::HashMap<String, String>,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) -> Result<Value, String> {
+    let request_id = *next_id;
+    *next_id += 1;
+    let mut request = json!({
+        "id": request_id,
+        "method": method,
+        "params": params,
+    });
+    if let Some(session_id) = session_id
+        && let Some(object) = request.as_object_mut()
+    {
+        object.insert(
+            "sessionId".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .map_err(|error| format!("Sending CDP method {method} failed: {error}"))?;
+
+    loop {
+        let Some(message) = read_supervisor_message(socket)? else {
+            continue;
+        };
+        if message.get("id").and_then(Value::as_i64) == Some(request_id) {
+            if let Some(error) = message.get("error") {
+                return Err(format!("CDP error: {error}"));
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+        handle_supervisor_message(
+            socket,
+            &message,
+            next_id,
+            state,
+            dialog_seq,
+            session_targets,
+        )?;
+    }
+}
+
+fn send_supervisor_request_no_wait(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    next_id: &mut i64,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let request_id = *next_id;
+    *next_id += 1;
+    let mut request = json!({
+        "id": request_id,
+        "method": method,
+        "params": params,
+    });
+    if let Some(session_id) = session_id
+        && let Some(object) = request.as_object_mut()
+    {
+        object.insert(
+            "sessionId".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .map_err(|error| format!("Sending CDP method {method} failed: {error}"))
+}
+
+fn handle_supervisor_message(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    message: &Value,
+    next_id: &mut i64,
+    state: &Arc<Mutex<BrowserSupervisorState>>,
+    dialog_seq: &mut u64,
+    session_targets: &mut std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match method {
+        "Page.javascriptDialogOpening" => {
+            *dialog_seq += 1;
+            let session_id = message
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let target_id = session_id
+                .as_deref()
+                .and_then(|session_id| session_targets.get(session_id).cloned());
+            let params = message.get("params").unwrap_or(&Value::Null);
+            let dialog = PendingDialog {
+                id: format!("d-{}", *dialog_seq),
+                dialog_type: params
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                message: params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                default_prompt: params
+                    .get("defaultPrompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                opened_at: unix_time_secs_f64(),
+                cdp_session_id: session_id,
+                target_id,
+            };
+            let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            guard.pending_dialogs.push(dialog);
+        }
+        "Page.javascriptDialogClosed" => {
+            let session_id = message
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            let position = guard
+                .pending_dialogs
+                .iter()
+                .position(|dialog| dialog.cdp_session_id.as_deref() == session_id.as_deref());
+            if let Some(position) = position {
+                guard.pending_dialogs.remove(position);
+            }
+        }
+        "Target.attachedToTarget" => {
+            let params = message.get("params").unwrap_or(&Value::Null);
+            let target_type = params
+                .get("targetInfo")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(target_type, "page" | "iframe") {
+                return Ok(());
+            }
+            let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+                return Ok(());
+            };
+            if let Some(target_id) = params
+                .get("targetInfo")
+                .and_then(|value| value.get("targetId"))
+                .and_then(Value::as_str)
+            {
+                session_targets.insert(session_id.to_string(), target_id.to_string());
+            }
+            let _ = send_supervisor_request_no_wait(
+                socket,
+                next_id,
+                "Page.enable",
+                json!({}),
+                Some(session_id),
+            );
+        }
+        "Target.detachedFromTarget" => {
+            let params = message.get("params").unwrap_or(&Value::Null);
+            let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+                return Ok(());
+            };
+            session_targets.remove(session_id);
+            let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .pending_dialogs
+                .retain(|dialog| dialog.cdp_session_id.as_deref() != Some(session_id));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_supervisor_message(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+) -> Result<Option<Value>, String> {
+    loop {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                return serde_json::from_str(text.as_ref())
+                    .map(Some)
+                    .map_err(|error| format!("Invalid JSON from CDP endpoint: {error}"));
+            }
+            Ok(Message::Binary(bytes)) => {
+                let text = String::from_utf8(bytes.to_vec())
+                    .map_err(|error| format!("Invalid binary CDP frame: {error}"))?;
+                return serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|error| format!("Invalid JSON from CDP endpoint: {error}"));
+            }
+            Ok(Message::Ping(payload)) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .map_err(|error| format!("Responding to CDP ping failed: {error}"))?;
+            }
+            Ok(Message::Close(_)) => {
+                return Err("CDP connection closed before a response arrived".to_string());
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                return Ok(None);
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return Err("CDP connection closed before a response arrived".to_string());
+            }
+            Err(error) => {
+                return Err(format!("Reading CDP response failed: {error}"));
+            }
+        }
+    }
+}
 
 pub fn browser_available() -> bool {
     find_agent_browser_command().is_ok()
@@ -56,7 +692,7 @@ pub fn browser_navigate_schema() -> Value {
 pub fn browser_snapshot_schema() -> Value {
     json!({
         "name": "browser_snapshot",
-        "description": "Get a text-based accessibility snapshot of the current page. full=false returns a compact interactive view. full=true returns a fuller snapshot. Large snapshots are truncated.",
+        "description": "Get a text-based accessibility snapshot of the current page. full=false returns a compact interactive view. full=true returns a fuller snapshot. Large snapshots are truncated. When a CDP browser supervisor is active, pending_dialogs is also included.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -251,7 +887,7 @@ pub fn browser_cdp_schema() -> Value {
 pub fn browser_dialog_schema() -> Value {
     json!({
         "name": "browser_dialog",
-        "description": "Respond to a blocking native JavaScript dialog through a CDP-capable browser connection. This sends Page.handleJavaScriptDialog to the current page target. Use action='accept' or action='dismiss'. prompt_text is only used for prompt dialogs. When multiple page targets exist, pass target_id to disambiguate.",
+        "description": "Respond to a blocking native JavaScript dialog through a CDP-capable browser connection. Use action='accept' or action='dismiss'. prompt_text is only used for prompt dialogs. Prefer dialog_id from browser_snapshot.pending_dialogs when available. When multiple page targets exist and no dialog_id is known, pass target_id to disambiguate.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -266,7 +902,7 @@ pub fn browser_dialog_schema() -> Value {
                 },
                 "dialog_id": {
                     "type": "string",
-                    "description": "Reserved for future supervisor-backed dialog queues. Not supported in the Rust runtime yet."
+                    "description": "Dialog id from browser_snapshot.pending_dialogs[].id."
                 },
                 "target_id": {
                     "type": "string",
@@ -365,6 +1001,13 @@ pub fn handle_browser_navigate(args: &Value, runtime: &ToolRuntime) -> String {
         }
     }
 
+    if let Some(endpoint) =
+        normalize_cdp_endpoint(&configured_cdp_url(runtime.hermes_home()).unwrap_or_default())
+            .filter(|value| value.starts_with("ws://") || value.starts_with("wss://"))
+    {
+        let _ = ensure_browser_supervisor(runtime, &endpoint);
+    }
+
     tool_result(response)
 }
 
@@ -398,11 +1041,32 @@ pub fn handle_browser_snapshot(args: &Value, runtime: &ToolRuntime) -> String {
         .map(|value| value.len())
         .unwrap_or(0);
 
-    tool_result(json!({
+    let mut response = json!({
         "success": true,
         "snapshot": truncate_snapshot(snapshot_text),
         "element_count": element_count,
-    }))
+    });
+
+    if let Some(endpoint) =
+        normalize_cdp_endpoint(&configured_cdp_url(runtime.hermes_home()).unwrap_or_default())
+            .filter(|value| value.starts_with("ws://") || value.starts_with("wss://"))
+        && let Ok(supervisor) = ensure_browser_supervisor(runtime, &endpoint)
+    {
+        let (active, pending_dialogs) = supervisor.snapshot();
+        if active && let Some(object) = response.as_object_mut() {
+            object.insert(
+                "pending_dialogs".to_string(),
+                Value::Array(
+                    pending_dialogs
+                        .iter()
+                        .map(PendingDialog::to_json)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+    }
+
+    tool_result(response)
 }
 
 pub fn handle_browser_click(args: &Value, runtime: &ToolRuntime) -> String {
@@ -819,15 +1483,13 @@ pub fn handle_browser_dialog(args: &Value, runtime: &ToolRuntime) -> String {
         Ok(value) => value,
         Err(error) => return browser_error(error),
     };
-    if dialog_id.is_some() {
-        return browser_error(
-            "dialog_id routing is not ported in the Rust runtime yet. Omit dialog_id and use target_id when multiple page targets are open.",
-        );
-    }
     let target_id = match optional_non_empty_string(args, "target_id") {
         Ok(value) => value,
         Err(error) => return browser_error(error),
     };
+    if dialog_id.is_some() && target_id.is_some() {
+        return browser_error("Provide either dialog_id or target_id, not both.");
+    }
     let timeout_secs = match optional_timeout_seconds(args, "timeout") {
         Ok(value) => value.unwrap_or(DEFAULT_CDP_TIMEOUT_SECS),
         Err(error) => return browser_error(error),
@@ -847,6 +1509,73 @@ pub fn handle_browser_dialog(args: &Value, runtime: &ToolRuntime) -> String {
         return browser_error(format!(
             "Configured CDP endpoint is not a WebSocket URL: {endpoint}"
         ));
+    }
+
+    if let Some(dialog_id_value) = dialog_id.as_deref() {
+        let supervisor = match ensure_browser_supervisor(runtime, endpoint.as_str()) {
+            Ok(value) => value,
+            Err(error) => return browser_error(error),
+        };
+        let dialog =
+            match supervisor.respond_dialog(dialog_id_value, accept, &prompt_text, timeout_secs) {
+                Ok(value) => value,
+                Err(error) => return browser_error(error),
+            };
+        let mut payload = json!({
+            "success": true,
+            "action": action,
+            "dialog_id": dialog.id,
+            "dialog_type": dialog.dialog_type,
+            "result": {},
+        });
+        if let Some(target_id) = dialog.target_id
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert("target_id".to_string(), Value::String(target_id));
+        }
+        return tool_result(payload);
+    }
+
+    if target_id.is_none() {
+        if let Some(supervisor) = lookup_browser_supervisor(runtime) {
+            let (active, pending_dialogs) = supervisor.snapshot();
+            if active {
+                if pending_dialogs.len() == 1 {
+                    let dialog = match supervisor.respond_dialog(
+                        &pending_dialogs[0].id,
+                        accept,
+                        &prompt_text,
+                        timeout_secs,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return browser_error(error),
+                    };
+                    let mut payload = json!({
+                        "success": true,
+                        "action": action,
+                        "dialog_id": dialog.id,
+                        "dialog_type": dialog.dialog_type,
+                        "result": {},
+                    });
+                    if let Some(target_id) = dialog.target_id
+                        && let Some(object) = payload.as_object_mut()
+                    {
+                        object.insert("target_id".to_string(), Value::String(target_id));
+                    }
+                    return tool_result(payload);
+                }
+                if pending_dialogs.len() > 1 {
+                    let candidates = pending_dialogs
+                        .iter()
+                        .map(|dialog| dialog.id.clone())
+                        .collect::<Vec<_>>();
+                    return browser_error(format!(
+                        "{} pending dialogs; specify dialog_id. Candidates: {candidates:?}",
+                        pending_dialogs.len()
+                    ));
+                }
+            }
+        }
     }
 
     let resolved_target = if let Some(target_id) = target_id.as_deref() {
@@ -1618,6 +2347,13 @@ fn cleanup_old_screenshots(directory: &Path, max_age: Duration) {
     }
 }
 
+fn unix_time_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 fn unix_ts_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1638,6 +2374,79 @@ mod tests {
     use tempfile::TempDir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn stop_all_browser_supervisors_for_test() {
+        let handles = {
+            let mut supervisors = browser_supervisors()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            supervisors
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle.stop();
+        }
+    }
+
+    fn install_fake_snapshot_browser_cli(temp: &TempDir) -> Option<OsString> {
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let cli = bin_dir.join("agent-browser");
+        fs::write(
+            &cli,
+            r#"#!/usr/bin/env bash
+set -e
+cmd=""
+for ((i=1; i<=$#; i++)); do
+  if [ "${!i}" = "--json" ]; then
+    j=$((i+1))
+    cmd="${!j}"
+    break
+  fi
+done
+case "$cmd" in
+  snapshot)
+    echo '{"success":true,"data":{"snapshot":"[ref=@e1] Confirm","refs":{"@e1":{}}}}'
+    ;;
+  open)
+    echo '{"success":true,"data":{"title":"Example","url":"https://example.com"}}'
+    ;;
+  *)
+    echo '{"success":false,"error":"unexpected command"}'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&cli).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cli, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        let joined = env::join_paths(
+            [bin_dir].into_iter().chain(
+                old_path
+                    .as_ref()
+                    .map(env::split_paths)
+                    .into_iter()
+                    .flatten(),
+            ),
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("PATH", joined);
+        }
+        old_path
+    }
+
+    fn restore_env_var(key: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => unsafe { env::set_var(key, value) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
 
     #[test]
     fn browser_blocks_secret_bearing_urls() {
@@ -1672,7 +2481,7 @@ mod tests {
 
     #[test]
     fn browser_tools_run_against_fake_agent_browser_cli() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -1842,7 +2651,7 @@ esac
 
     #[test]
     fn browser_cdp_available_reads_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("config.yaml"),
@@ -1871,7 +2680,7 @@ esac
 
     #[test]
     fn browser_cdp_calls_websocket_endpoint_with_target_attach() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1951,7 +2760,7 @@ esac
 
     #[test]
     fn browser_cdp_calls_websocket_endpoint_with_frame_attach() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2052,7 +2861,7 @@ esac
 
     #[test]
     fn browser_dialog_calls_cdp_with_explicit_target() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2128,7 +2937,7 @@ esac
 
     #[test]
     fn browser_dialog_discovers_single_page_target() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2225,23 +3034,215 @@ esac
     }
 
     #[test]
-    fn browser_dialog_rejects_dialog_id_routing() {
-        let runtime = ToolRuntime::default();
+    fn browser_snapshot_merges_pending_dialogs_from_supervisor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        stop_all_browser_supervisors_for_test();
+        let temp = TempDir::new().unwrap();
+        let old_path = install_fake_snapshot_browser_cli(&temp);
+        let old_cdp = env::var_os("BROWSER_CDP_URL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+
+            let enable = websocket.read().unwrap().into_text().unwrap();
+            let enable_json: Value = serde_json::from_str(&enable).unwrap();
+            assert_eq!(enable_json["method"], json!("Page.enable"));
+            let enable_id = enable_json["id"].as_i64().unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": enable_id,
+                        "result": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "params": {
+                            "type": "alert",
+                            "message": "Confirm delete?",
+                            "defaultPrompt": ""
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+
+            loop {
+                match websocket.read() {
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Ping(payload)) => {
+                        let _ = websocket.send(Message::Pong(payload));
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        unsafe {
+            env::set_var("BROWSER_CDP_URL", format!("ws://{addr}/devtools/page/test"));
+        }
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+
+        let mut merged = None;
+        for _ in 0..20 {
+            let result = handle_browser_snapshot(&json!({}), &runtime);
+            let parsed: Value = serde_json::from_str(&result).unwrap();
+            if parsed["pending_dialogs"]
+                .as_array()
+                .map(|value| value.len())
+                .unwrap_or(0)
+                == 1
+            {
+                merged = Some(parsed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let parsed = merged.expect("pending dialog did not appear in snapshot");
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["pending_dialogs"][0]["id"], json!("d-1"));
+        assert_eq!(parsed["pending_dialogs"][0]["type"], json!("alert"));
+        assert_eq!(
+            parsed["pending_dialogs"][0]["message"],
+            json!("Confirm delete?")
+        );
+
+        stop_all_browser_supervisors_for_test();
+        restore_env_var("BROWSER_CDP_URL", old_cdp);
+        restore_env_var("PATH", old_path);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn browser_dialog_routes_dialog_id_via_supervisor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        stop_all_browser_supervisors_for_test();
+        let temp = TempDir::new().unwrap();
+        let old_path = install_fake_snapshot_browser_cli(&temp);
+        let old_cdp = env::var_os("BROWSER_CDP_URL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+
+            let enable = websocket.read().unwrap().into_text().unwrap();
+            let enable_json: Value = serde_json::from_str(&enable).unwrap();
+            assert_eq!(enable_json["method"], json!("Page.enable"));
+            let enable_id = enable_json["id"].as_i64().unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": enable_id,
+                        "result": {}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Page.javascriptDialogOpening",
+                        "params": {
+                            "type": "prompt",
+                            "message": "Enter a name",
+                            "defaultPrompt": "draft"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+
+            loop {
+                let call = websocket.read().unwrap();
+                match call {
+                    Message::Text(text) => {
+                        let call_json: Value = serde_json::from_str(text.as_ref()).unwrap();
+                        if call_json["method"] == json!("Page.handleJavaScriptDialog") {
+                            assert_eq!(call_json["params"]["accept"], json!(true));
+                            assert_eq!(call_json["params"]["promptText"], json!("launch"));
+                            let call_id = call_json["id"].as_i64().unwrap();
+                            websocket
+                                .send(Message::Text(
+                                    json!({
+                                        "id": call_id,
+                                        "result": {}
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        let _ = websocket.send(Message::Pong(payload));
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        unsafe {
+            env::set_var("BROWSER_CDP_URL", format!("ws://{addr}/devtools/page/test"));
+        }
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+
+        for _ in 0..20 {
+            let result = handle_browser_snapshot(&json!({}), &runtime);
+            let parsed: Value = serde_json::from_str(&result).unwrap();
+            if parsed["pending_dialogs"]
+                .as_array()
+                .map(|value| value.len())
+                .unwrap_or(0)
+                == 1
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
         let result = handle_browser_dialog(
             &json!({
                 "action": "accept",
-                "dialog_id": "d-1"
+                "dialog_id": "d-1",
+                "prompt_text": "launch",
+                "timeout": 5
             }),
             &runtime,
         );
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], json!(false));
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("dialog_id routing is not ported")
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["dialog_id"], json!("d-1"));
+        assert_eq!(parsed["dialog_type"], json!("prompt"));
+
+        let snapshot = handle_browser_snapshot(&json!({}), &runtime);
+        let snapshot_json: Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(
+            snapshot_json["pending_dialogs"]
+                .as_array()
+                .map(|value| value.len())
+                .unwrap_or(0),
+            0
         );
+
+        stop_all_browser_supervisors_for_test();
+        restore_env_var("BROWSER_CDP_URL", old_cdp);
+        restore_env_var("PATH", old_path);
+        server.join().unwrap();
     }
 
     #[test]

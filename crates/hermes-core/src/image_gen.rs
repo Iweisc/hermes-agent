@@ -1662,6 +1662,9 @@ mod tests {
 
     #[test]
     fn resolve_fal_model_reads_config_and_env_fallbacks() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous = env::var_os("HERMES_HOME");
         set_env_var("HERMES_HOME", temp.path());
@@ -1777,6 +1780,9 @@ mod tests {
 
     #[test]
     fn image_generate_runs_against_managed_gateway_contract() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous_home = env::var_os("HERMES_HOME");
         let previous_key = env::var_os("FAL_KEY");
@@ -1825,6 +1831,9 @@ mod tests {
 
     #[test]
     fn image_generate_runs_with_openai_provider() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous_home = env::var_os("HERMES_HOME");
         set_env_var("HERMES_HOME", temp.path());
@@ -1932,6 +1941,9 @@ mod tests {
 
     #[test]
     fn image_generate_runs_with_openai_codex_provider() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous_home = env::var_os("HERMES_HOME");
         set_env_var("HERMES_HOME", temp.path());
@@ -2082,6 +2094,9 @@ mod tests {
 
     #[test]
     fn image_generate_runs_with_xai_provider() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous_home = env::var_os("HERMES_HOME");
         set_env_var("HERMES_HOME", temp.path());
@@ -2187,6 +2202,9 @@ mod tests {
 
     #[test]
     fn unsupported_provider_returns_registry_style_error() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = TempDir::new().unwrap();
         let previous_home = env::var_os("HERMES_HOME");
         set_env_var("HERMES_HOME", temp.path());
