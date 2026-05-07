@@ -22,10 +22,6 @@ pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("whatsapp", args)
 }
 
-pub fn print_uninstall(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("uninstall", args)
-}
-
 fn print_passthrough(command_name: &str, args: CompatArgs) -> Result<(), Box<dyn Error>> {
     launch_python_main_command(command_name, &args.args, Some("HERMES_COMPAT_PYTHON"), &[])
 }

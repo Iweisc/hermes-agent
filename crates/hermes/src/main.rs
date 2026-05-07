@@ -25,6 +25,7 @@ mod python_bridge;
 mod skills_cmd;
 mod slack_cmd;
 mod snapshot_cmd;
+mod uninstall_cmd;
 mod update_cmd;
 mod webhook;
 
@@ -138,7 +139,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<pairing_cmd::PairingCommand>,
     },
-    Uninstall(compat_cmd::CompatArgs),
+    Uninstall(uninstall_cmd::UninstallArgs),
     Backup(backup::BackupArgs),
     Import(backup::ImportArgs),
     Profile {
@@ -346,7 +347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Setup(args) => compat_cmd::print_setup(args)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
         Command::Pairing { command } => pairing_cmd::print_pairing(&context, command)?,
-        Command::Uninstall(args) => compat_cmd::print_uninstall(args)?,
+        Command::Uninstall(args) => uninstall_cmd::print_uninstall(&context, args)?,
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => print_profile(&context, command)?,
