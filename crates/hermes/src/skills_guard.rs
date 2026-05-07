@@ -1204,7 +1204,7 @@ fn install_policy(trust_level: &str, verdict: &str) -> InstallDecision {
     }
 }
 
-fn resolve_trust_level(source: &str) -> &'static str {
+pub(crate) fn resolve_trust_level(source: &str) -> &'static str {
     let mut normalized = source.trim();
     for prefix in ["skills-sh/", "skills.sh/", "skils-sh/", "skils.sh/"] {
         if let Some(rest) = normalized.strip_prefix(prefix) {

@@ -17,7 +17,7 @@ use sha2::Digest;
 use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
-use crate::skills_guard::{format_scan_report, scan_skill};
+use crate::skills_guard::{format_scan_report, resolve_trust_level, scan_skill};
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
 const MAX_NAME_LENGTH: usize = 64;
@@ -1233,15 +1233,24 @@ fn github_publish_skill(
 }
 
 fn github_headers(token: &str) -> Result<reqwest::header::HeaderMap, Box<dyn Error>> {
+    github_raw_headers(Some(token), "application/vnd.github.v3+json")
+}
+
+fn github_raw_headers(
+    token: Option<&str>,
+    accept: &'static str,
+) -> Result<reqwest::header::HeaderMap, Box<dyn Error>> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("application/vnd.github.v3+json"),
+        reqwest::header::HeaderValue::from_static(accept),
     );
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("token {token}"))?,
-    );
+    if let Some(token) = token.map(str::trim).filter(|value| !value.is_empty()) {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("token {token}"))?,
+        );
+    }
     Ok(headers)
 }
 
@@ -1589,7 +1598,113 @@ fn resolve_native_inspect_skill(
         return Ok(None);
     }
 
+    if let Some(skill) = fetch_remote_github_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
+
     Ok(None)
+}
+
+fn fetch_remote_github_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    if github_app_auth_configured() && resolve_github_publish_token().is_none() {
+        return Ok(None);
+    }
+
+    let Some((repo, skill_path, skill_md_path, normalized_identifier)) =
+        parse_github_inspect_identifier(identifier)
+    else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let token = resolve_github_publish_token();
+    let response = client
+        .get(format!(
+            "{}/repos/{repo}/contents/{skill_md_path}",
+            github_api_base()
+        ))
+        .headers(github_raw_headers(
+            token.as_deref(),
+            "application/vnd.github.v3.raw",
+        )?)
+        .send()?;
+    if response.status() != StatusCode::OK {
+        return Ok(None);
+    }
+
+    let content = response.text()?;
+    let (frontmatter, _body) = parse_frontmatter(&content);
+    let fallback_name = skill_path
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("skill");
+
+    Ok(Some(NativeInspectSkill {
+        name: frontmatter_string(&frontmatter, "name").unwrap_or_else(|| fallback_name.to_string()),
+        description: frontmatter_string(&frontmatter, "description")
+            .unwrap_or_else(|| String::from("(no description)")),
+        source: String::from("github"),
+        trust: resolve_trust_level(&normalized_identifier).to_string(),
+        identifier: normalized_identifier,
+        tags: extract_tags(&frontmatter),
+        preview: preview_lines(&content, 50),
+        path: PathBuf::from(format!("github/{repo}/{skill_md_path}")),
+    }))
+}
+
+fn parse_github_inspect_identifier(identifier: &str) -> Option<(String, String, String, String)> {
+    let trimmed = identifier.trim();
+    let trimmed = trimmed
+        .strip_prefix("github/")
+        .or_else(|| trimmed.strip_prefix("github:"))
+        .unwrap_or(trimmed);
+    if trimmed.starts_with("official/") {
+        return None;
+    }
+
+    let parts = trimmed.split('/').collect::<Vec<_>>();
+    if parts.len() < 3 || parts.iter().any(|part| part.trim().is_empty()) {
+        return None;
+    }
+
+    let owner = parts[0].trim();
+    let repo = parts[1].trim();
+    let skill_parts = parts[2..]
+        .iter()
+        .map(|part| part.trim())
+        .collect::<Vec<_>>();
+    if skill_parts.is_empty()
+        || skill_parts
+            .iter()
+            .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('\\'))
+    {
+        return None;
+    }
+
+    let mut skill_path = skill_parts.join("/");
+    let skill_md_path = if skill_path.ends_with("/SKILL.md") {
+        skill_path = skill_path
+            .strip_suffix("/SKILL.md")
+            .unwrap_or_default()
+            .to_string();
+        format!("{skill_path}/SKILL.md")
+    } else if skill_path == "SKILL.md" {
+        return None;
+    } else {
+        format!("{skill_path}/SKILL.md")
+    };
+    if skill_path.trim().is_empty() {
+        return None;
+    }
+
+    let repo_slug = format!("{owner}/{repo}");
+    let normalized_identifier = format!("{repo_slug}/{skill_path}");
+    Some((repo_slug, skill_path, skill_md_path, normalized_identifier))
 }
 
 fn build_installed_inspect_skill(
@@ -3991,6 +4106,58 @@ exit 9\n",
     }
 
     #[test]
+    fn inspect_resolves_explicit_github_skill_natively() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("inspect-github-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_inspect_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        let inspected = resolve_native_inspect_skill(&context, "github/openai/skills/shipit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected.name, "shipit");
+        assert_eq!(inspected.description, "Remote demo");
+        assert_eq!(inspected.source, "github");
+        assert_eq!(inspected.trust, "trusted");
+        assert_eq!(inspected.identifier, "openai/skills/shipit");
+        assert_eq!(
+            inspected.tags,
+            vec![String::from("deploy"), String::from("ops")]
+        );
+        assert!(inspected.preview.contains("remote-body"));
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md "));
+        assert!(
+            logged[0]
+                .to_ascii_lowercase()
+                .contains("authorization: token test-token")
+        );
+        assert!(
+            logged[0]
+                .to_ascii_lowercase()
+                .contains("accept: application/vnd.github.v3.raw")
+        );
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn collect_official_summaries_reads_optional_tree() {
         let _guard = test_env_lock().lock().unwrap();
         let optional = temp_path("official-summaries");
@@ -4660,6 +4827,42 @@ exit 9\n",
         (format!("http://{addr}"), handle)
     }
 
+    fn spawn_github_inspect_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            requests.lock().unwrap().push(request.clone());
+            let first_line = request.lines().next().unwrap_or_default();
+            let (status, body, content_type) = if first_line
+                .starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md ")
+            {
+                (
+                        "HTTP/1.1 200 OK",
+                        "---\nname: shipit\ndescription: Remote demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n      - ops\n---\nremote-body\n"
+                            .to_string(),
+                        "text/plain",
+                    )
+            } else {
+                (
+                    "HTTP/1.1 404 Not Found",
+                    "{}".to_string(),
+                    "application/json",
+                )
+            };
+            let response = format!(
+                "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn publish_native_github_flow_creates_pr_via_mock_api() {
         let _guard = test_env_lock().lock().unwrap();
@@ -4694,9 +4897,11 @@ exit 9\n",
         handle.join().unwrap();
         let logged = requests.lock().unwrap().clone();
         assert_eq!(logged.len(), 7);
-        assert!(logged.iter().all(|request| request
-            .to_ascii_lowercase()
-            .contains("authorization: token test-token")));
+        assert!(logged.iter().all(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: token test-token")
+        }));
         assert!(logged.iter().any(|request| {
             request.starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/SKILL.md ")
         }));
