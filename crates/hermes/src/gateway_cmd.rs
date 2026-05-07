@@ -13,7 +13,7 @@ use hermes_core::{HermesContext, is_container, is_wsl};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{launch_python_main_command, project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
 
@@ -114,7 +114,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
         }
         Some(GatewayCommand::Status(status)) => print_gateway_status(context, status),
         Some(GatewayCommand::Install(install)) => {
-            bridge_gateway(args.accept_hooks, &bridge_install_args(install))
+            print_gateway_install(context, args.accept_hooks, install)
         }
         Some(GatewayCommand::Uninstall(args2)) => print_gateway_uninstall(context, args2),
         Some(GatewayCommand::Setup) => bridge_gateway(args.accept_hooks, &[String::from("setup")]),
@@ -249,6 +249,50 @@ fn print_gateway_uninstall(
 
     println!("Gateway service is not installed");
     Ok(())
+}
+
+fn print_gateway_install(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayInstallArgs,
+) -> Result<(), Box<dyn Error>> {
+    if args.system || args.run_as_user.is_some() {
+        return bridge_gateway(accept_hooks, &bridge_install_args(args));
+    }
+
+    if is_termux(context) {
+        return Err(
+            "Gateway service installation is not supported on Termux. Run manually: hermes gateway run"
+                .into(),
+        );
+    }
+
+    if supports_systemd_services() {
+        install_systemd_service(context, args.force)?;
+        println!("Installed {} user service", gateway_service_name(context));
+        return Ok(());
+    }
+
+    if is_macos() {
+        install_launchd_service(context, args.force)?;
+        println!("Installed {} launchd service", launchd_label(context));
+        return Ok(());
+    }
+
+    if is_wsl() {
+        return Err(
+            "WSL detected but systemd is not available. Enable systemd or run `hermes gateway run`."
+                .into(),
+        );
+    }
+
+    if is_container() {
+        println!("Gateway service install is not applicable inside a Docker container.");
+        println!("The gateway should run as the container's main process.");
+        return Ok(());
+    }
+
+    Err("Gateway service installation is not supported on this platform".into())
 }
 
 fn print_gateway_status(
@@ -775,6 +819,31 @@ fn uninstall_systemd_service(
     Ok(true)
 }
 
+fn install_systemd_service(context: &HermesContext, force: bool) -> Result<(), Box<dyn Error>> {
+    let unit_path = systemd_unit_path(context, false);
+    let service_name = gateway_service_name(context);
+    let unit = generate_systemd_unit(context)?;
+    if unit_path.exists() && !force {
+        let current = fs::read_to_string(&unit_path).unwrap_or_default();
+        if current == unit {
+            println!("Service already installed at: {}", unit_path.display());
+            return Ok(());
+        }
+        return Err(format!(
+            "Service already installed at: {}. Use --force to reinstall.",
+            unit_path.display()
+        )
+        .into());
+    }
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&unit_path, unit)?;
+    run_systemctl(false, &["daemon-reload"])?;
+    run_systemctl(false, &["enable", &service_name])?;
+    Ok(())
+}
+
 fn run_systemctl(system: bool, args: &[&str]) -> Result<(), Box<dyn Error>> {
     let output = build_systemctl_command(system, args).output()?;
     if output.status.success() {
@@ -795,6 +864,46 @@ fn build_systemctl_command(system: bool, args: &[&str]) -> Command {
     }
     command.args(args);
     command
+}
+
+fn generate_systemd_unit(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, None)
+        .ok_or("could not find a Python interpreter for gateway service install")?;
+    let python_path = python.display().to_string();
+    let working_dir = root.display().to_string();
+    let hermes_home = context.hermes_home().display().to_string();
+    let profile_arg = gateway_profile_arg(context);
+    let venv_dir = derive_venv_dir(&python).unwrap_or_else(|| root.join(".venv"));
+    let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let node_bin = root.join("node_modules").join(".bin");
+
+    let mut path_entries = Vec::new();
+    for candidate in [venv_bin, node_bin] {
+        let rendered = candidate.display().to_string();
+        if !rendered.is_empty() {
+            path_entries.push(rendered);
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        path_entries.extend(
+            env::split_paths(&path)
+                .map(|entry| entry.display().to_string())
+                .filter(|entry| !entry.is_empty()),
+        );
+    }
+    path_entries.dedup();
+    let sane_path = path_entries.join(":");
+    let exec_start = if profile_arg.is_empty() {
+        format!("{python_path} -m hermes_cli.main gateway run --replace")
+    } else {
+        format!("{python_path} -m hermes_cli.main {profile_arg} gateway run --replace")
+    };
+
+    Ok(format!(
+        "[Unit]\nDescription=Hermes Agent Gateway - Messaging Platform Integration\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={exec_start}\nWorkingDirectory={working_dir}\nEnvironment=\"PATH={sane_path}\"\nEnvironment=\"VIRTUAL_ENV={}\"\nEnvironment=\"HERMES_HOME={hermes_home}\"\nRestart=always\nRestartSec=60\nRestartMaxDelaySec=300\nRestartSteps=5\nRestartForceExitStatus=75\nKillMode=mixed\nKillSignal=SIGTERM\nExecReload=/bin/kill -USR1 $MAINPID\nTimeoutStopSec=330\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n",
+        venv_dir.display()
+    ))
 }
 
 fn launchd_service_active(context: &HermesContext) -> bool {
@@ -888,6 +997,31 @@ fn uninstall_launchd_service(context: &HermesContext) -> Result<bool, Box<dyn Er
     Ok(true)
 }
 
+fn install_launchd_service(context: &HermesContext, force: bool) -> Result<(), Box<dyn Error>> {
+    let plist_path = launchd_plist_path(context);
+    let plist = generate_launchd_plist(context)?;
+    if plist_path.exists() && !force {
+        let current = fs::read_to_string(&plist_path).unwrap_or_default();
+        if current == plist {
+            println!("Service already installed at: {}", plist_path.display());
+            return Ok(());
+        }
+        return Err(format!(
+            "Service already installed at: {}. Use --force to reinstall.",
+            plist_path.display()
+        )
+        .into());
+    }
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&plist_path, plist)?;
+    let domain = launchd_domain();
+    let plist_arg = plist_path.display().to_string();
+    run_launchctl(&["bootstrap", &domain, &plist_arg])?;
+    Ok(())
+}
+
 fn run_launchctl(args: &[&str]) -> Result<(), Box<dyn Error>> {
     let output = Command::new("launchctl").args(args).output()?;
     if output.status.success() {
@@ -904,6 +1038,61 @@ fn launchd_target(context: &HermesContext) -> String {
     format!("{}/{}", launchd_domain(), launchd_label(context))
 }
 
+fn generate_launchd_plist(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, None)
+        .ok_or("could not find a Python interpreter for gateway service install")?;
+    let python_path = python.display().to_string();
+    let working_dir = root.display().to_string();
+    let hermes_home = context.hermes_home().display().to_string();
+    let log_dir = context.hermes_home().join("logs");
+    let profile_arg = gateway_profile_arg(context);
+    let venv_dir = derive_venv_dir(&python).unwrap_or_else(|| root.join(".venv"));
+    let venv_bin = venv_dir.join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let node_bin = root.join("node_modules").join(".bin");
+    let mut path_entries = Vec::new();
+    for candidate in [venv_bin, node_bin] {
+        let rendered = candidate.display().to_string();
+        if !rendered.is_empty() {
+            path_entries.push(rendered);
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        path_entries.extend(
+            env::split_paths(&path)
+                .map(|entry| entry.display().to_string())
+                .filter(|entry| !entry.is_empty()),
+        );
+    }
+    path_entries.dedup();
+    let sane_path = path_entries.join(":");
+
+    let mut program_args = vec![String::from("-m"), String::from("hermes_cli.main")];
+    if !profile_arg.is_empty() {
+        program_args.extend(profile_arg.split_whitespace().map(str::to_string));
+    }
+    program_args.extend([
+        String::from("gateway"),
+        String::from("run"),
+        String::from("--replace"),
+    ]);
+    let args_xml = program_args
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{}</string>\n\n    <key>ProgramArguments</key>\n    <array>\n        <string>{}</string>\n{}\n    </array>\n\n    <key>WorkingDirectory</key>\n    <string>{working_dir}</string>\n\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{sane_path}</string>\n        <key>VIRTUAL_ENV</key>\n        <string>{}</string>\n        <key>HERMES_HOME</key>\n        <string>{hermes_home}</string>\n    </dict>\n\n    <key>RunAtLoad</key>\n    <true/>\n\n    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>\n    </dict>\n\n    <key>StandardOutPath</key>\n    <string>{}/gateway.log</string>\n\n    <key>StandardErrorPath</key>\n    <string>{}/gateway.error.log</string>\n</dict>\n</plist>\n",
+        launchd_label(context),
+        xml_escape(&python_path),
+        args_xml,
+        venv_dir.display(),
+        log_dir.display(),
+        log_dir.display()
+    ))
+}
+
 fn stop_manual_gateway(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
     let pids = gateway_pids_for_profile(&context.hermes_home());
     let Some(pid) = pids.first().copied() else {
@@ -916,6 +1105,33 @@ fn stop_manual_gateway(context: &HermesContext) -> Result<bool, Box<dyn Error>> 
         Some(Duration::from_secs(5)),
     );
     Ok(true)
+}
+
+fn gateway_profile_arg(context: &HermesContext) -> String {
+    let profile = context.current_profile_name();
+    if profile == "default" || profile == "custom" || !is_valid_profile_id(&profile) {
+        String::new()
+    } else {
+        format!("--profile {profile}")
+    }
+}
+
+fn derive_venv_dir(python: &Path) -> Option<PathBuf> {
+    let parent = python.parent()?;
+    let name = parent.file_name()?.to_string_lossy();
+    if name == "bin" || name == "Scripts" {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn wait_for_gateway_exit(
@@ -1477,6 +1693,66 @@ mod tests {
         assert!(log.contains("--user disable hermes-gateway"));
         assert!(log.contains("--user daemon-reload"));
         set_env_var("PATH", original_path);
+    }
+
+    #[test]
+    fn gateway_install_writes_user_systemd_unit() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let fake_bin = ctx.home_dir().join("bin");
+        let log_path = ctx.home_dir().join("systemctl-install.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Install(GatewayInstallArgs {
+                    force: false,
+                    system: false,
+                    run_as_user: None,
+                })),
+            },
+        )
+        .unwrap();
+
+        let unit_path = systemd_unit_path(&ctx, false);
+        let unit = fs::read_to_string(&unit_path).unwrap();
+        assert!(unit.contains("gateway run --replace"));
+        assert!(unit.contains("HERMES_HOME="));
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--user daemon-reload"));
+        assert!(log.contains("--user enable hermes-gateway"));
+        set_env_var("PATH", original_path);
+    }
+
+    #[test]
+    fn generate_launchd_plist_contains_gateway_command_and_home() {
+        let (_temp, ctx) = test_context();
+        let plist = generate_launchd_plist(&ctx).unwrap();
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(plist.contains("gateway"));
+        assert!(plist.contains("run"));
+        assert!(plist.contains("--replace"));
+        assert!(plist.contains("HERMES_HOME"));
     }
 
     #[test]
