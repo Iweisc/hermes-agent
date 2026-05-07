@@ -116,9 +116,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
         Some(GatewayCommand::Install(install)) => {
             bridge_gateway(args.accept_hooks, &bridge_install_args(install))
         }
-        Some(GatewayCommand::Uninstall(args2)) => {
-            bridge_gateway(args.accept_hooks, &bridge_uninstall_args(args2))
-        }
+        Some(GatewayCommand::Uninstall(args2)) => print_gateway_uninstall(context, args2),
         Some(GatewayCommand::Setup) => bridge_gateway(args.accept_hooks, &[String::from("setup")]),
         Some(GatewayCommand::MigrateLegacy(args2)) => {
             bridge_gateway(args.accept_hooks, &bridge_migrate_legacy_args(args2))
@@ -223,6 +221,34 @@ fn print_gateway_restart(
     let _ = stop_manual_gateway(context)?;
     println!("Starting gateway...");
     bridge_gateway(accept_hooks, &[String::from("run")])
+}
+
+fn print_gateway_uninstall(
+    context: &HermesContext,
+    args: GatewaySystemArgs,
+) -> Result<(), Box<dyn Error>> {
+    if has_any_systemd_unit(context) {
+        let removed = uninstall_systemd_service(context, args.system)?;
+        if removed {
+            println!("Uninstalled {} service", gateway_service_name(context));
+        } else {
+            println!("Gateway service is not installed");
+        }
+        return Ok(());
+    }
+
+    if launchd_plist_path(context).exists() {
+        let removed = uninstall_launchd_service(context)?;
+        if removed {
+            println!("Uninstalled {} service", launchd_label(context));
+        } else {
+            println!("Gateway service is not installed");
+        }
+        return Ok(());
+    }
+
+    println!("Gateway service is not installed");
+    Ok(())
 }
 
 fn print_gateway_status(
@@ -399,14 +425,6 @@ fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
     {
         argv.push("--run-as-user".to_string());
         argv.push(user.to_string());
-    }
-    argv
-}
-
-fn bridge_uninstall_args(args: GatewaySystemArgs) -> Vec<String> {
-    let mut argv = vec!["uninstall".to_string()];
-    if args.system {
-        argv.push("--system".to_string());
     }
     argv
 }
@@ -737,6 +755,26 @@ fn restart_systemd_service(context: &HermesContext, system: bool) -> Result<(), 
     Ok(())
 }
 
+fn uninstall_systemd_service(
+    context: &HermesContext,
+    system: bool,
+) -> Result<bool, Box<dyn Error>> {
+    let selected_system = select_systemd_scope(context, system);
+    let unit_path = systemd_unit_path(context, selected_system);
+    if !unit_path.exists() {
+        return Ok(false);
+    }
+    if selected_system {
+        require_root_for_system_service("uninstall")?;
+    }
+    let service_name = gateway_service_name(context);
+    let _ = run_systemctl_allow_failure(selected_system, &["stop", &service_name]);
+    let _ = run_systemctl_allow_failure(selected_system, &["disable", &service_name]);
+    fs::remove_file(&unit_path)?;
+    let _ = run_systemctl_allow_failure(selected_system, &["daemon-reload"]);
+    Ok(true)
+}
+
 fn run_systemctl(system: bool, args: &[&str]) -> Result<(), Box<dyn Error>> {
     let output = build_systemctl_command(system, args).output()?;
     if output.status.success() {
@@ -832,6 +870,22 @@ fn restart_launchd_service(context: &HermesContext) -> Result<(), Box<dyn Error>
         }
         _ => Err(command_failure_message("launchctl", &output).into()),
     }
+}
+
+fn uninstall_launchd_service(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+    let plist_path = launchd_plist_path(context);
+    if !plist_path.exists() {
+        return Ok(false);
+    }
+    let target = launchd_target(context);
+    let output = Command::new("launchctl")
+        .args(["bootout", &target])
+        .output()?;
+    if !(output.status.success() || matches!(output.status.code(), Some(3) | Some(113))) {
+        return Err(command_failure_message("launchctl", &output).into());
+    }
+    fs::remove_file(&plist_path)?;
+    Ok(true)
 }
 
 fn run_launchctl(args: &[&str]) -> Result<(), Box<dyn Error>> {
@@ -1375,6 +1429,54 @@ mod tests {
 
         let status = child.wait().unwrap();
         assert!(!status.success());
+    }
+
+    #[test]
+    fn gateway_uninstall_removes_user_systemd_unit() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let fake_bin = ctx.home_dir().join("bin");
+        let log_path = ctx.home_dir().join("systemctl-uninstall.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+        let unit_path = systemd_unit_path(&ctx, false);
+        fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+        fs::write(&unit_path, "unit").unwrap();
+
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::Uninstall(GatewaySystemArgs {
+                    system: false,
+                })),
+            },
+        )
+        .unwrap();
+
+        assert!(!unit_path.exists());
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--user stop hermes-gateway"));
+        assert!(log.contains("--user disable hermes-gateway"));
+        assert!(log.contains("--user daemon-reload"));
+        set_env_var("PATH", original_path);
     }
 
     #[test]

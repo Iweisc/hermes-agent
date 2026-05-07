@@ -17,7 +17,10 @@ use serde_yaml::Value as YamlValue;
 use tar::{Archive, Builder, EntryType, Header};
 use tempfile::TempDir;
 
-use crate::python_bridge::{launch_python_main_command, project_root};
+use crate::gateway_cmd::{
+    GatewayArgs, GatewayCommand, GatewayServiceArgs, GatewaySystemArgs, print_gateway,
+};
+use crate::python_bridge::project_root;
 
 const RESERVED_ALIAS_NAMES: &[&str] = &["hermes", "default", "test", "tmp", "root", "sudo"];
 const HERMES_SUBCOMMANDS: &[&str] = &[
@@ -1075,15 +1078,27 @@ fn walk_skill_markdowns(root: &Path, count: &mut usize) {
 }
 
 fn cleanup_gateway_service(profile_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let env_home = vec![("HERMES_HOME".to_string(), profile_dir.display().to_string())];
-    for argv in [
-        vec!["stop".to_string()],
-        vec!["stop".to_string(), "--system".to_string()],
-        vec!["uninstall".to_string()],
-        vec!["uninstall".to_string(), "--system".to_string()],
+    let profile_context =
+        HermesContext::new("/tmp").with_hermes_home_env(Some(profile_dir.to_path_buf()));
+    for command in [
+        GatewayCommand::Stop(GatewayServiceArgs {
+            system: false,
+            all: false,
+        }),
+        GatewayCommand::Stop(GatewayServiceArgs {
+            system: true,
+            all: false,
+        }),
+        GatewayCommand::Uninstall(GatewaySystemArgs { system: false }),
+        GatewayCommand::Uninstall(GatewaySystemArgs { system: true }),
     ] {
-        let _ =
-            launch_python_main_command("gateway", &argv, Some("HERMES_PROFILE_PYTHON"), &env_home);
+        let _ = print_gateway(
+            &profile_context,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(command),
+            },
+        );
     }
     Ok(())
 }
