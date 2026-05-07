@@ -1,11 +1,11 @@
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::python_bridge::launch_python_main_command;
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 const OPENCLAW_DIR_NAMES: [&str; 3] = [".openclaw", ".clawdbot", ".moltbot"];
 
@@ -93,42 +93,76 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut argv = Vec::new();
-    if let Some(path) = args.source {
-        argv.push(String::from("--source"));
-        argv.push(path.display().to_string());
-    }
-    if args.dry_run {
-        argv.push(String::from("--dry-run"));
-    }
-    if args.preset != MigratePreset::Full {
-        argv.push(String::from("--preset"));
-        argv.push(args.preset.as_str().to_string());
-    }
-    if args.overwrite {
-        argv.push(String::from("--overwrite"));
-    }
-    if args.migrate_secrets {
-        argv.push(String::from("--migrate-secrets"));
-    }
-    if args.no_backup {
-        argv.push(String::from("--no-backup"));
-    }
-    if let Some(path) = args.workspace_target {
-        argv.push(String::from("--workspace-target"));
-        argv.push(path.display().to_string());
-    }
-    if args.skill_conflict != SkillConflict::Skip {
-        argv.push(String::from("--skill-conflict"));
-        argv.push(args.skill_conflict.as_str().to_string());
-    }
-    if args.yes {
-        argv.push(String::from("--yes"));
-    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLAW_PYTHON"))
+        .ok_or("could not find a Python interpreter for claw migrate")?;
 
-    let mut full = vec![String::from("migrate")];
-    full.extend(argv);
-    launch_python_main_command("claw", &full, Some("HERMES_CLAW_PYTHON"), &[])
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env(
+            "HERMES_CLAW_MIGRATE_DRY_RUN",
+            if args.dry_run { "1" } else { "0" },
+        )
+        .env("HERMES_CLAW_MIGRATE_PRESET", args.preset.as_str())
+        .env(
+            "HERMES_CLAW_MIGRATE_OVERWRITE",
+            if args.overwrite { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_CLAW_MIGRATE_SECRETS",
+            if args.migrate_secrets { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_CLAW_MIGRATE_NO_BACKUP",
+            if args.no_backup { "1" } else { "0" },
+        )
+        .env(
+            "HERMES_CLAW_MIGRATE_SKILL_CONFLICT",
+            args.skill_conflict.as_str(),
+        )
+        .env("HERMES_CLAW_MIGRATE_YES", if args.yes { "1" } else { "0" });
+    if let Some(path) = args.source.as_ref() {
+        command.env("HERMES_CLAW_MIGRATE_SOURCE", path.display().to_string());
+    }
+    if let Some(path) = args.workspace_target.as_ref() {
+        command.env(
+            "HERMES_CLAW_MIGRATE_WORKSPACE_TARGET",
+            path.display().to_string(),
+        );
+    }
+    command.arg("-c").arg(CLAW_MIGRATE_BOOTSTRAP);
+
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(exit_status_message("claw", status).into())
+}
+
+const CLAW_MIGRATE_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import os\n",
+    "from hermes_cli.claw import _cmd_migrate\n",
+    "_cmd_migrate(argparse.Namespace(\n",
+    "    source=(os.environ.get('HERMES_CLAW_MIGRATE_SOURCE') or None),\n",
+    "    dry_run=(os.environ.get('HERMES_CLAW_MIGRATE_DRY_RUN') == '1'),\n",
+    "    preset=(os.environ.get('HERMES_CLAW_MIGRATE_PRESET') or 'full'),\n",
+    "    overwrite=(os.environ.get('HERMES_CLAW_MIGRATE_OVERWRITE') == '1'),\n",
+    "    migrate_secrets=(os.environ.get('HERMES_CLAW_MIGRATE_SECRETS') == '1'),\n",
+    "    no_backup=(os.environ.get('HERMES_CLAW_MIGRATE_NO_BACKUP') == '1'),\n",
+    "    workspace_target=(os.environ.get('HERMES_CLAW_MIGRATE_WORKSPACE_TARGET') or None),\n",
+    "    skill_conflict=(os.environ.get('HERMES_CLAW_MIGRATE_SKILL_CONFLICT') or 'skip'),\n",
+    "    yes=(os.environ.get('HERMES_CLAW_MIGRATE_YES') == '1'),\n",
+    "))\n",
+);
+
+fn exit_status_message(command: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{command} exited with status {code}"),
+        None => format!("{command} terminated by signal"),
+    }
 }
 
 fn print_cleanup(args: CleanupArgs) -> Result<(), Box<dyn Error>> {
@@ -514,7 +548,29 @@ impl IsTerminal for io::Stdin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
+    }
 
     #[test]
     fn archive_path_adds_timestamp_when_base_exists() {
@@ -557,70 +613,57 @@ mod tests {
     }
 
     #[test]
-    fn build_migrate_args_preserves_requested_flags() {
-        let args = MigrateArgs {
-            source: Some(PathBuf::from("/tmp/openclaw")),
+    #[cfg(unix)]
+    fn migrate_uses_python_override_and_env_flags() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        let source = temp.path().join(".openclaw");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'source=%s dry=%s preset=%s overwrite=%s secrets=%s no_backup=%s workspace=%s conflict=%s yes=%s\\n' \\\n\
+    \"$HERMES_CLAW_MIGRATE_SOURCE\" \"$HERMES_CLAW_MIGRATE_DRY_RUN\" \"$HERMES_CLAW_MIGRATE_PRESET\" \\\n\
+    \"$HERMES_CLAW_MIGRATE_OVERWRITE\" \"$HERMES_CLAW_MIGRATE_SECRETS\" \"$HERMES_CLAW_MIGRATE_NO_BACKUP\" \\\n\
+    \"$HERMES_CLAW_MIGRATE_WORKSPACE_TARGET\" \"$HERMES_CLAW_MIGRATE_SKILL_CONFLICT\" \"$HERMES_CLAW_MIGRATE_YES\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
+        print_migrate(MigrateArgs {
+            source: Some(source.clone()),
             dry_run: true,
             preset: MigratePreset::UserData,
             overwrite: true,
             migrate_secrets: true,
             no_backup: true,
-            workspace_target: Some(PathBuf::from("/tmp/workspace")),
+            workspace_target: Some(workspace.clone()),
             skill_conflict: SkillConflict::Rename,
             yes: true,
-        };
+        })
+        .unwrap();
 
-        let mut argv = vec![String::from("migrate")];
-        if let Some(path) = args.source.as_ref() {
-            argv.push(String::from("--source"));
-            argv.push(path.display().to_string());
-        }
-        if args.dry_run {
-            argv.push(String::from("--dry-run"));
-        }
-        if args.preset != MigratePreset::Full {
-            argv.push(String::from("--preset"));
-            argv.push(args.preset.as_str().to_string());
-        }
-        if args.overwrite {
-            argv.push(String::from("--overwrite"));
-        }
-        if args.migrate_secrets {
-            argv.push(String::from("--migrate-secrets"));
-        }
-        if args.no_backup {
-            argv.push(String::from("--no-backup"));
-        }
-        if let Some(path) = args.workspace_target.as_ref() {
-            argv.push(String::from("--workspace-target"));
-            argv.push(path.display().to_string());
-        }
-        if args.skill_conflict != SkillConflict::Skip {
-            argv.push(String::from("--skill-conflict"));
-            argv.push(args.skill_conflict.as_str().to_string());
-        }
-        if args.yes {
-            argv.push(String::from("--yes"));
-        }
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains(&format!(
+            "source={} dry=1 preset=user-data overwrite=1 secrets=1 no_backup=1 workspace={} conflict=rename yes=1",
+            source.display(),
+            workspace.display()
+        )));
 
-        assert_eq!(
-            argv,
-            vec![
-                "migrate",
-                "--source",
-                "/tmp/openclaw",
-                "--dry-run",
-                "--preset",
-                "user-data",
-                "--overwrite",
-                "--migrate-secrets",
-                "--no-backup",
-                "--workspace-target",
-                "/tmp/workspace",
-                "--skill-conflict",
-                "rename",
-                "--yes"
-            ]
-        );
+        remove_env_var("HERMES_CLAW_PYTHON");
     }
 }
