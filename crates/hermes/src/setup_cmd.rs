@@ -590,7 +590,7 @@ fn run_native_terminal_setup(
     }
 
     let selected_backend = choices[selected_index - 1].0;
-    if matches!(selected_backend, "modal" | "daytona" | "vercel_sandbox") {
+    if matches!(selected_backend, "modal" | "daytona") {
         ui.line("Falling back to Python setup for this backend.")?;
         return print_setup_python(SetupArgs {
             section: Some(SetupSection::Terminal),
@@ -612,10 +612,16 @@ fn run_native_terminal_setup(
         "docker" => configure_docker_terminal(context, ui, terminal)?,
         "singularity" => configure_singularity_terminal(context, ui, terminal)?,
         "ssh" => configure_ssh_terminal(context, ui)?,
+        "vercel_sandbox" => configure_vercel_terminal(ui, terminal)?,
         _ => unreachable!(),
     }
 
     save_env_value(context.env_path(), "TERMINAL_ENV", selected_backend)?;
+    if selected_backend == "vercel_sandbox" {
+        if let Some(runtime) = mapping_string(terminal, "vercel_runtime") {
+            save_env_value(context.env_path(), "TERMINAL_VERCEL_RUNTIME", &runtime)?;
+        }
+    }
     write_yaml_mapping(&context.config_path(), &root)?;
     ui.blank()?;
     ui.line(&format!("Terminal backend set to: {selected_backend}"))?;
@@ -749,6 +755,50 @@ fn configure_ssh_terminal(
         }
     }
 
+    Ok(())
+}
+
+fn configure_vercel_terminal(
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    const SUPPORTED_RUNTIMES: &[&str] = &["node24", "node22", "python3.13"];
+
+    ui.line("Terminal backend: Vercel Sandbox")?;
+    ui.line("Cloud microVM sandboxes with snapshot-backed filesystem persistence.")?;
+    ui.line("Requires the optional SDK: pip install 'hermes-agent[vercel]'")?;
+    if !python_module_installed("vercel")? {
+        ui.line("vercel SDK not detected; install it before using this backend.")?;
+    }
+
+    let current_runtime =
+        mapping_string(terminal, "vercel_runtime").unwrap_or_else(|| "node24".to_string());
+    let runtime = prompt_enum_choice(ui, "  Runtime", SUPPORTED_RUNTIMES, &current_runtime)?;
+    terminal.insert(yaml_key("vercel_runtime"), Value::String(runtime.clone()));
+
+    let current_persist = mapping_bool(terminal, "container_persistent").unwrap_or(true);
+    let persist_default = if current_persist { "yes" } else { "no" };
+    let persist = prompt_yes_no(
+        ui,
+        &format!("  Persist filesystem with snapshots? (yes/no) [{persist_default}]: "),
+        current_persist,
+    )?;
+    terminal.insert(yaml_key("container_persistent"), Value::Bool(persist));
+
+    let current_cpu = mapping_f64(terminal, "container_cpu").unwrap_or(1.0);
+    let cpu = prompt_f64_range(ui, "  CPU cores", current_cpu, 0.1, 512.0)?;
+    terminal.insert(yaml_key("container_cpu"), serde_yaml::to_value(cpu)?);
+
+    let current_memory = mapping_i64(terminal, "container_memory").unwrap_or(5120);
+    let memory = prompt_positive_i64(
+        ui,
+        "  Memory in MB (5120 = 5GB)",
+        current_memory,
+        "Enter a positive integer.",
+    )?;
+    terminal.insert(yaml_key("container_memory"), serde_yaml::to_value(memory)?);
+
+    terminal.insert(yaml_key("container_disk"), serde_yaml::to_value(51200_i64)?);
     Ok(())
 }
 
@@ -1341,6 +1391,29 @@ exit 9\n",
         let env_text = fs::read_to_string(context.env_path()).unwrap();
         assert!(env_text.contains("TERMINAL_ENV=docker"));
         assert!(env_text.contains("TERMINAL_DOCKER_IMAGE=my-image:latest"));
+    }
+
+    #[test]
+    fn native_terminal_setup_writes_vercel_backend() {
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "terminal:\n  backend: local\n").unwrap();
+
+        let mut ui = TestUi::new(&["6", "node22", "no", "1.5", "2048"]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: vercel_sandbox"));
+        assert!(saved.contains("vercel_runtime: node22"));
+        assert!(saved.contains("container_persistent: false"));
+        assert!(saved.contains("container_cpu: 1.5"));
+        assert!(saved.contains("container_memory: 2048"));
+        assert!(saved.contains("container_disk: 51200"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TERMINAL_ENV=vercel_sandbox"));
+        assert!(env_text.contains("TERMINAL_VERCEL_RUNTIME=node22"));
     }
 
     #[test]
