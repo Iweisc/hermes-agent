@@ -1,10 +1,11 @@
 use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
 use clap::Args;
+
+use crate::python_bridge::launch_python_main_command;
 
 const DASHBOARD_PATTERNS: &[&str] = &[
     "hermes dashboard",
@@ -277,131 +278,27 @@ fn kill_dashboard_processes_unix(pids: &[i32]) -> StopResult {
 }
 
 fn launch_python_dashboard(args: DashboardArgs) -> Result<(), Box<dyn Error>> {
-    let project_root = project_root();
-    let python = resolve_dashboard_python(&project_root)
-        .ok_or("could not find a Python interpreter for dashboard launch")?;
-
-    let mut command = Command::new(python);
-    command
-        .current_dir(&project_root)
-        .env("PYTHONPATH", project_root.display().to_string())
-        .arg("-m")
-        .arg("hermes_cli.main")
-        .arg("dashboard")
-        .arg("--port")
-        .arg(args.port.to_string())
-        .arg("--host")
-        .arg(args.host);
+    let mut argv = vec![
+        "--port".to_string(),
+        args.port.to_string(),
+        "--host".to_string(),
+        args.host,
+    ];
     if args.no_open {
-        command.arg("--no-open");
+        argv.push("--no-open".to_string());
     }
     if args.insecure {
-        command.arg("--insecure");
+        argv.push("--insecure".to_string());
     }
     if args.tui {
-        command.arg("--tui");
+        argv.push("--tui".to_string());
     }
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("dashboard", status).into())
-}
-
-fn resolve_dashboard_python(project_root: &Path) -> Option<PathBuf> {
-    resolve_dashboard_python_override(project_root, std::env::var("HERMES_DASHBOARD_PYTHON").ok())
-}
-
-fn resolve_dashboard_python_override(
-    project_root: &Path,
-    override_value: Option<String>,
-) -> Option<PathBuf> {
-    if let Some(value) = override_value.as_deref() {
-        if !value.trim().is_empty() {
-            return Some(PathBuf::from(value.trim()));
-        }
-    }
-    let candidates = [
-        project_root.join(".venv").join(python_bin_name()),
-        project_root.join("venv").join(python_bin_name()),
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(".hermes")
-            .join("hermes-agent")
-            .join("venv")
-            .join(python_bin_name()),
-    ];
-    for candidate in candidates {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    which_on_path("python3").or_else(|| which_on_path("python"))
-}
-
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let candidate = dir.join(format!("{name}.exe"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn python_bin_name() -> &'static str {
-    #[cfg(windows)]
-    {
-        "Scripts/python.exe"
-    }
-    #[cfg(not(windows))]
-    {
-        "bin/python"
-    }
-}
-
-fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-        })
-}
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
+    launch_python_main_command("dashboard", &argv, Some("HERMES_DASHBOARD_PYTHON"), &[])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_path(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("hermes-rs-dashboard-{label}-{unique}"))
-    }
 
     #[test]
     #[cfg(not(windows))]
@@ -425,18 +322,5 @@ mod tests {
             "python -m hermes_cli.main dashboard --port 9119",
             100
         ));
-    }
-
-    #[test]
-    fn resolve_dashboard_python_honors_override() {
-        let script = temp_path("python");
-        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
-        let resolved = resolve_dashboard_python_override(
-            Path::new("/tmp"),
-            Some(script.display().to_string()),
-        )
-        .unwrap();
-        assert_eq!(resolved, script);
-        let _ = fs::remove_file(resolved);
     }
 }

@@ -1,5 +1,6 @@
 mod auth_cmd;
 mod backup;
+mod compat_cmd;
 mod completion;
 mod config_cmd;
 mod dashboard_cmd;
@@ -10,6 +11,7 @@ mod hooks;
 mod login_cmd;
 mod logs;
 mod model_cmd;
+mod python_bridge;
 mod slack_cmd;
 mod webhook;
 
@@ -70,15 +72,18 @@ enum Command {
     },
     Completion(completion::CompletionArgs),
     Dashboard(dashboard_cmd::DashboardArgs),
+    Gateway(compat_cmd::CompatArgs),
     Logout(auth_cmd::LogoutArgs),
     Auth {
         #[command(subcommand)]
         command: Option<auth_cmd::AuthCommand>,
     },
+    Setup(compat_cmd::CompatArgs),
     Config {
         #[command(subcommand)]
         command: Option<config_cmd::ConfigCommand>,
     },
+    Uninstall(compat_cmd::CompatArgs),
     Backup(backup::BackupArgs),
     Import(backup::ImportArgs),
     Profile {
@@ -119,6 +124,8 @@ enum Command {
         #[command(subcommand)]
         command: ToolsCommand,
     },
+    Update(compat_cmd::CompatArgs),
+    Whatsapp(compat_cmd::CompatArgs),
     Status,
 }
 
@@ -262,12 +269,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Login(args) => login_cmd::print_login(args)?,
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
+        Command::Gateway(args) => compat_cmd::print_gateway(args)?,
         Command::Slack { command } => slack_cmd::print_slack(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
+        Command::Setup(args) => compat_cmd::print_setup(args)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
+        Command::Uninstall(args) => compat_cmd::print_uninstall(args)?,
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => print_profile(&context, command)?,
@@ -298,6 +308,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
         Command::Tools { command } => print_tools(&context, &config, command)?,
+        Command::Update(args) => compat_cmd::print_update(args)?,
+        Command::Whatsapp(args) => compat_cmd::print_whatsapp(args)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
     }
 
