@@ -57,6 +57,13 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         let mut ui = TerminalUi;
         return run_native_tts_setup(context, &mut ui);
     }
+    if should_use_native_terminal_setup(&args)
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let mut ui = TerminalUi;
+        return run_native_terminal_setup(context, &mut ui);
+    }
     print_setup_python(args)
 }
 
@@ -106,6 +113,14 @@ fn should_use_native_tts_setup(context: &HermesContext, args: &SetupArgs) -> boo
         && !args.reconfigure
         && !args.quick
         && !nous_auth_present(context)
+}
+
+fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
+    matches!(args.section, Some(SetupSection::Terminal))
+        && !args.non_interactive
+        && !args.reset
+        && !args.reconfigure
+        && !args.quick
 }
 
 impl SetupSection {
@@ -516,6 +531,293 @@ fn run_native_tts_setup(
         provider_label(&selected, &providers)
     ))?;
     Ok(())
+}
+
+fn run_native_terminal_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_backend =
+        get_nested_string(&root, &["terminal", "backend"]).unwrap_or_else(|| "local".to_string());
+
+    let mut choices = vec![
+        ("local", "Local - run directly on this machine (default)"),
+        (
+            "docker",
+            "Docker - isolated container with configurable resources",
+        ),
+        ("modal", "Modal - serverless cloud sandbox"),
+        ("ssh", "SSH - run on a remote machine"),
+        (
+            "daytona",
+            "Daytona - persistent cloud development environment",
+        ),
+        (
+            "vercel_sandbox",
+            "Vercel Sandbox - cloud microVM with snapshot filesystem persistence",
+        ),
+    ];
+    if cfg!(target_os = "linux") {
+        choices.push((
+            "singularity",
+            "Singularity/Apptainer - HPC-friendly container",
+        ));
+    }
+
+    ui.blank()?;
+    ui.line("⚕ Hermes Setup — Terminal Backend")?;
+    ui.line("Choose where Hermes runs shell commands and code.")?;
+    ui.blank()?;
+    for (index, (_, label)) in choices.iter().enumerate() {
+        ui.line(&format!("  {}. {}", index + 1, label))?;
+    }
+    ui.line(&format!(
+        "  {}. Keep current ({})",
+        choices.len() + 1,
+        current_backend
+    ))?;
+
+    let selected_index = prompt_menu_choice(
+        ui,
+        "Select terminal backend: ",
+        choices.len() + 1,
+        choices.len() + 1,
+    )?;
+    if selected_index == choices.len() + 1 {
+        ui.line(&format!("Keeping current backend: {current_backend}"))?;
+        return Ok(());
+    }
+
+    let selected_backend = choices[selected_index - 1].0;
+    if matches!(selected_backend, "modal" | "daytona" | "vercel_sandbox") {
+        ui.line("Falling back to Python setup for this backend.")?;
+        return print_setup_python(SetupArgs {
+            section: Some(SetupSection::Terminal),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        });
+    }
+
+    let terminal = ensure_mapping(&mut root, "terminal");
+    terminal.insert(
+        yaml_key("backend"),
+        Value::String(selected_backend.to_string()),
+    );
+
+    match selected_backend {
+        "local" => configure_local_terminal(context, ui, terminal)?,
+        "docker" => configure_docker_terminal(context, ui, terminal)?,
+        "singularity" => configure_singularity_terminal(context, ui, terminal)?,
+        "ssh" => configure_ssh_terminal(context, ui)?,
+        _ => unreachable!(),
+    }
+
+    save_env_value(context.env_path(), "TERMINAL_ENV", selected_backend)?;
+    write_yaml_mapping(&context.config_path(), &root)?;
+    ui.blank()?;
+    ui.line(&format!("Terminal backend set to: {selected_backend}"))?;
+    Ok(())
+}
+
+fn configure_local_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: Local")?;
+    let current_cwd =
+        mapping_string(terminal, "cwd").unwrap_or_else(|| context.home_dir().display().to_string());
+    let cwd = ui.prompt(&format!("  Gateway working directory [{}]: ", current_cwd))?;
+    if !cwd.trim().is_empty() {
+        terminal.insert(yaml_key("cwd"), Value::String(cwd.trim().to_string()));
+    }
+
+    if env_value("SUDO_PASSWORD").is_some() {
+        ui.line("Sudo password: configured")?;
+    } else if prompt_yes_no(
+        ui,
+        "Enable sudo support? (stores password for apt install, etc.) [y/N]: ",
+        false,
+    )? {
+        let sudo_password = ui.prompt_secret("  Sudo password: ")?;
+        if !sudo_password.trim().is_empty() {
+            save_env_value(context.env_path(), "SUDO_PASSWORD", sudo_password.trim())?;
+            ui.line("Sudo password saved")?;
+        }
+    }
+    Ok(())
+}
+
+fn configure_docker_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: Docker")?;
+    if !command_exists("docker") {
+        ui.line("Docker not found in PATH. Install Docker: https://docs.docker.com/get-docker/")?;
+    }
+    let current_image = mapping_string(terminal, "docker_image")
+        .unwrap_or_else(|| "nikolaik/python-nodejs:python3.11-nodejs20".to_string());
+    let image = prompt_with_default(ui, "  Docker image", &current_image)?;
+    terminal.insert(yaml_key("docker_image"), Value::String(image.clone()));
+    save_env_value(context.env_path(), "TERMINAL_DOCKER_IMAGE", &image)?;
+    prompt_container_resources(ui, terminal)
+}
+
+fn configure_singularity_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: Singularity/Apptainer")?;
+    if !command_exists("apptainer") && !command_exists("singularity") {
+        ui.line(
+            "Singularity/Apptainer not found in PATH. Install: https://apptainer.org/docs/admin/main/installation.html",
+        )?;
+    }
+    let current_image = mapping_string(terminal, "singularity_image")
+        .unwrap_or_else(|| "docker://nikolaik/python-nodejs:python3.11-nodejs20".to_string());
+    let image = prompt_with_default(ui, "  Container image", &current_image)?;
+    terminal.insert(yaml_key("singularity_image"), Value::String(image.clone()));
+    save_env_value(context.env_path(), "TERMINAL_SINGULARITY_IMAGE", &image)?;
+    prompt_container_resources(ui, terminal)
+}
+
+fn configure_ssh_terminal(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+) -> Result<(), Box<dyn Error>> {
+    ui.line("Terminal backend: SSH")?;
+    let current_host = env_value("TERMINAL_SSH_HOST").unwrap_or_default();
+    let host = prompt_with_default(ui, "  SSH host (hostname or IP)", &current_host)?;
+    if !host.trim().is_empty() {
+        save_env_value(context.env_path(), "TERMINAL_SSH_HOST", host.trim())?;
+    }
+
+    let default_user = std::env::var("USER").unwrap_or_default();
+    let current_user = env_value("TERMINAL_SSH_USER").unwrap_or_else(|| default_user.clone());
+    let user = prompt_with_default(ui, "  SSH user", &current_user)?;
+    if !user.trim().is_empty() {
+        save_env_value(context.env_path(), "TERMINAL_SSH_USER", user.trim())?;
+    }
+
+    let current_port = env_value("TERMINAL_SSH_PORT").unwrap_or_else(|| "22".to_string());
+    let port = prompt_with_default(ui, "  SSH port", &current_port)?;
+    if !port.trim().is_empty() && port.trim() != "22" {
+        save_env_value(context.env_path(), "TERMINAL_SSH_PORT", port.trim())?;
+    }
+
+    let default_key = context.home_dir().join(".ssh").join("id_rsa");
+    let current_key =
+        env_value("TERMINAL_SSH_KEY").unwrap_or_else(|| default_key.display().to_string());
+    let ssh_key = prompt_with_default(ui, "  SSH private key path", &current_key)?;
+    if !ssh_key.trim().is_empty() {
+        save_env_value(context.env_path(), "TERMINAL_SSH_KEY", ssh_key.trim())?;
+    }
+
+    if !host.trim().is_empty() && prompt_yes_no(ui, "  Test SSH connection? [Y/n]: ", true)? {
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+        if !ssh_key.trim().is_empty() {
+            ssh.args(["-i", ssh_key.trim()]);
+        }
+        if !port.trim().is_empty() && port.trim() != "22" {
+            ssh.args(["-p", port.trim()]);
+        }
+        let destination = if !user.trim().is_empty() {
+            format!("{}@{}", user.trim(), host.trim())
+        } else {
+            host.trim().to_string()
+        };
+        ssh.arg(destination).arg("echo ok");
+        match ssh.output() {
+            Ok(output) if output.status.success() => ui.line("  SSH connection successful!")?,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let detail = stderr.trim();
+                if detail.is_empty() {
+                    ui.line("  SSH connection failed.")?;
+                } else {
+                    ui.line(&format!("  SSH connection failed: {detail}"))?;
+                }
+            }
+            Err(error) => ui.line(&format!("  SSH connection failed: {error}"))?,
+        }
+    }
+
+    Ok(())
+}
+
+fn prompt_container_resources(
+    ui: &mut dyn SetupUi,
+    terminal: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    let current_persist = mapping_bool(terminal, "container_persistent").unwrap_or(true);
+    let persist_default = if current_persist { "yes" } else { "no" };
+    let persist = prompt_yes_no(
+        ui,
+        &format!("  Persist filesystem across sessions? (yes/no) [{persist_default}]: "),
+        current_persist,
+    )?;
+    terminal.insert(yaml_key("container_persistent"), Value::Bool(persist));
+
+    let current_cpu = mapping_f64(terminal, "container_cpu").unwrap_or(1.0);
+    let cpu = prompt_f64_range(ui, "  CPU cores", current_cpu, 0.1, 512.0)?;
+    terminal.insert(yaml_key("container_cpu"), serde_yaml::to_value(cpu)?);
+
+    let current_memory = mapping_i64(terminal, "container_memory").unwrap_or(5120);
+    let memory = prompt_positive_i64(
+        ui,
+        "  Memory in MB (5120 = 5GB)",
+        current_memory,
+        "Enter a positive integer.",
+    )?;
+    terminal.insert(yaml_key("container_memory"), serde_yaml::to_value(memory)?);
+
+    let current_disk = mapping_i64(terminal, "container_disk").unwrap_or(51200);
+    let disk = prompt_positive_i64(
+        ui,
+        "  Disk in MB (51200 = 50GB)",
+        current_disk,
+        "Enter a positive integer.",
+    )?;
+    terminal.insert(yaml_key("container_disk"), serde_yaml::to_value(disk)?);
+    Ok(())
+}
+
+fn prompt_with_default(
+    ui: &mut dyn SetupUi,
+    label: &str,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    let input = ui.prompt(&format!("{label} [{current}]: "))?;
+    if input.trim().is_empty() {
+        return Ok(current.to_string());
+    }
+    Ok(input.trim().to_string())
+}
+
+fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
+    mapping
+        .get(yaml_key(key))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn mapping_bool(mapping: &Mapping, key: &str) -> Option<bool> {
+    mapping.get(yaml_key(key)).and_then(Value::as_bool)
+}
+
+fn mapping_i64(mapping: &Mapping, key: &str) -> Option<i64> {
+    mapping.get(yaml_key(key)).and_then(Value::as_i64)
+}
+
+fn mapping_f64(mapping: &Mapping, key: &str) -> Option<f64> {
+    mapping.get(yaml_key(key)).and_then(Value::as_f64)
 }
 
 fn provider_label<'a>(provider: &str, providers: &'a [(&str, &'a str)]) -> &'a str {
@@ -1019,6 +1321,29 @@ exit 9\n",
     }
 
     #[test]
+    fn native_terminal_setup_writes_docker_backend() {
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "terminal:\n  backend: local\n").unwrap();
+
+        let mut ui = TestUi::new(&["2", "my-image:latest", "yes", "2", "4096", "20480"]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: docker"));
+        assert!(saved.contains("docker_image: my-image:latest"));
+        assert!(saved.contains("container_persistent: true"));
+        assert!(saved.contains("container_cpu: 2.0"));
+        assert!(saved.contains("container_memory: 4096"));
+        assert!(saved.contains("container_disk: 20480"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TERMINAL_ENV=docker"));
+        assert!(env_text.contains("TERMINAL_DOCKER_IMAGE=my-image:latest"));
+    }
+
+    #[test]
     fn agent_setup_with_extra_flags_stays_on_python_path() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -1108,6 +1433,42 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("section=tts"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_setup_cloud_backend_falls_back_to_python() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'section=%s\\n' \"$HERMES_SETUP_SECTION\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+
+        let mut ui = TestUi::new(&["3"]);
+        run_native_terminal_setup(&context, &mut ui).unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("section=terminal"));
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 }
