@@ -286,10 +286,65 @@ fn print_skills_usage() {
 }
 
 fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
-    bridge_skills(Some(action), passthrough)
+    match action {
+        "browse" => print_python_skills_command(
+            "browse",
+            "skills browse",
+            SKILLS_BROWSE_BOOTSTRAP,
+            passthrough,
+        ),
+        "search" => print_python_skills_command(
+            "search",
+            "skills search",
+            SKILLS_SEARCH_BOOTSTRAP,
+            passthrough,
+        ),
+        "install" => print_python_skills_command(
+            "install",
+            "skills install",
+            SKILLS_INSTALL_BOOTSTRAP,
+            passthrough,
+        ),
+        "inspect" => print_python_skills_command(
+            "inspect",
+            "skills inspect",
+            SKILLS_INSPECT_BOOTSTRAP,
+            passthrough,
+        ),
+        "check" => print_python_skills_command(
+            "check",
+            "skills check",
+            SKILLS_CHECK_BOOTSTRAP,
+            passthrough,
+        ),
+        "update" => print_python_skills_command(
+            "update",
+            "skills update",
+            SKILLS_UPDATE_BOOTSTRAP,
+            passthrough,
+        ),
+        "audit" => print_python_skills_command(
+            "audit",
+            "skills audit",
+            SKILLS_AUDIT_BOOTSTRAP,
+            passthrough,
+        ),
+        "publish" => print_python_skills_command(
+            "publish",
+            "skills publish",
+            SKILLS_PUBLISH_BOOTSTRAP,
+            passthrough,
+        ),
+        _ => Err(format!("unsupported bridged skills action: {action}").into()),
+    }
 }
 
-fn bridge_skills(action: Option<&str>, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
+fn print_python_skills_command(
+    action: &str,
+    command_name: &str,
+    bootstrap: &str,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_SKILLS_PYTHON"))
         .ok_or("could not find a Python interpreter for skills")?;
@@ -298,77 +353,105 @@ fn bridge_skills(action: Option<&str>, passthrough: &[String]) -> Result<(), Box
     command
         .current_dir(&root)
         .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_SKILLS_ACTION", action.unwrap_or(""))
+        .env("HERMES_SKILLS_COMMAND", action)
         .arg("-c")
-        .arg(SKILLS_BOOTSTRAP)
+        .arg(bootstrap)
         .args(passthrough);
 
     let status = command.status()?;
     if status.success() {
         return Ok(());
     }
-    Err(exit_status_message("skills", status).into())
+    Err(exit_status_message(command_name, status).into())
 }
 
-const SKILLS_BOOTSTRAP: &str = concat!(
+const SKILLS_BROWSE_BOOTSTRAP: &str = concat!(
     "import argparse\n",
-    "import os\n",
     "import sys\n",
-    "action = (os.environ.get('HERMES_SKILLS_ACTION') or '').strip()\n",
-    "if action == 'config':\n",
-    "    from hermes_cli.skills_config import skills_command\n",
-    "else:\n",
-    "    from hermes_cli.skills_hub import skills_command\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills')\n",
-    "parser.set_defaults(skills_action=(action or None))\n",
-    "if action == 'browse':\n",
-    "    parser.add_argument('--page', type=int, default=1)\n",
-    "    parser.add_argument('--size', type=int, default=20)\n",
-    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
-    "elif action == 'search':\n",
-    "    parser.add_argument('query')\n",
-    "    parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
-    "    parser.add_argument('--limit', type=int, default=10)\n",
-    "elif action == 'install':\n",
-    "    parser.add_argument('identifier')\n",
-    "    parser.add_argument('--category', default='')\n",
-    "    parser.add_argument('--name', default='')\n",
-    "    parser.add_argument('--force', action='store_true')\n",
-    "    parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
-    "elif action == 'inspect':\n",
-    "    parser.add_argument('identifier')\n",
-    "elif action == 'check':\n",
-    "    parser.add_argument('name', nargs='?')\n",
-    "elif action == 'update':\n",
-    "    parser.add_argument('name', nargs='?')\n",
-    "elif action == 'audit':\n",
-    "    parser.add_argument('name', nargs='?')\n",
-    "elif action == 'reset':\n",
-    "    parser.add_argument('name')\n",
-    "    parser.add_argument('--restore', action='store_true')\n",
-    "    parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
-    "elif action == 'publish':\n",
-    "    parser.add_argument('skill_path')\n",
-    "    parser.add_argument('--to', default='github', choices=['github', 'clawhub'])\n",
-    "    parser.add_argument('--repo', default='')\n",
-    "elif action == 'snapshot':\n",
-    "    subparsers = parser.add_subparsers(dest='snapshot_action')\n",
-    "    export_p = subparsers.add_parser('export')\n",
-    "    export_p.add_argument('output')\n",
-    "    import_p = subparsers.add_parser('import')\n",
-    "    import_p.add_argument('input')\n",
-    "    import_p.add_argument('--force', action='store_true')\n",
-    "elif action == 'tap':\n",
-    "    subparsers = parser.add_subparsers(dest='tap_action')\n",
-    "    subparsers.add_parser('list')\n",
-    "    add_p = subparsers.add_parser('add')\n",
-    "    add_p.add_argument('repo')\n",
-    "    remove_p = subparsers.add_parser('remove')\n",
-    "    remove_p.add_argument('name')\n",
-    "elif action == 'config':\n",
-    "    pass\n",
-    "elif action:\n",
-    "    raise SystemExit(f'unsupported skills action: {action}')\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills browse')\n",
+    "parser.set_defaults(skills_action='browse')\n",
+    "parser.add_argument('--page', type=int, default=1)\n",
+    "parser.add_argument('--size', type=int, default=20)\n",
+    "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_SEARCH_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills search')\n",
+    "parser.set_defaults(skills_action='search')\n",
+    "parser.add_argument('query')\n",
+    "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
+    "parser.add_argument('--limit', type=int, default=10)\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills install')\n",
+    "parser.set_defaults(skills_action='install')\n",
+    "parser.add_argument('identifier')\n",
+    "parser.add_argument('--category', default='')\n",
+    "parser.add_argument('--name', default='')\n",
+    "parser.add_argument('--force', action='store_true')\n",
+    "parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_INSPECT_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills inspect')\n",
+    "parser.set_defaults(skills_action='inspect')\n",
+    "parser.add_argument('identifier')\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_CHECK_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills check')\n",
+    "parser.set_defaults(skills_action='check')\n",
+    "parser.add_argument('name', nargs='?')\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_UPDATE_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills update')\n",
+    "parser.set_defaults(skills_action='update')\n",
+    "parser.add_argument('name', nargs='?')\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_AUDIT_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills audit')\n",
+    "parser.set_defaults(skills_action='audit')\n",
+    "parser.add_argument('name', nargs='?')\n",
+    "skills_command(parser.parse_args(sys.argv[1:]))\n",
+);
+
+const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
+    "import argparse\n",
+    "import sys\n",
+    "from hermes_cli.skills_hub import skills_command\n",
+    "parser = argparse.ArgumentParser(prog='hermes skills publish')\n",
+    "parser.set_defaults(skills_action='publish')\n",
+    "parser.add_argument('skill_path')\n",
+    "parser.add_argument('--to', default='github', choices=['github', 'clawhub'])\n",
+    "parser.add_argument('--repo', default='')\n",
     "skills_command(parser.parse_args(sys.argv[1:]))\n",
 );
 
@@ -7531,7 +7614,7 @@ mod tests {
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
   shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -7550,7 +7633,7 @@ exit 9\n",
         inspect_skill_command(&context, "owner/repo/remote-skill").unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=inspect argv=owner/repo/remote-skill"));
+        assert!(output.contains("command=inspect argv=owner/repo/remote-skill"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -7722,7 +7805,7 @@ exit 9\n",
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
   shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -7748,7 +7831,7 @@ exit 9\n",
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=browse argv=--source mystery-source --page 1"));
+        assert!(output.contains("command=browse argv=--source mystery-source --page 1"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -8305,7 +8388,7 @@ exit 9\n",
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
   shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -8330,7 +8413,7 @@ exit 9\n",
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=search argv=deploy --source mystery-source"));
+        assert!(output.contains("command=search argv=deploy --source mystery-source"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }
@@ -9346,7 +9429,7 @@ exit 9\n",
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
   shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -9365,7 +9448,7 @@ exit 9\n",
         audit_skills_command(&context, &[String::from("demo"), String::from("extra")]).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=audit argv=demo extra"));
+        assert!(output.contains("command=audit argv=demo extra"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -10295,7 +10378,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
 
     #[test]
     #[cfg(unix)]
-    fn bridge_skills_uses_python_override_and_passes_action_and_args() {
+    fn bridge_prefixed_uses_python_override_and_passes_command_and_args() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -10306,7 +10389,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
   shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -10328,11 +10411,9 @@ exit 9\n",
             ],
         )
         .unwrap();
-        bridge_skills(None, &[]).unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=official/mlops/demo --force --yes"));
-        assert!(output.contains("action= argv="));
+        assert!(output.contains("command=install argv=official/mlops/demo --force --yes"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
     }

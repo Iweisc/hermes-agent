@@ -1780,9 +1780,8 @@ fn resolve_gateway_virtual_env(project_root: &Path) -> Option<PathBuf> {
     if let Some(value) = env_nonempty("VIRTUAL_ENV") {
         return Some(PathBuf::from(value));
     }
-    if let Some(venv_dir) =
-        resolve_repo_python(project_root, Some("HERMES_GATEWAY_PYTHON"))
-            .and_then(|python| derive_venv_dir(&python))
+    if let Some(venv_dir) = resolve_repo_python(project_root, Some("HERMES_GATEWAY_PYTHON"))
+        .and_then(|python| derive_venv_dir(&python))
     {
         return Some(venv_dir);
     }
@@ -2408,7 +2407,7 @@ exit 9\n",
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
                 log_path.display()
             ),
         )
@@ -2507,7 +2506,7 @@ exit 9\n",
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
                 log_path.display()
             ),
         )
@@ -2555,7 +2554,7 @@ exit 9\n",
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
                 log_path.display()
             ),
         )
@@ -2609,7 +2608,7 @@ exit 9\n",
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
                 log_path.display()
             ),
         )
@@ -2762,7 +2761,7 @@ exit 9\n",
         fs::write(
             &script,
             format!(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
                 log_path.display()
             ),
         )
