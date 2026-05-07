@@ -37,7 +37,10 @@ mod web;
 mod yuanbao;
 
 pub use agent::AgentTurnResult;
-pub use auth::{codex_cloudflare_headers, resolve_codex_access_token};
+pub use auth::{
+    MinimaxOAuthRuntimeCredentials, codex_cloudflare_headers, resolve_codex_access_token,
+    resolve_minimax_oauth_runtime_credentials,
+};
 pub use config::{
     AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,
     MemoryConfig, ModelOverrides, ModelRuntimeConfig, NetworkConfig, SecurityConfig,

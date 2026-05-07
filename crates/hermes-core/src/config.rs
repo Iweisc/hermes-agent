@@ -9,7 +9,7 @@ use crate::{
     HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
     normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
-    resolve_provider_api_mode,
+    resolve_minimax_oauth_runtime_credentials, resolve_provider_api_mode,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -438,9 +438,17 @@ impl HermesContext {
             detail: format!("Provider '{provider}' is not recognized by the Rust runtime."),
         })?;
         let model = normalize_model_for_provider(&raw_model, &provider);
+        let minimax_oauth = if provider == "minimax-oauth" {
+            Some(resolve_minimax_oauth_runtime_credentials(
+                &self.hermes_home(),
+            )?)
+        } else {
+            None
+        };
 
         let base_url = explicit_base_url
             .or(config_base_url)
+            .or_else(|| minimax_oauth.as_ref().map(|creds| creds.base_url.clone()))
             .or_else(|| {
                 profile
                     .base_url_env_var()
@@ -457,6 +465,11 @@ impl HermesContext {
 
         let mut api_key = explicit_api_key
             .or(config_api_key)
+            .or_else(|| {
+                minimax_oauth
+                    .as_ref()
+                    .map(|creds| creds.access_token.clone())
+            })
             .or_else(|| {
                 profile
                     .api_key_env_vars()
@@ -1039,5 +1052,44 @@ mod tests {
             .expect("resolve runtime");
 
         assert_eq!(runtime.api_mode, "anthropic_messages");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_minimax_oauth_auth_store() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.hermes_home().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "minimax-oauth": {
+                        "access_token": "mini-runtime-token",
+                        "refresh_token": "mini-refresh-token",
+                        "portal_base_url": "https://api.minimax.io",
+                        "inference_base_url": "https://api.minimaxi.com/anthropic",
+                        "client_id": "mini-client",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: MiniMax-M2.7-highspeed\n  provider: minimax-oauth\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        assert_eq!(runtime.provider, "minimax-oauth");
+        assert_eq!(runtime.api_mode, "anthropic_messages");
+        assert_eq!(runtime.api_key, "mini-runtime-token");
+        assert_eq!(runtime.base_url, "https://api.minimaxi.com/anthropic");
     }
 }
