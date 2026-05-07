@@ -1,8 +1,6 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-#[cfg(not(windows))]
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -19,7 +17,7 @@ const SERVICE_BASE: &str = "hermes-gateway";
 
 #[derive(Args, Debug, Clone)]
 pub struct GatewayArgs {
-    #[arg(long, default_value_t = false)]
+    #[arg(long, global = true, default_value_t = false)]
     pub accept_hooks: bool,
     #[command(subcommand)]
     pub command: Option<GatewayCommand>,
@@ -99,12 +97,9 @@ struct GatewaySnapshot {
     service_scope: Option<String>,
 }
 
-pub fn print_gateway(
-    context: &HermesContext,
-    args: GatewayArgs,
-) -> Result<(), Box<dyn Error>> {
+pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
-        None => bridge_gateway(args.accept_hooks, &[]),
+        None => bridge_gateway(args.accept_hooks, &[String::from("run")]),
         Some(GatewayCommand::Run(run)) => bridge_gateway(args.accept_hooks, &bridge_run_args(run)),
         Some(GatewayCommand::Start(service)) => {
             bridge_gateway(args.accept_hooks, &bridge_service_args("start", service))
@@ -134,6 +129,8 @@ fn print_gateway_status(
     args: GatewayStatusArgs,
 ) -> Result<(), Box<dyn Error>> {
     let snapshot = gateway_snapshot(context, args.system);
+    println!("profile={}", context.current_profile_name());
+    println!("home={}", context.display_hermes_home());
     if snapshot.manager.starts_with("systemd") && snapshot.service_installed {
         println!("manager={}", snapshot.manager);
         println!(
@@ -147,7 +144,8 @@ fn print_gateway_status(
         println!("service_name={}", gateway_service_name(context));
         println!(
             "unit_path={}",
-            systemd_unit_path(context, snapshot.service_scope.as_deref() == Some("system")).display()
+            systemd_unit_path(context, snapshot.service_scope.as_deref() == Some("system"))
+                .display()
         );
         if snapshot.has_process_service_mismatch() {
             println!("warning=process running but service is not active");
@@ -166,14 +164,24 @@ fn print_gateway_status(
             }
         }
         if args.full {
-            run_optional_status_command(
-                "systemctl",
-                if snapshot.service_scope.as_deref() == Some("system") {
-                    &["status", &gateway_service_name(context), "--no-pager", "-l"]
-                } else {
-                    &["--user", "status", &gateway_service_name(context), "--no-pager", "-l"]
-                },
-            );
+            let service_name = gateway_service_name(context);
+            let argv = if snapshot.service_scope.as_deref() == Some("system") {
+                vec![
+                    String::from("status"),
+                    service_name,
+                    String::from("--no-pager"),
+                    String::from("-l"),
+                ]
+            } else {
+                vec![
+                    String::from("--user"),
+                    String::from("status"),
+                    service_name,
+                    String::from("--no-pager"),
+                    String::from("-l"),
+                ]
+            };
+            run_optional_status_command("systemctl", &argv);
         }
     } else if is_macos() && snapshot.service_installed {
         println!("manager=launchd");
@@ -191,7 +199,10 @@ fn print_gateway_status(
             println!("pids={}", format_pids(&snapshot.gateway_pids, None));
         }
         if args.full {
-            run_optional_status_command("launchctl", &["list", &launchd_label(context)]);
+            run_optional_status_command(
+                "launchctl",
+                &[String::from("list"), launchd_label(context)],
+            );
         }
     } else if !snapshot.gateway_pids.is_empty() {
         println!("manager={}", snapshot.manager);
@@ -279,7 +290,12 @@ fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
     if args.system {
         argv.push("--system".to_string());
     }
-    if let Some(user) = args.run_as_user.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(user) = args
+        .run_as_user
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         argv.push("--run-as-user".to_string());
         argv.push(user.to_string());
     }
@@ -372,11 +388,11 @@ fn gateway_snapshot(context: &HermesContext, system: bool) -> GatewaySnapshot {
 
 fn gateway_service_name(context: &HermesContext) -> String {
     let home = context.hermes_home();
-    let default_root = context.default_hermes_root();
+    let default_root = context.home_dir().join(".hermes");
     if home == default_root {
         return SERVICE_BASE.to_string();
     }
-    let profiles_root = context.profiles_root();
+    let profiles_root = default_root.join("profiles");
     if let Ok(relative) = home.strip_prefix(&profiles_root) {
         let mut parts = relative.components();
         if let Some(first) = parts.next() {
@@ -420,7 +436,10 @@ fn launchd_label(context: &HermesContext) -> String {
     if name == SERVICE_BASE {
         "ai.hermes.gateway".to_string()
     } else {
-        format!("ai.hermes.gateway-{}", name.trim_start_matches(&format!("{SERVICE_BASE}-")))
+        format!(
+            "ai.hermes.gateway-{}",
+            name.trim_start_matches(&format!("{SERVICE_BASE}-"))
+        )
     }
 }
 
@@ -496,7 +515,11 @@ fn runtime_health_lines(context: &HermesContext) -> Result<Vec<String>, Box<dyn 
             }
         }
         Some("draining") => {
-            let action = if restart_requested { "restart" } else { "shutdown" };
+            let action = if restart_requested {
+                "restart"
+            } else {
+                "shutdown"
+            };
             lines.push(format!(
                 "⏳ Gateway draining for {action} ({active_agents} active agent(s))"
             ));
@@ -620,7 +643,11 @@ fn systemd_linger_status() -> Option<(bool, String)> {
     let user = env::var("USER")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| env::var("LOGNAME").ok().filter(|value| !value.trim().is_empty()))?;
+        .or_else(|| {
+            env::var("LOGNAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })?;
     let output = Command::new("loginctl")
         .args(["show-user", &user, "--property=Linger", "--value"])
         .output()
@@ -639,7 +666,7 @@ fn systemd_linger_status() -> Option<(bool, String)> {
     }
 }
 
-fn run_optional_status_command(binary: &str, args: &[&str]) {
+fn run_optional_status_command(binary: &str, args: &[String]) {
     let _ = Command::new(binary).args(args).status();
 }
 
@@ -649,7 +676,11 @@ fn process_running(pid: i64) -> bool {
     }
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -793,13 +824,25 @@ mod tests {
     }
 
     #[test]
+    fn gateway_args_accept_hooks_after_subcommand() {
+        let parsed = GatewayHarness::try_parse_from(["gateway", "run", "--accept-hooks"]).unwrap();
+        assert!(parsed.args.accept_hooks);
+        match parsed.args.command.unwrap() {
+            GatewayCommand::Run(_) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn bridge_run_args_omits_run_for_default_invocation() {
-        assert!(bridge_run_args(GatewayRunArgs {
-            verbose: 0,
-            quiet: false,
-            replace: false,
-        })
-        .is_empty());
+        assert!(
+            bridge_run_args(GatewayRunArgs {
+                verbose: 0,
+                quiet: false,
+                replace: false,
+            })
+            .is_empty()
+        );
     }
 
     #[test]
@@ -847,7 +890,11 @@ mod tests {
         .unwrap();
         let lines = runtime_health_lines(&ctx).unwrap();
         assert!(lines.iter().any(|line| line.contains("telegram")));
-        assert!(lines.iter().any(|line| line.contains("draining for restart")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("draining for restart"))
+        );
     }
 
     #[test]
@@ -884,7 +931,6 @@ mod tests {
         let (_temp, ctx) = test_context();
         let service = gateway_service_name(&ctx);
         let user_unit = systemd_unit_path(&ctx, false);
-        let system_unit = PathBuf::from("/etc/systemd/system").join(format!("{service}.service"));
         let fake_systemd = ctx.home_dir().join("etc-systemd");
         fs::create_dir_all(fake_systemd.clone()).unwrap();
         set_env_var("HERMES_FAKE_SYSTEMD_DIR", &fake_systemd);
