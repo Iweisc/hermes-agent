@@ -1,3 +1,4 @@
+mod auth_cmd;
 mod config_cmd;
 mod doctor;
 mod dump;
@@ -35,6 +36,11 @@ enum Command {
     Version,
     Dump(dump::DumpArgs),
     Doctor(doctor::DoctorArgs),
+    Logout(auth_cmd::LogoutArgs),
+    Auth {
+        #[command(subcommand)]
+        command: Option<auth_cmd::AuthCommand>,
+    },
     Config {
         #[command(subcommand)]
         command: Option<config_cmd::ConfigCommand>,
@@ -215,6 +221,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Doctor(args) => {
             doctor::print_doctor(&context, &env_report, &config, &session_store, args)?
         }
+        Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
+        Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
         Command::Profile { command } => print_profile(&context, command)?,
         Command::Chat {

@@ -40,12 +40,13 @@ mod yuanbao;
 
 pub use agent::AgentTurnResult;
 pub use auth::{
-    CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials, GoogleGeminiRuntimeCredentials,
-    MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials, QwenRuntimeCredentials,
-    codex_cloudflare_headers, resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
-    resolve_copilot_runtime_credentials, resolve_google_gemini_runtime_credentials,
-    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
-    resolve_qwen_runtime_credentials,
+    AuthStatusSummary, CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials,
+    GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials,
+    QwenRuntimeCredentials, clear_provider_auth_state, codex_cloudflare_headers,
+    get_active_auth_provider, get_auth_status_summary, resolve_codex_access_token,
+    resolve_copilot_acp_runtime_credentials, resolve_copilot_runtime_credentials,
+    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
+    resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
 };
 pub use config::{
     AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,

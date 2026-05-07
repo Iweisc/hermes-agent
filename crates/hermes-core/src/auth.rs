@@ -12,7 +12,7 @@ use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::HermesError;
+use crate::{HermesError, providers::get_provider_profile};
 
 const AUTH_STORE_VERSION: i64 = 1;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -89,6 +89,110 @@ pub struct GoogleGeminiRuntimeCredentials {
 pub struct QwenRuntimeCredentials {
     pub access_token: String,
     pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthStatusSummary {
+    pub provider: String,
+    pub display_name: String,
+    pub configured: bool,
+    pub logged_in: bool,
+    pub source: Option<String>,
+    pub auth_path: Option<String>,
+    pub detail: Option<String>,
+}
+
+pub fn get_active_auth_provider(hermes_home: &Path) -> Result<Option<String>, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let auth_store = load_auth_store(&auth_path)?;
+    Ok(auth_store
+        .get("active_provider")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed))
+}
+
+pub fn clear_provider_auth_state(hermes_home: &Path, provider: &str) -> Result<bool, HermesError> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Ok(false);
+    }
+
+    let auth_path = hermes_home.join("auth.json");
+    let mut changed = false;
+    if auth_path.exists() {
+        let mut auth_store = load_auth_store(&auth_path)?;
+        if let Some(root) = auth_store.as_object_mut() {
+            if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
+                changed |= providers.remove(provider).is_some();
+            }
+            if let Some(pool) = root
+                .get_mut("credential_pool")
+                .and_then(Value::as_object_mut)
+            {
+                changed |= pool.remove(provider).is_some();
+            }
+            if root.get("active_provider").and_then(Value::as_str) == Some(provider) {
+                root.insert("active_provider".to_string(), Value::Null);
+                changed = true;
+            }
+        }
+        if changed {
+            save_auth_store_json(&auth_path, &auth_store)?;
+        }
+    }
+
+    match provider {
+        "google-gemini-cli" => {
+            let path = google_oauth_path(hermes_home);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|source| HermesError::Io {
+                    action: "removing",
+                    path: path.clone(),
+                    source,
+                })?;
+                changed = true;
+            }
+        }
+        "qwen-oauth" => {
+            let path = qwen_cli_auth_path()?;
+            if path.exists() {
+                fs::remove_file(&path).map_err(|source| HermesError::Io {
+                    action: "removing",
+                    path: path.clone(),
+                    source,
+                })?;
+                changed = true;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(changed)
+}
+
+pub fn get_auth_status_summary(
+    hermes_home: &Path,
+    provider: &str,
+) -> Result<AuthStatusSummary, HermesError> {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider.is_empty() {
+        return Err(HermesError::State {
+            action: "reading auth status",
+            detail: "provider cannot be empty".to_string(),
+        });
+    }
+
+    match provider.as_str() {
+        "openai-codex" => codex_status(hermes_home),
+        "nous" => nous_status(hermes_home),
+        "minimax-oauth" => minimax_status(hermes_home),
+        "google-gemini-cli" => google_status(hermes_home),
+        "qwen-oauth" => qwen_status(),
+        "spotify" => spotify_status(hermes_home),
+        "copilot-acp" => copilot_acp_status(),
+        "copilot" => copilot_status(),
+        _ => generic_provider_status(&provider),
+    }
 }
 
 pub fn resolve_codex_access_token(hermes_home: &Path) -> Result<String, HermesError> {
@@ -492,6 +596,25 @@ fn load_auth_store(path: &Path) -> Result<Value, HermesError> {
     })
 }
 
+fn save_auth_store_json(path: &Path, value: &Value) -> Result<(), HermesError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| HermesError::Io {
+            action: "creating",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(value).map_err(|error| HermesError::State {
+        action: "serializing auth store",
+        detail: error.to_string(),
+    })?;
+    fs::write(path, format!("{payload}\n")).map_err(|source| HermesError::Io {
+        action: "writing",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 fn qwen_cli_auth_path() -> Result<std::path::PathBuf, HermesError> {
     let home = dirs::home_dir().ok_or_else(|| HermesError::State {
         action: "resolving Qwen OAuth auth",
@@ -533,6 +656,363 @@ fn copilot_token_cache() -> &'static Mutex<HashMap<String, (String, f64)>> {
 
 fn google_oauth_path(hermes_home: &Path) -> std::path::PathBuf {
     hermes_home.join("auth").join("google_oauth.json")
+}
+
+fn display_name_for_provider(provider: &str) -> String {
+    match provider {
+        "openai-codex" => "OpenAI Codex".to_string(),
+        "google-gemini-cli" => "Google Gemini CLI".to_string(),
+        "qwen-oauth" => "Qwen OAuth".to_string(),
+        "minimax-oauth" => "MiniMax OAuth".to_string(),
+        "copilot-acp" => "Copilot ACP".to_string(),
+        "spotify" => "Spotify".to_string(),
+        other => get_provider_profile(other)
+            .map(|profile| profile.name.to_string())
+            .unwrap_or_else(|| other.to_string()),
+    }
+}
+
+fn configured_summary(
+    provider: &str,
+    configured: bool,
+    logged_in: bool,
+    source: Option<String>,
+    auth_path: Option<String>,
+    detail: Option<String>,
+) -> AuthStatusSummary {
+    AuthStatusSummary {
+        provider: provider.to_string(),
+        display_name: display_name_for_provider(provider),
+        configured,
+        logged_in,
+        source,
+        auth_path,
+        detail,
+    }
+}
+
+fn provider_state<'a>(
+    auth_store: &'a Value,
+    provider: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    auth_store
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get(provider))
+        .and_then(Value::as_object)
+}
+
+fn codex_status(hermes_home: &Path) -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let auth_store = load_auth_store(&auth_path)?;
+    let Some(state) = provider_state(&auth_store, "openai-codex") else {
+        return Ok(configured_summary(
+            "openai-codex",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("no stored provider state".to_string()),
+        ));
+    };
+    let tokens = state.get("tokens").and_then(Value::as_object);
+    let access = tokens
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let refresh = tokens
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    Ok(configured_summary(
+        "openai-codex",
+        access.is_some() || refresh.is_some(),
+        access.is_some() || refresh.is_some(),
+        state
+            .get("auth_mode")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn nous_status(hermes_home: &Path) -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let auth_store = load_auth_store(&auth_path)?;
+    let Some(state) = provider_state(&auth_store, "nous") else {
+        return Ok(configured_summary(
+            "nous",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("no stored provider state".to_string()),
+        ));
+    };
+    let access = state
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let refresh = state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let agent_key = state
+        .get("agent_key")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    Ok(configured_summary(
+        "nous",
+        access.is_some() || refresh.is_some() || agent_key.is_some(),
+        access.is_some() || refresh.is_some() || agent_key.is_some(),
+        Some("auth.json".to_string()),
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn minimax_status(hermes_home: &Path) -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let auth_store = load_auth_store(&auth_path)?;
+    let Some(state) = provider_state(&auth_store, "minimax-oauth") else {
+        return Ok(configured_summary(
+            "minimax-oauth",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("no stored provider state".to_string()),
+        ));
+    };
+    let access = state
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let refresh = state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    Ok(configured_summary(
+        "minimax-oauth",
+        access.is_some() || refresh.is_some(),
+        access.is_some() || refresh.is_some(),
+        state
+            .get("portal_base_url")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn google_status(hermes_home: &Path) -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = google_oauth_path(hermes_home);
+    if !auth_path.exists() {
+        return Ok(configured_summary(
+            "google-gemini-cli",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("credentials file not found".to_string()),
+        ));
+    }
+    let state = load_google_state(&auth_path)?;
+    let configured =
+        !state.access_token.trim().is_empty() || !state.refresh_token.trim().is_empty();
+    Ok(configured_summary(
+        "google-gemini-cli",
+        configured,
+        configured,
+        (!state.email.trim().is_empty()).then(|| state.email.clone()),
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn qwen_status() -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = qwen_cli_auth_path()?;
+    if !auth_path.exists() {
+        return Ok(configured_summary(
+            "qwen-oauth",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("credentials file not found".to_string()),
+        ));
+    }
+    let tokens = load_qwen_tokens(&auth_path)?;
+    let access = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let refresh = tokens
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    Ok(configured_summary(
+        "qwen-oauth",
+        access.is_some() || refresh.is_some(),
+        access.is_some() || refresh.is_some(),
+        None,
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn spotify_status(hermes_home: &Path) -> Result<AuthStatusSummary, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let auth_store = load_auth_store(&auth_path)?;
+    let Some(state) = provider_state(&auth_store, "spotify") else {
+        return Ok(configured_summary(
+            "spotify",
+            false,
+            false,
+            None,
+            Some(auth_path.display().to_string()),
+            Some("no stored provider state".to_string()),
+        ));
+    };
+    let access = state
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let refresh = state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    Ok(configured_summary(
+        "spotify",
+        access.is_some() || refresh.is_some(),
+        access.is_some() || refresh.is_some(),
+        Some("auth.json".to_string()),
+        Some(auth_path.display().to_string()),
+        None,
+    ))
+}
+
+fn copilot_acp_status() -> Result<AuthStatusSummary, HermesError> {
+    match resolve_copilot_acp_runtime_credentials() {
+        Ok(creds) => Ok(configured_summary(
+            "copilot-acp",
+            true,
+            true,
+            Some(creds.command),
+            None,
+            Some(creds.base_url),
+        )),
+        Err(error) => Ok(configured_summary(
+            "copilot-acp",
+            false,
+            false,
+            None,
+            None,
+            Some(error.to_string()),
+        )),
+    }
+}
+
+fn copilot_status() -> Result<AuthStatusSummary, HermesError> {
+    for env_var in COPILOT_ENV_VARS {
+        if env::var(env_var)
+            .ok()
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .is_some()
+        {
+            return Ok(configured_summary(
+                "copilot",
+                true,
+                true,
+                Some(env_var.to_string()),
+                None,
+                None,
+            ));
+        }
+    }
+    if let Some(gh_path) = env::var("HERMES_COPILOT_GH_PATH")
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .or_else(|| resolve_command_path("gh"))
+    {
+        return Ok(configured_summary(
+            "copilot",
+            true,
+            true,
+            Some(gh_path),
+            None,
+            Some("GitHub token will be resolved via gh auth token".to_string()),
+        ));
+    }
+    Ok(configured_summary(
+        "copilot",
+        false,
+        false,
+        None,
+        None,
+        Some("no GitHub token or gh CLI found".to_string()),
+    ))
+}
+
+fn generic_provider_status(provider: &str) -> Result<AuthStatusSummary, HermesError> {
+    let Some(profile) = get_provider_profile(provider) else {
+        return Err(HermesError::State {
+            action: "reading auth status",
+            detail: format!("Provider '{provider}' is not recognized."),
+        });
+    };
+    match profile.auth_type {
+        "api_key" => {
+            let configured = profile.api_key_env_vars().any(|env_var| {
+                env::var(env_var)
+                    .ok()
+                    .as_deref()
+                    .and_then(non_empty_trimmed)
+                    .is_some()
+            });
+            Ok(configured_summary(
+                provider,
+                configured,
+                configured,
+                None,
+                None,
+                (!configured).then(|| "no API key environment variable is set".to_string()),
+            ))
+        }
+        "aws_sdk" => {
+            let configured = env::var("AWS_ACCESS_KEY_ID")
+                .ok()
+                .as_deref()
+                .and_then(non_empty_trimmed)
+                .is_some()
+                || env::var("AWS_PROFILE")
+                    .ok()
+                    .as_deref()
+                    .and_then(non_empty_trimmed)
+                    .is_some();
+            Ok(configured_summary(
+                provider,
+                configured,
+                configured,
+                None,
+                None,
+                (!configured).then(|| "set AWS credentials or AWS_PROFILE".to_string()),
+            ))
+        }
+        other => Ok(configured_summary(
+            provider,
+            false,
+            false,
+            None,
+            None,
+            Some(format!(
+                "auth type '{other}' is not handled by Rust auth status yet"
+            )),
+        )),
+    }
 }
 
 fn persist_codex_tokens(
@@ -2864,5 +3344,81 @@ mod tests {
             serde_json::from_str::<Value>(&fs::read_to_string(&auth_path).unwrap()).unwrap();
         assert_eq!(persisted["access_token"], "qwen-new");
         assert_eq!(persisted["refresh_token"], "qwen-refresh-new");
+    }
+
+    #[test]
+    fn auth_status_summary_reads_codex_provider_state() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "active_provider": "openai-codex",
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "access-1",
+                            "refresh_token": "refresh-1"
+                        },
+                        "auth_mode": "chatgpt"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let status = get_auth_status_summary(temp.path(), "openai-codex").unwrap();
+        assert!(status.configured);
+        assert!(status.logged_in);
+        assert_eq!(status.source.as_deref(), Some("chatgpt"));
+        assert_eq!(
+            get_active_auth_provider(temp.path()).unwrap().as_deref(),
+            Some("openai-codex")
+        );
+    }
+
+    #[test]
+    fn clear_provider_auth_state_removes_provider_entries() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("auth")).unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "active_provider": "google-gemini-cli",
+                "providers": {
+                    "google-gemini-cli": {
+                        "access_token": "google-access"
+                    }
+                },
+                "credential_pool": {
+                    "google-gemini-cli": {
+                        "entries": []
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("auth").join("google_oauth.json"),
+            json!({
+                "refresh": "refresh",
+                "access": "access",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(clear_provider_auth_state(temp.path(), "google-gemini-cli").unwrap());
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(persisted["providers"]["google-gemini-cli"].is_null());
+        assert!(persisted["credential_pool"]["google-gemini-cli"].is_null());
+        assert!(persisted["active_provider"].is_null());
+        assert!(!temp.path().join("auth").join("google_oauth.json").exists());
     }
 }
