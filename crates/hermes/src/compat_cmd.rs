@@ -58,10 +58,6 @@ pub fn print_cleanup(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("cleanup", args)
 }
 
-pub fn print_acp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("acp", args)
-}
-
 pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("whatsapp", args)
 }

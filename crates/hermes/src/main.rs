@@ -1,3 +1,4 @@
+mod acp_cmd;
 mod auth_cmd;
 mod backup;
 mod compat_cmd;
@@ -88,7 +89,7 @@ enum Command {
     Claw(compat_cmd::CompatArgs),
     Migrate(compat_cmd::CompatArgs),
     Cleanup(compat_cmd::CompatArgs),
-    Acp(compat_cmd::CompatArgs),
+    Acp(acp_cmd::AcpArgs),
     Logout(auth_cmd::LogoutArgs),
     Auth {
         #[command(subcommand)]
@@ -299,7 +300,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Claw(args) => compat_cmd::print_claw(args)?,
         Command::Migrate(args) => compat_cmd::print_migrate(args)?,
         Command::Cleanup(args) => compat_cmd::print_cleanup(args)?,
-        Command::Acp(args) => compat_cmd::print_acp(args)?,
+        Command::Acp(args) => acp_cmd::print_acp(args)?,
         Command::Slack { command } => slack_cmd::print_slack(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
         Command::Completion(args) => completion::print_completion(args)?,
