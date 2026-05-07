@@ -24,12 +24,14 @@ mod pairing_cmd;
 mod plugins_cmd;
 mod profile_cmd;
 mod python_bridge;
+mod setup_cmd;
 mod skills_cmd;
 mod slack_cmd;
 mod snapshot_cmd;
 mod uninstall_cmd;
 mod update_cmd;
 mod webhook;
+mod whatsapp_cmd;
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -132,7 +134,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<auth_cmd::AuthCommand>,
     },
-    Setup(compat_cmd::CompatArgs),
+    Setup(setup_cmd::SetupArgs),
     Config {
         #[command(subcommand)]
         command: Option<config_cmd::ConfigCommand>,
@@ -183,7 +185,7 @@ enum Command {
         command: ToolsCommand,
     },
     Update(update_cmd::UpdateArgs),
-    Whatsapp(compat_cmd::CompatArgs),
+    Whatsapp,
     Status,
 }
 
@@ -338,7 +340,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Completion(args) => completion::print_completion(args)?,
         Command::Logout(args) => auth_cmd::print_logout(&context, &config, args)?,
         Command::Auth { command } => auth_cmd::print_auth(&context, &config, command)?,
-        Command::Setup(args) => compat_cmd::print_setup(args)?,
+        Command::Setup(args) => setup_cmd::print_setup(args)?,
         Command::Config { command } => config_cmd::print_config(&context, &config, command)?,
         Command::Pairing { command } => pairing_cmd::print_pairing(&context, command)?,
         Command::Uninstall(args) => uninstall_cmd::print_uninstall(&context, args)?,
@@ -373,7 +375,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
         Command::Tools { command } => print_tools(&context, &config, command)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
-        Command::Whatsapp(args) => compat_cmd::print_whatsapp(args)?,
+        Command::Whatsapp => whatsapp_cmd::print_whatsapp()?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
     }
 

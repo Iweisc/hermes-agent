@@ -1,25 +1,9 @@
-use std::error::Error;
-
 use clap::Args;
-
-use crate::python_bridge::launch_python_main_command;
 
 #[derive(Args, Debug, Clone)]
 pub struct CompatArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
-}
-
-pub fn print_setup(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("setup", args)
-}
-
-pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("whatsapp", args)
-}
-
-fn print_passthrough(command_name: &str, args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    launch_python_main_command(command_name, &args.args, Some("HERMES_COMPAT_PYTHON"), &[])
 }
 
 #[cfg(test)]
