@@ -23,6 +23,8 @@ const DEFAULT_ELEVENLABS_MODEL_ID: &str = "eleven_multilingual_v2";
 const DEFAULT_ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io/v1";
 const DEFAULT_KITTENTTS_MODEL: &str = "KittenML/kitten-tts-nano-0.8-int8";
 const DEFAULT_KITTENTTS_VOICE: &str = "Jasper";
+const DEFAULT_NEUTTS_MODEL: &str = "neuphonic/neutts-air-q4-gguf";
+const DEFAULT_NEUTTS_DEVICE: &str = "cpu";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE: &str = "alloy";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -81,6 +83,11 @@ struct TtsSettings {
     kittentts_speed: f64,
     kittentts_clean_text: bool,
     kittentts_pythonpath: Option<String>,
+    neutts_ref_audio: PathBuf,
+    neutts_ref_text: PathBuf,
+    neutts_model: String,
+    neutts_device: String,
+    neutts_pythonpath: Option<String>,
     openai_model: String,
     openai_voice: String,
     openai_base_url: String,
@@ -184,6 +191,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "edge" => synthesize_edge(&settings, &truncated, &output_path),
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
         "kittentts" => synthesize_kittentts(&settings, &truncated, &output_path),
+        "neutts" => synthesize_neutts(&settings, &truncated, &output_path),
         "openai" => synthesize_openai(&settings, &truncated, &output_path),
         "piper" => synthesize_piper(&settings, &truncated, &output_path),
         "minimax" => synthesize_minimax(&settings, &truncated, &output_path),
@@ -191,7 +199,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "mistral" => synthesize_mistral(&settings, &truncated, &output_path),
         "xai" => synthesize_xai(&settings, &truncated, &output_path),
         other => Err(format!(
-            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, kittentts, openai, piper, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
+            "TTS provider '{other}' is not ported in the Rust runtime yet. Supported providers: edge, elevenlabs, kittentts, neutts, openai, piper, minimax, gemini, mistral, xai, and configured tts.providers.<name> command backends."
         )),
     };
     if let Err(error) = result {
@@ -265,6 +273,17 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let kittentts_clean_text =
         yaml_mapping_bool(root, &["kittentts", "clean_text"]).unwrap_or(true);
     let kittentts_pythonpath = yaml_mapping_value(root, &["kittentts", "pythonpath"]);
+    let neutts_ref_audio = yaml_mapping_value(root, &["neutts", "ref_audio"])
+        .map(|value| expand_user_path(&value))
+        .unwrap_or_else(default_neutts_ref_audio);
+    let neutts_ref_text = yaml_mapping_value(root, &["neutts", "ref_text"])
+        .map(|value| expand_user_path(&value))
+        .unwrap_or_else(default_neutts_ref_text);
+    let neutts_model = yaml_mapping_value(root, &["neutts", "model"])
+        .unwrap_or_else(|| DEFAULT_NEUTTS_MODEL.to_string());
+    let neutts_device = yaml_mapping_value(root, &["neutts", "device"])
+        .unwrap_or_else(|| DEFAULT_NEUTTS_DEVICE.to_string());
+    let neutts_pythonpath = yaml_mapping_value(root, &["neutts", "pythonpath"]);
     let openai_model = yaml_mapping_value(root, &["openai", "model"])
         .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
     let openai_voice = yaml_mapping_value(root, &["openai", "voice"])
@@ -356,6 +375,11 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
         kittentts_speed,
         kittentts_clean_text,
         kittentts_pythonpath,
+        neutts_ref_audio,
+        neutts_ref_text,
+        neutts_model,
+        neutts_device,
+        neutts_pythonpath,
         openai_model,
         openai_voice,
         openai_base_url,
@@ -616,6 +640,88 @@ sf.write(wav_path, audio, 24000)
         } else {
             format!(
                 "KittenTTS synthesis exited with code {}: {}",
+                output.status.code().unwrap_or(-1),
+                detail
+            )
+        });
+    }
+    ensure_audio_file(&wav_path)?;
+    finalize_wav_output(&wav_path, output_path)
+}
+
+fn synthesize_neutts(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
+    if !settings.neutts_ref_audio.exists() {
+        return Err(format!(
+            "NeuTTS reference audio not found: {}",
+            settings.neutts_ref_audio.display()
+        ));
+    }
+    if !settings.neutts_ref_text.exists() {
+        return Err(format!(
+            "NeuTTS reference text not found: {}",
+            settings.neutts_ref_text.display()
+        ));
+    }
+    let script_path = repo_root().join("tools").join("neutts_synth.py");
+    if !script_path.exists() {
+        return Err(format!(
+            "NeuTTS synthesis helper not found: {}",
+            script_path.display()
+        ));
+    }
+
+    let wav_path = if output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    {
+        output_path.to_path_buf()
+    } else {
+        output_path.with_extension("wav")
+    };
+    let interpreter = resolve_python_interpreter();
+    let mut command = Command::new(&interpreter);
+    command
+        .arg(&script_path)
+        .arg("--text")
+        .arg(text)
+        .arg("--out")
+        .arg(&wav_path)
+        .arg("--ref-audio")
+        .arg(&settings.neutts_ref_audio)
+        .arg("--ref-text")
+        .arg(&settings.neutts_ref_text)
+        .arg("--model")
+        .arg(&settings.neutts_model)
+        .arg("--device")
+        .arg(&settings.neutts_device);
+    apply_pythonpath_override(&mut command, settings.neutts_pythonpath.as_deref());
+    let output = command.output().map_err(|error| {
+        format!(
+            "starting NeuTTS synthesis with {} failed: {error}",
+            interpreter.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Error: neutts not installed")
+            || stderr.contains("No module named 'neutts'")
+            || stderr.contains("No module named \"neutts\"")
+        {
+            return Err(
+                "NeuTTS provider selected but neutts is not installed. Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
+                    .to_string(),
+            );
+        }
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!(
+                "NeuTTS synthesis exited with code {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            format!(
+                "NeuTTS synthesis exited with code {}: {}",
                 output.status.code().unwrap_or(-1),
                 detail
             )
@@ -1161,6 +1267,7 @@ fn is_builtin_tts_provider(provider: &str) -> bool {
         "edge"
             | "elevenlabs"
             | "kittentts"
+            | "neutts"
             | "openai"
             | "piper"
             | "minimax"
@@ -1249,6 +1356,7 @@ fn provider_max_text_length(settings: &TtsSettings) -> usize {
         "edge" => EDGE_MAX_TEXT_LENGTH,
         "openai" => OPENAI_MAX_TEXT_LENGTH,
         "kittentts" => 2_000,
+        "neutts" => 2_000,
         "piper" => DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH,
         "minimax" => MINIMAX_MAX_TEXT_LENGTH,
         "gemini" => GEMINI_MAX_TEXT_LENGTH,
@@ -1288,9 +1396,7 @@ fn synthesize_command_provider(
     if output_path.exists() {
         let _ = fs::remove_file(output_path);
     }
-    let temp_dir = std::env::temp_dir().join(format!("hermes_tts_{:x}", unix_ts_nanos()));
-    fs::create_dir_all(&temp_dir)
-        .map_err(|error| format!("creating {} failed: {error}", temp_dir.display()))?;
+    let temp_dir = create_tts_temp_dir()?;
     let input_path = temp_dir.join("input.txt");
     fs::write(&input_path, text)
         .map_err(|error| format!("writing {} failed: {error}", input_path.display()))?;
@@ -1626,6 +1732,32 @@ fn ffmpeg_available() -> bool {
         .is_ok()
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+        })
+}
+
+fn default_neutts_ref_audio() -> PathBuf {
+    repo_root()
+        .join("tools")
+        .join("neutts_samples")
+        .join("jo.wav")
+}
+
+fn default_neutts_ref_text() -> PathBuf {
+    repo_root()
+        .join("tools")
+        .join("neutts_samples")
+        .join("jo.txt")
+}
+
 fn resolve_python_interpreter() -> PathBuf {
     if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
         let candidate = PathBuf::from(venv).join(if cfg!(windows) {
@@ -1921,6 +2053,25 @@ fn tts_config_error(action: &'static str, error: HermesError) -> String {
     format!("TTS config {action} failed: {error}")
 }
 
+fn create_tts_temp_dir() -> Result<PathBuf, String> {
+    for attempt in 0..16_u8 {
+        let candidate = std::env::temp_dir().join(format!(
+            "hermes_tts_{}_{:x}_{}",
+            std::process::id(),
+            unix_ts_nanos(),
+            attempt
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("creating {} failed: {error}", candidate.display()));
+            }
+        }
+    }
+    Err("creating temporary TTS directory failed after repeated collisions".to_string())
+}
+
 fn unix_ts_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2077,6 +2228,58 @@ class KittenTTS:
             r#"
 def write(path, audio, samplerate):
     payload = str(audio).encode("utf-8")
+    with open(path, "wb") as fh:
+        fh.write(b"RIFF")
+        fh.write(payload)
+"#,
+        )
+        .unwrap();
+    }
+
+    fn install_fake_neutts_package(root: &Path, broken: bool) {
+        let package = root.join("neutts");
+        fs::create_dir_all(&package).unwrap();
+        if broken {
+            fs::write(
+                package.join("__init__.py"),
+                "raise ModuleNotFoundError(\"No module named 'neutts'\")\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                package.join("__init__.py"),
+                r#"
+class NeuTTS:
+    def __init__(self, backbone_repo, backbone_device, codec_repo, codec_device):
+        self.backbone_repo = backbone_repo
+        self.backbone_device = backbone_device
+        self.codec_repo = codec_repo
+        self.codec_device = codec_device
+        self.ref_audio = ""
+
+    def encode_reference(self, ref_audio):
+        self.ref_audio = ref_audio
+        return {"ref_audio": ref_audio}
+
+    def infer(self, text, ref_codes, ref_text):
+        return {
+            "text": text,
+            "ref_audio": ref_codes["ref_audio"],
+            "ref_text": ref_text,
+            "model": self.backbone_repo,
+            "device": self.backbone_device,
+            "codec_repo": self.codec_repo,
+            "codec_device": self.codec_device,
+        }
+"#,
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.join("soundfile.py"),
+            r#"
+def write(path, audio, samplerate):
+    payload = str({"audio": audio, "samplerate": samplerate}).encode("utf-8")
     with open(path, "wb") as fh:
         fh.write(b"RIFF")
         fh.write(payload)
@@ -3113,6 +3316,79 @@ def write(path, audio, samplerate):
                 .unwrap()
                 .to_ascii_lowercase()
                 .contains("kittentts")
+        );
+    }
+
+    #[test]
+    fn neutts_writes_audio_file_with_custom_config() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        install_fake_neutts_package(&pyroot, false);
+        let ref_audio = temp.path().join("voice.wav");
+        let ref_text = temp.path().join("voice.txt");
+        fs::write(&ref_audio, b"fake-reference").unwrap();
+        fs::write(&ref_text, "reference transcript").unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: neutts\n  neutts:\n    ref_audio: {}\n    ref_text: {}\n    model: neuphonic/neutts-air-mini\n    device: cuda\n    pythonpath: {}\n",
+                ref_audio.display(),
+                ref_text.display(),
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("neutts.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello neutts",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("neutts"));
+        let audio = fs::read(&output_path).unwrap();
+        assert_eq!(&audio[..4], b"RIFF");
+        let rendered = String::from_utf8_lossy(&audio);
+        assert!(rendered.contains("hello neutts"));
+        assert!(rendered.contains("reference transcript"));
+        assert!(rendered.contains(&ref_audio.display().to_string()));
+        assert!(rendered.contains("neuphonic/neutts-air-mini"));
+        assert!(rendered.contains("cuda"));
+        assert!(rendered.contains("neuphonic/neucodec"));
+    }
+
+    #[test]
+    fn neutts_missing_package_returns_helpful_error() {
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        install_fake_neutts_package(&pyroot, true);
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: neutts\n  neutts:\n    pythonpath: {}\n",
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(&json!({"text":"hello neutts"}), &runtime);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("neutts")
         );
     }
 }
