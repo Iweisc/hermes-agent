@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -162,6 +162,14 @@ struct GitHubSkillSummary {
 
 #[derive(Debug, Clone)]
 struct LobeHubSkillSummary {
+    name: String,
+    description: String,
+    identifier: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClawHubSkillSummary {
     name: String,
     description: String,
     identifier: String,
@@ -541,6 +549,43 @@ fn browse_skills_command(
         println!();
         return Ok(());
     }
+    if source == "clawhub" {
+        let skills = browse_clawhub_skill_summaries(page, page_size)?;
+        if skills.is_empty() {
+            println!("No skills found in the Skills Hub.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &skills {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "clawhub",
+                "community",
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!("Page {page} — {} clawhub skill(s)", skills.len());
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
     if source != "official" {
         return bridge_prefixed("browse", passthrough);
     }
@@ -722,6 +767,42 @@ fn search_skills_command(
                 "{:<24} {:<12} {:<10} {:<30} {}",
                 truncate(&skill.name, 24),
                 "well-known",
+                "community",
+                truncate(&skill.identifier, 30),
+                truncate(&skill.description, 60),
+            );
+        }
+        println!();
+        println!(
+            "Use: hermes skills inspect <identifier> to preview, hermes skills install <identifier> to install"
+        );
+        println!();
+        return Ok(());
+    }
+    if source == "clawhub" {
+        let matches = search_clawhub_skill_summaries(&query, limit)?;
+        if matches.is_empty() {
+            println!("No skills found matching your query.");
+            println!();
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} Description",
+            "Name", "Source", "Trust", "Identifier"
+        );
+        println!(
+            "{:<24} {:<12} {:<10} {:<30} -----------",
+            "------------------------",
+            "------------",
+            "----------",
+            "------------------------------"
+        );
+        for skill in &matches {
+            println!(
+                "{:<24} {:<12} {:<10} {:<30} {}",
+                truncate(&skill.name, 24),
+                "clawhub",
                 "community",
                 truncate(&skill.identifier, 30),
                 truncate(&skill.description, 60),
@@ -944,6 +1025,29 @@ fn install_github_skill_command(
             identifier,
             "lobehub",
             "LobeHub",
+        );
+    }
+    if let Some((bundle_dir, skill_name, trust_level, identifier)) =
+        fetch_clawhub_bundle_to_tempdir(&args.identifier)?
+    {
+        let Some(skill_name) = skill_name.or_else(|| {
+            if args.name_override.trim().is_empty() {
+                None
+            } else {
+                Some(args.name_override.trim().to_string())
+            }
+        }) else {
+            return bridge_prefixed("install", passthrough);
+        };
+        return install_remote_skill_bundle(
+            context,
+            args,
+            bundle_dir,
+            skill_name,
+            trust_level,
+            identifier,
+            "clawhub",
+            "ClawHub",
         );
     }
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
@@ -1359,6 +1463,7 @@ fn check_skills_command(
         source != "official"
             && source != "github"
             && source != "lobehub"
+            && source != "clawhub"
             && source != "well-known"
             && source != "url"
     }) {
@@ -1398,6 +1503,7 @@ fn update_skills_command(
         if entry.source != "official"
             && entry.source != "github"
             && entry.source != "lobehub"
+            && entry.source != "clawhub"
             && entry.source != "well-known"
             && entry.source != "url"
         {
@@ -1420,6 +1526,7 @@ fn update_skills_command(
             entry.source != "official"
                 && entry.source != "github"
                 && entry.source != "lobehub"
+                && entry.source != "clawhub"
                 && entry.source != "well-known"
                 && entry.source != "url"
         }) {
@@ -1949,6 +2056,7 @@ fn collect_official_skill_candidates(
             .to_string();
         let (source_dir, files, latest_hash, trust_level, temp_dir) = if entry.source == "github"
             || entry.source == "lobehub"
+            || entry.source == "clawhub"
             || entry.source == "well-known"
             || entry.source == "url"
         {
@@ -1964,6 +2072,8 @@ fn collect_official_skill_candidates(
                         (bundle_dir, Some(bundle_name), trust, resolved_identifier)
                     },
                 )
+            } else if entry.source == "clawhub" {
+                fetch_clawhub_bundle_to_tempdir(&identifier)?
             } else if entry.source == "well-known" {
                 fetch_well_known_bundle_to_tempdir(&identifier)?
             } else {
@@ -2053,6 +2163,7 @@ fn apply_official_updates(
         let install_path = validated_install_path(&skills_root, &update.install_path)?;
         let scan_verdict = if update.source == "github"
             || update.source == "lobehub"
+            || update.source == "clawhub"
             || update.source == "well-known"
             || update.source == "url"
         {
@@ -2228,6 +2339,9 @@ fn resolve_native_inspect_skill(
         return Ok(Some(skill));
     }
     if let Some(skill) = fetch_remote_lobehub_inspect_skill(identifier)? {
+        return Ok(Some(skill));
+    }
+    if let Some(skill) = fetch_remote_clawhub_inspect_skill(identifier)? {
         return Ok(Some(skill));
     }
     if let Some(skill) = fetch_remote_well_known_inspect_skill(identifier)? {
@@ -4086,6 +4200,460 @@ fn collect_lobehub_skill_summaries() -> Result<Vec<LobeHubSkillSummary>, Box<dyn
     }
     summaries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(summaries)
+}
+
+fn clawhub_base_url() -> String {
+    std::env::var("HERMES_CLAWHUB_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("https://clawhub.ai/api/v1"))
+}
+
+fn parse_clawhub_identifier(identifier: &str) -> Option<String> {
+    let trimmed = identifier.trim();
+    let raw = trimmed
+        .strip_prefix("clawhub/")
+        .or_else(|| trimmed.strip_prefix("clawhub:"))?;
+    let slug = raw.trim();
+    if slug.is_empty()
+        || slug.contains('/')
+        || matches!(slug, "." | "..")
+        || slug.contains('\\')
+        || slug.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(slug.to_string())
+}
+
+fn clawhub_get_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    query: Option<&[(&str, String)]>,
+) -> Result<Option<JsonValue>, Box<dyn Error>> {
+    let mut request = client.get(url);
+    if let Some(query) = query {
+        request = request.query(query);
+    }
+    let response = request.send()?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() != StatusCode::OK {
+        return Ok(None);
+    }
+    Ok(Some(response.json::<JsonValue>()?))
+}
+
+fn clawhub_normalize_tags(value: Option<&JsonValue>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if let Some(values) = value.as_array() {
+        return values
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(values) = value.as_object() {
+        return values
+            .keys()
+            .filter(|key| key.as_str() != "latest")
+            .cloned()
+            .collect();
+    }
+    Vec::new()
+}
+
+fn clawhub_summary_from_value(value: &JsonValue) -> Option<ClawHubSkillSummary> {
+    let slug = value
+        .get("slug")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(ClawHubSkillSummary {
+        name: value
+            .get("displayName")
+            .and_then(JsonValue::as_str)
+            .or_else(|| value.get("name").and_then(JsonValue::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(slug)
+            .to_string(),
+        description: value
+            .get("summary")
+            .and_then(JsonValue::as_str)
+            .or_else(|| value.get("description").and_then(JsonValue::as_str))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string(),
+        identifier: format!("clawhub/{slug}"),
+        tags: clawhub_normalize_tags(value.get("tags")),
+    })
+}
+
+fn fetch_clawhub_listing_page(
+    client: &reqwest::blocking::Client,
+    search: Option<&str>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Option<JsonValue>, Box<dyn Error>> {
+    let mut query = vec![("limit", limit.to_string())];
+    if let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(("search", search.to_string()));
+    }
+    if let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(("cursor", cursor.to_string()));
+    }
+    clawhub_get_json(
+        client,
+        &format!("{}/skills", clawhub_base_url()),
+        Some(&query),
+    )
+}
+
+fn browse_clawhub_skill_summaries(
+    page: usize,
+    page_size: usize,
+) -> Result<Vec<ClawHubSkillSummary>, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let mut cursor = None::<String>;
+
+    for current_page in 1..=page {
+        let Some(data) =
+            fetch_clawhub_listing_page(&client, None, page_size.max(1), cursor.as_deref())?
+        else {
+            return Ok(Vec::new());
+        };
+        let items = data
+            .get("items")
+            .and_then(JsonValue::as_array)
+            .or_else(|| data.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if current_page == page {
+            let mut summaries = items
+                .iter()
+                .filter_map(clawhub_summary_from_value)
+                .collect::<Vec<_>>();
+            summaries.sort_by(|left, right| left.name.cmp(&right.name));
+            return Ok(summaries);
+        }
+        cursor = data
+            .get("nextCursor")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            return Ok(Vec::new());
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn search_clawhub_skill_summaries(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ClawHubSkillSummary>, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(data) = fetch_clawhub_listing_page(&client, Some(query), limit.max(1), None)? else {
+        return Ok(Vec::new());
+    };
+    let items = data
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .or_else(|| data.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut summaries = items
+        .iter()
+        .filter_map(clawhub_summary_from_value)
+        .take(limit)
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(summaries)
+}
+
+fn clawhub_skill_object<'a>(
+    value: &'a JsonValue,
+) -> Option<&'a serde_json::Map<String, JsonValue>> {
+    value
+        .get("skill")
+        .and_then(JsonValue::as_object)
+        .or_else(|| value.as_object())
+}
+
+fn resolve_clawhub_latest_version(
+    client: &reqwest::blocking::Client,
+    slug: &str,
+    skill_data: &JsonValue,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let object = clawhub_skill_object(skill_data);
+    if let Some(version) = object
+        .and_then(|value| value.get("latestVersion"))
+        .or_else(|| skill_data.get("latestVersion"))
+        .and_then(JsonValue::as_object)
+        .and_then(|value| value.get("version"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(version.to_string()));
+    }
+
+    if let Some(version) = object
+        .and_then(|value| value.get("tags"))
+        .or_else(|| skill_data.get("tags"))
+        .and_then(JsonValue::as_object)
+        .and_then(|value| value.get("latest"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(version.to_string()));
+    }
+
+    let Some(versions) = clawhub_get_json(
+        client,
+        &format!("{}/skills/{slug}/versions", clawhub_base_url()),
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    let first = versions.as_array().and_then(|values| values.first());
+    Ok(first
+        .and_then(JsonValue::as_object)
+        .and_then(|value| value.get("version"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+fn extract_clawhub_files(
+    client: &reqwest::blocking::Client,
+    version_data: &JsonValue,
+) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    let mut files = HashMap::new();
+    let Some(file_list) = version_data.get("files") else {
+        return Ok(files);
+    };
+
+    if let Some(map) = file_list.as_object() {
+        for (path, content) in map {
+            let safe_rel_path = match normalize_bundle_relative_path(path) {
+                Ok(path) => path.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            let Some(content) = content.as_str() else {
+                continue;
+            };
+            files.insert(safe_rel_path, content.to_string());
+        }
+        return Ok(files);
+    }
+
+    let Some(list) = file_list.as_array() else {
+        return Ok(files);
+    };
+    for file_meta in list {
+        let Some(file_meta) = file_meta.as_object() else {
+            continue;
+        };
+        let Some(path) = file_meta
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .or_else(|| file_meta.get("name").and_then(JsonValue::as_str))
+        else {
+            continue;
+        };
+        let safe_rel_path = match normalize_bundle_relative_path(path) {
+            Ok(path) => path.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if let Some(content) = file_meta.get("content").and_then(JsonValue::as_str) {
+            files.insert(safe_rel_path, content.to_string());
+            continue;
+        }
+        let Some(raw_url) = file_meta
+            .get("rawUrl")
+            .and_then(JsonValue::as_str)
+            .or_else(|| file_meta.get("downloadUrl").and_then(JsonValue::as_str))
+            .or_else(|| file_meta.get("url").and_then(JsonValue::as_str))
+            .map(str::trim)
+            .filter(|value| value.starts_with("http"))
+        else {
+            continue;
+        };
+        let Some(content) = fetch_text(client, raw_url)? else {
+            continue;
+        };
+        files.insert(safe_rel_path, content);
+    }
+    Ok(files)
+}
+
+fn download_clawhub_zip(
+    client: &reqwest::blocking::Client,
+    slug: &str,
+    version: &str,
+) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    let response = client
+        .get(format!("{}/download", clawhub_base_url()))
+        .query(&[("slug", slug), ("version", version)])
+        .send()?;
+    if response.status() != StatusCode::OK {
+        return Ok(HashMap::new());
+    }
+
+    let bytes = response.bytes()?;
+    let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+        Ok(archive) => archive,
+        Err(_) => return Ok(HashMap::new()),
+    };
+
+    let mut files = HashMap::new();
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index)?;
+        if file.is_dir() || file.size() > 500_000 {
+            continue;
+        }
+        let safe_rel_path = match normalize_bundle_relative_path(file.name()) {
+            Ok(path) => path.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        let mut content = String::new();
+        if file.read_to_string(&mut content).is_err() {
+            continue;
+        }
+        files.insert(safe_rel_path, content);
+    }
+    Ok(files)
+}
+
+fn fetch_clawhub_bundle_to_tempdir(
+    identifier: &str,
+) -> Result<Option<(tempfile::TempDir, Option<String>, String, String)>, Box<dyn Error>> {
+    let Some(slug) = parse_clawhub_identifier(identifier) else {
+        return Ok(None);
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(skill_data) = clawhub_get_json(
+        &client,
+        &format!("{}/skills/{slug}", clawhub_base_url()),
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(version) = resolve_clawhub_latest_version(&client, &slug, &skill_data)? else {
+        return Ok(None);
+    };
+
+    let mut files = download_clawhub_zip(&client, &slug, &version)?;
+    if !files.contains_key("SKILL.md") {
+        if let Some(version_data) = clawhub_get_json(
+            &client,
+            &format!("{}/skills/{slug}/versions/{version}", clawhub_base_url()),
+            None,
+        )? {
+            let extracted = extract_clawhub_files(&client, &version_data)?;
+            if extracted.contains_key("SKILL.md") {
+                files = extracted;
+            } else if let Some(nested) = version_data.get("version") {
+                let extracted = extract_clawhub_files(&client, nested)?;
+                if extracted.contains_key("SKILL.md") {
+                    files = extracted;
+                }
+            }
+        }
+    }
+    if !files.contains_key("SKILL.md") {
+        return Ok(None);
+    }
+
+    let bundle_dir = tempfile::TempDir::new()?;
+    for (relative, content) in files {
+        let dest_path = bundle_dir.path().join(&relative);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest_path, content)?;
+    }
+    Ok(Some((
+        bundle_dir,
+        Some(slug.clone()),
+        String::from("community"),
+        format!("clawhub/{slug}"),
+    )))
+}
+
+fn fetch_remote_clawhub_inspect_skill(
+    identifier: &str,
+) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
+    let Some(slug) = parse_clawhub_identifier(identifier) else {
+        return Ok(None);
+    };
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let Some(skill_data) = clawhub_get_json(
+        &client,
+        &format!("{}/skills/{slug}", clawhub_base_url()),
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    let skill_object = match clawhub_skill_object(&skill_data) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let bundle = fetch_clawhub_bundle_to_tempdir(&format!("clawhub/{slug}"))?;
+    let preview = bundle
+        .as_ref()
+        .and_then(|(bundle_dir, ..)| fs::read_to_string(bundle_dir.path().join("SKILL.md")).ok())
+        .map(|content| preview_lines(&content, 50))
+        .unwrap_or_default();
+
+    Ok(Some(NativeInspectSkill {
+        name: skill_object
+            .get("displayName")
+            .and_then(JsonValue::as_str)
+            .or_else(|| skill_object.get("name").and_then(JsonValue::as_str))
+            .or_else(|| skill_object.get("slug").and_then(JsonValue::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(slug.as_str())
+            .to_string(),
+        description: skill_object
+            .get("summary")
+            .and_then(JsonValue::as_str)
+            .or_else(|| skill_object.get("description").and_then(JsonValue::as_str))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string(),
+        source: String::from("clawhub"),
+        trust: String::from("community"),
+        identifier: format!("clawhub/{slug}"),
+        tags: clawhub_normalize_tags(skill_object.get("tags").or_else(|| skill_data.get("tags"))),
+        preview,
+        path: PathBuf::from(format!("clawhub/{slug}")),
+    }))
 }
 
 fn collect_well_known_skill_summaries(
@@ -6203,6 +6771,58 @@ exit 9\n",
     }
 
     #[test]
+    fn install_native_clawhub_skill_copies_files_and_writes_lock() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-clawhub-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_clawhub_server(requests.clone());
+        let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
+
+        install_skill_command(
+            &context,
+            &[String::from("clawhub/deploy-agent"), String::from("--yes")],
+        )
+        .unwrap();
+
+        let install_dir = home.join("skills").join("deploy-agent");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("name: deploy-agent"));
+        assert!(skill_md.contains("ClawHub deploy helper"));
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "downloaded from clawhub\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-agent").unwrap();
+        assert_eq!(entry.source, "clawhub");
+        assert_eq!(entry.trust_level, "community");
+        assert_eq!(entry.install_path, "deploy-agent");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("clawhub/deploy-agent")
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/v1/skills/deploy-agent "))
+        );
+        assert!(logged.iter().any(|request| {
+            request.starts_with("GET /api/v1/download?slug=deploy-agent&version=1.2.3 ")
+        }));
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn install_native_well_known_skill_copies_files_and_writes_lock() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("install-well-known-home");
@@ -6306,12 +6926,12 @@ exit 9\n",
         set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
         install_skill_command(
             &context,
-            &[String::from("clawhub/demo"), String::from("--force")],
+            &[String::from("skills-sh/demo"), String::from("--force")],
         )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=clawhub/demo --force"));
+        assert!(output.contains("action=install argv=skills-sh/demo --force"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
@@ -6530,6 +7150,43 @@ exit 9\n",
     }
 
     #[test]
+    fn collect_clawhub_skill_summaries_reads_listing_and_search() {
+        let _guard = test_env_lock().lock().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_clawhub_server(requests.clone());
+        let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
+
+        let browse = browse_clawhub_skill_summaries(1, 5).unwrap();
+        assert_eq!(browse.len(), 2);
+        let search = search_clawhub_skill_summaries("deploy", 5).unwrap();
+        assert_eq!(search.len(), 1);
+        assert_eq!(search[0].identifier, "clawhub/deploy-agent");
+        assert_eq!(
+            search[0].tags,
+            vec![String::from("ops"), String::from("deploy")]
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/v1/skills?limit=5 "))
+        );
+        assert!(
+            logged.iter().any(|request| {
+                request.starts_with("GET /api/v1/skills?limit=5&search=deploy ")
+            })
+        );
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+    }
+
+    #[test]
     fn collect_well_known_skill_summaries_reads_index() {
         let _guard = test_env_lock().lock().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -6720,6 +7377,67 @@ exit 9\n",
     }
 
     #[test]
+    fn update_native_clawhub_skill_restores_files_and_lock_hash() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("clawhub-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("deploy-agent");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::write(
+            install_dir.join("SKILL.md"),
+            "---\nname: deploy-agent\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(install_dir.join("old.txt"), "stale\n").unwrap();
+        fs::write(
+            home.join("skills").join(".hub").join("lock.json"),
+            r#"{"version":1,"installed":{"deploy-agent":{"source":"clawhub","identifier":"clawhub/deploy-agent","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"deploy-agent","files":["SKILL.md"]}}}"#,
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_clawhub_server(requests.clone());
+        let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
+        set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
+
+        update_skills_command(&context, &[]).unwrap();
+
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("deploy-agent").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md.contains("ClawHub deploy helper"));
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "downloaded from clawhub\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/v1/skills/deploy-agent "))
+        );
+        assert!(logged.iter().any(|request| {
+            request.starts_with("GET /api/v1/download?slug=deploy-agent&version=1.2.3 ")
+        }));
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_CLAWHUB_BASE_URL", value),
+            None => remove_env_var("HERMES_CLAWHUB_BASE_URL"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn update_native_well_known_skill_restores_files_and_lock_hash() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("well-known-update-home");
@@ -6853,7 +7571,7 @@ exit 9\n",
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"clawhub","identifier":"clawhub/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"demo":{"source":"skills-sh","identifier":"skills-sh/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
 
@@ -6897,7 +7615,7 @@ exit 9\n",
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"clawhub","identifier":"clawhub/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"demo":{"source":"skills-sh","identifier":"skills-sh/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
 
@@ -7263,6 +7981,90 @@ exit 9\n",
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    fn clawhub_zip_bytes() -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("SKILL.md", options).unwrap();
+        writer
+            .write_all(b"---\nname: deploy-agent\ndescription: ClawHub deploy helper\n---\nbody\n")
+            .unwrap();
+        writer.start_file("notes.txt", options).unwrap();
+        writer.write_all(b"downloaded from clawhub\n").unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn spawn_clawhub_server(requests: Arc<Mutex<Vec<String>>>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let zip_body = clawhub_zip_bytes();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        if first_line
+                            .starts_with("GET /api/v1/download?slug=deploy-agent&version=1.2.3 ")
+                        {
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                zip_body.len()
+                            );
+                            stream.write_all(header.as_bytes()).unwrap();
+                            stream.write_all(&zip_body).unwrap();
+                            continue;
+                        }
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /api/v1/skills?limit=5&search=deploy ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"items":[{"slug":"deploy-agent","displayName":"Deploy Agent","summary":"ClawHub deploy helper","tags":["ops","deploy"],"latestVersion":{"version":"1.2.3"}}]}"#.to_string(),
+                                "application/json",
+                            )
+                        } else if first_line.starts_with("GET /api/v1/skills?limit=5 ") {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"items":[{"slug":"deploy-agent","displayName":"Deploy Agent","summary":"ClawHub deploy helper","tags":["ops","deploy"],"latestVersion":{"version":"1.2.3"}},{"slug":"research-agent","displayName":"Research Agent","summary":"ClawHub research helper","tags":["research"],"latestVersion":{"version":"2.0.0"}}]}"#.to_string(),
+                                "application/json",
+                            )
+                        } else if first_line.starts_with("GET /api/v1/skills/deploy-agent ") {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"{"skill":{"slug":"deploy-agent","displayName":"Deploy Agent","summary":"ClawHub deploy helper","tags":["ops","deploy"],"latestVersion":{"version":"1.2.3"}}}"#.to_string(),
+                                "application/json",
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("clawhub test server accept failed: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}/api/v1"), handle)
     }
 
     fn spawn_well_known_server(
