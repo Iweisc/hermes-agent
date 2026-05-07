@@ -5,9 +5,11 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::HermesContext;
 use md5::Context as Md5Context;
+use reqwest::StatusCode;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 use sha2::Digest;
@@ -172,6 +174,13 @@ struct HubInstalledEntry {
 }
 
 #[derive(Debug, Clone)]
+struct PublishArgsParsed {
+    skill_path: String,
+    target: String,
+    repo: String,
+}
+
+#[derive(Debug, Clone)]
 struct TapEntry {
     repo: String,
     raw: JsonMap<String, JsonValue>,
@@ -182,7 +191,10 @@ pub fn print_skills(
     command: Option<SkillsCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        None => bridge_skills(None, &[]),
+        None => {
+            print_skills_usage();
+            Ok(())
+        }
         Some(SkillsCommand::Browse(args)) => browse_skills_command(&args.args),
         Some(SkillsCommand::Search(args)) => search_skills_command(&args.args),
         Some(SkillsCommand::Install(args)) => install_skill_command(context, &args.args),
@@ -194,10 +206,19 @@ pub fn print_skills(
         Some(SkillsCommand::Audit(args)) => audit_skills_command(context, &args.args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
         Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
-        Some(SkillsCommand::Publish(args)) => bridge_prefixed("publish", &args.args),
+        Some(SkillsCommand::Publish(args)) => publish_skill_command(context, &args.args),
         Some(SkillsCommand::Snapshot(args)) => print_snapshot(context, args),
         Some(SkillsCommand::Tap(args)) => print_taps(context, args),
     }
+}
+
+fn print_skills_usage() {
+    println!(
+        "Usage: hermes skills [browse|search|install|inspect|list|check|update|audit|uninstall|reset|publish|snapshot|tap]"
+    );
+    println!();
+    println!("Run 'hermes skills <command> --help' for details.");
+    println!();
 }
 
 fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
@@ -746,6 +767,54 @@ fn parse_install_args(passthrough: &[String]) -> Result<Option<InstallArgsParsed
     }))
 }
 
+fn parse_publish_args(passthrough: &[String]) -> Result<PublishArgsParsed, Box<dyn Error>> {
+    let Some(first) = passthrough.first() else {
+        return Err(
+            "Usage: hermes skills publish <skill-path> [--to github|clawhub] [--repo owner/repo]"
+                .into(),
+        );
+    };
+    let skill_path = first.trim();
+    if skill_path.is_empty() {
+        return Err("skill path cannot be empty".into());
+    }
+
+    let mut target = String::from("github");
+    let mut repo = String::new();
+    let mut index = 1usize;
+    while index < passthrough.len() {
+        match passthrough[index].as_str() {
+            "--to" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("--to requires a value".into());
+                };
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized != "github" && normalized != "clawhub" {
+                    return Err("target must be 'github' or 'clawhub'".into());
+                }
+                target = normalized;
+                index += 2;
+            }
+            "--repo" => {
+                let Some(value) = passthrough.get(index + 1) else {
+                    return Err("--repo requires a value".into());
+                };
+                repo = validate_tap_repo(value)?.to_string();
+                index += 2;
+            }
+            flag => {
+                return Err(format!("unknown publish argument: {flag}").into());
+            }
+        }
+    }
+
+    Ok(PublishArgsParsed {
+        skill_path: skill_path.to_string(),
+        target,
+        repo,
+    })
+}
+
 fn parse_positive_usize(raw: &str, flag: &str) -> Result<usize, Box<dyn Error>> {
     let parsed = raw
         .trim()
@@ -900,6 +969,334 @@ fn audit_skills_command(
         println!();
     }
 
+    Ok(())
+}
+
+fn publish_skill_command(
+    context: &HermesContext,
+    passthrough: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let args = parse_publish_args(passthrough)?;
+    let skill_dir = resolve_publish_skill_dir(context, &args.skill_path)?;
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        return Err(format!("No SKILL.md found at {}", skill_dir.display()).into());
+    }
+
+    let skill_text = fs::read_to_string(&skill_md)?;
+    let (frontmatter, _) = parse_frontmatter(&skill_text);
+    let name = frontmatter_string(&frontmatter, "name").unwrap_or_else(|| {
+        skill_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
+    let description = frontmatter_string(&frontmatter, "description").unwrap_or_default();
+    if description.trim().is_empty() {
+        return Err("SKILL.md must have a 'description' in frontmatter.".into());
+    }
+
+    println!("Scanning '{}' before publish...", name);
+    let scan_result = scan_skill(&skill_dir, "self");
+    println!("{}", format_scan_report(&scan_result));
+    if scan_result.verdict == "dangerous" {
+        return Err("Cannot publish a skill with DANGEROUS verdict.".into());
+    }
+
+    match args.target.as_str() {
+        "clawhub" => {
+            println!(
+                "ClawHub publishing is not yet supported. Submit manually at https://clawhub.ai/submit"
+            );
+            println!();
+            Ok(())
+        }
+        "github" => {
+            if args.repo.is_empty() {
+                return Err(
+                    "Usage: hermes skills publish <path> --to github --repo owner/repo".into(),
+                );
+            }
+            if github_app_auth_configured() && resolve_github_publish_token().is_none() {
+                return bridge_prefixed("publish", passthrough);
+            }
+            let token = resolve_github_publish_token().ok_or_else(|| {
+                format!(
+                    "GitHub authentication required. Set GITHUB_TOKEN in {}/.env or run 'gh auth login'.",
+                    context.display_hermes_home()
+                )
+            })?;
+            println!("Publishing '{}' to {}...", name, args.repo);
+            let pr_url = github_publish_skill(&skill_dir, &name, &args.repo, &token)?;
+            println!("PR created: {pr_url}");
+            println!();
+            Ok(())
+        }
+        _ => Err("target must be 'github' or 'clawhub'".into()),
+    }
+}
+
+fn resolve_publish_skill_dir(
+    context: &HermesContext,
+    raw_skill_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let expanded = expand_path_like(raw_skill_path.trim());
+    if expanded.is_empty() {
+        return Err("skill path cannot be empty".into());
+    }
+    let path = Path::new(&expanded);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        context.hermes_home().join("skills").join(path)
+    };
+    if !resolved.exists() || !resolved.is_dir() {
+        return Err(format!("No SKILL.md found at {}", resolved.display()).into());
+    }
+    Ok(resolved)
+}
+
+fn github_app_auth_configured() -> bool {
+    std::env::var("GITHUB_APP_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        && std::env::var("GITHUB_APP_PRIVATE_KEY_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        && std::env::var("GITHUB_APP_INSTALLATION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+}
+
+fn resolve_github_publish_token() -> Option<String> {
+    let env_token = std::env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GH_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if env_token.is_some() {
+        return env_token;
+    }
+
+    let output = Command::new("gh").arg("auth").arg("token").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+fn github_api_base() -> String {
+    std::env::var("GITHUB_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("https://api.github.com"))
+}
+
+fn github_publish_skill(
+    skill_dir: &Path,
+    skill_name: &str,
+    target_repo: &str,
+    token: &str,
+) -> Result<String, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("hermes-rs-cli")
+        .build()?;
+    let headers = github_headers(token)?;
+    let api_base = github_api_base();
+
+    let fork_resp = client
+        .post(format!("{api_base}/repos/{target_repo}/forks"))
+        .headers(headers.clone())
+        .send()?;
+    let fork_status = fork_resp.status();
+    let fork_body = fork_resp.text()?;
+    if fork_status == StatusCode::FORBIDDEN {
+        return Err("GitHub token lacks permission to fork repos".into());
+    }
+    if fork_status != StatusCode::OK && fork_status != StatusCode::ACCEPTED {
+        return Err(format!("Failed to fork {target_repo}: {}", fork_status.as_u16()).into());
+    }
+    let fork_repo = serde_json::from_str::<JsonValue>(&fork_body)?
+        .get("full_name")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Failed to resolve fork repository name")?
+        .to_string();
+
+    let repo_resp = client
+        .get(format!("{api_base}/repos/{target_repo}"))
+        .headers(headers.clone())
+        .send()?;
+    let repo_default_branch = repo_resp
+        .json::<JsonValue>()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("default_branch")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from("main"));
+
+    let ref_resp = client
+        .get(format!(
+            "{api_base}/repos/{fork_repo}/git/refs/heads/{repo_default_branch}"
+        ))
+        .headers(headers.clone())
+        .send()?;
+    let ref_body = ref_resp.text()?;
+    let base_sha = serde_json::from_str::<JsonValue>(&ref_body)?
+        .get("object")
+        .and_then(JsonValue::as_object)
+        .and_then(|object| object.get("sha"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Failed to get base branch SHA")?
+        .to_string();
+
+    let branch_name = format!("add-skill-{}", github_branch_slug(skill_name));
+    let branch_resp = client
+        .post(format!("{api_base}/repos/{fork_repo}/git/refs"))
+        .headers(headers.clone())
+        .json(&serde_json::json!({
+            "ref": format!("refs/heads/{branch_name}"),
+            "sha": base_sha,
+        }))
+        .send()?;
+    if !branch_resp.status().is_success()
+        && branch_resp.status() != StatusCode::UNPROCESSABLE_ENTITY
+    {
+        return Err(format!("Failed to create branch: {}", branch_resp.status().as_u16()).into());
+    }
+
+    for (relative, path) in collect_publish_files(skill_dir)? {
+        let upload_path = format!("skills/{skill_name}/{relative}");
+        let content_b64 = BASE64_STANDARD.encode(fs::read(&path)?);
+        let upload_resp = client
+            .put(format!(
+                "{api_base}/repos/{fork_repo}/contents/{upload_path}"
+            ))
+            .headers(headers.clone())
+            .json(&serde_json::json!({
+                "message": format!("Add {skill_name} skill: {relative}"),
+                "content": content_b64,
+                "branch": branch_name,
+            }))
+            .send()?;
+        if !upload_resp.status().is_success() {
+            let status = upload_resp.status().as_u16();
+            let body = truncate(&upload_resp.text().unwrap_or_default(), 200);
+            return Err(format!("Failed to upload {relative}: {status} {body}").into());
+        }
+    }
+
+    let pr_resp = client
+        .post(format!("{api_base}/repos/{target_repo}/pulls"))
+        .headers(headers)
+        .json(&serde_json::json!({
+            "title": format!("Add skill: {skill_name}"),
+            "body": format!(
+                "Submitting the `{skill_name}` skill via Hermes Skills Hub.\n\nThis skill was scanned by the Hermes Skills Guard before submission."
+            ),
+            "head": format!("{}:{branch_name}", fork_repo.split('/').next().unwrap_or("fork")),
+            "base": repo_default_branch,
+        }))
+        .send()?;
+    let pr_status = pr_resp.status();
+    let pr_body = pr_resp.text()?;
+    if pr_status != StatusCode::CREATED {
+        return Err(format!(
+            "Failed to create PR: {} {}",
+            pr_status.as_u16(),
+            truncate(&pr_body, 200)
+        )
+        .into());
+    }
+    let pr_value = serde_json::from_str::<JsonValue>(&pr_body)?;
+    let pr_url = pr_value
+        .get("html_url")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("Failed to parse PR URL")?;
+    Ok(pr_url.to_string())
+}
+
+fn github_headers(token: &str) -> Result<reqwest::header::HeaderMap, Box<dyn Error>> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/vnd.github.v3+json"),
+    );
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("token {token}"))?,
+    );
+    Ok(headers)
+}
+
+fn github_branch_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        String::from("skill")
+    } else {
+        slug
+    }
+}
+
+fn collect_publish_files(root: &Path) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
+    let mut output = Vec::new();
+    collect_publish_files_recursive(root, root, &mut output)?;
+    output.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(output)
+}
+
+fn collect_publish_files_recursive(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<(String, PathBuf)>,
+) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_publish_files_recursive(root, &path, output)?;
+            continue;
+        }
+        if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            output.push((relative, path));
+        }
+    }
     Ok(())
 }
 
@@ -3174,10 +3571,13 @@ mod tests {
     use super::*;
     use std::env;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -3677,6 +4077,26 @@ exit 9\n",
     }
 
     #[test]
+    fn parse_publish_args_accepts_repo_and_target() {
+        let parsed = parse_publish_args(&[
+            String::from("demo"),
+            String::from("--to"),
+            String::from("github"),
+            String::from("--repo"),
+            String::from("owner/repo"),
+        ])
+        .unwrap();
+        assert_eq!(parsed.skill_path, "demo");
+        assert_eq!(parsed.target, "github");
+        assert_eq!(parsed.repo, "owner/repo");
+    }
+
+    #[test]
+    fn print_skills_without_subcommand_is_native() {
+        print_skills_usage();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn inspect_bridges_when_native_resolution_misses() {
         let _guard = test_env_lock().lock().unwrap();
@@ -4144,6 +4564,232 @@ exit 9\n",
         assert!(output.contains("action=audit argv=demo extra"));
 
         remove_env_var("HERMES_SKILLS_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let mut content_length = None::<usize>;
+        let mut header_end = None::<usize>;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if header_end.is_none() {
+                        if let Some(pos) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let end = pos + 4;
+                            header_end = Some(end);
+                            let headers = String::from_utf8_lossy(&buffer[..end]);
+                            content_length = headers.lines().find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            });
+                        }
+                    }
+                    if let Some(end) = header_end {
+                        let expected = end + content_length.unwrap_or(0);
+                        if buffer.len() >= expected {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn spawn_github_publish_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                requests.lock().unwrap().push(request.clone());
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if first_line.starts_with("POST /repos/owner/repo/forks ") {
+                    (
+                        "HTTP/1.1 202 Accepted",
+                        r#"{"full_name":"tester/repo-fork"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("GET /repos/owner/repo ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"default_branch":"main"}"#.to_string(),
+                    )
+                } else if first_line.starts_with("GET /repos/tester/repo-fork/git/refs/heads/main ")
+                {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"object":{"sha":"abc123"}}"#.to_string(),
+                    )
+                } else if first_line.starts_with("POST /repos/tester/repo-fork/git/refs ") {
+                    ("HTTP/1.1 201 Created", "{}".to_string())
+                } else if first_line
+                    .starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/")
+                {
+                    ("HTTP/1.1 201 Created", "{}".to_string())
+                } else if first_line.starts_with("POST /repos/owner/repo/pulls ") {
+                    (
+                        "HTTP/1.1 201 Created",
+                        r#"{"html_url":"https://example.test/pr/1"}"#.to_string(),
+                    )
+                } else {
+                    ("HTTP/1.1 404 Not Found", "{}".to_string())
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn publish_native_github_flow_creates_pr_via_mock_api() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("publish-native");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skill_dir = home.join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo helper\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("notes.txt"), "hello\n").unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (api_base, handle) = spawn_github_publish_server(requests.clone());
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
+
+        publish_skill_command(
+            &context,
+            &[
+                String::from("demo"),
+                String::from("--repo"),
+                String::from("owner/repo"),
+            ],
+        )
+        .unwrap();
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 7);
+        assert!(logged.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("authorization: token test-token")));
+        assert!(logged.iter().any(|request| {
+            request.starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/SKILL.md ")
+        }));
+        assert!(logged.iter().any(|request| {
+            request.starts_with("PUT /repos/tester/repo-fork/contents/skills/demo/notes.txt ")
+        }));
+
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn publish_bridges_when_github_app_auth_is_configured() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        let old_path = env::var_os("PATH");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        let old_gh_token = env::var_os("GH_TOKEN");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  shift 2\n\
+  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp_path("publish-bridge");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skill_dir = home.join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo helper\n---\nbody\n",
+        )
+        .unwrap();
+
+        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
+        set_env_var("PATH", temp.path());
+        remove_env_var("GITHUB_TOKEN");
+        remove_env_var("GH_TOKEN");
+        set_env_var("GITHUB_APP_ID", "123");
+        set_env_var("GITHUB_APP_PRIVATE_KEY_PATH", "/tmp/key.pem");
+        set_env_var("GITHUB_APP_INSTALLATION_ID", "456");
+
+        publish_skill_command(
+            &context,
+            &[
+                String::from("demo"),
+                String::from("--repo"),
+                String::from("owner/repo"),
+            ],
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&log).unwrap();
+        assert!(output.contains("action=publish argv=demo --repo owner/repo"));
+
+        remove_env_var("HERMES_SKILLS_PYTHON");
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
+        match old_gh_token {
+            Some(value) => set_env_var("GH_TOKEN", value),
+            None => remove_env_var("GH_TOKEN"),
+        }
+        remove_env_var("GITHUB_APP_ID");
+        remove_env_var("GITHUB_APP_PRIVATE_KEY_PATH");
+        remove_env_var("GITHUB_APP_INSTALLATION_ID");
         let _ = fs::remove_dir_all(home);
     }
 

@@ -640,6 +640,7 @@ dependencies = [
 name = "hermes-rs-cli"
 version = "0.12.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "ctrlc",

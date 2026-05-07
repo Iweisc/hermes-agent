@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
