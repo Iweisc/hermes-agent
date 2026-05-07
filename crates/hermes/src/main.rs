@@ -29,6 +29,7 @@ mod skills_cmd;
 mod skills_guard;
 mod slack_cmd;
 mod snapshot_cmd;
+mod tools_cmd;
 mod uninstall_cmd;
 mod update_cmd;
 mod webhook;
@@ -50,7 +51,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, KanbanDispatchOptions, LoadedConfig,
-    LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once, dispatch_tool,
+    LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once,
     get_tool_definitions, is_container, is_wsl, kanban_has_spawnable_ready, run_cron_job_now,
     run_due_cron_jobs, run_kanban_task,
 };
@@ -189,10 +190,7 @@ enum Command {
         #[command(subcommand)]
         command: KanbanCommand,
     },
-    Tools {
-        #[command(subcommand)]
-        command: ToolsCommand,
-    },
+    Tools(tools_cmd::ToolsArgs),
     Update(update_cmd::UpdateArgs),
     Whatsapp,
     Status,
@@ -276,21 +274,6 @@ enum KanbanCommand {
         id: String,
         #[arg(long)]
         dry_run: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ToolsCommand {
-    List {
-        #[arg(long)]
-        toolset: Option<String>,
-    },
-    Run {
-        name: String,
-        #[arg(long, default_value = "{}")]
-        args: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
     },
 }
 
@@ -384,7 +367,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Cron { command } => print_cron(&context, &config, &session_store, command)?,
         Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { command } => print_kanban(&context, &config, command)?,
-        Command::Tools { command } => print_tools(&context, &config, command)?,
+        Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
@@ -906,61 +889,7 @@ fn print_kanban(
     Ok(())
 }
 
-fn print_tools(
-    context: &HermesContext,
-    config: &LoadedConfig,
-    command: ToolsCommand,
-) -> Result<(), Box<dyn Error>> {
-    match command {
-        ToolsCommand::List { toolset } => {
-            let enabled = toolset.map(|name| vec![name]);
-            let disabled = disabled_memory_toolsets(&config.config.memory);
-            let tools = get_tool_definitions(enabled.as_deref(), disabled.as_deref());
-            for tool in tools {
-                println!(
-                    "{}\ttoolset={}\temoji={}\tdescription={}",
-                    tool.name, tool.toolset, tool.emoji, tool.description
-                );
-            }
-        }
-        ToolsCommand::Run { name, args, cwd } => {
-            let parsed_args: serde_json::Value = serde_json::from_str(&args)?;
-            if !parsed_args.is_object() {
-                return Err("tools run --args must be a JSON object".into());
-            }
-            let disabled = disabled_memory_toolsets(&config.config.memory);
-            let tool_names =
-                get_tool_definitions(Some(&config.config.toolsets), disabled.as_deref())
-                    .into_iter()
-                    .map(|tool| tool.name)
-                    .collect::<Vec<_>>();
-            let delegate = DelegateExecutor::new(
-                context.clone(),
-                config.clone(),
-                "rust-delegate",
-                config.config.toolsets.clone(),
-                ModelOverrides::default(),
-                cwd.clone().unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                }),
-            );
-            let runtime = match cwd {
-                Some(path) => ToolRuntime::new(path),
-                None => ToolRuntime::default(),
-            }
-            .with_hermes_home(context.hermes_home())
-            .with_available_tool_names(tool_names)
-            .with_clarify_callback(run_clarify_prompt)
-            .with_delegate_callback(move |request| delegate.execute(request));
-            let mut runtime = runtime;
-            let _ = runtime.load_memory_store(&config.config.memory);
-            println!("{}", dispatch_tool(&name, parsed_args, &runtime));
-        }
-    }
-    Ok(())
-}
-
-fn disabled_memory_toolsets(memory: &hermes_core::MemoryConfig) -> Option<Vec<String>> {
+pub(crate) fn disabled_memory_toolsets(memory: &hermes_core::MemoryConfig) -> Option<Vec<String>> {
     (!memory.any_enabled()).then(|| vec![String::from("memory")])
 }
 
@@ -1031,7 +960,10 @@ fn confirm_prompt(prompt: &str) -> Result<bool, Box<dyn Error>> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-fn run_clarify_prompt(question: &str, choices: Option<&[String]>) -> Result<String, String> {
+pub(crate) fn run_clarify_prompt(
+    question: &str,
+    choices: Option<&[String]>,
+) -> Result<String, String> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "\n[clarify] {question}").map_err(|error| error.to_string())?;
     if let Some(choices) = choices {
