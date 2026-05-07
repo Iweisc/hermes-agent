@@ -5,14 +5,16 @@ use std::io::{self, Write};
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 use clap::Args;
 use hermes_core::HermesContext;
 
-use crate::python_bridge::{project_root as repo_project_root, resolve_repo_python};
+use crate::gateway_cmd::{
+    GatewayArgs, GatewayCommand, GatewayServiceArgs, GatewaySystemArgs, print_gateway,
+};
+use crate::python_bridge::project_root as repo_project_root;
 
 #[derive(Args, Debug, Clone)]
 pub struct UninstallArgs {
@@ -90,7 +92,7 @@ pub fn print_uninstall(context: &HermesContext, args: UninstallArgs) -> Result<(
 
     println!("uninstalling...");
 
-    let removed_gateway = cleanup_gateway_for_profile(None);
+    let removed_gateway = cleanup_gateway_for_profile(context, None);
     if removed_gateway {
         println!("gateway_cleanup=done");
     } else {
@@ -123,7 +125,7 @@ pub fn print_uninstall(context: &HermesContext, args: UninstallArgs) -> Result<(
     if full_uninstall {
         if remove_named_profiles {
             for profile in &named_profiles {
-                let cleaned = cleanup_gateway_for_profile(Some(&profile.path));
+                let cleaned = cleanup_gateway_for_profile(context, Some(&profile.path));
                 let alias_removed = remove_profile_alias(context.home_dir(), &profile.name);
                 println!(
                     "profile_cleanup name={} gateway={} alias_removed={}",
@@ -322,37 +324,34 @@ fn wrapper_dir(home_dir: &Path) -> PathBuf {
     home_dir.join(".local").join("bin")
 }
 
-fn cleanup_gateway_for_profile(profile_home: Option<&Path>) -> bool {
-    let root = uninstall_project_root();
-    let Some(python) = resolve_repo_python(&root, Some("HERMES_UNINSTALL_PYTHON")) else {
-        return false;
-    };
-
-    let mut any_success = false;
-    let env_home = profile_home.map(|path| path.display().to_string());
-    for argv in [
-        ["gateway", "stop"].as_slice(),
-        ["gateway", "stop", "--system"].as_slice(),
-        ["gateway", "uninstall"].as_slice(),
-        ["gateway", "uninstall", "--system"].as_slice(),
-    ] {
-        let mut command = Command::new(&python);
-        command
-            .current_dir(&root)
-            .env("PYTHONPATH", root.display().to_string())
-            .arg("-m")
-            .arg("hermes_cli.main");
-        if let Some(home) = env_home.as_deref() {
-            command.env("HERMES_HOME", home);
+fn cleanup_gateway_for_profile(context: &HermesContext, profile_home: Option<&Path>) -> bool {
+    let profile_context = match profile_home {
+        Some(path) => {
+            HermesContext::new(context.home_dir()).with_hermes_home_env(Some(path.into()))
         }
-        command.args(argv);
-        let ok = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        None => context.clone(),
+    };
+    let mut any_success = false;
+    for command in [
+        GatewayCommand::Stop(GatewayServiceArgs {
+            system: false,
+            all: false,
+        }),
+        GatewayCommand::Stop(GatewayServiceArgs {
+            system: true,
+            all: false,
+        }),
+        GatewayCommand::Uninstall(GatewaySystemArgs { system: false }),
+        GatewayCommand::Uninstall(GatewaySystemArgs { system: true }),
+    ] {
+        let ok = print_gateway(
+            &profile_context,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(command),
+            },
+        )
+        .is_ok();
         any_success |= ok;
     }
     any_success
@@ -498,7 +497,6 @@ mod tests {
         );
 
         set_env_var("HERMES_UNINSTALL_PROJECT_ROOT", &project_root);
-        set_env_var("HERMES_UNINSTALL_PYTHON", "/bin/true");
 
         let context = HermesContext::new(&home).with_hermes_home_env(Some(hermes_home.clone()));
         print_uninstall(
@@ -520,7 +518,6 @@ mod tests {
         );
 
         remove_env_var("HERMES_UNINSTALL_PROJECT_ROOT");
-        remove_env_var("HERMES_UNINSTALL_PYTHON");
     }
 
     #[test]
@@ -547,7 +544,6 @@ mod tests {
         );
 
         set_env_var("HERMES_UNINSTALL_PROJECT_ROOT", &project_root);
-        set_env_var("HERMES_UNINSTALL_PYTHON", "/bin/true");
 
         let context = HermesContext::new(&home).with_hermes_home_env(Some(hermes_home.clone()));
         print_uninstall(
@@ -565,6 +561,54 @@ mod tests {
         assert!(!home.join(".local/bin/coder").exists());
 
         remove_env_var("HERMES_UNINSTALL_PROJECT_ROOT");
-        remove_env_var("HERMES_UNINSTALL_PYTHON");
+    }
+
+    #[test]
+    fn cleanup_gateway_for_profile_removes_named_profile_user_service() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let hermes_home = home.join(".hermes");
+        let profile_home = hermes_home.join("profiles").join("coder");
+        let user_unit_dir = home.join(".config").join("systemd").join("user");
+        fs::create_dir_all(&profile_home).unwrap();
+        fs::create_dir_all(&user_unit_dir).unwrap();
+        let unit_path = user_unit_dir.join("hermes-gateway-coder.service");
+        fs::write(&unit_path, "[Unit]\nDescription=Hermes Gateway\n").unwrap();
+
+        let fake_bin = home.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let log_path = home.join("systemctl.log");
+        let systemctl = fake_bin.join("systemctl");
+        fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--user\" ] && [ \"$2\" = \"is-system-running\" ]; then\n  echo running\n  exit 0\nfi\nif [ \"$1\" = \"is-system-running\" ]; then\n  echo running\n  exit 0\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&systemctl).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&systemctl, perms).unwrap();
+        }
+
+        let path = env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![fake_bin.clone()];
+        paths.extend(env::split_paths(&path));
+        let joined = env::join_paths(paths).unwrap();
+        set_env_var("PATH", &joined);
+
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(hermes_home));
+        assert!(cleanup_gateway_for_profile(&context, Some(&profile_home)));
+        assert!(!unit_path.exists());
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("--user stop hermes-gateway-coder"));
+        assert!(log.contains("--user disable hermes-gateway-coder"));
+        assert!(log.contains("--user daemon-reload"));
     }
 }
