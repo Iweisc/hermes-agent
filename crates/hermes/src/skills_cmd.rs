@@ -1781,18 +1781,6 @@ fn check_skills_command(
     {
         return bridge_prefixed("check", passthrough);
     }
-    if targets.iter().any(|(name, source)| {
-        if source != "skills-sh" {
-            return false;
-        }
-        installed
-            .get(name)
-            .map(entry_identifier)
-            .is_some_and(|identifier| parse_skills_sh_identifier(&identifier).is_none())
-    }) {
-        return bridge_prefixed("check", passthrough);
-    }
-
     let target_names = targets
         .iter()
         .map(|(name, _)| name.clone())
@@ -1833,11 +1821,6 @@ fn update_skills_command(
         {
             return bridge_prefixed("update", passthrough);
         }
-        if entry.source == "skills-sh"
-            && parse_skills_sh_identifier(&entry_identifier(entry)).is_none()
-        {
-            return bridge_prefixed("update", passthrough);
-        }
         vec![name.to_string()]
     } else {
         if installed.is_empty() {
@@ -1860,12 +1843,6 @@ fn update_skills_command(
             && github_app_auth_configured()
             && resolve_github_publish_token().is_none()
         {
-            return bridge_prefixed("update", passthrough);
-        }
-        if installed.values().any(|entry| {
-            entry.source == "skills-sh"
-                && parse_skills_sh_identifier(&entry_identifier(entry)).is_none()
-        }) {
             return bridge_prefixed("update", passthrough);
         }
         let mut names = installed.keys().cloned().collect::<Vec<_>>();
@@ -5265,10 +5242,81 @@ fn parse_skills_sh_identifier(identifier: &str) -> Option<String> {
     Some(normalized)
 }
 
+fn parse_skills_sh_short_identifier(identifier: &str) -> Option<String> {
+    let trimmed = identifier.trim();
+    let raw = trimmed
+        .strip_prefix("skills-sh/")
+        .or_else(|| trimmed.strip_prefix("skills-sh:"))?;
+    let normalized = raw.trim().trim_matches('/').to_string();
+    if normalized.is_empty()
+        || normalized.contains('\\')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn normalize_skills_sh_token(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('/')
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn skills_sh_summary_matches_short_identifier(
+    summary: &SkillsShSkillSummary,
+    short_identifier: &str,
+) -> bool {
+    let short_token = normalize_skills_sh_token(short_identifier);
+    let canonical = summary
+        .identifier
+        .strip_prefix("skills-sh/")
+        .unwrap_or(summary.identifier.as_str());
+    let tail = canonical.rsplit('/').next().unwrap_or(canonical);
+    normalize_skills_sh_token(&summary.name) == short_token
+        || normalize_skills_sh_token(tail) == short_token
+        || normalize_skills_sh_token(canonical) == short_token
+}
+
+fn resolve_skills_sh_identifier(identifier: &str) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(canonical) = parse_skills_sh_identifier(identifier) {
+        return Ok(Some(canonical));
+    }
+    let Some(short_identifier) = parse_skills_sh_short_identifier(identifier) else {
+        return Ok(None);
+    };
+
+    let mut matches = BTreeSet::new();
+    for summary in search_skills_sh_summaries(&short_identifier, 20)? {
+        if skills_sh_summary_matches_short_identifier(&summary, &short_identifier)
+            && let Some(canonical) = summary.identifier.strip_prefix("skills-sh/")
+        {
+            matches.insert(canonical.to_string());
+        }
+    }
+    if matches.is_empty() {
+        for summary in collect_skills_sh_featured_summaries(50)? {
+            if skills_sh_summary_matches_short_identifier(&summary, &short_identifier)
+                && let Some(canonical) = summary.identifier.strip_prefix("skills-sh/")
+            {
+                matches.insert(canonical.to_string());
+            }
+        }
+    }
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next());
+    }
+    Ok(None)
+}
+
 fn fetch_skills_sh_bundle_to_tempdir(
     identifier: &str,
 ) -> Result<Option<(tempfile::TempDir, Option<String>, String, String)>, Box<dyn Error>> {
-    let Some(canonical) = parse_skills_sh_identifier(identifier) else {
+    let Some(canonical) = resolve_skills_sh_identifier(identifier)? else {
         return Ok(None);
     };
     let Some((bundle_dir, bundle_name, trust, resolved_identifier)) =
@@ -5287,7 +5335,7 @@ fn fetch_skills_sh_bundle_to_tempdir(
 fn fetch_remote_skills_sh_inspect_skill(
     identifier: &str,
 ) -> Result<Option<NativeInspectSkill>, Box<dyn Error>> {
-    let Some(canonical) = parse_skills_sh_identifier(identifier) else {
+    let Some(canonical) = resolve_skills_sh_identifier(identifier)? else {
         return Ok(None);
     };
     let Some((repo, skill_path, skill_md_path, normalized_identifier)) =
@@ -8015,44 +8063,69 @@ exit 9\n",
     }
 
     #[test]
-    #[cfg(unix)]
-    fn install_bridges_for_non_official_identifier() {
+    fn install_native_legacy_skills_sh_identifier_resolves_and_installs() {
         let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp_path("install-bridge");
+        let home = temp_path("install-skills-sh-legacy-home");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (api_base, github_handle) = spawn_github_install_server(github_requests.clone());
+        let old_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
         install_skill_command(
             &context,
-            &[String::from("skills-sh/demo"), String::from("--force")],
+            &[String::from("skills-sh/shipit"), String::from("--yes")],
         )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=install argv=skills-sh/demo --force"));
+        let install_dir = home.join("skills").join("shipit");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("SKILL.md")).unwrap(),
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        assert_eq!(entry.source, "skills-sh");
+        assert_eq!(entry.trust_level, "trusted");
+        assert_eq!(entry.install_path, "shipit");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some("skills-sh/openai/skills/shipit")
+        );
 
-        remove_env_var("HERMES_SKILLS_PYTHON");
+        skills_sh_handle.join().unwrap();
+        github_handle.join().unwrap();
+        let skills_sh_logged = skills_sh_requests.lock().unwrap().clone();
+        let github_logged = github_requests.lock().unwrap().clone();
+        assert!(
+            skills_sh_logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/search?"))
+        );
+        assert!(
+            github_logged.iter().any(|request| {
+                request.starts_with("GET /repos/openai/skills/contents/shipit ")
+            })
+        );
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
         let _ = fs::remove_dir_all(home);
     }
 
@@ -8924,90 +8997,143 @@ exit 9\n",
     }
 
     #[test]
-    #[cfg(unix)]
-    fn check_bridges_when_non_official_sources_are_present() {
+    fn check_native_legacy_skills_sh_identifier_collects_candidates() {
         let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp_path("check-bridge");
+        let home = temp_path("check-skills-sh-legacy");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"skills-sh","identifier":"skills-sh/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"shipit":{"source":"skills-sh","identifier":"skills-sh/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (api_base, github_handle) = spawn_github_install_server(github_requests.clone());
+        let old_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        check_skills_command(&context, &[]).unwrap();
+        let installed = load_hub_lock(&context).unwrap();
+        let candidates =
+            collect_official_skill_candidates(&installed, &[String::from("shipit")]).unwrap();
+        let candidate = candidates.get("shipit").unwrap();
+        assert_eq!(candidate.source, "skills-sh");
+        assert_eq!(candidate.identifier, "skills-sh/shipit");
+        assert_eq!(candidate.trust_level, "trusted");
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=check argv="));
+        skills_sh_handle.join().unwrap();
+        github_handle.join().unwrap();
+        let skills_sh_logged = skills_sh_requests.lock().unwrap().clone();
+        let github_logged = github_requests.lock().unwrap().clone();
+        assert!(
+            skills_sh_logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/search?"))
+        );
+        assert!(
+            github_logged.iter().any(|request| {
+                request.starts_with("GET /repos/openai/skills/contents/shipit ")
+            })
+        );
 
-        remove_env_var("HERMES_SKILLS_PYTHON");
+        match old_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
         let _ = fs::remove_dir_all(home);
     }
 
     #[test]
-    #[cfg(unix)]
-    fn update_bridges_when_non_official_sources_are_present() {
+    fn update_native_legacy_skills_sh_identifier_restores_files_and_lock_hash() {
         let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
+        let home = temp_path("skills-sh-legacy-update-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let install_dir = home.join("skills").join("shipit");
+        fs::create_dir_all(install_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
+        fs::create_dir_all(&install_dir).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'action=%s argv=%s\\n' \"$HERMES_SKILLS_ACTION\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            install_dir.join("SKILL.md"),
+            "---\nname: shipit\ndescription: Old\n---\nold\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp_path("update-bridge");
-        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
-        fs::create_dir_all(home.join("skills").join(".hub")).unwrap();
         fs::write(
             home.join("skills").join(".hub").join("lock.json"),
-            r#"{"version":1,"installed":{"demo":{"source":"skills-sh","identifier":"skills-sh/demo","trust_level":"community","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"demo","files":["SKILL.md"]}}}"#,
+            r#"{"version":1,"installed":{"shipit":{"source":"skills-sh","identifier":"skills-sh/shipit","trust_level":"trusted","scan_verdict":"safe","content_hash":"sha256:stale","install_path":"shipit","files":["SKILL.md"]}}}"#,
         )
         .unwrap();
+        let skills_sh_requests = Arc::new(Mutex::new(Vec::new()));
+        let github_requests = Arc::new(Mutex::new(Vec::new()));
+        let (skills_sh_base, skills_sh_handle) = spawn_skills_sh_server(skills_sh_requests.clone());
+        let (api_base, github_handle) = spawn_github_install_server(github_requests.clone());
+        let old_base = env::var_os("HERMES_SKILLS_SH_BASE_URL");
+        let old_api_base = env::var_os("GITHUB_API_BASE_URL");
+        let old_github_token = env::var_os("GITHUB_TOKEN");
+        set_env_var("HERMES_SKILLS_SH_BASE_URL", &skills_sh_base);
+        set_env_var("GITHUB_API_BASE_URL", &api_base);
+        set_env_var("GITHUB_TOKEN", "test-token");
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
         update_skills_command(&context, &[]).unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("action=update argv="));
+        let updated = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
+        assert_eq!(
+            updated,
+            "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("shipit").unwrap();
+        let saved_hash = entry
+            .raw
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_ne!(saved_hash, "sha256:stale");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!install_dir.join("old.txt").exists());
 
-        remove_env_var("HERMES_SKILLS_PYTHON");
+        skills_sh_handle.join().unwrap();
+        github_handle.join().unwrap();
+        let skills_sh_logged = skills_sh_requests.lock().unwrap().clone();
+        let github_logged = github_requests.lock().unwrap().clone();
+        assert!(
+            skills_sh_logged
+                .iter()
+                .any(|request| request.starts_with("GET /api/search?"))
+        );
+        assert!(
+            github_logged.iter().any(|request| {
+                request.starts_with("GET /repos/openai/skills/contents/shipit ")
+            })
+        );
+
+        match old_base {
+            Some(value) => set_env_var("HERMES_SKILLS_SH_BASE_URL", value),
+            None => remove_env_var("HERMES_SKILLS_SH_BASE_URL"),
+        }
+        match old_api_base {
+            Some(value) => set_env_var("GITHUB_API_BASE_URL", value),
+            None => remove_env_var("GITHUB_API_BASE_URL"),
+        }
+        match old_github_token {
+            Some(value) => set_env_var("GITHUB_TOKEN", value),
+            None => remove_env_var("GITHUB_TOKEN"),
+        }
         let _ = fs::remove_dir_all(home);
     }
 
