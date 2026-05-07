@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -16,6 +17,14 @@ use sha2::{Digest, Sha256};
 use crate::python_bridge::{launch_python_main_command, project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
+const LEGACY_SERVICE_NAMES: &[&str] = &["hermes.service"];
+const LEGACY_UNIT_EXECSTART_MARKERS: &[&str] = &[
+    "hermes_cli.main gateway",
+    "hermes_cli/main.py gateway",
+    "gateway/run.py",
+    " hermes gateway ",
+    "/hermes gateway ",
+];
 
 #[derive(Args, Debug, Clone)]
 pub struct GatewayArgs {
@@ -99,6 +108,13 @@ struct GatewaySnapshot {
     service_scope: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyGatewayUnit {
+    name: String,
+    path: PathBuf,
+    is_system: bool,
+}
+
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => bridge_gateway(args.accept_hooks, &[String::from("run")]),
@@ -118,9 +134,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
         }
         Some(GatewayCommand::Uninstall(args2)) => print_gateway_uninstall(context, args2),
         Some(GatewayCommand::Setup) => bridge_gateway(args.accept_hooks, &[String::from("setup")]),
-        Some(GatewayCommand::MigrateLegacy(args2)) => {
-            bridge_gateway(args.accept_hooks, &bridge_migrate_legacy_args(args2))
-        }
+        Some(GatewayCommand::MigrateLegacy(args2)) => print_gateway_migrate_legacy(context, args2),
     }
 }
 
@@ -293,6 +307,52 @@ fn print_gateway_install(
     }
 
     Err("Gateway service installation is not supported on this platform".into())
+}
+
+fn print_gateway_migrate_legacy(
+    context: &HermesContext,
+    args: GatewayMigrateLegacyArgs,
+) -> Result<(), Box<dyn Error>> {
+    if !supports_systemd_services() && !is_macos() {
+        println!("Legacy unit migration only applies to systemd-based Linux hosts.");
+        return Ok(());
+    }
+
+    let legacy = find_legacy_gateway_units(context);
+    if legacy.is_empty() {
+        println!("No legacy Hermes gateway units found.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Legacy Hermes gateway unit(s) found:");
+    for unit in &legacy {
+        let scope = if unit.is_system { "system" } else { "user" };
+        println!("  {}  ({scope} scope)", unit.path.display());
+    }
+    println!();
+
+    if args.dry_run {
+        println!("(dry-run - nothing removed)");
+        return Ok(());
+    }
+
+    if !args.yes && !confirm_legacy_removal()? {
+        println!("Skipped. Run again with: hermes gateway migrate-legacy");
+        return Ok(());
+    }
+
+    let (removed, remaining) = remove_legacy_gateway_units(&legacy)?;
+    println!();
+    if remaining.is_empty() {
+        println!("Removed {removed} legacy unit(s).");
+    } else {
+        println!(
+            "{} legacy unit(s) still present - see messages above.",
+            remaining.len()
+        );
+    }
+    Ok(())
 }
 
 fn print_gateway_status(
@@ -469,17 +529,6 @@ fn bridge_install_args(args: GatewayInstallArgs) -> Vec<String> {
     {
         argv.push("--run-as-user".to_string());
         argv.push(user.to_string());
-    }
-    argv
-}
-
-fn bridge_migrate_legacy_args(args: GatewayMigrateLegacyArgs) -> Vec<String> {
-    let mut argv = vec!["migrate-legacy".to_string()];
-    if args.dry_run {
-        argv.push("--dry-run".to_string());
-    }
-    if args.yes {
-        argv.push("--yes".to_string());
     }
     argv
 }
@@ -819,6 +868,93 @@ fn uninstall_systemd_service(
     Ok(true)
 }
 
+fn legacy_unit_search_paths(context: &HermesContext) -> Vec<(bool, PathBuf)> {
+    let mut paths = vec![(
+        false,
+        context
+            .home_dir()
+            .join(".config")
+            .join("systemd")
+            .join("user"),
+    )];
+    let system_base = env::var_os("HERMES_FAKE_SYSTEMD_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
+    paths.push((true, system_base));
+    paths
+}
+
+fn find_legacy_gateway_units(context: &HermesContext) -> Vec<LegacyGatewayUnit> {
+    let mut units = Vec::new();
+    for (is_system, base) in legacy_unit_search_paths(context) {
+        for name in LEGACY_SERVICE_NAMES {
+            let unit_path = base.join(name);
+            let Ok(text) = fs::read_to_string(&unit_path) else {
+                continue;
+            };
+            if !LEGACY_UNIT_EXECSTART_MARKERS
+                .iter()
+                .any(|marker| text.contains(marker))
+            {
+                continue;
+            }
+            units.push(LegacyGatewayUnit {
+                name: (*name).to_string(),
+                path: unit_path,
+                is_system,
+            });
+        }
+    }
+    units
+}
+
+fn remove_legacy_gateway_units(
+    legacy: &[LegacyGatewayUnit],
+) -> Result<(usize, Vec<PathBuf>), Box<dyn Error>> {
+    let mut removed = 0usize;
+    let mut remaining = Vec::new();
+
+    for unit in legacy {
+        if unit.is_system && current_uid() != 0 {
+            println!("System-scope legacy units require root to remove.");
+            println!("  Re-run with: sudo hermes gateway migrate-legacy");
+            remaining.push(unit.path.clone());
+            continue;
+        }
+
+        if !unit.is_system {
+            let _ = run_systemctl_allow_failure(false, &["stop", &unit.name]);
+            let _ = run_systemctl_allow_failure(false, &["disable", &unit.name]);
+        } else {
+            let _ = run_systemctl_allow_failure(true, &["stop", &unit.name]);
+            let _ = run_systemctl_allow_failure(true, &["disable", &unit.name]);
+        }
+
+        match fs::remove_file(&unit.path) {
+            Ok(_) => {
+                println!("  Removed {}", unit.path.display());
+                removed += 1;
+            }
+            Err(error) => {
+                println!("  Could not remove {}: {error}", unit.path.display());
+                remaining.push(unit.path.clone());
+            }
+        }
+    }
+
+    let had_user = legacy.iter().any(|unit| !unit.is_system);
+    let had_system = legacy.iter().any(|unit| unit.is_system);
+    if had_user {
+        let _ = run_systemctl_allow_failure(false, &["daemon-reload"]);
+    }
+    if had_system && current_uid() == 0 {
+        let _ = run_systemctl_allow_failure(true, &["daemon-reload"]);
+    }
+
+    Ok((removed, remaining))
+}
+
 fn install_systemd_service(context: &HermesContext, force: bool) -> Result<(), Box<dyn Error>> {
     let unit_path = systemd_unit_path(context, false);
     let service_name = gateway_service_name(context);
@@ -1132,6 +1268,15 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('\"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn confirm_legacy_removal() -> Result<bool, Box<dyn Error>> {
+    print!("Remove these legacy units? [Y/n] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim().to_ascii_lowercase();
+    Ok(choice.is_empty() || choice == "y" || choice == "yes")
 }
 
 fn wait_for_gateway_exit(
@@ -1753,6 +1898,88 @@ mod tests {
         assert!(plist.contains("run"));
         assert!(plist.contains("--replace"));
         assert!(plist.contains("HERMES_HOME"));
+    }
+
+    #[test]
+    fn find_legacy_gateway_units_filters_by_execstart_markers() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let user_dir = ctx.home_dir().join(".config").join("systemd").join("user");
+        let fake_system = ctx.home_dir().join("etc-systemd");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::create_dir_all(&fake_system).unwrap();
+        set_env_var("HERMES_FAKE_SYSTEMD_DIR", &fake_system);
+
+        fs::write(
+            user_dir.join("hermes.service"),
+            "[Service]\nExecStart=/usr/bin/python -m hermes_cli.main gateway run\n",
+        )
+        .unwrap();
+        fs::write(
+            fake_system.join("hermes.service"),
+            "[Service]\nExecStart=/usr/bin/other-daemon\n",
+        )
+        .unwrap();
+
+        let units = find_legacy_gateway_units(&ctx);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].path, user_dir.join("hermes.service"));
+        assert!(!units[0].is_system);
+        remove_env_var("HERMES_FAKE_SYSTEMD_DIR");
+    }
+
+    #[test]
+    fn migrate_legacy_removes_user_unit_and_reload() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        let fake_bin = ctx.home_dir().join("bin");
+        let log_path = ctx.home_dir().join("systemctl-legacy.log");
+        let user_dir = ctx.home_dir().join(".config").join("systemd").join("user");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$*\" == *\"is-system-running\"* ]]; then\n  printf 'running\\n'\nfi\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+        let unit_path = user_dir.join("hermes.service");
+        fs::write(
+            &unit_path,
+            "[Service]\nExecStart=/usr/bin/python -m hermes_cli.main gateway run\n",
+        )
+        .unwrap();
+
+        print_gateway(
+            &ctx,
+            GatewayArgs {
+                accept_hooks: false,
+                command: Some(GatewayCommand::MigrateLegacy(GatewayMigrateLegacyArgs {
+                    dry_run: false,
+                    yes: true,
+                })),
+            },
+        )
+        .unwrap();
+
+        assert!(!unit_path.exists());
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--user stop hermes.service"));
+        assert!(log.contains("--user disable hermes.service"));
+        assert!(log.contains("--user daemon-reload"));
+        set_env_var("PATH", original_path);
     }
 
     #[test]
