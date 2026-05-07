@@ -12,6 +12,7 @@ mod debug;
 mod doctor;
 mod dump;
 mod fallback_cmd;
+mod gateway_cmd;
 mod hooks;
 mod insights_cmd;
 mod login_cmd;
@@ -91,7 +92,7 @@ enum Command {
     },
     Completion(completion::CompletionArgs),
     Dashboard(dashboard_cmd::DashboardArgs),
-    Gateway(compat_cmd::CompatArgs),
+    Gateway(gateway_cmd::GatewayArgs),
     Skills {
         #[command(subcommand)]
         command: Option<skills_cmd::SkillsCommand>,
@@ -321,7 +322,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
-        Command::Gateway(args) => compat_cmd::print_gateway(args)?,
+        Command::Gateway(args) => gateway_cmd::print_gateway(&context, args)?,
         Command::Skills { command } => skills_cmd::print_skills(&context, command)?,
         Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,

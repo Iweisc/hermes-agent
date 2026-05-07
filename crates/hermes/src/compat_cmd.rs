@@ -14,10 +14,6 @@ pub fn print_setup(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("setup", args)
 }
 
-pub fn print_gateway(args: CompatArgs) -> Result<(), Box<dyn Error>> {
-    print_passthrough("gateway", args)
-}
-
 pub fn print_whatsapp(args: CompatArgs) -> Result<(), Box<dyn Error>> {
     print_passthrough("whatsapp", args)
 }
