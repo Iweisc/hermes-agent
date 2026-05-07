@@ -66,6 +66,7 @@ pub enum ConfigCommand {
     Show,
     Edit,
     Check,
+    Migrate,
     Set {
         key: String,
         value: String,
@@ -90,6 +91,9 @@ pub fn print_config(
         }
         ConfigCommand::Check => {
             println!("{}", render_config_check(context, env_report, loaded));
+        }
+        ConfigCommand::Migrate => {
+            migrate_config(context)?;
         }
         ConfigCommand::Set { key, value } => {
             set_config_value(context, &key, &value)?;
@@ -198,6 +202,7 @@ fn render_config(context: &HermesContext, loaded: &LoadedConfig) -> String {
     lines.push(String::from("  hermes config edit"));
     lines.push(String::from("  hermes config set <key> <value>"));
     lines.push(String::from("  hermes config check"));
+    lines.push(String::from("  hermes config migrate"));
     lines.push(String::from("  hermes config path"));
     lines.push(String::from("  hermes config env-path"));
     lines.join("\n")
@@ -348,6 +353,40 @@ fn edit_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     Err(format!("editor exited with status {:?}", status.code()).into())
 }
 
+fn migrate_config(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let created_env = ensure_env_file(&context.env_path())?;
+    let created_config = ensure_config_file(&context.config_path())?;
+    let mut user_config = read_raw_yaml_mapping(&context.config_path())?;
+    let default_value = serde_yaml::to_value(HermesConfig::default())?;
+    let default_mapping = default_value
+        .as_mapping()
+        .ok_or("Rust default config must be a YAML mapping")?;
+
+    let mut added = Vec::new();
+    merge_missing_defaults(&mut user_config, default_mapping, String::new(), &mut added);
+    if !added.is_empty() {
+        write_yaml_mapping(&context.config_path(), &user_config)?;
+    }
+
+    println!("=== Hermes Config Migrate ===");
+    if created_env {
+        println!("created {}", context.env_path().display());
+    }
+    if created_config {
+        println!("created {}", context.config_path().display());
+    }
+    if added.is_empty() {
+        println!("config defaults already up to date");
+    } else {
+        println!("added {} config option(s):", added.len());
+        for key in &added {
+            println!("  - {key}");
+        }
+    }
+    println!("migration_complete");
+    Ok(())
+}
+
 fn ensure_config_file(path: &Path) -> Result<bool, Box<dyn Error>> {
     if path.exists() {
         return Ok(false);
@@ -358,6 +397,47 @@ fn ensure_config_file(path: &Path) -> Result<bool, Box<dyn Error>> {
     let rendered = serde_yaml::to_string(&HermesConfig::default())?;
     atomic_write(path, rendered.as_bytes())?;
     Ok(true)
+}
+
+fn ensure_env_file(path: &Path) -> Result<bool, Box<dyn Error>> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(path, b"")?;
+    Ok(true)
+}
+
+fn merge_missing_defaults(
+    current: &mut Mapping,
+    defaults: &Mapping,
+    prefix: String,
+    added: &mut Vec<String>,
+) {
+    for (key, default_value) in defaults {
+        let Value::String(key_text) = key else {
+            continue;
+        };
+        let full_key = if prefix.is_empty() {
+            key_text.clone()
+        } else {
+            format!("{prefix}.{key_text}")
+        };
+        match current.get_mut(key) {
+            Some(Value::Mapping(existing)) if matches!(default_value, Value::Mapping(_)) => {
+                if let Value::Mapping(default_mapping) = default_value {
+                    merge_missing_defaults(existing, default_mapping, full_key, added);
+                }
+            }
+            Some(_) => {}
+            None => {
+                current.insert(key.clone(), default_value.clone());
+                added.push(full_key);
+            }
+        }
+    }
 }
 
 fn resolve_editor_command() -> Result<Option<Vec<String>>, Box<dyn Error>> {
@@ -839,6 +919,25 @@ mod tests {
         assert!(rendered.contains("config:       missing"));
         assert!(rendered.contains("env:          missing"));
         assert!(rendered.contains("status:       issues"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn migrate_config_creates_env_and_backfills_missing_defaults() {
+        let home = temp_path("migrate-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.yaml"), "display:\n  skin: slate\n").unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        migrate_config(&context).unwrap();
+
+        assert!(home.join(".env").exists());
+        let written = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(written.contains("skin: slate"));
+        assert!(written.contains("toolsets:"));
+        assert!(written.contains("agent:"));
+        assert!(written.contains("terminal:"));
 
         let _ = fs::remove_dir_all(home);
     }
