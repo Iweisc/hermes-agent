@@ -1307,7 +1307,7 @@ fn provider_available_for_native_model_setup(context: &HermesContext, provider: 
 }
 
 fn provider_supports_fresh_native_model_setup(provider: &str) -> bool {
-    matches!(provider, "openai-codex" | "minimax-oauth")
+    matches!(provider, "openai-codex" | "minimax-oauth" | "nous")
 }
 
 fn ensure_runtime_model_provider_credentials(
@@ -1340,6 +1340,19 @@ fn ensure_runtime_model_provider_credentials(
         "minimax-oauth" => {
             let mut output = SetupUiWriteAdapter::new(ui);
             auth_cmd::native_auth_add_minimax_oauth_with_io(
+                context,
+                &AuthAddArgs {
+                    provider: provider.name.clone(),
+                    auth_type: Some("oauth".to_string()),
+                    ..AuthAddArgs::default()
+                },
+                &mut output,
+            )?;
+            output.flush()?;
+        }
+        "nous" => {
+            let mut output = SetupUiWriteAdapter::new(ui);
+            auth_cmd::native_auth_add_nous_oauth_with_io(
                 context,
                 &AuthAddArgs {
                     provider: provider.name.clone(),
@@ -3526,6 +3539,62 @@ mod tests {
         (base_url, requests, handle)
     }
 
+    fn spawn_nous_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let base_for_thread = base_url.clone();
+        let handle = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let payload = match idx {
+                    0 => serde_json::json!({
+                        "device_code": "nous-device-code",
+                        "user_code": "NOUS-CODE",
+                        "verification_uri": format!("{base_for_thread}/verify"),
+                        "verification_uri_complete": format!("{base_for_thread}/verify?code=NOUS-CODE"),
+                        "expires_in": 60,
+                        "interval": 1
+                    }),
+                    1 => serde_json::json!({
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "token_type": "Bearer",
+                        "scope": "inference:mint_agent_key offline_access",
+                        "expires_in": 3600,
+                        "inference_base_url": format!("{base_for_thread}/portal-inference/v1")
+                    }),
+                    _ => serde_json::json!({
+                        "api_key": "nous-agent-key",
+                        "key_id": "agent-key-123",
+                        "expires_at": "2999-01-02T00:00:00Z",
+                        "expires_in": 86400,
+                        "inference_base_url": format!("{base_for_thread}/runtime-inference/v1"),
+                        "reused": false
+                    }),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
     #[derive(Default)]
     struct TestUi {
         answers: Vec<String>,
@@ -4157,6 +4226,73 @@ exit 9\n",
         assert!(rendered.contains(&format!("Portal: {portal_base_url}")));
         assert!(rendered.contains("Added minimax-oauth OAuth credential #1"));
         assert!(rendered.contains("Default model set to: MiniMax-M2.7 (via MiniMax (OAuth))"));
+    }
+
+    #[test]
+    fn setup_model_nous_fresh_login_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared = temp.path().join("shared");
+        fs::create_dir_all(&home).unwrap();
+        let (portal_base_url, requests, server) = spawn_nous_oauth_server(
+            "header.eyJlbWFpbCI6Im5vdXMtc2V0dXBAZXhhbXBsZS5jb20ifQ.sig",
+            "nous-refresh-setup",
+        );
+        set_env_var("HERMES_SHARED_AUTH_DIR", &shared);
+        set_env_var("HERMES_PORTAL_BASE_URL", &portal_base_url);
+        set_env_var(
+            "NOUS_INFERENCE_BASE_URL",
+            format!("{portal_base_url}/requested-inference/v1"),
+        );
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let nous_choice = providers
+            .iter()
+            .position(|provider| provider.name == "nous")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input =
+            io::Cursor::new(format!("{nous_choice}\nmoonshotai/kimi-k2.6\n").into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("HERMES_SHARED_AUTH_DIR");
+        remove_env_var("HERMES_PORTAL_BASE_URL");
+        remove_env_var("NOUS_INFERENCE_BASE_URL");
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: nous"));
+        assert!(config_text.contains("default: moonshotai/kimi-k2.6"));
+        assert!(config_text.contains(&format!("base_url: {portal_base_url}/runtime-inference/v1")));
+        assert!(config_text.contains("api_mode: chat_completions"));
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert_eq!(
+            auth_json["providers"]["nous"]["refresh_token"],
+            "nous-refresh-setup"
+        );
+        assert_eq!(
+            auth_json["providers"]["nous"]["agent_key"],
+            "nous-agent-key"
+        );
+        assert_eq!(
+            auth_json["credential_pool"]["nous"][0]["label"],
+            "nous-setup@example.com"
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Starting Hermes login via Nous..."));
+        assert!(rendered.contains(&format!("Portal: {portal_base_url}")));
+        assert!(rendered.contains("Added nous OAuth credential #1"));
+        assert!(rendered.contains("Default model set to: moonshotai/kimi-k2.6 (via Nous Portal)"));
     }
 
     #[test]

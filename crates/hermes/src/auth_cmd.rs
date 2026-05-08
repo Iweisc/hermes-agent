@@ -1526,7 +1526,7 @@ fn native_auth_add_nous_oauth(
     native_auth_add_nous_oauth_with_io(context, args, &mut output)
 }
 
-fn native_auth_add_nous_oauth_with_io(
+pub(crate) fn native_auth_add_nous_oauth_with_io(
     context: &HermesContext,
     args: &AuthAddArgs,
     output: &mut dyn Write,
