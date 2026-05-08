@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use hermes_core::{HermesContext, is_container, is_wsl};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
+use crate::config_cmd::save_env_value;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -141,6 +143,40 @@ pub(crate) struct GatewayUpdateRestartSummary {
     pub stopped_manual: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GatewaySetupPlatform {
+    key: String,
+    label: String,
+    emoji: String,
+    status: String,
+    #[serde(default)]
+    token_var: String,
+    #[serde(default)]
+    install_hint: Option<String>,
+    #[serde(default)]
+    setup_instructions: Vec<String>,
+    #[serde(default)]
+    required_env: Vec<String>,
+    #[serde(default)]
+    has_builtin_setup: bool,
+    #[serde(default)]
+    has_plugin_setup: bool,
+    #[serde(default)]
+    vars: Vec<GatewaySetupVar>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GatewaySetupVar {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    password: bool,
+    #[serde(default)]
+    help: String,
+    #[serde(default)]
+    is_allowlist: bool,
+}
+
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
@@ -166,7 +202,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
             print_gateway_install(context, args.accept_hooks, install)
         }
         Some(GatewayCommand::Uninstall(args2)) => print_gateway_uninstall(context, args2),
-        Some(GatewayCommand::Setup) => print_gateway_setup(args.accept_hooks),
+        Some(GatewayCommand::Setup) => print_gateway_setup(context, args.accept_hooks),
         Some(GatewayCommand::MigrateLegacy(args2)) => print_gateway_migrate_legacy(context, args2),
     }
 }
@@ -729,7 +765,232 @@ const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     ")\n",
 );
 
-fn print_gateway_setup(accept_hooks: bool) -> Result<(), Box<dyn Error>> {
+fn print_gateway_setup(context: &HermesContext, accept_hooks: bool) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    run_gateway_setup_with_io(context, &mut input, &mut output, accept_hooks)
+}
+
+fn run_gateway_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    accept_hooks: bool,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "┌─────────────────────────────────────────────────────────┐"
+    )?;
+    writeln!(
+        output,
+        "│             ⚕ Gateway Setup                            │"
+    )?;
+    writeln!(
+        output,
+        "├─────────────────────────────────────────────────────────┤"
+    )?;
+    writeln!(
+        output,
+        "│  Configure messaging platforms and the gateway service. │"
+    )?;
+    writeln!(
+        output,
+        "│  Press Ctrl+C at any time to exit.                     │"
+    )?;
+    writeln!(
+        output,
+        "└─────────────────────────────────────────────────────────┘"
+    )?;
+    writeln!(output)?;
+
+    let snapshot = gateway_snapshot(context, false);
+    if snapshot.service_installed && snapshot.service_running {
+        writeln!(output, "Gateway service is installed and running.")?;
+    } else if snapshot.service_installed {
+        writeln!(output, "Gateway service is installed but not running.")?;
+        if prompt_gateway_yes_no(input, output, "Start it now?", true)? {
+            if let Err(error) = print_gateway_start(
+                context,
+                accept_hooks,
+                GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                },
+            ) {
+                writeln!(output, "Start failed: {error}")?;
+            }
+        }
+    } else {
+        writeln!(output, "Gateway service is not installed yet.")?;
+        writeln!(
+            output,
+            "You'll be offered to install it after configuring platforms."
+        )?;
+    }
+
+    loop {
+        writeln!(output)?;
+        writeln!(output, "Messaging Platforms")?;
+        let platforms = load_gateway_setup_metadata(accept_hooks)?;
+        let mut labels = platforms
+            .iter()
+            .map(|platform| {
+                format!(
+                    "{} {} ({})",
+                    platform.emoji, platform.label, platform.status
+                )
+            })
+            .collect::<Vec<_>>();
+        labels.push(String::from("Done"));
+        let choice = prompt_gateway_menu_choice(
+            input,
+            output,
+            "Select a platform to configure",
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        if choice >= platforms.len() {
+            break;
+        }
+        let platform = &platforms[choice];
+        if gateway_platform_uses_native_standard_setup(platform) {
+            configure_standard_gateway_platform_with_io(context, platform, input, output)?;
+        } else {
+            run_gateway_platform_setup_bridge(accept_hooks, &platform.key)?;
+        }
+    }
+
+    let platforms = load_gateway_setup_metadata(accept_hooks)?;
+    let any_configured = platforms
+        .iter()
+        .any(|platform| gateway_platform_status_is_progress(&platform.status));
+    if !any_configured {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "No platforms configured. Run 'hermes gateway setup' when ready."
+        )?;
+        writeln!(output)?;
+        return Ok(());
+    }
+
+    writeln!(output)?;
+    let snapshot = gateway_snapshot(context, false);
+    if snapshot.service_running {
+        if prompt_gateway_yes_no(
+            input,
+            output,
+            "Restart the gateway to pick up changes?",
+            true,
+        )? {
+            if let Err(error) = print_gateway_restart(
+                context,
+                accept_hooks,
+                GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                },
+            ) {
+                writeln!(output, "Restart failed: {error}")?;
+            }
+        }
+    } else if snapshot.service_installed {
+        if prompt_gateway_yes_no(input, output, "Start the gateway service?", true)? {
+            if let Err(error) = print_gateway_start(
+                context,
+                accept_hooks,
+                GatewayServiceArgs {
+                    system: false,
+                    all: false,
+                },
+            ) {
+                writeln!(output, "Start failed: {error}")?;
+            }
+        }
+    } else if supports_systemd_services() || is_macos() {
+        let service_kind = if supports_systemd_services() {
+            "systemd"
+        } else {
+            "launchd"
+        };
+        let question = if is_wsl() {
+            format!(
+                "Install the gateway as a {service_kind} service? (note: services may not survive WSL restarts)"
+            )
+        } else {
+            format!("Install the gateway as a {service_kind} service?")
+        };
+        if prompt_gateway_yes_no(input, output, question.as_str(), true)? {
+            match print_gateway_install(
+                context,
+                accept_hooks,
+                GatewayInstallArgs {
+                    force: false,
+                    system: false,
+                    run_as_user: None,
+                },
+            ) {
+                Ok(()) => {
+                    if prompt_gateway_yes_no(input, output, "Start the service now?", true)? {
+                        if let Err(error) = print_gateway_start(
+                            context,
+                            accept_hooks,
+                            GatewayServiceArgs {
+                                system: false,
+                                all: false,
+                            },
+                        ) {
+                            writeln!(output, "Start failed: {error}")?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    writeln!(output, "Install failed: {error}")?;
+                }
+            }
+        } else {
+            writeln!(output, "You can install later: hermes gateway install")?;
+            if supports_systemd_services() {
+                writeln!(
+                    output,
+                    "Or as a boot-time service: sudo hermes gateway install --system"
+                )?;
+            }
+            writeln!(output, "Or run in foreground: hermes gateway run")?;
+        }
+    } else if is_wsl() {
+        writeln!(output, "WSL detected but systemd is not running.")?;
+        writeln!(output, "Run in foreground: hermes gateway run")?;
+        writeln!(
+            output,
+            "For persistence:   tmux new -s hermes 'hermes gateway run'"
+        )?;
+        writeln!(
+            output,
+            "To enable systemd: add systemd=true to /etc/wsl.conf, then 'wsl --shutdown'"
+        )?;
+    } else if is_termux(context) {
+        writeln!(output, "Termux does not use systemd/launchd services.")?;
+        writeln!(output, "Run in foreground: hermes gateway run")?;
+        writeln!(
+            output,
+            "Or start it manually in the background (best effort): nohup hermes gateway run >{}/logs/gateway.log 2>&1 &",
+            context.display_hermes_home()
+        )?;
+    } else {
+        writeln!(output, "Service install not supported on this platform.")?;
+        writeln!(output, "Run in foreground: hermes gateway run")?;
+    }
+
+    writeln!(output)?;
+    Ok(())
+}
+
+fn load_gateway_setup_metadata(
+    accept_hooks: bool,
+) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
         .ok_or("could not find a Python interpreter for gateway setup")?;
@@ -741,18 +1002,377 @@ fn print_gateway_setup(accept_hooks: bool) -> Result<(), Box<dyn Error>> {
     if accept_hooks {
         command.env("HERMES_ACCEPT_HOOKS", "1");
     }
-    command.arg("-c").arg(GATEWAY_SETUP_BOOTSTRAP);
+    command.arg("-c").arg(GATEWAY_SETUP_METADATA_BOOTSTRAP);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(exit_status_message("gateway metadata", output.status).into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    serde_json::from_str::<Vec<GatewaySetupPlatform>>(stdout.trim())
+        .map_err(|error| format!("invalid gateway setup metadata: {error}").into())
+}
+
+fn run_gateway_platform_setup_bridge(
+    accept_hooks: bool,
+    platform_key: &str,
+) -> Result<(), Box<dyn Error>> {
+    if platform_key.trim().is_empty() {
+        return Err("gateway platform key cannot be empty".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
+        .ok_or("could not find a Python interpreter for gateway setup")?;
+
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_GATEWAY_SETUP_PLATFORM", platform_key);
+    if accept_hooks {
+        command.env("HERMES_ACCEPT_HOOKS", "1");
+    }
+    command.arg("-c").arg(GATEWAY_SETUP_PLATFORM_BOOTSTRAP);
 
     let status = command.status()?;
     if status.success() {
         return Ok(());
     }
-    Err(exit_status_message("gateway", status).into())
+    Err(exit_status_message("gateway platform setup", status).into())
 }
 
-const GATEWAY_SETUP_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.gateway import gateway_setup\n",
-    "gateway_setup()\n",
+fn gateway_platform_uses_native_standard_setup(platform: &GatewaySetupPlatform) -> bool {
+    !platform.vars.is_empty() && !platform.has_builtin_setup && !platform.has_plugin_setup
+}
+
+fn gateway_platform_status_is_progress(status: &str) -> bool {
+    let lowered = status.trim().to_ascii_lowercase();
+    !(lowered == "not configured"
+        || lowered.starts_with("partially")
+        || lowered.starts_with("plugin disabled"))
+}
+
+fn configure_standard_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    if let Some(existing) = read_effective_env_value(context, platform.token_var.as_str())
+        .filter(|_| !platform.token_var.is_empty())
+    {
+        let _ = existing;
+        writeln!(output)?;
+        writeln!(output, "{} is already configured.", platform.label)?;
+        if !prompt_gateway_yes_no(
+            input,
+            output,
+            format!("Reconfigure {}?", platform.label).as_str(),
+            false,
+        )? {
+            return Ok(());
+        }
+    }
+
+    let mut allowlist_value: Option<String> = None;
+    for var in &platform.vars {
+        writeln!(output)?;
+        if !var.help.trim().is_empty() {
+            writeln!(output, "  {}", var.help.trim())?;
+        }
+        let existing = read_effective_env_value(context, &var.name);
+        if !var.password
+            && let Some(current) = existing.as_deref().filter(|value| !value.trim().is_empty())
+        {
+            writeln!(output, "  Current: {current}")?;
+        }
+
+        if var.is_allowlist {
+            writeln!(output, "  The gateway denies all users by default.")?;
+            writeln!(
+                output,
+                "  Enter user IDs to create an allowlist, or leave empty to choose another access mode."
+            )?;
+            let value = prompt_gateway_line(input, output, format!("  {}", var.prompt).as_str())?;
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                let cleaned = normalize_gateway_allowlist(&var.name, trimmed);
+                save_env_value(context.env_path(), &var.name, &cleaned)?;
+                remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+                writeln!(
+                    output,
+                    "  Saved — only these users can interact with the bot."
+                )?;
+                allowlist_value = Some(cleaned);
+            } else {
+                let access_choices = [
+                    "Enable open access (anyone can message the bot)",
+                    "Use DM pairing (unknown users request access, you approve later)",
+                    "Skip for now (bot will deny all users until configured)",
+                ];
+                let access_idx = prompt_gateway_menu_choice(
+                    input,
+                    output,
+                    "How should unauthorized users be handled?",
+                    &access_choices,
+                )?;
+                match access_idx {
+                    0 => {
+                        save_env_value(context.env_path(), "GATEWAY_ALLOW_ALL_USERS", "true")?;
+                        writeln!(output, "  Open access enabled.")?;
+                    }
+                    1 | 2 => {
+                        remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+                        if access_idx == 1 {
+                            writeln!(
+                                output,
+                                "  DM pairing mode selected. Approve codes with `hermes pairing approve`."
+                            )?;
+                        } else {
+                            writeln!(
+                                output,
+                                "  Skipped — configure later with `hermes gateway setup`."
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        let value = prompt_gateway_line(input, output, format!("  {}", var.prompt).as_str())?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            save_env_value(context.env_path(), &var.name, trimmed)?;
+            writeln!(output, "  Saved {}", var.name)?;
+        } else if var.name == platform.token_var {
+            writeln!(
+                output,
+                "  Skipped — {} won't work without this.",
+                platform.label
+            )?;
+            return Ok(());
+        } else {
+            writeln!(output, "  Skipped (can configure later)")?;
+        }
+    }
+
+    if platform.key == "telegram"
+        && let Some(allowlist) = allowlist_value
+        && read_effective_env_value(context, "TELEGRAM_HOME_CHANNEL").is_none()
+        && let Some(first_id) = allowlist
+            .split(',')
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+        && prompt_gateway_yes_no(
+            input,
+            output,
+            format!("Use your user ID ({first_id}) as the home channel?").as_str(),
+            true,
+        )?
+    {
+        save_env_value(context.env_path(), "TELEGRAM_HOME_CHANNEL", first_id)?;
+        writeln!(output, "  Home channel set to {first_id}")?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    Ok(())
+}
+
+fn prompt_gateway_menu_choice(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    title: &str,
+    choices: &[&str],
+) -> Result<usize, Box<dyn Error>> {
+    loop {
+        writeln!(output, "{title}:")?;
+        for (index, choice) in choices.iter().enumerate() {
+            writeln!(output, "  {}. {}", index + 1, choice)?;
+        }
+        let response = prompt_gateway_line(input, output, "Enter a number")?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            writeln!(output, "Please enter a selection.")?;
+            continue;
+        }
+        let Ok(index) = trimmed.parse::<usize>() else {
+            writeln!(output, "Invalid selection: '{trimmed}'.")?;
+            continue;
+        };
+        if !(1..=choices.len()).contains(&index) {
+            writeln!(output, "Selection must be between 1 and {}.", choices.len())?;
+            continue;
+        }
+        return Ok(index - 1);
+    }
+}
+
+fn prompt_gateway_yes_no(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    prompt: &str,
+    default: bool,
+) -> Result<bool, Box<dyn Error>> {
+    let suffix = if default { " [Y/n]" } else { " [y/N]" };
+    loop {
+        let response = prompt_gateway_line(input, output, format!("{prompt}{suffix}").as_str())?;
+        let trimmed = response.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        match trimmed.as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => {
+                writeln!(output, "Please answer yes or no.")?;
+            }
+        }
+    }
+}
+
+fn prompt_gateway_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    prompt: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{prompt}: ")?;
+    output.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Err("interactive input closed".into());
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn read_effective_env_value(context: &HermesContext, key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| read_env_file_value(&context.env_path(), key))
+}
+
+fn read_env_file_value(path: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(key) else {
+            continue;
+        };
+        if !rest.starts_with('=') {
+            continue;
+        }
+        let value = rest[1..].trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn remove_env_key_if_present(path: &Path, key: &str) -> Result<(), Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(path)?;
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for line in original.lines() {
+        if line
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with('='))
+        {
+            removed = true;
+            continue;
+        }
+        kept.push(format!("{line}\n"));
+    }
+    if removed {
+        fs::write(path, kept.concat())?;
+    }
+    Ok(())
+}
+
+fn normalize_gateway_allowlist(var_name: &str, value: &str) -> String {
+    let cleaned = value.replace(' ', "");
+    if !var_name.contains("DISCORD") {
+        return cleaned;
+    }
+    cleaned
+        .split(',')
+        .filter_map(|entry| {
+            let mut value = entry.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if value.starts_with("<@") && value.ends_with('>') {
+                value = value.trim_start_matches("<@").trim_start_matches('!');
+                value = value.trim_end_matches('>');
+            }
+            if let Some(stripped) = value.strip_prefix("user:") {
+                value = stripped;
+            }
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+const GATEWAY_SETUP_METADATA_BOOTSTRAP: &str = concat!(
+    "import json\n",
+    "from hermes_cli.gateway import _all_platforms, _platform_status, _builtin_setup_fn\n",
+    "items = []\n",
+    "for platform in _all_platforms():\n",
+    "    entry = platform.get('_registry_entry')\n",
+    "    vars_ = []\n",
+    "    for spec in platform.get('vars') or []:\n",
+    "        vars_.append({\n",
+    "            'name': spec.get('name', ''),\n",
+    "            'prompt': spec.get('prompt', ''),\n",
+    "            'password': bool(spec.get('password', False)),\n",
+    "            'help': spec.get('help', '') or '',\n",
+    "            'is_allowlist': bool(spec.get('is_allowlist', False)),\n",
+    "        })\n",
+    "    items.append({\n",
+    "        'key': platform.get('key', ''),\n",
+    "        'label': platform.get('label', ''),\n",
+    "        'emoji': platform.get('emoji', ''),\n",
+    "        'status': _platform_status(platform),\n",
+    "        'token_var': platform.get('token_var', '') or '',\n",
+    "        'install_hint': platform.get('install_hint'),\n",
+    "        'setup_instructions': list(platform.get('setup_instructions') or []),\n",
+    "        'required_env': list(getattr(entry, 'required_env', []) or []),\n",
+    "        'has_builtin_setup': _builtin_setup_fn(platform.get('key', '')) is not None,\n",
+    "        'has_plugin_setup': bool(entry is not None and getattr(entry, 'setup_fn', None) is not None),\n",
+    "        'vars': vars_,\n",
+    "    })\n",
+    "print(json.dumps(items))\n",
+);
+
+const GATEWAY_SETUP_PLATFORM_BOOTSTRAP: &str = concat!(
+    "import os\n",
+    "from hermes_cli.gateway import _all_platforms, _configure_platform\n",
+    "target = os.environ['HERMES_GATEWAY_SETUP_PLATFORM']\n",
+    "for platform in _all_platforms():\n",
+    "    if platform.get('key') == target:\n",
+    "        _configure_platform(platform)\n",
+    "        break\n",
+    "else:\n",
+    "    raise SystemExit(f'unknown gateway platform: {target}')\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -2350,6 +2970,7 @@ fn remove_env_var(key: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io::Cursor;
     use tempfile::TempDir;
 
     #[derive(Parser, Debug)]
@@ -2541,7 +3162,7 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn gateway_setup_uses_python_override_and_accept_hooks() {
+    fn gateway_setup_metadata_uses_python_override_and_accept_hooks() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
@@ -2553,7 +3174,10 @@ exit 9\n",
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'setup accept=%s\\n' \"$HERMES_ACCEPT_HOOKS\" >> '{}'\n\
+  printf 'metadata accept=%s platform=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
+  cat <<'JSON'\n\
+[{{\"key\":\"email\",\"label\":\"Email\",\"emoji\":\"@\",\"status\":\"not configured\",\"token_var\":\"EMAIL_ADDRESS\",\"vars\":[{{\"name\":\"EMAIL_ADDRESS\",\"prompt\":\"Email address\",\"help\":\"Mailbox address.\"}}]}}]\n\
+JSON\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -2566,12 +3190,119 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        print_gateway_setup(true).unwrap();
+        let metadata = load_gateway_setup_metadata(true).unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("setup accept=1"));
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].key, "email");
+        assert_eq!(metadata[0].label, "Email");
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("metadata accept=1 platform="));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_setup_platform_bridge_uses_python_override_and_selected_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'platform accept=%s key=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        run_gateway_platform_setup_bridge(true, "telegram").unwrap();
+
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("platform accept=1 key=telegram"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    fn configure_standard_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = GatewaySetupPlatform {
+            key: String::from("email"),
+            label: String::from("Email"),
+            emoji: String::from("@"),
+            status: String::from("not configured"),
+            token_var: String::from("EMAIL_ADDRESS"),
+            install_hint: None,
+            setup_instructions: vec![String::from("1. Use a dedicated mailbox.")],
+            required_env: Vec::new(),
+            has_builtin_setup: false,
+            has_plugin_setup: false,
+            vars: vec![
+                GatewaySetupVar {
+                    name: String::from("EMAIL_ADDRESS"),
+                    prompt: String::from("Email address"),
+                    password: false,
+                    help: String::from("Mailbox address."),
+                    is_allowlist: false,
+                },
+                GatewaySetupVar {
+                    name: String::from("EMAIL_PASSWORD"),
+                    prompt: String::from("Password"),
+                    password: true,
+                    help: String::from("App password."),
+                    is_allowlist: false,
+                },
+                GatewaySetupVar {
+                    name: String::from("EMAIL_IMAP_HOST"),
+                    prompt: String::from("IMAP host"),
+                    password: false,
+                    help: String::from("IMAP server."),
+                    is_allowlist: false,
+                },
+                GatewaySetupVar {
+                    name: String::from("EMAIL_SMTP_HOST"),
+                    prompt: String::from("SMTP host"),
+                    password: false,
+                    help: String::from("SMTP server."),
+                    is_allowlist: false,
+                },
+                GatewaySetupVar {
+                    name: String::from("EMAIL_ALLOWED_USERS"),
+                    prompt: String::from("Allowed sender emails"),
+                    password: false,
+                    help: String::from("Trusted senders."),
+                    is_allowlist: true,
+                },
+            ],
+        };
+
+        let mut input = Cursor::new(
+            "bot@example.com\napp-password\nimap.example.com\nsmtp.example.com\nme@example.com,ops@example.com\n",
+        );
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("EMAIL_ADDRESS=bot@example.com"));
+        assert!(env_text.contains("EMAIL_PASSWORD=app-password"));
+        assert!(env_text.contains("EMAIL_IMAP_HOST=imap.example.com"));
+        assert!(env_text.contains("EMAIL_SMTP_HOST=smtp.example.com"));
+        assert!(env_text.contains("EMAIL_ALLOWED_USERS=me@example.com,ops@example.com"));
     }
 
     #[test]
