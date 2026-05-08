@@ -2068,7 +2068,7 @@ fn resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
         return Err(HermesError::State {
             action: "resolving Google Gemini OAuth auth",
             detail: format!(
-                "{} is missing an access token. Run `hermes auth add google-gemini-cli` in the Python runtime first.",
+                "{} is missing an access token. Run `hermes auth add google-gemini-cli` first.",
                 auth_path.display()
             ),
         });
@@ -2108,7 +2108,7 @@ fn load_google_state(auth_path: &Path) -> Result<GoogleOAuthState, HermesError> 
         return Err(HermesError::State {
             action: "resolving Google Gemini OAuth auth",
             detail: format!(
-                "Google OAuth credentials not found at {}. Run `hermes auth add google-gemini-cli` in the Python runtime first.",
+                "Google OAuth credentials not found at {}. Run `hermes auth add google-gemini-cli` first.",
                 auth_path.display()
             ),
         });
@@ -2146,7 +2146,7 @@ fn refresh_google_state(
         return Err(HermesError::State {
             action: "refreshing Google Gemini OAuth auth",
             detail:
-                "Google OAuth refresh token missing. Run `hermes auth add google-gemini-cli` in the Python runtime again."
+                "Google OAuth refresh token missing. Run `hermes auth add google-gemini-cli` again."
                     .to_string(),
         });
     }
@@ -2190,11 +2190,11 @@ fn refresh_google_state(
         return Err(HermesError::State {
             action: "refreshing Google Gemini OAuth auth",
             detail: if detail.is_empty() {
-                "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli` in the Python runtime."
+                "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli`."
                     .to_string()
             } else {
                 format!(
-                    "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli` in the Python runtime. Response: {detail}"
+                    "Google OAuth refresh failed. Re-run `hermes auth add google-gemini-cli`. Response: {detail}"
                 )
             },
         });

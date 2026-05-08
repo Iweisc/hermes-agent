@@ -1504,6 +1504,16 @@ fn try_native_auth_remove(
             vec![format!("Cleared {provider} OAuth tokens from auth store")],
             Vec::new(),
         ),
+        "google-gemini-cli" if source == "manual:google_pkce" => (
+            true,
+            vec![source.to_string()],
+            remove_google_gemini_oauth_file(hermes_home)?,
+            vec![
+                "Suppressed Google Gemini CLI credential — it will not be re-added automatically."
+                    .to_string(),
+                "Run `hermes auth add google-gemini-cli` to re-enable if needed.".to_string(),
+            ],
+        ),
         _ if source.starts_with("env:") => remove_env_source_native(hermes_home, provider, source)?,
         _ if source.starts_with("config:") || source == "model_config" => (
             false,
@@ -2801,6 +2811,17 @@ fn remove_hermes_pkce_file(hermes_home: &Path) -> Result<Vec<String>, Box<dyn Er
     fs::remove_file(&oauth_file)?;
     Ok(vec![
         "Cleared Hermes Anthropic OAuth credentials".to_string(),
+    ])
+}
+
+fn remove_google_gemini_oauth_file(hermes_home: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let oauth_file = hermes_home.join("auth").join("google_oauth.json");
+    if !oauth_file.exists() {
+        return Ok(Vec::new());
+    }
+    fs::remove_file(&oauth_file)?;
+    Ok(vec![
+        "Cleared Google Gemini CLI OAuth credentials".to_string(),
     ])
 }
 
@@ -5285,6 +5306,75 @@ mod tests {
                 .as_array()
                 .is_some_and(|entries| entries.is_empty())
         );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_google_gemini_cli_stays_native_and_clears_oauth_file() {
+        let home = temp_path("auth-remove-google-gemini");
+        fs::create_dir_all(home.join("auth")).unwrap();
+        fs::write(
+            home.join("auth").join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh",
+                "access": "google-access",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "active_provider": "google-gemini-cli",
+                "providers": {
+                    "google-gemini-cli": {
+                        "note": "placeholder"
+                    }
+                },
+                "credential_pool": {
+                    "google-gemini-cli": [
+                        {
+                            "id": "google1",
+                            "label": "Google Gemini CLI",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:google_pkce",
+                            "access_token": "google-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "google-gemini-cli".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert!(persisted["providers"].get("google-gemini-cli").is_none());
+        assert_eq!(persisted["active_provider"], JsonValue::Null);
+        assert_eq!(
+            persisted["suppressed_sources"]["google-gemini-cli"][0],
+            "manual:google_pkce"
+        );
+        assert!(
+            persisted["credential_pool"]["google-gemini-cli"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+        );
+        assert!(!home.join("auth").join("google_oauth.json").exists());
         let _ = fs::remove_dir_all(home);
     }
 }
