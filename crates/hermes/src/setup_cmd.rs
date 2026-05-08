@@ -1307,7 +1307,7 @@ fn provider_available_for_native_model_setup(context: &HermesContext, provider: 
 }
 
 fn provider_supports_fresh_native_model_setup(provider: &str) -> bool {
-    provider == "openai-codex"
+    matches!(provider, "openai-codex" | "minimax-oauth")
 }
 
 fn ensure_runtime_model_provider_credentials(
@@ -1327,6 +1327,19 @@ fn ensure_runtime_model_provider_credentials(
         "openai-codex" => {
             let mut output = SetupUiWriteAdapter::new(ui);
             auth_cmd::native_auth_add_openai_codex_oauth_with_io(
+                context,
+                &AuthAddArgs {
+                    provider: provider.name.clone(),
+                    auth_type: Some("oauth".to_string()),
+                    ..AuthAddArgs::default()
+                },
+                &mut output,
+            )?;
+            output.flush()?;
+        }
+        "minimax-oauth" => {
+            let mut output = SetupUiWriteAdapter::new(ui);
+            auth_cmd::native_auth_add_minimax_oauth_with_io(
                 context,
                 &AuthAddArgs {
                     provider: provider.name.clone(),
@@ -3463,6 +3476,56 @@ mod tests {
         (base_url, requests, handle)
     }
 
+    fn spawn_minimax_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+        state: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let state = state.to_string();
+        let base_for_thread = base_url.clone();
+        let handle = thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request);
+                let payload = match idx {
+                    0 => serde_json::json!({
+                        "user_code": "MINIMAX-CODE",
+                        "verification_uri": format!("{base_for_thread}/verify"),
+                        "expired_in": 60,
+                        "interval": 100,
+                        "state": state
+                    }),
+                    _ => serde_json::json!({
+                        "status": "success",
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "expired_in": 3600,
+                        "token_type": "Bearer",
+                        "resource_url": "group-123",
+                        "notification_message": "quota synced"
+                    }),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
     #[derive(Default)]
     struct TestUi {
         answers: Vec<String>,
@@ -4028,6 +4091,72 @@ exit 9\n",
         assert!(rendered.contains("Signing in to OpenAI Codex..."));
         assert!(rendered.contains("Added openai-codex OAuth credential #1"));
         assert!(rendered.contains("Default model set to: gpt-5.5 (via OpenAI Codex)"));
+    }
+
+    #[test]
+    fn setup_model_minimax_oauth_fresh_login_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (portal_base_url, requests, server) = spawn_minimax_oauth_server(
+            "header.eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJtaW5pbWF4LXNldHVwQGV4YW1wbGUuY29tIn0.sig",
+            "minimax-refresh-setup",
+            "minimax-state-setup",
+        );
+        set_env_var("HERMES_AUTH_MINIMAX_PORTAL_URL", &portal_base_url);
+        set_env_var(
+            "HERMES_AUTH_MINIMAX_TEST_VERIFIER",
+            "minimax-verifier-setup",
+        );
+        set_env_var("HERMES_AUTH_MINIMAX_TEST_STATE", "minimax-state-setup");
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let minimax_choice = providers
+            .iter()
+            .position(|provider| provider.name == "minimax-oauth")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(format!("{minimax_choice}\nMiniMax-M2.7\n").into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("HERMES_AUTH_MINIMAX_PORTAL_URL");
+        remove_env_var("HERMES_AUTH_MINIMAX_TEST_VERIFIER");
+        remove_env_var("HERMES_AUTH_MINIMAX_TEST_STATE");
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: minimax-oauth"));
+        assert!(config_text.contains("default: MiniMax-M2.7"));
+        assert!(config_text.contains(&format!("base_url: {portal_base_url}/anthropic")));
+        assert!(config_text.contains("api_mode: anthropic_messages"));
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert_eq!(
+            auth_json["providers"]["minimax-oauth"]["access_token"],
+            "header.eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJtaW5pbWF4LXNldHVwQGV4YW1wbGUuY29tIn0.sig"
+        );
+        assert_eq!(
+            auth_json["providers"]["minimax-oauth"]["refresh_token"],
+            "minimax-refresh-setup"
+        );
+        assert_eq!(
+            auth_json["credential_pool"]["minimax-oauth"][0]["label"],
+            "minimax-setup@example.com"
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Starting Hermes login via MiniMax OAuth..."));
+        assert!(rendered.contains(&format!("Portal: {portal_base_url}")));
+        assert!(rendered.contains("Added minimax-oauth OAuth credential #1"));
+        assert!(rendered.contains("Default model set to: MiniMax-M2.7 (via MiniMax (OAuth))"));
     }
 
     #[test]

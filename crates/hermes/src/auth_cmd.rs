@@ -1018,7 +1018,7 @@ fn native_auth_add_minimax_oauth(
     native_auth_add_minimax_oauth_with_io(context, args, &mut output)
 }
 
-fn native_auth_add_minimax_oauth_with_io(
+pub(crate) fn native_auth_add_minimax_oauth_with_io(
     context: &HermesContext,
     args: &AuthAddArgs,
     output: &mut dyn Write,
@@ -3894,6 +3894,7 @@ fn resolve_minimax_portal_base_url(args: &AuthAddArgs) -> Result<String, Box<dyn
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("HERMES_AUTH_MINIMAX_PORTAL_URL"))
         .unwrap_or_else(|| DEFAULT_MINIMAX_OAUTH_PORTAL_BASE_URL.to_string());
     normalize_http_url(&candidate, "portal URL")
 }
@@ -3908,6 +3909,7 @@ fn resolve_minimax_inference_base_url(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("HERMES_AUTH_MINIMAX_INFERENCE_URL"))
         .unwrap_or_else(|| match portal_base_url {
             DEFAULT_MINIMAX_OAUTH_CN_PORTAL_BASE_URL => {
                 DEFAULT_MINIMAX_OAUTH_CN_INFERENCE_BASE_URL.to_string()
@@ -3926,6 +3928,7 @@ fn resolve_minimax_client_id(args: &AuthAddArgs) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("HERMES_AUTH_MINIMAX_CLIENT_ID"))
         .unwrap_or_else(|| MINIMAX_OAUTH_CLIENT_ID.to_string())
 }
 
@@ -3935,6 +3938,7 @@ fn resolve_minimax_scope(args: &AuthAddArgs) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("HERMES_AUTH_MINIMAX_SCOPE"))
         .unwrap_or_else(|| MINIMAX_OAUTH_SCOPE.to_string())
 }
 
