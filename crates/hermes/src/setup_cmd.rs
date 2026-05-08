@@ -286,7 +286,7 @@ fn run_native_model_setup(
     let current_model = get_nested_string(&root, &["model", "default"]).unwrap_or_default();
     let current_base_url = get_nested_string(&root, &["model", "base_url"]).unwrap_or_default();
 
-    let providers = native_setup_model_providers();
+    let providers = native_setup_model_providers(context);
     let saved_custom_providers = collect_saved_custom_model_providers(&root);
     let current_label = model_provider_label(&current_provider);
 
@@ -294,7 +294,7 @@ fn run_native_model_setup(
     ui.line("⚕ Hermes Setup — Inference Provider")?;
     ui.line("Choose a provider and default model.")?;
     ui.line(
-        "OAuth providers and the advanced model picker remain available through the compatibility flow.",
+        "Fresh OAuth login, Copilot/Bedrock, and the advanced model picker remain available through the compatibility flow.",
     )?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
@@ -429,17 +429,26 @@ fn run_native_model_setup(
     }
 
     let selected = &providers[selection - 1];
-    let selected_base_url =
-        if current_provider == selected.name && !current_base_url.trim().is_empty() {
-            current_base_url.clone()
-        } else if !selected.base_url.trim().is_empty() {
-            selected.base_url.to_string()
-        } else {
-            String::new()
-        };
+    let selected_base_url = resolved_native_model_provider_base_url(
+        context,
+        selected,
+        &current_provider,
+        &current_base_url,
+    )?;
 
-    ensure_model_provider_secret(context, ui, selected)?;
-    let base_url = prompt_model_base_url(ui, selected, &selected_base_url)?;
+    if selected.auth_type == "api_key" {
+        ensure_model_provider_secret(context, ui, selected)?;
+    } else {
+        ui.line(&format!(
+            "{} credentials: already configured",
+            selected.label
+        ))?;
+    }
+    let base_url = if selected.auth_type == "api_key" {
+        prompt_model_base_url(ui, selected, &selected_base_url)?
+    } else {
+        selected_base_url
+    };
     let current_model_for_provider = if current_provider == selected.name {
         current_model.clone()
     } else {
@@ -942,9 +951,18 @@ struct NativeModelProvider {
     label: String,
     base_url: &'static str,
     api_mode: &'static str,
-    api_key_env_var: String,
+    auth_type: &'static str,
+    api_key_env_var: Option<String>,
     base_url_env_var: Option<String>,
 }
+
+const NATIVE_MODEL_RUNTIME_PROVIDERS: &[&str] = &[
+    "nous",
+    "openai-codex",
+    "google-gemini-cli",
+    "qwen-oauth",
+    "minimax-oauth",
+];
 
 #[derive(Debug, Clone)]
 struct SavedCustomModelProvider {
@@ -1195,24 +1213,97 @@ fn run_native_agent_setup(
     Ok(())
 }
 
-fn native_setup_model_providers() -> Vec<NativeModelProvider> {
+fn native_setup_model_providers(context: &HermesContext) -> Vec<NativeModelProvider> {
     let mut providers = list_provider_profiles()
         .into_iter()
-        .filter(|profile| profile.auth_type == "api_key" && profile.name != "custom")
+        .filter(|profile| profile.name != "custom")
         .filter_map(|profile| {
-            let api_key_env_var = profile.api_key_env_vars().next()?.to_string();
-            Some(NativeModelProvider {
-                name: profile.name.to_string(),
-                label: model_provider_label(profile.name),
-                base_url: profile.base_url,
-                api_mode: profile.api_mode,
-                api_key_env_var,
-                base_url_env_var: profile.base_url_env_var().map(ToOwned::to_owned),
-            })
+            if profile.auth_type == "api_key" {
+                return Some(NativeModelProvider {
+                    name: profile.name.to_string(),
+                    label: model_provider_label(profile.name),
+                    base_url: profile.base_url,
+                    api_mode: profile.api_mode,
+                    auth_type: profile.auth_type,
+                    api_key_env_var: profile.api_key_env_vars().next().map(ToOwned::to_owned),
+                    base_url_env_var: profile.base_url_env_var().map(ToOwned::to_owned),
+                });
+            }
+            if native_runtime_model_provider_supported(profile.name)
+                && provider_available_for_native_model_setup(context, profile.name)
+            {
+                return Some(NativeModelProvider {
+                    name: profile.name.to_string(),
+                    label: model_provider_label(profile.name),
+                    base_url: profile.base_url,
+                    api_mode: profile.api_mode,
+                    auth_type: profile.auth_type,
+                    api_key_env_var: None,
+                    base_url_env_var: None,
+                });
+            }
+            None
         })
         .collect::<Vec<_>>();
     providers.sort_by_key(|provider| model_provider_order(&provider.name));
     providers
+}
+
+fn native_runtime_model_provider_supported(provider: &str) -> bool {
+    NATIVE_MODEL_RUNTIME_PROVIDERS.contains(&provider)
+}
+
+fn provider_available_for_native_model_setup(context: &HermesContext, provider: &str) -> bool {
+    get_auth_status_summary(context.hermes_home().as_path(), provider)
+        .map(|status| status.configured || status.logged_in)
+        .unwrap_or(false)
+}
+
+fn resolved_native_model_provider_base_url(
+    context: &HermesContext,
+    provider: &NativeModelProvider,
+    current_provider: &str,
+    current_base_url: &str,
+) -> Result<String, Box<dyn Error>> {
+    if provider.name == current_provider && !current_base_url.trim().is_empty() {
+        return Ok(current_base_url.trim_end_matches('/').to_string());
+    }
+
+    let auth_path = context.hermes_home().join("auth.json");
+    let auth_store = if auth_path.exists() {
+        serde_json::from_str::<JsonValue>(&fs::read_to_string(&auth_path)?)?
+    } else {
+        JsonValue::Null
+    };
+
+    let from_state = match provider.name.as_str() {
+        "nous" | "minimax-oauth" => auth_store
+            .get("providers")
+            .and_then(|providers| providers.get(&provider.name))
+            .and_then(|state| state.get("inference_base_url"))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string()),
+        _ => None,
+    };
+    if let Some(base_url) = from_state {
+        return Ok(base_url);
+    }
+
+    if provider.name == "qwen-oauth"
+        && let Some(base_url) = std::env::var("HERMES_QWEN_BASE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+    {
+        return Ok(base_url);
+    }
+
+    if provider.base_url.trim().is_empty() {
+        return Err(format!("{} has no default base URL", provider.label).into());
+    }
+    Ok(provider.base_url.trim_end_matches('/').to_string())
 }
 
 fn collect_saved_custom_model_providers(root: &Mapping) -> Vec<SavedCustomModelProvider> {
@@ -1753,14 +1844,19 @@ fn remove_saved_custom_model_provider_from_root(
 fn model_provider_order(provider: &str) -> (usize, String) {
     let priority = match provider {
         "openrouter" => 0,
-        "openai" => 1,
-        "anthropic" => 2,
-        "deepseek" => 3,
-        "gemini" => 4,
-        "xai" => 5,
-        "zai" => 6,
-        "minimax" => 7,
-        "ai-gateway" => 8,
+        "nous" => 1,
+        "openai" => 2,
+        "openai-codex" => 3,
+        "anthropic" => 4,
+        "deepseek" => 5,
+        "gemini" => 6,
+        "google-gemini-cli" => 7,
+        "qwen-oauth" => 8,
+        "minimax" => 9,
+        "minimax-oauth" => 10,
+        "xai" => 11,
+        "zai" => 12,
+        "ai-gateway" => 13,
         _ => 100,
     };
     (priority, provider.to_string())
@@ -1769,13 +1865,18 @@ fn model_provider_order(provider: &str) -> (usize, String) {
 fn model_provider_label(provider: &str) -> String {
     match provider {
         "openrouter" => "OpenRouter".to_string(),
+        "nous" => "Nous Portal".to_string(),
         "openai" => "OpenAI".to_string(),
+        "openai-codex" => "OpenAI Codex".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "deepseek" => "DeepSeek".to_string(),
         "gemini" => "Google Gemini API".to_string(),
+        "google-gemini-cli" => "Google Gemini (OAuth)".to_string(),
+        "qwen-oauth" => "Qwen OAuth".to_string(),
         "xai" => "xAI".to_string(),
         "zai" => "Z.AI / GLM".to_string(),
         "minimax" => "MiniMax".to_string(),
+        "minimax-oauth" => "MiniMax (OAuth)".to_string(),
         "minimax-cn" => "MiniMax CN".to_string(),
         "kimi-coding" => "Kimi Coding".to_string(),
         "kimi-coding-cn" => "Kimi Coding (China)".to_string(),
@@ -1803,7 +1904,10 @@ fn ensure_model_provider_secret(
     ui: &mut dyn SetupUi,
     provider: &NativeModelProvider,
 ) -> Result<(), Box<dyn Error>> {
-    let current = env_value_for_context(context, &provider.api_key_env_var);
+    let Some(api_key_env_var) = provider.api_key_env_var.as_deref() else {
+        return Ok(());
+    };
+    let current = env_value_for_context(context, api_key_env_var);
     if current.is_some() {
         ui.line(&format!("{} API key: already configured", provider.label))?;
         if !prompt_yes_no(ui, "  Update API key? [y/N]: ", false)? {
@@ -1812,7 +1916,7 @@ fn ensure_model_provider_secret(
     } else {
         ui.line(&format!(
             "{} requires an API key in {}.",
-            provider.label, provider.api_key_env_var
+            provider.label, api_key_env_var
         ))?;
     }
 
@@ -1820,12 +1924,8 @@ fn ensure_model_provider_secret(
     if api_key.trim().is_empty() {
         return Err("No API key provided.".into());
     }
-    save_env_value(
-        context.env_path(),
-        &provider.api_key_env_var,
-        api_key.trim(),
-    )?;
-    ui.line(&format!("Saved {}", provider.api_key_env_var))?;
+    save_env_value(context.env_path(), api_key_env_var, api_key.trim())?;
+    ui.line(&format!("Saved {}", api_key_env_var))?;
     Ok(())
 }
 
@@ -1878,13 +1978,18 @@ fn prompt_model_name(
 fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "openrouter" => "openai/gpt-5.4".to_string(),
+        "nous" => "moonshotai/kimi-k2.6".to_string(),
         "openai" => "gpt-5.4".to_string(),
+        "openai-codex" => "gpt-5.5".to_string(),
         "anthropic" => "claude-sonnet-4.6".to_string(),
         "deepseek" => "deepseek-chat".to_string(),
         "gemini" => "gemini-2.5-flash".to_string(),
+        "google-gemini-cli" => "gemini-3.1-pro-preview".to_string(),
         "xai" => "grok-4-fast-reasoning".to_string(),
         "zai" => "glm-5".to_string(),
         "minimax" | "minimax-cn" => "MiniMax-M2.7".to_string(),
+        "minimax-oauth" => "MiniMax-M2.7".to_string(),
+        "qwen-oauth" => "qwen3-coder-plus".to_string(),
         "ai-gateway" => "anthropic/claude-sonnet-4.6".to_string(),
         "kimi-coding" | "kimi-coding-cn" => "kimi-k2.6".to_string(),
         "alibaba" => "qwen-plus".to_string(),
@@ -3514,7 +3619,7 @@ exit 9\n",
         .unwrap();
 
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let openrouter_choice = providers
             .iter()
             .position(|provider| provider.name == "openrouter")
@@ -3557,7 +3662,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let saved_choice = providers.len() + 1;
         let mut input = io::Cursor::new(format!("{saved_choice}\nllama3.3:70b\n").into_bytes());
         let mut output = Vec::new();
@@ -3589,7 +3694,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let saved_choice = providers.len() + 1;
         let mut input = io::Cursor::new(format!("{saved_choice}\ndemo-chat-v2\n").into_bytes());
         let mut output = Vec::new();
@@ -3614,7 +3719,7 @@ exit 9\n",
         let home = temp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let custom_choice = providers.len() + 1;
         let mut input = io::Cursor::new(
             format!("{custom_choice}\nhttp://localhost:11434\nsk-local\n\nllama3.1:8b\n64k\n\n")
@@ -3653,7 +3758,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let remove_choice = providers.len() + 3;
         let mut input = io::Cursor::new(format!("{remove_choice}\n1\n").into_bytes());
         let mut output = Vec::new();
@@ -3679,7 +3784,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let remove_choice = providers.len() + 3;
         let mut input = io::Cursor::new(format!("{remove_choice}\n1\n").into_bytes());
         let mut output = Vec::new();
@@ -3695,12 +3800,100 @@ exit 9\n",
     }
 
     #[test]
+    fn setup_model_openai_codex_stays_native_when_logged_in() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "codex-access-token"
+                        },
+                        "auth_mode": "chatgpt"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let codex_choice = providers
+            .iter()
+            .position(|provider| provider.name == "openai-codex")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(format!("{codex_choice}\ngpt-5.4\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: openai-codex"));
+        assert!(config_text.contains("default: gpt-5.4"));
+        assert!(config_text.contains("base_url: https://chatgpt.com/backend-api/codex"));
+        assert!(config_text.contains("api_mode: codex_responses"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("OpenAI Codex credentials: already configured"));
+        assert!(rendered.contains("Default model set to: gpt-5.4 (via OpenAI Codex)"));
+    }
+
+    #[test]
+    fn setup_model_nous_stays_native_when_logged_in() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access-token",
+                        "portal_base_url": "https://portal.nous.test",
+                        "inference_base_url": "https://inference.nous.test/v1"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let nous_choice = providers
+            .iter()
+            .position(|provider| provider.name == "nous")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input =
+            io::Cursor::new(format!("{nous_choice}\nmoonshotai/kimi-k2.6\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: nous"));
+        assert!(config_text.contains("default: moonshotai/kimi-k2.6"));
+        assert!(config_text.contains("base_url: https://inference.nous.test/v1"));
+        assert!(config_text.contains("api_mode: chat_completions"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Nous Portal credentials: already configured"));
+        assert!(rendered.contains("Default model set to: moonshotai/kimi-k2.6 (via Nous Portal)"));
+    }
+
+    #[test]
     fn setup_model_auxiliary_custom_endpoint_stays_native() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let auxiliary_choice = providers.len() + 2;
         let aux_providers = native_auxiliary_model_providers(&context, "auto", "");
         let custom_choice = aux_providers.len() + 2;
@@ -3738,7 +3931,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let auxiliary_choice = providers.len() + 2;
         let openrouter_choice = native_auxiliary_model_providers(&context, "openrouter", "")
             .iter()
@@ -3775,7 +3968,7 @@ exit 9\n",
         )
         .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let providers = native_setup_model_providers();
+        let providers = native_setup_model_providers(&context);
         let auxiliary_choice = providers.len() + 2;
         let reset_choice = AUXILIARY_MODEL_TASKS.len() + 1;
         let back_choice = AUXILIARY_MODEL_TASKS.len() + 2;
