@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -286,12 +287,15 @@ fn run_native_model_setup(
     let current_base_url = get_nested_string(&root, &["model", "base_url"]).unwrap_or_default();
 
     let providers = native_setup_model_providers();
+    let saved_custom_providers = collect_saved_custom_model_providers(&root);
     let current_label = model_provider_label(&current_provider);
 
     ui.blank()?;
     ui.line("⚕ Hermes Setup — Inference Provider")?;
-    ui.line("Choose an API-key provider and default model.")?;
-    ui.line("OAuth providers, custom endpoints, and the advanced model picker remain available through the compatibility flow.")?;
+    ui.line("Choose a provider and default model.")?;
+    ui.line(
+        "OAuth providers, brand-new custom endpoints, and the advanced model picker remain available through the compatibility flow.",
+    )?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
     ui.line(&format!(
@@ -307,19 +311,43 @@ fn run_native_model_setup(
     for (index, provider) in providers.iter().enumerate() {
         ui.line(&format!("  {}. {}", index + 1, provider.label))?;
     }
-    let compatibility_choice = providers.len() + 1;
-    let keep_choice = providers.len() + 2;
+    let saved_offset = providers.len();
+    for (index, provider) in saved_custom_providers.iter().enumerate() {
+        let saved_model = provider.model.as_deref().unwrap_or("");
+        let model_hint = if saved_model.is_empty() {
+            String::new()
+        } else {
+            format!(" — {saved_model}")
+        };
+        ui.line(&format!(
+            "  {}. {} ({}){}",
+            saved_offset + index + 1,
+            provider.name,
+            format_saved_custom_provider_url(&provider.base_url),
+            model_hint
+        ))?;
+    }
+    let compatibility_choice = providers.len() + saved_custom_providers.len() + 1;
+    let keep_choice = compatibility_choice + 1;
     ui.line(&format!(
-        "  {}. Use compatibility flow (OAuth, custom endpoint, advanced picker)",
+        "  {}. Use compatibility flow (OAuth, new custom endpoint, advanced picker)",
         compatibility_choice
     ))?;
     ui.line(&format!("  {}. Keep current", keep_choice))?;
 
-    let default_choice = providers
+    let mut default_choice = providers
         .iter()
         .position(|provider| provider.name == current_provider)
         .map(|index| index + 1)
         .unwrap_or(keep_choice);
+    if current_provider == "custom" && !current_base_url.trim().is_empty() {
+        if let Some(index) = saved_custom_providers
+            .iter()
+            .position(|provider| provider.base_url == current_base_url.trim_end_matches('/'))
+        {
+            default_choice = saved_offset + index + 1;
+        }
+    }
     let selection = prompt_menu_choice(ui, "Select provider: ", keep_choice, default_choice)?;
 
     if selection == keep_choice {
@@ -336,6 +364,25 @@ fn run_native_model_setup(
 
     if selection == compatibility_choice {
         return print_direct_setup_python(SetupSection::Model);
+    }
+
+    if selection > providers.len() {
+        let selected = &saved_custom_providers[selection - providers.len() - 1];
+        let current_model_for_provider = if current_provider == "custom"
+            && selected.base_url == current_base_url.trim_end_matches('/')
+        {
+            current_model.clone()
+        } else {
+            selected.model.clone().unwrap_or_default()
+        };
+        let model_name = prompt_model_name(ui, "custom", &current_model_for_provider)?;
+        apply_saved_custom_model_provider_choice(context, &mut root, selected, &model_name)?;
+        ui.line(&format!(
+            "Default model set to: {} (via {})",
+            normalize_model_for_provider(&model_name, "custom"),
+            selected.name
+        ))?;
+        return Ok(());
     }
 
     let selected = &providers[selection - 1];
@@ -546,6 +593,38 @@ struct NativeModelProvider {
     base_url_env_var: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SavedCustomModelProvider {
+    name: String,
+    base_url: String,
+    api_key_config_value: Option<String>,
+    api_mode: Option<String>,
+    model: Option<String>,
+    source: SavedCustomModelProviderSource,
+}
+
+#[derive(Debug, Clone)]
+enum SavedCustomModelProviderSource {
+    LegacyCustomProviders {
+        index: usize,
+    },
+    ProvidersMap {
+        key: String,
+        model_field_key: String,
+    },
+}
+
+impl SavedCustomModelProvider {
+    fn saved_provider_key(&self) -> Option<String> {
+        match &self.source {
+            SavedCustomModelProviderSource::LegacyCustomProviders { .. } => None,
+            SavedCustomModelProviderSource::ProvidersMap { key, .. } => {
+                Some(key.trim().to_ascii_lowercase())
+            }
+        }
+    }
+}
+
 impl SetupUi for StreamUi<'_> {
     fn line(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
         writeln!(self.output, "{text}")?;
@@ -720,6 +799,150 @@ fn native_setup_model_providers() -> Vec<NativeModelProvider> {
         .collect::<Vec<_>>();
     providers.sort_by_key(|provider| model_provider_order(&provider.name));
     providers
+}
+
+fn collect_saved_custom_model_providers(root: &Mapping) -> Vec<SavedCustomModelProvider> {
+    let mut providers = Vec::new();
+    let mut seen_provider_keys = HashSet::new();
+    let mut seen_name_url_model = HashSet::new();
+
+    if let Some(entries) = root.get(yaml_key("providers")).and_then(Value::as_mapping) {
+        for (key, value) in entries {
+            let Some(provider_key) = key.as_str().map(str::trim).filter(|key| !key.is_empty())
+            else {
+                continue;
+            };
+            let Some(mapping) = value.as_mapping() else {
+                continue;
+            };
+            if let Some(provider) = saved_custom_model_provider_from_mapping(
+                mapping,
+                Some(provider_key),
+                SavedCustomModelProviderSource::ProvidersMap {
+                    key: provider_key.to_string(),
+                    model_field_key: preferred_saved_provider_model_key(mapping),
+                },
+            ) {
+                append_saved_custom_provider(
+                    &mut providers,
+                    &mut seen_provider_keys,
+                    &mut seen_name_url_model,
+                    provider,
+                );
+            }
+        }
+    }
+
+    if let Some(entries) = root
+        .get(yaml_key("custom_providers"))
+        .and_then(Value::as_sequence)
+    {
+        for (index, value) in entries.iter().enumerate() {
+            let Some(mapping) = value.as_mapping() else {
+                continue;
+            };
+            if let Some(provider) = saved_custom_model_provider_from_mapping(
+                mapping,
+                None,
+                SavedCustomModelProviderSource::LegacyCustomProviders { index },
+            ) {
+                append_saved_custom_provider(
+                    &mut providers,
+                    &mut seen_provider_keys,
+                    &mut seen_name_url_model,
+                    provider,
+                );
+            }
+        }
+    }
+
+    providers
+}
+
+fn append_saved_custom_provider(
+    providers: &mut Vec<SavedCustomModelProvider>,
+    seen_provider_keys: &mut HashSet<String>,
+    seen_name_url_model: &mut HashSet<(String, String, String)>,
+    provider: SavedCustomModelProvider,
+) {
+    let provider_key = provider.saved_provider_key();
+    let name = provider.name.trim().to_ascii_lowercase();
+    let base_url = provider.base_url.trim_end_matches('/').to_ascii_lowercase();
+    let model = provider
+        .model
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if let Some(provider_key) = provider_key.as_deref() {
+        if seen_provider_keys.contains(provider_key) {
+            return;
+        }
+    }
+    if !name.is_empty()
+        && !base_url.is_empty()
+        && seen_name_url_model.contains(&(name.clone(), base_url.clone(), model.clone()))
+    {
+        return;
+    }
+
+    if let Some(provider_key) = provider_key {
+        seen_provider_keys.insert(provider_key);
+    }
+    if !name.is_empty() && !base_url.is_empty() {
+        seen_name_url_model.insert((name, base_url, model));
+    }
+    providers.push(provider);
+}
+
+fn saved_custom_model_provider_from_mapping(
+    mapping: &Mapping,
+    provider_key: Option<&str>,
+    source: SavedCustomModelProviderSource,
+) -> Option<SavedCustomModelProvider> {
+    let base_url = mapping_string_alias(mapping, &["base_url", "url", "api", "baseUrl"])?;
+    if !looks_like_http_url(&base_url) {
+        return None;
+    }
+
+    let name = mapping_string_alias(mapping, &["name"])
+        .or_else(|| provider_key.map(|value| value.trim().to_string()))
+        .filter(|value| !value.trim().is_empty())?;
+    let raw_api_key = mapping_string_alias(mapping, &["api_key", "apiKey"]);
+    let key_env = mapping_string_alias(mapping, &["key_env", "api_key_env", "keyEnv", "apiKeyEnv"]);
+    let api_key_config_value = raw_api_key.or_else(|| key_env.map(|key| format!("${{{key}}}")));
+
+    Some(SavedCustomModelProvider {
+        name,
+        base_url: base_url.trim_end_matches('/').to_string(),
+        api_key_config_value,
+        api_mode: mapping_string_alias(mapping, &["api_mode", "transport", "apiMode"]),
+        model: mapping_string_alias(mapping, &["model", "default_model", "defaultModel"]),
+        source,
+    })
+}
+
+fn preferred_saved_provider_model_key(mapping: &Mapping) -> String {
+    if mapping.contains_key(yaml_key("model")) {
+        return String::from("model");
+    }
+    if mapping.contains_key(yaml_key("default_model")) {
+        return String::from("default_model");
+    }
+    if mapping.contains_key(yaml_key("defaultModel")) {
+        return String::from("defaultModel");
+    }
+    String::from("default_model")
+}
+
+fn format_saved_custom_provider_url(base_url: &str) -> String {
+    base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn model_provider_order(provider: &str) -> (usize, String) {
@@ -909,6 +1132,81 @@ fn apply_model_provider_choice(
     clear_active_provider_marker(context.hermes_home().as_path())?;
     write_yaml_mapping(&context.config_path(), root)?;
     Ok(())
+}
+
+fn apply_saved_custom_model_provider_choice(
+    context: &HermesContext,
+    root: &mut Mapping,
+    provider: &SavedCustomModelProvider,
+    model_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let model = ensure_mapping(root, "model");
+    model.insert(
+        yaml_key("default"),
+        Value::String(normalize_model_for_provider(model_name, "custom")),
+    );
+    model.insert(yaml_key("provider"), Value::String(String::from("custom")));
+    model.insert(
+        yaml_key("base_url"),
+        Value::String(provider.base_url.trim_end_matches('/').to_string()),
+    );
+    if let Some(api_key) = provider.api_key_config_value.as_deref() {
+        model.insert(yaml_key("api_key"), Value::String(api_key.to_string()));
+    } else {
+        model.remove(yaml_key("api_key"));
+    }
+    if let Some(api_mode) = provider.api_mode.as_deref() {
+        model.insert(yaml_key("api_mode"), Value::String(api_mode.to_string()));
+    } else {
+        model.remove(yaml_key("api_mode"));
+    }
+
+    persist_saved_custom_provider_model(root, &provider.source, model_name);
+    clear_active_provider_marker(context.hermes_home().as_path())?;
+    write_yaml_mapping(&context.config_path(), root)?;
+    Ok(())
+}
+
+fn persist_saved_custom_provider_model(
+    root: &mut Mapping,
+    source: &SavedCustomModelProviderSource,
+    model_name: &str,
+) {
+    match source {
+        SavedCustomModelProviderSource::LegacyCustomProviders { index } => {
+            let Some(entries) = root
+                .get_mut(yaml_key("custom_providers"))
+                .and_then(Value::as_sequence_mut)
+            else {
+                return;
+            };
+            let Some(entry) = entries.get_mut(*index).and_then(Value::as_mapping_mut) else {
+                return;
+            };
+            entry.insert(yaml_key("model"), Value::String(model_name.to_string()));
+        }
+        SavedCustomModelProviderSource::ProvidersMap {
+            key,
+            model_field_key,
+        } => {
+            let Some(entries) = root
+                .get_mut(yaml_key("providers"))
+                .and_then(Value::as_mapping_mut)
+            else {
+                return;
+            };
+            let Some(entry) = entries
+                .get_mut(yaml_key(key))
+                .and_then(Value::as_mapping_mut)
+            else {
+                return;
+            };
+            entry.insert(
+                yaml_key(model_field_key),
+                Value::String(model_name.to_string()),
+            );
+        }
+    }
 }
 
 fn clear_active_provider_marker(hermes_home: &Path) -> Result<(), Box<dyn Error>> {
@@ -1634,6 +1932,14 @@ fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
         .get(yaml_key(key))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn mapping_string_alias(mapping: &Mapping, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        mapping_string(mapping, key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn mapping_bool(mapping: &Mapping, key: &str) -> Option<bool> {
@@ -2419,8 +2725,70 @@ exit 9\n",
         assert!(auth_json["active_provider"].is_null());
 
         let rendered = String::from_utf8(output).unwrap();
-        assert!(rendered.contains("Choose an API-key provider and default model."));
+        assert!(rendered.contains("Choose a provider and default model."));
         assert!(rendered.contains("Default model set to: openai/gpt-5.4 (via OpenRouter)"));
+    }
+
+    #[test]
+    fn setup_model_saved_legacy_custom_provider_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "custom_providers:\n  - name: Local Ollama\n    base_url: http://localhost:11434/v1\n    api_key: ${LOCAL_LLM_KEY}\n    model: llama3.1:8b\n    api_mode: chat_completions\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let saved_choice = providers.len() + 1;
+        let mut input = io::Cursor::new(format!("{saved_choice}\nllama3.3:70b\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: custom"));
+        assert!(config_text.contains("default: llama3.3:70b"));
+        assert!(config_text.contains("base_url: http://localhost:11434/v1"));
+        assert!(config_text.contains("api_key: ${LOCAL_LLM_KEY}"));
+        assert!(config_text.contains("api_mode: chat_completions"));
+        assert!(config_text.contains("- name: Local Ollama"));
+        assert!(config_text.contains("model: llama3.3:70b"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Local Ollama (localhost:11434/v1)"));
+        assert!(rendered.contains("Default model set to: llama3.3:70b (via Local Ollama)"));
+    }
+
+    #[test]
+    fn setup_model_saved_keyed_custom_provider_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "providers:\n  demo-endpoint:\n    name: Demo Endpoint\n    api: https://demo.example/v1/\n    key_env: DEMO_API_KEY\n    default_model: demo-chat-v1\n    api_mode: chat_completions\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let saved_choice = providers.len() + 1;
+        let mut input = io::Cursor::new(format!("{saved_choice}\ndemo-chat-v2\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: custom"));
+        assert!(config_text.contains("default: demo-chat-v2"));
+        assert!(config_text.contains("base_url: https://demo.example/v1"));
+        assert!(config_text.contains("api_key: ${DEMO_API_KEY}"));
+        assert!(config_text.contains("default_model: demo-chat-v2"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Demo Endpoint (demo.example/v1)"));
+        assert!(rendered.contains("Default model set to: demo-chat-v2 (via Demo Endpoint)"));
     }
 
     #[test]
