@@ -773,7 +773,7 @@ fn print_gateway_setup(context: &HermesContext, accept_hooks: bool) -> Result<()
     run_gateway_setup_with_io(context, &mut input, &mut output, accept_hooks)
 }
 
-fn run_gateway_setup_with_io(
+pub(crate) fn run_gateway_setup_with_io(
     context: &HermesContext,
     input: &mut dyn BufRead,
     output: &mut dyn Write,

@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
+use crate::gateway_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::tools_cmd;
 
@@ -64,6 +65,12 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         let mut ui = TerminalUi;
         return run_native_terminal_setup(context, &mut ui);
     }
+    if should_use_native_gateway_setup(&args)
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        return run_native_gateway_setup(context);
+    }
     if should_use_native_tools_setup(&args)
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -114,8 +121,11 @@ fn print_setup_python_bootstrap(bootstrap: &str, args: SetupArgs) -> Result<(), 
 fn print_direct_setup_python(section: SetupSection) -> Result<(), Box<dyn Error>> {
     let bootstrap = match section {
         SetupSection::Model => SETUP_MODEL_BOOTSTRAP,
-        SetupSection::Gateway => SETUP_GATEWAY_BOOTSTRAP,
-        SetupSection::Tools | SetupSection::Tts | SetupSection::Terminal | SetupSection::Agent => {
+        SetupSection::Gateway
+        | SetupSection::Tools
+        | SetupSection::Tts
+        | SetupSection::Terminal
+        | SetupSection::Agent => {
             return Err(format!("unsupported direct setup section: {}", section.as_str()).into());
         }
     };
@@ -155,6 +165,14 @@ fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
+fn should_use_native_gateway_setup(args: &SetupArgs) -> bool {
+    matches!(args.section, Some(SetupSection::Gateway))
+        && !args.non_interactive
+        && !args.reset
+        && !args.reconfigure
+        && !args.quick
+}
+
 fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Tools))
         && !args.non_interactive
@@ -168,7 +186,7 @@ fn direct_python_setup_section(args: &SetupArgs) -> Option<SetupSection> {
         return None;
     }
     match args.section {
-        Some(SetupSection::Model | SetupSection::Gateway) => args.section,
+        Some(SetupSection::Model) => args.section,
         _ => None,
     }
 }
@@ -216,22 +234,6 @@ const SETUP_MODEL_BOOTSTRAP: &str = concat!(
     "        save_config(config)\n",
 );
 
-const SETUP_GATEWAY_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
-    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
-    "if is_managed():\n",
-    "    managed_error('run setup wizard')\n",
-    "else:\n",
-    "    ensure_hermes_home()\n",
-    "    if not is_interactive_stdin():\n",
-    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
-    "    else:\n",
-    "        config = load_config()\n",
-    "        from hermes_cli.setup import setup_gateway\n",
-    "        setup_gateway(config)\n",
-    "        save_config(config)\n",
-);
-
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("{command} exited with status {code}"),
@@ -248,6 +250,37 @@ fn run_native_tools_setup(context: &HermesContext) -> Result<(), Box<dyn Error>>
         return Ok(());
     }
     tools_cmd::run_native_tools_interactive(context)
+}
+
+fn run_native_gateway_setup(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        eprintln!(
+            "{}",
+            format_setup_managed_message(&system, "run setup wizard")
+        );
+        return Ok(());
+    }
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    run_native_gateway_setup_with_io(context, &mut input, &mut output)
+}
+
+fn run_native_gateway_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn io::BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        writeln!(
+            output,
+            "{}",
+            format_setup_managed_message(&system, "run setup wizard")
+        )?;
+        return Ok(());
+    }
+    gateway_cmd::run_gateway_setup_with_io(context, input, output, false)
 }
 
 fn run_native_tools_setup_with_io(
@@ -1707,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_python_setup_section_only_allows_plain_model_and_gateway() {
+    fn direct_python_setup_section_only_allows_plain_model() {
         assert_eq!(
             direct_python_setup_section(&SetupArgs {
                 section: Some(SetupSection::Model),
@@ -1726,7 +1759,7 @@ mod tests {
                 reconfigure: false,
                 quick: false,
             }),
-            Some(SetupSection::Gateway)
+            None
         );
         assert_eq!(
             direct_python_setup_section(&SetupArgs {
@@ -1778,6 +1811,31 @@ mod tests {
         }));
         assert!(!should_use_native_tools_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+    }
+
+    #[test]
+    fn native_gateway_setup_only_allows_plain_gateway() {
+        assert!(should_use_native_gateway_setup(&SetupArgs {
+            section: Some(SetupSection::Gateway),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+        assert!(!should_use_native_gateway_setup(&SetupArgs {
+            section: Some(SetupSection::Gateway),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: false,
+        }));
+        assert!(!should_use_native_gateway_setup(&SetupArgs {
+            section: Some(SetupSection::Model),
             non_interactive: false,
             reset: false,
             reconfigure: false,
@@ -1891,24 +1949,25 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn setup_gateway_section_uses_direct_python_bootstrap() {
+    fn setup_gateway_section_runs_native_gateway_flow() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let fake_python = temp.path().join("gateway-python3");
         let log = temp.path().join("python.log");
         fs::write(
             &fake_python,
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  case \"$2\" in\n\
-    *\"setup_gateway\"*) echo gateway >> '{}';;\n\
-    *\"run_setup_wizard\"*) echo wizard >> '{}';;\n\
-  esac\n\
+  printf 'accept=%s key=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
+  cat <<'JSON'\n\
+[]\n\
+JSON\n\
   exit 0\n\
 fi\n\
 exit 9\n",
-                log.display(),
                 log.display()
             ),
         )
@@ -1917,24 +1976,18 @@ exit 9\n",
         perms.set_mode(0o755);
         fs::set_permissions(&fake_python, perms).unwrap();
 
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
-        let context = HermesContext::new(temp.path());
-        print_setup(
-            &context,
-            SetupArgs {
-                section: Some(SetupSection::Gateway),
-                non_interactive: false,
-                reset: false,
-                reconfigure: false,
-                quick: false,
-            },
-        )
-        .unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        let mut input = io::Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        run_native_gateway_setup_with_io(&context, &mut input, &mut output).unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("gateway"));
-        assert!(!output.contains("wizard"));
-        remove_env_var("HERMES_SETUP_PYTHON");
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("accept= key="));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Gateway Setup"));
+        assert!(rendered.contains("Messaging Platforms"));
+        assert!(rendered.contains("No platforms configured"));
+        remove_env_var("HERMES_GATEWAY_PYTHON");
     }
 
     #[test]
