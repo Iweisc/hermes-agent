@@ -330,7 +330,8 @@ fn run_native_model_setup(
     let custom_endpoint_choice = providers.len() + saved_custom_providers.len() + 1;
     let remove_custom_choice =
         (!saved_custom_providers.is_empty()).then_some(custom_endpoint_choice + 1);
-    let compatibility_choice = remove_custom_choice.unwrap_or(custom_endpoint_choice) + 1;
+    let auxiliary_choice = remove_custom_choice.unwrap_or(custom_endpoint_choice) + 1;
+    let compatibility_choice = auxiliary_choice + 1;
     let keep_choice = compatibility_choice + 1;
     ui.line(&format!(
         "  {}. Custom endpoint (enter URL manually)",
@@ -342,6 +343,10 @@ fn run_native_model_setup(
             remove_custom_choice
         ))?;
     }
+    ui.line(&format!(
+        "  {}. Configure auxiliary models...",
+        auxiliary_choice
+    ))?;
     ui.line(&format!(
         "  {}. Use compatibility flow (OAuth, advanced picker)",
         compatibility_choice
@@ -400,6 +405,10 @@ fn run_native_model_setup(
         return remove_saved_custom_model_provider(context, ui, &mut root, &saved_custom_providers);
     }
 
+    if selection == auxiliary_choice {
+        return run_native_auxiliary_model_setup(context, ui, &mut root);
+    }
+
     if selection > providers.len() {
         let selected = &saved_custom_providers[selection - providers.len() - 1];
         let current_model_for_provider = if current_provider == "custom"
@@ -454,6 +463,316 @@ pub(crate) fn run_native_model_setup_with_io(
 ) -> Result<(), Box<dyn Error>> {
     let mut ui = StreamUi { input, output };
     run_native_model_setup(context, &mut ui)
+}
+
+fn run_native_auxiliary_model_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    let reset_choice = AUXILIARY_MODEL_TASKS.len() + 1;
+    let back_choice = reset_choice + 1;
+    loop {
+        ui.blank()?;
+        ui.line("Auxiliary models — side-task routing")?;
+        ui.blank()?;
+        ui.line("Override individual side tasks without changing your main chat model.")?;
+        ui.line(
+            "Use auto to inherit the main provider, or pin a task to a specific provider/model.",
+        )?;
+        ui.blank()?;
+
+        for (index, task) in AUXILIARY_MODEL_TASKS.iter().enumerate() {
+            ui.line(&format!(
+                "  {}. {} ({}) — {}",
+                index + 1,
+                task.name,
+                task.description,
+                format_auxiliary_task_current(root, task.key)
+            ))?;
+        }
+        ui.line(&format!("  {}. Reset all to auto", reset_choice))?;
+        ui.line(&format!("  {}. Back", back_choice))?;
+
+        let selection = prompt_menu_choice(ui, "Select task: ", back_choice, 1)?;
+        if selection == back_choice {
+            return Ok(());
+        }
+        if selection == reset_choice {
+            let count = reset_all_auxiliary_tasks(root);
+            write_yaml_mapping(&context.config_path(), root)?;
+            if count == 0 {
+                ui.line("All auxiliary tasks were already set to auto.")?;
+            } else {
+                ui.line(&format!("Reset {count} auxiliary task(s) to auto."))?;
+            }
+            continue;
+        }
+
+        configure_auxiliary_model_task(context, ui, root, AUXILIARY_MODEL_TASKS[selection - 1])?;
+    }
+}
+
+fn configure_auxiliary_model_task(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+    task: AuxiliaryModelTask,
+) -> Result<(), Box<dyn Error>> {
+    let current_provider = get_nested_string(root, &["auxiliary", task.key, "provider"])
+        .unwrap_or_else(|| "auto".to_string());
+    let current_model =
+        get_nested_string(root, &["auxiliary", task.key, "model"]).unwrap_or_default();
+    let current_base_url =
+        get_nested_string(root, &["auxiliary", task.key, "base_url"]).unwrap_or_default();
+    let current_api_key =
+        get_nested_string(root, &["auxiliary", task.key, "api_key"]).unwrap_or_default();
+    let providers = native_auxiliary_model_providers(context, &current_provider, &current_base_url);
+
+    ui.blank()?;
+    ui.line(&format!(
+        "Configure {} — current: {}",
+        task.name,
+        format_auxiliary_task_current(root, task.key)
+    ))?;
+    ui.blank()?;
+    ui.line("  1. auto (recommended)")?;
+    for (index, provider) in providers.iter().enumerate() {
+        ui.line(&format!("  {}. {}", index + 2, provider.label))?;
+    }
+    let custom_choice = providers.len() + 2;
+    let back_choice = custom_choice + 1;
+    ui.line(&format!(
+        "  {}. Custom endpoint (direct URL)",
+        custom_choice
+    ))?;
+    ui.line(&format!("  {}. Back", back_choice))?;
+
+    let default_choice = if !current_base_url.trim().is_empty() {
+        custom_choice
+    } else if current_provider.trim().eq_ignore_ascii_case("auto") {
+        1
+    } else {
+        providers
+            .iter()
+            .position(|provider| provider.name == current_provider)
+            .map(|index| index + 2)
+            .unwrap_or(1)
+    };
+    let selection = prompt_menu_choice(ui, "Select provider: ", back_choice, default_choice)?;
+    if selection == back_choice {
+        ui.line("No change.")?;
+        return Ok(());
+    }
+    if selection == 1 {
+        save_auxiliary_task_choice(root, task.key, "auto", "", "", "");
+        write_yaml_mapping(&context.config_path(), root)?;
+        ui.line(&format!("{}: reset to auto.", task.name))?;
+        return Ok(());
+    }
+    if selection == custom_choice {
+        return run_native_auxiliary_custom_endpoint_setup(
+            context,
+            ui,
+            root,
+            task,
+            &current_base_url,
+            &current_model,
+            &current_api_key,
+        );
+    }
+
+    let provider = &providers[selection - 2];
+    let model_name = prompt_auxiliary_model_name(ui, &current_model)?;
+    save_auxiliary_task_choice(root, task.key, &provider.name, &model_name, "", "");
+    write_yaml_mapping(&context.config_path(), root)?;
+    if model_name.trim().is_empty() {
+        ui.line(&format!(
+            "{}: {} (provider default model)",
+            task.name, provider.label
+        ))?;
+    } else {
+        ui.line(&format!(
+            "{}: {} · {}",
+            task.name,
+            provider.label,
+            model_name.trim()
+        ))?;
+    }
+    Ok(())
+}
+
+fn run_native_auxiliary_custom_endpoint_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+    task: AuxiliaryModelTask,
+    current_base_url: &str,
+    current_model: &str,
+    current_api_key: &str,
+) -> Result<(), Box<dyn Error>> {
+    ui.blank()?;
+    ui.line(&format!("Custom endpoint for {}", task.name))?;
+    ui.line("Provide an OpenAI-compatible base URL for this side task.")?;
+    ui.blank()?;
+
+    let mut base_url = match prompt_custom_endpoint_base_url(ui, current_base_url)? {
+        Some(value) => value,
+        None => {
+            ui.line("No URL provided. No change.")?;
+            return Ok(());
+        }
+    };
+    base_url = maybe_add_local_v1_suffix(ui, &base_url)?;
+    let model_name = prompt_auxiliary_model_name(ui, current_model)?;
+    let api_key = prompt_custom_endpoint_api_key(ui, current_api_key)?;
+
+    save_auxiliary_task_choice(root, task.key, "custom", &model_name, &base_url, &api_key);
+    write_yaml_mapping(&context.config_path(), root)?;
+    let short = format_saved_custom_provider_url(&base_url);
+    if model_name.trim().is_empty() {
+        ui.line(&format!("{}: custom ({short})", task.name))?;
+    } else {
+        ui.line(&format!(
+            "{}: custom ({short}) · {}",
+            task.name,
+            model_name.trim()
+        ))?;
+    }
+    Ok(())
+}
+
+fn prompt_auxiliary_model_name(
+    ui: &mut dyn SetupUi,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    let prompt = if current.trim().is_empty() {
+        "Model slug [optional, '-' for provider default]: "
+    } else {
+        "Model slug [press Enter to keep current, '-' for provider default]: "
+    };
+    let input = ui.prompt(prompt)?;
+    let trimmed = input.trim();
+    if trimmed == "-" {
+        return Ok(String::new());
+    }
+    if trimmed.is_empty() {
+        return Ok(current.trim().to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn native_auxiliary_model_providers(
+    context: &HermesContext,
+    current_provider: &str,
+    current_base_url: &str,
+) -> Vec<NativeAuxiliaryProvider> {
+    let current_provider = canonical_provider_name(current_provider);
+    let current_is_custom = !current_base_url.trim().is_empty();
+    let mut providers = list_provider_profiles()
+        .into_iter()
+        .filter(|profile| profile.name != "custom")
+        .filter(|profile| {
+            (!current_is_custom && current_provider.as_deref() == Some(profile.name))
+                || provider_available_for_auxiliary(context, profile.name)
+        })
+        .map(|profile| NativeAuxiliaryProvider {
+            name: profile.name.to_string(),
+            label: model_provider_label(profile.name),
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|provider| model_provider_order(&provider.name));
+    providers.dedup_by(|left, right| left.name == right.name);
+    providers
+}
+
+fn provider_available_for_auxiliary(context: &HermesContext, provider: &str) -> bool {
+    get_auth_status_summary(context.hermes_home().as_path(), provider)
+        .map(|status| status.configured || status.logged_in)
+        .unwrap_or(false)
+}
+
+fn canonical_provider_name(provider: &str) -> Option<String> {
+    let normalized = provider.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    list_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.matches(normalized))
+        .map(|profile| profile.name.to_string())
+        .or_else(|| Some(normalized.to_ascii_lowercase()))
+}
+
+fn format_auxiliary_task_current(root: &Mapping, task: &str) -> String {
+    let provider = get_nested_string(root, &["auxiliary", task, "provider"])
+        .unwrap_or_else(|| "auto".to_string());
+    let model = get_nested_string(root, &["auxiliary", task, "model"]).unwrap_or_default();
+    let base_url = get_nested_string(root, &["auxiliary", task, "base_url"]).unwrap_or_default();
+    if !base_url.trim().is_empty() {
+        let short = format_saved_custom_provider_url(&base_url);
+        if model.trim().is_empty() {
+            return format!("custom ({short})");
+        }
+        return format!("custom ({short}) · {}", model.trim());
+    }
+    if provider.trim().is_empty() || provider.trim().eq_ignore_ascii_case("auto") {
+        if model.trim().is_empty() {
+            return "auto".to_string();
+        }
+        return format!("auto · {}", model.trim());
+    }
+    let label = model_provider_label(provider.trim());
+    if model.trim().is_empty() {
+        return label;
+    }
+    format!("{label} · {}", model.trim())
+}
+
+fn save_auxiliary_task_choice(
+    root: &mut Mapping,
+    task: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: &str,
+) {
+    let auxiliary = ensure_mapping(root, "auxiliary");
+    let entry = ensure_mapping(auxiliary, task);
+    entry.insert(
+        yaml_key("provider"),
+        Value::String(provider.trim().to_string()),
+    );
+    entry.insert(yaml_key("model"), Value::String(model.trim().to_string()));
+    entry.insert(
+        yaml_key("base_url"),
+        Value::String(base_url.trim_end_matches('/').to_string()),
+    );
+    entry.insert(
+        yaml_key("api_key"),
+        Value::String(api_key.trim().to_string()),
+    );
+}
+
+fn reset_all_auxiliary_tasks(root: &mut Mapping) -> usize {
+    let auxiliary = ensure_mapping(root, "auxiliary");
+    let mut reset = 0usize;
+    for task in AUXILIARY_MODEL_TASKS {
+        let entry = ensure_mapping(auxiliary, task.key);
+        let changed = mapping_string(entry, "provider")
+            .is_some_and(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("auto"))
+            || mapping_string(entry, "model").is_some_and(|value| !value.trim().is_empty())
+            || mapping_string(entry, "base_url").is_some_and(|value| !value.trim().is_empty())
+            || mapping_string(entry, "api_key").is_some_and(|value| !value.trim().is_empty());
+        entry.insert(yaml_key("provider"), Value::String("auto".to_string()));
+        entry.insert(yaml_key("model"), Value::String(String::new()));
+        entry.insert(yaml_key("base_url"), Value::String(String::new()));
+        entry.insert(yaml_key("api_key"), Value::String(String::new()));
+        if changed {
+            reset += 1;
+        }
+    }
+    reset
 }
 
 fn run_native_gateway_setup(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -657,6 +976,67 @@ impl SavedCustomModelProvider {
             }
         }
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct AuxiliaryModelTask {
+    key: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+const AUXILIARY_MODEL_TASKS: &[AuxiliaryModelTask] = &[
+    AuxiliaryModelTask {
+        key: "vision",
+        name: "Vision",
+        description: "image/screenshot analysis",
+    },
+    AuxiliaryModelTask {
+        key: "compression",
+        name: "Compression",
+        description: "context summarization",
+    },
+    AuxiliaryModelTask {
+        key: "web_extract",
+        name: "Web extract",
+        description: "web page summarization",
+    },
+    AuxiliaryModelTask {
+        key: "session_search",
+        name: "Session search",
+        description: "past-conversation recall",
+    },
+    AuxiliaryModelTask {
+        key: "approval",
+        name: "Approval",
+        description: "smart command approval",
+    },
+    AuxiliaryModelTask {
+        key: "mcp",
+        name: "MCP",
+        description: "MCP tool reasoning",
+    },
+    AuxiliaryModelTask {
+        key: "title_generation",
+        name: "Title generation",
+        description: "session titles",
+    },
+    AuxiliaryModelTask {
+        key: "skills_hub",
+        name: "Skills hub",
+        description: "skills search/install",
+    },
+    AuxiliaryModelTask {
+        key: "curator",
+        name: "Curator",
+        description: "skill-usage review pass",
+    },
+];
+
+#[derive(Debug, Clone)]
+struct NativeAuxiliaryProvider {
+    name: String,
+    label: String,
 }
 
 impl SetupUi for StreamUi<'_> {
@@ -3312,6 +3692,108 @@ exit 9\n",
 
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Removed \"Demo Endpoint\" from saved custom providers."));
+    }
+
+    #[test]
+    fn setup_model_auxiliary_custom_endpoint_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let auxiliary_choice = providers.len() + 2;
+        let aux_providers = native_auxiliary_model_providers(&context, "auto", "");
+        let custom_choice = aux_providers.len() + 2;
+        let back_choice = AUXILIARY_MODEL_TASKS.len() + 2;
+        let mut input = io::Cursor::new(
+            format!(
+                "{auxiliary_choice}\n1\n{custom_choice}\nhttp://localhost:11434\n\nllama3.1:8b\nsk-local\n{back_choice}\n"
+            )
+            .into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("vision:"));
+        assert!(config_text.contains("provider: custom"));
+        assert!(config_text.contains("model: llama3.1:8b"));
+        assert!(config_text.contains("base_url: http://localhost:11434/v1"));
+        assert!(config_text.contains("api_key: sk-local"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Configure auxiliary models..."));
+        assert!(rendered.contains("Vision: custom (localhost:11434/v1) · llama3.1:8b"));
+    }
+
+    #[test]
+    fn setup_model_auxiliary_provider_pin_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "auxiliary:\n  vision:\n    provider: openrouter\n    model: openai/gpt-5.4\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let auxiliary_choice = providers.len() + 2;
+        let openrouter_choice = native_auxiliary_model_providers(&context, "openrouter", "")
+            .iter()
+            .position(|provider| provider.name == "openrouter")
+            .map(|index| index + 2)
+            .unwrap();
+        let back_choice = AUXILIARY_MODEL_TASKS.len() + 2;
+        let mut input = io::Cursor::new(
+            format!(
+                "{auxiliary_choice}\n1\n{openrouter_choice}\nopenai/gpt-5.4-mini\n{back_choice}\n"
+            )
+            .into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: openrouter"));
+        assert!(config_text.contains("model: openai/gpt-5.4-mini"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Vision: OpenRouter · openai/gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn setup_model_auxiliary_reset_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "auxiliary:\n  vision:\n    provider: openrouter\n    model: openai/gpt-5.4\n    base_url: https://old.example/v1\n    api_key: old-secret\n    timeout: 77\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let auxiliary_choice = providers.len() + 2;
+        let reset_choice = AUXILIARY_MODEL_TASKS.len() + 1;
+        let back_choice = AUXILIARY_MODEL_TASKS.len() + 2;
+        let mut input = io::Cursor::new(
+            format!("{auxiliary_choice}\n{reset_choice}\n{back_choice}\n").into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: auto"));
+        assert!(config_text.contains("timeout: 77"));
+        assert!(!config_text.contains("https://old.example/v1"));
+        assert!(!config_text.contains("old-secret"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Reset 1 auxiliary task(s) to auto."));
     }
 
     #[test]
