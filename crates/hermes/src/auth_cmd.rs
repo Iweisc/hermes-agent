@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -424,7 +424,7 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     if profile.name == "custom" || profile.auth_type != "api_key" {
         return false;
     }
-    auth_add_uses_api_key_shape(args)
+    auth_add_is_plain_api_key_request(args)
 }
 
 fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
@@ -539,85 +539,65 @@ fn native_auth_add_api_key(
         .ok_or("provider is required. Example: `hermes auth add openrouter --api-key ...`.")?;
     let profile =
         get_provider_profile(&provider).ok_or_else(|| format!("Unknown provider: {provider}"))?;
+    if let Some(api_key) = args
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return persist_native_api_key_entry(
+            context,
+            &provider,
+            args.label.as_deref(),
+            api_key,
+            profile.base_url,
+        );
+    }
+    let api_key = read_secret_line_auth("Paste your API key: ")?.ok_or("auth add cancelled")?;
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("No API key provided.".into());
+    }
+    persist_native_api_key_entry(
+        context,
+        &provider,
+        args.label.as_deref(),
+        trimmed,
+        profile.base_url,
+    )
+}
+
+fn native_auth_add_api_key_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add openrouter --api-key ...`.")?;
+    let profile =
+        get_provider_profile(&provider).ok_or_else(|| format!("Unknown provider: {provider}"))?;
     let api_key = args
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("No API key provided.")?;
-    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
-    let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
-    let requested_label = args
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let (entry_count, label) = {
-        let root = auth_store
-            .as_object_mut()
-            .ok_or("auth store is not a JSON object")?;
-        if !root.contains_key("version") {
-            root.insert("version".to_string(), JsonValue::from(1));
-        }
-        if !root.contains_key("providers") {
-            root.insert(
-                "providers".to_string(),
-                JsonValue::Object(Default::default()),
-            );
-        }
-        let pool = ensure_json_object(root, "credential_pool")?;
-        let provider_entries = pool
-            .entry(provider.clone())
-            .or_insert_with(|| JsonValue::Array(Vec::new()));
-        let provider_entries = provider_entries
-            .as_array_mut()
-            .ok_or("credential_pool entry is not an array")?;
-        let existing = provider_entries
-            .iter()
-            .filter_map(parse_pool_entry)
-            .collect::<Vec<_>>();
-        let next_index = existing.len() + 1;
-        let priority = existing
-            .iter()
-            .map(|entry| entry.priority)
-            .max()
-            .unwrap_or(-1)
-            + 1;
-        let label = requested_label
-            .clone()
-            .unwrap_or_else(|| format!("api-key-{next_index}"));
-        let mut entry = serde_json::Map::new();
-        entry.insert("id".to_string(), JsonValue::String(generate_short_id()));
-        entry.insert("label".to_string(), JsonValue::String(label.clone()));
-        entry.insert(
-            "auth_type".to_string(),
-            JsonValue::String("api_key".to_string()),
-        );
-        entry.insert("priority".to_string(), JsonValue::from(priority));
-        entry.insert(
-            "source".to_string(),
-            JsonValue::String("manual".to_string()),
-        );
-        entry.insert(
-            "access_token".to_string(),
-            JsonValue::String(api_key.to_string()),
-        );
-        if !profile.base_url.trim().is_empty() {
-            entry.insert(
-                "base_url".to_string(),
-                JsonValue::String(profile.base_url.to_string()),
-            );
-        }
-        provider_entries.push(JsonValue::Object(entry));
-        (provider_entries.len(), label)
+    let api_key = match api_key {
+        Some(value) => value,
+        None => prompt_line(input, output, "Paste your API key")?,
     };
-    save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
-    println!(
-        "Added {} credential #{}: \"{}\"",
-        provider, entry_count, label
-    );
-    Ok(())
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("No API key provided.".into());
+    }
+    persist_native_api_key_entry(
+        context,
+        &provider,
+        args.label.as_deref(),
+        trimmed,
+        profile.base_url,
+    )
 }
 
 fn native_auth_add_custom_api_key(
@@ -625,20 +605,75 @@ fn native_auth_add_custom_api_key(
     args: &AuthAddArgs,
     custom_provider: &ResolvedCustomProvider,
 ) -> Result<(), Box<dyn Error>> {
+    if let Some(api_key) = args
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return persist_native_api_key_entry(
+            context,
+            custom_provider.pool_key.as_str(),
+            args.label.as_deref(),
+            api_key,
+            custom_provider.base_url.as_deref().unwrap_or(""),
+        );
+    }
+    let prompt = "Paste your API key: ";
+    let api_key = read_secret_line_auth(prompt)?.ok_or("auth add cancelled")?;
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("No API key provided.".into());
+    }
+    persist_native_api_key_entry(
+        context,
+        custom_provider.pool_key.as_str(),
+        args.label.as_deref(),
+        trimmed,
+        custom_provider.base_url.as_deref().unwrap_or(""),
+    )
+}
+
+fn native_auth_add_custom_api_key_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    custom_provider: &ResolvedCustomProvider,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
     let api_key = args
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("No API key provided.")?;
-    clear_provider_suppressions(
-        context.hermes_home().as_path(),
+        .map(ToOwned::to_owned);
+    let api_key = match api_key {
+        Some(value) => value,
+        None => prompt_line(input, output, "Paste your API key")?,
+    };
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("No API key provided.".into());
+    }
+    persist_native_api_key_entry(
+        context,
         custom_provider.pool_key.as_str(),
-    )?;
+        args.label.as_deref(),
+        trimmed,
+        custom_provider.base_url.as_deref().unwrap_or(""),
+    )
+}
+
+fn persist_native_api_key_entry(
+    context: &HermesContext,
+    provider: &str,
+    label: Option<&str>,
+    api_key: &str,
+    base_url: &str,
+) -> Result<(), Box<dyn Error>> {
+    clear_provider_suppressions(context.hermes_home().as_path(), provider)?;
     let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
-    let requested_label = args
-        .label
-        .as_deref()
+    let requested_label = label
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
@@ -657,7 +692,7 @@ fn native_auth_add_custom_api_key(
         }
         let pool = ensure_json_object(root, "credential_pool")?;
         let provider_entries = pool
-            .entry(custom_provider.pool_key.clone())
+            .entry(provider.to_string())
             .or_insert_with(|| JsonValue::Array(Vec::new()));
         let provider_entries = provider_entries
             .as_array_mut()
@@ -692,9 +727,7 @@ fn native_auth_add_custom_api_key(
             "access_token".to_string(),
             JsonValue::String(api_key.to_string()),
         );
-        if let Some(base_url) = custom_provider
-            .base_url
-            .as_deref()
+        if let Some(base_url) = Some(base_url)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
@@ -709,7 +742,7 @@ fn native_auth_add_custom_api_key(
     save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
     println!(
         "Added {} credential #{}: \"{}\"",
-        custom_provider.pool_key, entry_count, label
+        provider, entry_count, label
     );
     Ok(())
 }
@@ -2744,6 +2777,36 @@ fn prompt_line(
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
+fn read_secret_line_auth(prompt: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(prompt.as_bytes())?;
+    stdout.flush()?;
+
+    let can_hide = cfg!(unix) && io::stdin().is_terminal();
+    let echo_disabled = if can_hide {
+        Command::new("stty")
+            .arg("-echo")
+            .status()
+            .ok()
+            .is_some_and(|status| status.success())
+    } else {
+        false
+    };
+
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+
+    if echo_disabled {
+        let _ = Command::new("stty").arg("echo").status();
+        println!();
+    }
+
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
+}
+
 fn is_remote_session() -> bool {
     std::env::var_os("SSH_CLIENT").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
@@ -3536,14 +3599,11 @@ struct ResolvedCustomProvider {
     base_url: Option<String>,
 }
 
-fn auth_add_uses_api_key_shape(args: &AuthAddArgs) -> bool {
+fn auth_add_is_plain_api_key_request(args: &AuthAddArgs) -> bool {
     match normalize_auth_type(args.auth_type.as_deref()) {
         Some("oauth") => false,
         Some("api_key") | None => {
-            args.api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                && args.portal_url.is_none()
+            args.portal_url.is_none()
                 && args.inference_url.is_none()
                 && args.client_id.is_none()
                 && args.scope.is_none()
@@ -3560,7 +3620,7 @@ fn resolve_custom_provider_api_key_target(
     config_path: &Path,
     args: &AuthAddArgs,
 ) -> Result<Option<ResolvedCustomProvider>, Box<dyn Error>> {
-    if !auth_add_uses_api_key_shape(args) {
+    if !auth_add_is_plain_api_key_request(args) {
         return Ok(None);
     }
     resolve_custom_provider_target(config_path, &args.provider)
@@ -5522,6 +5582,48 @@ mod tests {
     }
 
     #[test]
+    fn auth_add_api_key_prompt_stays_native() {
+        let home = temp_path("auth-add-prompt");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let mut input = Cursor::new(b"sk-openrouter-interactive\n".to_vec());
+        let mut output = Vec::new();
+
+        native_auth_add_api_key_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "openrouter".to_string(),
+                ..AuthAddArgs::default()
+            },
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["openrouter"][0];
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["access_token"], "sk-openrouter-interactive");
+        assert_eq!(entry["base_url"], OPENROUTER_BASE_URL);
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Paste your API key:")
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn auth_add_custom_api_key_from_provider_key_stays_native() {
         let home = temp_path("auth-add-custom");
         fs::create_dir_all(&home).unwrap();
@@ -5569,6 +5671,58 @@ mod tests {
                 .and_then(JsonValue::as_object)
                 .and_then(|sources| sources.get("custom:demo-provider"))
                 .is_none()
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_custom_api_key_prompt_stays_native() {
+        let home = temp_path("auth-add-custom-prompt");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "providers:\n  demo-endpoint:\n    name: Demo Provider\n    api: https://demo.example/v1/\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let custom_provider =
+            resolve_custom_provider_target(&home.join("config.yaml"), "demo-endpoint")
+                .unwrap()
+                .unwrap();
+        let mut input = Cursor::new(b"sk-demo-interactive\n".to_vec());
+        let mut output = Vec::new();
+
+        native_auth_add_custom_api_key_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "demo-endpoint".to_string(),
+                ..AuthAddArgs::default()
+            },
+            &custom_provider,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["custom:demo-provider"][0];
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["access_token"], "sk-demo-interactive");
+        assert_eq!(entry["base_url"], "https://demo.example/v1");
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Paste your API key:")
         );
         let _ = fs::remove_dir_all(home);
     }
