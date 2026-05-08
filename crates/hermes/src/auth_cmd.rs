@@ -14,8 +14,9 @@ use getrandom::fill as fill_random;
 use hermes_core::{
     AuthStatusSummary, HermesContext, LoadedConfig, OPENROUTER_BASE_URL, clear_provider_auth_state,
     get_active_auth_provider, get_auth_status_summary, get_provider_profile,
-    normalize_provider_alias, resolve_google_gemini_runtime_credentials,
-    resolve_minimax_oauth_runtime_credentials, resolve_qwen_runtime_credentials,
+    normalize_provider_alias, resolve_codex_access_token,
+    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
+    resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
 };
 use reqwest::Url;
 use reqwest::blocking::Client;
@@ -386,7 +387,7 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     };
     if !matches!(
         provider.as_str(),
-        "google-gemini-cli" | "qwen-oauth" | "minimax-oauth"
+        "google-gemini-cli" | "qwen-oauth" | "minimax-oauth" | "nous" | "openai-codex"
     ) {
         return false;
     }
@@ -500,6 +501,11 @@ fn native_auth_add_runtime_oauth(
 ) -> Result<(), Box<dyn Error>> {
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
+    if matches!(provider.as_str(), "nous" | "openai-codex")
+        && provider_pool_has_entries(context.hermes_home().as_path(), &provider)?
+    {
+        return run_python_auth_add(args);
+    }
     let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
     let default_label = oauth_default_label(&provider, next_index);
     let requested_label = args
@@ -539,6 +545,57 @@ fn native_auth_add_runtime_oauth(
                 creds.access_token,
                 None,
                 non_empty_trimmed_owned(&creds.base_url),
+                label,
+            )
+        }
+        "nous" => {
+            if !provider_state_exists(context.hermes_home().as_path(), "nous")? {
+                return run_python_auth_add(args);
+            }
+            let creds =
+                resolve_nous_runtime_credentials(context.hermes_home().as_path(), 300, 15.0)?;
+            let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+            let mut state = provider_state_json(&auth_store, "nous")
+                .ok_or("Nous auth state is missing after runtime resolution.")?;
+            if let Some(label) = requested_label.as_deref() {
+                state.insert("label".to_string(), JsonValue::String(label.to_string()));
+                store_provider_state(&mut auth_store, "nous", state.clone())?;
+                save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
+            }
+            let access_token = json_string(&state, "access_token")
+                .ok_or("Nous auth state is missing access_token after runtime resolution.")?
+                .to_string();
+            let label = json_string(&state, "label")
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| label_from_token(&access_token, &default_label));
+            (
+                "device_code".to_string(),
+                access_token,
+                json_string(&state, "refresh_token").map(ToOwned::to_owned),
+                non_empty_trimmed_owned(&creds.base_url),
+                label,
+            )
+        }
+        "openai-codex" => {
+            if !provider_state_exists(context.hermes_home().as_path(), "openai-codex")? {
+                return run_python_auth_add(args);
+            }
+            let access_token = resolve_codex_access_token(context.hermes_home().as_path())?;
+            let auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+            let state = provider_state_json(&auth_store, "openai-codex")
+                .ok_or("Codex auth state is missing after runtime resolution.")?;
+            let tokens = state
+                .get("tokens")
+                .and_then(JsonValue::as_object)
+                .ok_or("Codex auth state is missing tokens after runtime resolution.")?;
+            let label = label_from_token(&access_token, &default_label);
+            (
+                "device_code".to_string(),
+                access_token,
+                json_string(tokens, "refresh_token").map(ToOwned::to_owned),
+                get_provider_profile("openai-codex")
+                    .map(|profile| profile.base_url.trim().to_string())
+                    .filter(|value| !value.is_empty()),
                 label,
             )
         }
@@ -1786,6 +1843,33 @@ fn next_provider_entry_index(hermes_home: &Path, provider: &str) -> Result<usize
     Ok(count + 1)
 }
 
+fn provider_pool_has_entries(hermes_home: &Path, provider: &str) -> Result<bool, Box<dyn Error>> {
+    let auth_store = load_auth_store_json(hermes_home)?;
+    Ok(auth_store
+        .get("credential_pool")
+        .and_then(JsonValue::as_object)
+        .and_then(|pool| pool.get(provider))
+        .and_then(JsonValue::as_array)
+        .is_some_and(|entries| !entries.is_empty()))
+}
+
+fn provider_state_exists(hermes_home: &Path, provider: &str) -> Result<bool, Box<dyn Error>> {
+    let auth_store = load_auth_store_json(hermes_home)?;
+    Ok(provider_state_json(&auth_store, provider).is_some())
+}
+
+fn provider_state_json(
+    auth_store: &JsonValue,
+    provider: &str,
+) -> Option<JsonMap<String, JsonValue>> {
+    auth_store
+        .get("providers")
+        .and_then(JsonValue::as_object)
+        .and_then(|providers| providers.get(provider))
+        .and_then(JsonValue::as_object)
+        .cloned()
+}
+
 fn add_auth_pool_entry(
     hermes_home: &Path,
     provider: &str,
@@ -2459,6 +2543,151 @@ mod tests {
         assert_eq!(entry["source"], "manual:minimax_oauth");
         assert_eq!(entry["base_url"], "https://api.minimax.io/anthropic");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_nous_oauth_uses_native_runtime_with_existing_state() {
+        let home = temp_path("auth-add-nous");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "header.eyJlbWFpbCI6Im5vdXNAZXhhbXBsZS5jb20ifQ.sig",
+                        "refresh_token": "nous-refresh",
+                        "expires_at": "2999-01-01T00:00:00Z",
+                        "client_id": "hermes-cli",
+                        "portal_base_url": "https://portal.nous.test",
+                        "inference_base_url": "https://inference.nous.test/v1",
+                        "agent_key": "nous-agent-key",
+                        "agent_key_expires_at": "2999-01-01T00:00:00Z",
+                        "label": "Nous Main"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "nous".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["nous"][0];
+        assert_eq!(entry["label"], "Nous Main");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "device_code");
+        assert_eq!(
+            entry["access_token"],
+            "header.eyJlbWFpbCI6Im5vdXNAZXhhbXBsZS5jb20ifQ.sig"
+        );
+        assert_eq!(entry["refresh_token"], "nous-refresh");
+        assert_eq!(entry["base_url"], "https://inference.nous.test/v1");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_openai_codex_oauth_uses_native_runtime_with_existing_state() {
+        let home = temp_path("auth-add-codex");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "header.eyJlbWFpbCI6ImNvZGV4QGV4YW1wbGUuY29tIn0.sig",
+                            "refresh_token": "codex-refresh"
+                        },
+                        "last_refresh": "2026-05-08T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "openai-codex".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["openai-codex"][0];
+        assert_eq!(entry["label"], "codex@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "device_code");
+        assert_eq!(
+            entry["access_token"],
+            "header.eyJlbWFpbCI6ImNvZGV4QGV4YW1wbGUuY29tIn0.sig"
+        );
+        assert_eq!(entry["refresh_token"], "codex-refresh");
+        assert_eq!(entry["base_url"], "https://chatgpt.com/backend-api/codex");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_nous_oauth_without_state_uses_python_fallback() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = temp_path("auth-add-nous-bridge");
+        let home = temp.join("home");
+        let log_path = temp.join("auth-add.log");
+        let python = temp.join("python3");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nprintf 'provider=%s\\ntype=%s\\n' \"$HERMES_AUTH_ADD_PROVIDER\" \"$HERMES_AUTH_ADD_TYPE\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                log_path.display(),
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "nous".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        );
+        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+
+        result.unwrap();
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("provider=nous"));
+        assert!(logged.contains("type=oauth"));
+        assert!(logged.contains("auth_add_command"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
