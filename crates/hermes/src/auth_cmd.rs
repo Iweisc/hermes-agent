@@ -1070,6 +1070,53 @@ fn native_auth_add_nous_oauth_with_io(
         return Ok(());
     }
 
+    if let Some(shared) = read_shared_nous_state() {
+        let path = nous_shared_store_path();
+        writeln!(output)?;
+        if path.exists() {
+            writeln!(
+                output,
+                "Found existing Nous OAuth credentials at {}",
+                path.display()
+            )?;
+        } else {
+            writeln!(output, "Found existing shared Nous OAuth credentials")?;
+        }
+        writeln!(
+            output,
+            "Rehydrating Nous session from shared credentials..."
+        )?;
+        output.flush()?;
+        let import_state = build_nous_shared_import_state(&shared);
+        match seed_nous_provider_state_and_resolve(
+            context.hermes_home().as_path(),
+            import_state,
+            timeout_seconds,
+        ) {
+            Ok(()) => {
+                let (stored_count, label) = finalize_nous_auth_add(
+                    context.hermes_home().as_path(),
+                    requested_label.as_deref(),
+                    &default_label,
+                )?;
+                writeln!(
+                    output,
+                    "Imported nous OAuth credentials #{}: \"{}\"",
+                    stored_count, label
+                )?;
+                output.flush()?;
+                return Ok(());
+            }
+            Err(_) => {
+                writeln!(
+                    output,
+                    "Could not refresh shared credentials — falling back to device-code login."
+                )?;
+                output.flush()?;
+            }
+        }
+    }
+
     let portal_base_url = resolve_nous_portal_base_url(args)?;
     let requested_inference_url = resolve_nous_inference_base_url(args)?;
     let client_id = resolve_nous_client_id(args);
@@ -3253,6 +3300,99 @@ fn write_shared_nous_state(state: &JsonMap<String, JsonValue>) {
     }
 }
 
+fn read_shared_nous_state() -> Option<JsonMap<String, JsonValue>> {
+    let path = nous_shared_store_path();
+    if !path.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let payload = serde_json::from_str::<JsonValue>(&raw).ok()?;
+    let payload = payload.as_object()?.clone();
+    json_string(&payload, "refresh_token")?;
+    json_string(&payload, "access_token")?;
+    Some(payload)
+}
+
+fn build_nous_shared_import_state(
+    shared: &JsonMap<String, JsonValue>,
+) -> JsonMap<String, JsonValue> {
+    let mut state = JsonMap::new();
+    state.insert(
+        "access_token".to_string(),
+        JsonValue::String(
+            json_string(shared, "access_token")
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "refresh_token".to_string(),
+        JsonValue::String(
+            json_string(shared, "refresh_token")
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "client_id".to_string(),
+        JsonValue::String(
+            json_string(shared, "client_id")
+                .unwrap_or(DEFAULT_NOUS_CLIENT_ID)
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "portal_base_url".to_string(),
+        JsonValue::String(
+            json_string(shared, "portal_base_url")
+                .unwrap_or(DEFAULT_NOUS_PORTAL_URL)
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "inference_base_url".to_string(),
+        JsonValue::String(
+            json_string(shared, "inference_base_url")
+                .unwrap_or(DEFAULT_NOUS_INFERENCE_URL)
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "token_type".to_string(),
+        JsonValue::String(
+            json_string(shared, "token_type")
+                .unwrap_or("Bearer")
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "scope".to_string(),
+        JsonValue::String(
+            json_string(shared, "scope")
+                .unwrap_or(DEFAULT_NOUS_SCOPE)
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "obtained_at".to_string(),
+        shared
+            .get("obtained_at")
+            .cloned()
+            .unwrap_or(JsonValue::Null),
+    );
+    state.insert(
+        "expires_at".to_string(),
+        JsonValue::String("1970-01-01T00:00:00Z".to_string()),
+    );
+    state.insert("agent_key".to_string(), JsonValue::Null);
+    state.insert("agent_key_id".to_string(), JsonValue::Null);
+    state.insert("agent_key_expires_at".to_string(), JsonValue::Null);
+    state.insert("agent_key_expires_in".to_string(), JsonValue::Null);
+    state.insert("agent_key_reused".to_string(), JsonValue::Null);
+    state.insert("agent_key_obtained_at".to_string(), JsonValue::Null);
+    state
+}
+
 fn label_from_token(token: &str, fallback: &str) -> String {
     let Some(claims) = decode_jwt_claims(token) else {
         return fallback.to_string();
@@ -3650,6 +3790,54 @@ mod tests {
                         "api_key": "nous-agent-key",
                         "key_id": "agent-key-123",
                         "expires_at": "2999-01-02T00:00:00Z",
+                        "expires_in": 86400,
+                        "inference_base_url": format!("{base_for_thread}/runtime-inference/v1"),
+                        "reused": false
+                    }),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn spawn_nous_shared_import_server(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let base_for_thread = base_url.clone();
+        let handle = thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let payload = match idx {
+                    0 => json!({
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "token_type": "Bearer",
+                        "scope": "inference:mint_agent_key offline_access",
+                        "expires_in": 3600,
+                        "inference_base_url": format!("{base_for_thread}/refreshed-inference/v1")
+                    }),
+                    _ => json!({
+                        "api_key": "nous-agent-key-imported",
+                        "key_id": "agent-key-import-123",
+                        "expires_at": "2999-01-03T00:00:00Z",
                         "expires_in": 86400,
                         "inference_base_url": format!("{base_for_thread}/runtime-inference/v1"),
                         "reused": false
@@ -4491,6 +4679,88 @@ mod tests {
             JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
         );
         assert!(shared_state.get("agent_key").is_none());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn auth_add_nous_oauth_imports_shared_state_before_device_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = temp_path("auth-add-nous-shared");
+        let home = temp.join("home");
+        let shared = temp.join("shared");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (portal_base_url, requests, server) = spawn_nous_shared_import_server(
+            "header.eyJlbWFpbCI6Im5vdXMtaW1wb3J0QGV4YW1wbGUuY29tIn0.sig",
+            "shared-refresh-2",
+        );
+        fs::write(
+            shared.join("nous_auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "_schema": 1,
+                "access_token": "stale-shared-access",
+                "refresh_token": "shared-refresh-1",
+                "token_type": "Bearer",
+                "scope": "inference:mint_agent_key offline_access",
+                "client_id": "shared-client",
+                "portal_base_url": portal_base_url,
+                "inference_base_url": format!("{portal_base_url}/shared-inference/v1"),
+                "obtained_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("HERMES_SHARED_AUTH_DIR", &shared) };
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "nous".to_string(),
+                auth_type: Some("oauth".to_string()),
+                label: Some("Imported Nous".to_string()),
+                timeout: Some(5.0),
+                ..AuthAddArgs::default()
+            },
+        );
+        unsafe { std::env::remove_var("HERMES_SHARED_AUTH_DIR") };
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].starts_with("POST /oauth/token "));
+        assert!(captured[0].contains("grant_type=refresh_token"));
+        assert!(captured[0].contains("client_id=shared-client"));
+        assert!(captured[0].contains("refresh_token=shared-refresh-1"));
+        assert!(captured[1].starts_with("POST /api/oauth/agent-key "));
+        assert!(captured[1].contains("header.eyJlbWFpbCI6Im5vdXMtaW1wb3J0QGV4YW1wbGUuY29tIn0.sig"));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let state = &persisted["providers"]["nous"];
+        assert_eq!(state["label"], "Imported Nous");
+        assert_eq!(state["client_id"], "shared-client");
+        assert_eq!(state["refresh_token"], "shared-refresh-2");
+        assert_eq!(state["agent_key"], "nous-agent-key-imported");
+        assert_eq!(
+            state["inference_base_url"],
+            JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
+        );
+        let entries = persisted["credential_pool"]["nous"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["source"], "device_code");
+        assert_eq!(entries[0]["label"], "Imported Nous");
+        assert_eq!(entries[0]["refresh_token"], "shared-refresh-2");
+        let rewritten_shared: JsonValue =
+            serde_json::from_str(&fs::read_to_string(shared.join("nous_auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(rewritten_shared["refresh_token"], "shared-refresh-2");
+        assert_eq!(
+            rewritten_shared["inference_base_url"],
+            JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
