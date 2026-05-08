@@ -52,9 +52,7 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         let mut ui = TerminalUi;
         return run_native_agent_setup(context, &mut ui);
     }
-    if should_use_native_tts_setup(context, &args)
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal()
+    if should_use_native_tts_setup(&args) && io::stdin().is_terminal() && io::stdout().is_terminal()
     {
         let mut ui = TerminalUi;
         return run_native_tts_setup(context, &mut ui);
@@ -141,13 +139,12 @@ fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
-fn should_use_native_tts_setup(context: &HermesContext, args: &SetupArgs) -> bool {
+fn should_use_native_tts_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Tts))
         && !args.non_interactive
         && !args.reset
         && !args.reconfigure
         && !args.quick
-        && !nous_auth_present(context)
 }
 
 fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
@@ -544,10 +541,20 @@ fn run_native_tts_setup(
     ui: &mut dyn SetupUi,
 ) -> Result<(), Box<dyn Error>> {
     let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let managed_available = nous_auth_present(context);
     let current_provider =
         get_nested_string(&root, &["tts", "provider"]).unwrap_or_else(|| "edge".to_string());
+    let current_use_gateway = root
+        .get(yaml_key("tts"))
+        .and_then(Value::as_mapping)
+        .and_then(|tts| mapping_bool(tts, "use_gateway"))
+        .unwrap_or(false);
 
-    let providers = [
+    let mut providers = Vec::new();
+    if managed_available {
+        providers.push(("nous_managed", "Nous Subscription"));
+    }
+    providers.extend([
         ("edge", "Edge TTS"),
         ("elevenlabs", "ElevenLabs"),
         ("openai", "OpenAI TTS"),
@@ -557,14 +564,18 @@ fn run_native_tts_setup(
         ("gemini", "Google Gemini TTS"),
         ("neutts", "NeuTTS"),
         ("kittentts", "KittenTTS"),
-    ];
+        ("piper", "Piper"),
+    ]);
+    let current_label = if current_use_gateway && current_provider == "openai" && managed_available
+    {
+        "Nous Subscription"
+    } else {
+        provider_label(&current_provider, &providers)
+    };
 
     ui.blank()?;
     ui.line("⚕ Hermes Setup — Text-to-Speech")?;
-    ui.line(&format!(
-        "Current: {}",
-        provider_label(&current_provider, &providers)
-    ))?;
+    ui.line(&format!("Current: {current_label}"))?;
     ui.blank()?;
     for (index, (_, label)) in providers.iter().enumerate() {
         ui.line(&format!("  {}. {}", index + 1, label))?;
@@ -572,7 +583,7 @@ fn run_native_tts_setup(
     ui.line(&format!(
         "  {}. Keep current ({})",
         providers.len() + 1,
-        provider_label(&current_provider, &providers)
+        current_label
     ))?;
 
     let selection = prompt_menu_choice(
@@ -582,21 +593,28 @@ fn run_native_tts_setup(
         providers.len() + 1,
     )?;
     if selection == providers.len() + 1 {
-        ui.line(&format!(
-            "Keeping current TTS provider: {}",
-            provider_label(&current_provider, &providers)
-        ))?;
+        ui.line(&format!("Keeping current TTS provider: {current_label}"))?;
         return Ok(());
     }
 
     let mut selected = providers[selection - 1].0.to_string();
+    let mut resolved_provider = selected.clone();
+    let mut use_gateway = false;
     match selected.as_str() {
+        "nous_managed" => {
+            resolved_provider = "openai".to_string();
+            use_gateway = true;
+            ui.line(
+                "TTS requests will use the managed Nous gateway and bill to your subscription.",
+            )?;
+        }
         "elevenlabs" => {
             if env_value("ELEVENLABS_API_KEY").is_none() {
                 let api_key = ui.prompt_secret("ElevenLabs API key: ")?;
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "ELEVENLABS_API_KEY", api_key.trim())?;
                     ui.line("ElevenLabs API key saved")?;
@@ -611,6 +629,7 @@ fn run_native_tts_setup(
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "VOICE_TOOLS_OPENAI_KEY", api_key.trim())?;
                     ui.line("OpenAI TTS API key saved")?;
@@ -623,6 +642,7 @@ fn run_native_tts_setup(
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "XAI_API_KEY", api_key.trim())?;
                     ui.line("xAI TTS API key saved")?;
@@ -645,6 +665,7 @@ fn run_native_tts_setup(
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "MINIMAX_API_KEY", api_key.trim())?;
                     ui.line("MiniMax TTS API key saved")?;
@@ -657,6 +678,7 @@ fn run_native_tts_setup(
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "MISTRAL_API_KEY", api_key.trim())?;
                     ui.line("Mistral TTS API key saved")?;
@@ -670,6 +692,7 @@ fn run_native_tts_setup(
                 if api_key.trim().is_empty() {
                     ui.line("No API key provided. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 } else {
                     save_env_value(context.env_path(), "GEMINI_API_KEY", api_key.trim())?;
                     ui.line("Gemini TTS API key saved")?;
@@ -683,10 +706,12 @@ fn run_native_tts_setup(
                     if !install_neutts_deps(ui)? {
                         ui.line("NeuTTS installation incomplete. Falling back to Edge TTS.")?;
                         selected = "edge".to_string();
+                        resolved_provider = selected.clone();
                     }
                 } else {
                     ui.line("Skipping install. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 }
             } else {
                 ui.line("NeuTTS is already installed")?;
@@ -699,19 +724,44 @@ fn run_native_tts_setup(
                     if !install_kittentts_deps(ui)? {
                         ui.line("KittenTTS installation incomplete. Falling back to Edge TTS.")?;
                         selected = "edge".to_string();
+                        resolved_provider = selected.clone();
                     }
                 } else {
                     ui.line("Skipping install. Falling back to Edge TTS.")?;
                     selected = "edge".to_string();
+                    resolved_provider = selected.clone();
                 }
             } else {
                 ui.line("KittenTTS is already installed")?;
             }
         }
+        "piper" => {
+            if !python_module_installed("piper")? {
+                ui.line("Piper is local neural TTS with voices downloaded on first use.")?;
+                if prompt_yes_no(ui, "Install Piper now? [Y/n]: ", true)? {
+                    if !install_piper_deps(ui)? {
+                        ui.line("Piper installation incomplete. Falling back to Edge TTS.")?;
+                        selected = "edge".to_string();
+                        resolved_provider = selected.clone();
+                    }
+                } else {
+                    ui.line("Skipping install. Falling back to Edge TTS.")?;
+                    selected = "edge".to_string();
+                    resolved_provider = selected.clone();
+                }
+            } else {
+                ui.line("Piper is already installed")?;
+            }
+        }
         _ => {}
     }
 
-    ensure_mapping(&mut root, "tts").insert(yaml_key("provider"), Value::String(selected.clone()));
+    let tts = ensure_mapping(&mut root, "tts");
+    tts.insert(
+        yaml_key("provider"),
+        Value::String(resolved_provider.clone()),
+    );
+    tts.insert(yaml_key("use_gateway"), Value::Bool(use_gateway));
     write_yaml_mapping(&context.config_path(), &root)?;
     ui.line(&format!(
         "TTS provider set to: {}",
@@ -724,13 +774,10 @@ pub(crate) fn run_native_tts_setup_with_io(
     context: &HermesContext,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-) -> Result<bool, Box<dyn Error>> {
-    if nous_auth_present(context) {
-        return Ok(false);
-    }
+) -> Result<(), Box<dyn Error>> {
     let mut ui = StreamUi { input, output };
     run_native_tts_setup(context, &mut ui)?;
-    Ok(true)
+    Ok(())
 }
 
 fn run_native_terminal_setup(
@@ -1377,6 +1424,15 @@ fn install_kittentts_deps(ui: &mut dyn SetupUi) -> Result<bool, Box<dyn Error>> 
     Ok(status.success())
 }
 
+fn install_piper_deps(ui: &mut dyn SetupUi) -> Result<bool, Box<dyn Error>> {
+    ui.line("Installing piper-tts Python package...")?;
+    let success = install_python_package(&["piper-tts", "--quiet"])?;
+    if success {
+        ui.line("Piper installed. Voices download on first use.")?;
+    }
+    Ok(success)
+}
+
 fn command_exists(command: &str) -> bool {
     std::env::var_os("PATH")
         .into_iter()
@@ -1975,6 +2031,68 @@ exit 9\n",
     }
 
     #[test]
+    #[cfg(unix)]
+    fn native_tts_setup_writes_managed_nous_provider() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(
+            context.hermes_home().join("auth.json"),
+            r#"{"providers":{"nous":{"access_token":"nous-access-token"}}}"#,
+        )
+        .unwrap();
+
+        let mut ui = TestUi::new(&["1"]);
+        run_native_tts_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: openai"));
+        assert!(saved.contains("use_gateway: true"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_tts_setup_installs_piper() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  exit 1\n\
+fi\n\
+if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ] && [ \"$3\" = \"install\" ]; then\n\
+  printf '%s %s %s %s %s %s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"$5\" \"$6\" >> '{}'\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
+
+        let mut ui = TestUi::new(&["10", "y"]);
+        run_native_tts_setup(&context, &mut ui).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: piper"));
+        let logged = fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("-m pip install -U piper-tts --quiet"));
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
     fn native_terminal_setup_writes_docker_backend() {
         let temp = TempDir::new().unwrap();
         let context = HermesContext::new(temp.path());
@@ -2177,56 +2295,6 @@ exit 9\n",
 
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("section=agent quick=1"));
-        remove_env_var("HERMES_SETUP_PYTHON");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn tts_setup_with_nous_auth_stays_on_python_path() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'section=%s\\n' \"$HERMES_SETUP_SECTION\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let context = HermesContext::new(temp.path());
-        fs::create_dir_all(context.hermes_home()).unwrap();
-        fs::write(
-            context.hermes_home().join("auth.json"),
-            r#"{"providers":{"nous":{"agent_key":"test-key"}}}"#,
-        )
-        .unwrap();
-
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
-        print_setup(
-            &context,
-            SetupArgs {
-                section: Some(SetupSection::Tts),
-                non_interactive: false,
-                reset: false,
-                reconfigure: false,
-                quick: false,
-            },
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("section=tts"));
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 }

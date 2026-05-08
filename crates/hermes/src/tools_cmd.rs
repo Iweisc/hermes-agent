@@ -887,10 +887,7 @@ fn reconfigure_tts_with_io(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    if setup_cmd::run_native_tts_setup_with_io(context, input, output)? {
-        return Ok(());
-    }
-    run_python_tools_reconfigure_toolset("tts")
+    setup_cmd::run_native_tts_setup_with_io(context, input, output)
 }
 
 fn reconfigure_image_gen_with_io(
@@ -2351,6 +2348,30 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Hermes Setup"));
         assert!(rendered.contains("TTS provider set to: OpenAI TTS"));
+    }
+
+    #[test]
+    fn tools_reconfigure_tts_uses_managed_nous_flow_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-tts-nous");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(&context.config_path(), "tts:\n  provider: edge\n");
+        fs::write(
+            context.hermes_home().join("auth.json"),
+            r#"{"providers":{"nous":{"access_token":"nous-access-token"}}}"#,
+        )
+        .unwrap();
+
+        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_tts_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: openai"));
+        assert!(saved.contains("use_gateway: true"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Nous Subscription"));
+        assert!(rendered.contains("managed Nous gateway"));
     }
 
     #[test]
