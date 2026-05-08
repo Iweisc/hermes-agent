@@ -328,12 +328,20 @@ fn run_native_model_setup(
         ))?;
     }
     let custom_endpoint_choice = providers.len() + saved_custom_providers.len() + 1;
-    let compatibility_choice = custom_endpoint_choice + 1;
+    let remove_custom_choice =
+        (!saved_custom_providers.is_empty()).then_some(custom_endpoint_choice + 1);
+    let compatibility_choice = remove_custom_choice.unwrap_or(custom_endpoint_choice) + 1;
     let keep_choice = compatibility_choice + 1;
     ui.line(&format!(
         "  {}. Custom endpoint (enter URL manually)",
         custom_endpoint_choice
     ))?;
+    if let Some(remove_custom_choice) = remove_custom_choice {
+        ui.line(&format!(
+            "  {}. Remove a saved custom provider",
+            remove_custom_choice
+        ))?;
+    }
     ui.line(&format!(
         "  {}. Use compatibility flow (OAuth, advanced picker)",
         compatibility_choice
@@ -386,6 +394,10 @@ fn run_native_model_setup(
             &current_base_url,
             &current_api_key,
         );
+    }
+
+    if Some(selection) == remove_custom_choice {
+        return remove_saved_custom_model_provider(context, ui, &mut root, &saved_custom_providers);
     }
 
     if selection > providers.len() {
@@ -1283,6 +1295,79 @@ fn save_custom_model_provider(
         }
     }
     providers.push(Value::Mapping(entry));
+}
+
+fn remove_saved_custom_model_provider(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+    providers: &[SavedCustomModelProvider],
+) -> Result<(), Box<dyn Error>> {
+    if providers.is_empty() {
+        ui.line("No saved custom providers configured.")?;
+        return Ok(());
+    }
+
+    ui.blank()?;
+    ui.line("Remove a saved custom provider:")?;
+    ui.blank()?;
+    for (index, provider) in providers.iter().enumerate() {
+        ui.line(&format!(
+            "  {}. {} ({})",
+            index + 1,
+            provider.name,
+            format_saved_custom_provider_url(&provider.base_url)
+        ))?;
+    }
+    let cancel_choice = providers.len() + 1;
+    ui.line(&format!("  {}. Cancel", cancel_choice))?;
+
+    let selection = prompt_menu_choice(ui, "Select provider to remove: ", cancel_choice, 1)?;
+    if selection == cancel_choice {
+        ui.line("No change.")?;
+        return Ok(());
+    }
+
+    let selected = &providers[selection - 1];
+    remove_saved_custom_model_provider_from_root(root, &selected.source)?;
+    write_yaml_mapping(&context.config_path(), root)?;
+    ui.line(&format!(
+        "Removed \"{}\" from saved custom providers.",
+        selected.name
+    ))?;
+    Ok(())
+}
+
+fn remove_saved_custom_model_provider_from_root(
+    root: &mut Mapping,
+    source: &SavedCustomModelProviderSource,
+) -> Result<(), Box<dyn Error>> {
+    match source {
+        SavedCustomModelProviderSource::LegacyCustomProviders { index } => {
+            let Some(entries) = root
+                .get_mut(yaml_key("custom_providers"))
+                .and_then(Value::as_sequence_mut)
+            else {
+                return Err("custom_providers list is missing".into());
+            };
+            if *index >= entries.len() {
+                return Err("saved custom provider entry no longer exists".into());
+            }
+            entries.remove(*index);
+        }
+        SavedCustomModelProviderSource::ProvidersMap { key, .. } => {
+            let Some(entries) = root
+                .get_mut(yaml_key("providers"))
+                .and_then(Value::as_mapping_mut)
+            else {
+                return Err("providers mapping is missing".into());
+            };
+            if entries.remove(yaml_key(key)).is_none() {
+                return Err("saved custom provider entry no longer exists".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn model_provider_order(provider: &str) -> (usize, String) {
@@ -3175,6 +3260,58 @@ exit 9\n",
         assert!(
             rendered.contains("Default model set to: llama3.1:8b (via http://localhost:11434/v1)")
         );
+    }
+
+    #[test]
+    fn setup_model_remove_saved_legacy_custom_provider_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "custom_providers:\n  - name: Local Ollama\n    base_url: http://localhost:11434/v1\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let remove_choice = providers.len() + 3;
+        let mut input = io::Cursor::new(format!("{remove_choice}\n1\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!config_text.contains("Local Ollama"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Remove a saved custom provider"));
+        assert!(rendered.contains("Removed \"Local Ollama\" from saved custom providers."));
+    }
+
+    #[test]
+    fn setup_model_remove_saved_keyed_custom_provider_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "providers:\n  demo-endpoint:\n    name: Demo Endpoint\n    api: https://demo.example/v1/\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let remove_choice = providers.len() + 3;
+        let mut input = io::Cursor::new(format!("{remove_choice}\n1\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!config_text.contains("demo-endpoint"));
+        assert!(!config_text.contains("Demo Endpoint"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Removed \"Demo Endpoint\" from saved custom providers."));
     }
 
     #[test]
