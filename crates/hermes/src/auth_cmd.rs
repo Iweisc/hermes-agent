@@ -719,6 +719,8 @@ struct NativeAuthRemoveResult {
     hints: Vec<String>,
 }
 
+type NativeRemovePlan = (bool, Vec<String>, Vec<String>, Vec<String>);
+
 fn try_native_auth_remove(
     hermes_home: &Path,
     provider: &str,
@@ -727,6 +729,37 @@ fn try_native_auth_remove(
 ) -> Result<Option<NativeAuthRemoveResult>, Box<dyn Error>> {
     let source = entry.source.trim();
     let (clear_provider_state, suppress_sources, cleaned, hints) = match provider {
+        "copilot" if source == "gh_cli" || source.starts_with("env:") => (
+            false,
+            vec![
+                "gh_cli".to_string(),
+                "env:COPILOT_GITHUB_TOKEN".to_string(),
+                "env:GH_TOKEN".to_string(),
+                "env:GITHUB_TOKEN".to_string(),
+            ],
+            Vec::new(),
+            vec![
+                "Suppressed all copilot token sources (gh_cli + env vars) — they will not be re-seeded.".to_string(),
+                "Note: Your gh CLI / shell environment is unchanged.".to_string(),
+                "Run `hermes auth add copilot` to re-enable if needed.".to_string(),
+            ],
+        ),
+        "anthropic" if source == "claude_code" => (
+            false,
+            vec![source.to_string()],
+            Vec::new(),
+            vec![
+                "Suppressed claude_code credential — it will not be re-seeded.".to_string(),
+                "Note: Claude Code credentials still live in ~/.claude/.credentials.json".to_string(),
+                "Run `hermes auth add anthropic` to re-enable if needed.".to_string(),
+            ],
+        ),
+        "anthropic" if source == "hermes_pkce" => (
+            false,
+            vec![source.to_string()],
+            remove_hermes_pkce_file(hermes_home)?,
+            Vec::new(),
+        ),
         "nous" if source == "device_code" => (
             true,
             vec![source.to_string()],
@@ -765,6 +798,16 @@ fn try_native_auth_remove(
             vec![source.to_string()],
             vec![format!("Cleared {provider} OAuth tokens from auth store")],
             Vec::new(),
+        ),
+        _ if source.starts_with("env:") => remove_env_source_native(hermes_home, provider, source)?,
+        _ if source.starts_with("config:") || source == "model_config" => (
+            false,
+            vec![source.to_string()],
+            Vec::new(),
+            vec![
+                format!("Suppressed {source} — it will not be re-seeded."),
+                "Note: The underlying value in config.yaml is unchanged.  Edit it directly if you want to remove the credential from disk.".to_string(),
+            ],
         ),
         _ => return Ok(None),
     };
@@ -2022,6 +2065,94 @@ fn apply_native_auth_remove_changes(
     save_auth_store_json(hermes_home, &auth_store)
 }
 
+fn remove_hermes_pkce_file(hermes_home: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let oauth_file = hermes_home.join(".anthropic_oauth.json");
+    if !oauth_file.exists() {
+        return Ok(Vec::new());
+    }
+    fs::remove_file(&oauth_file)?;
+    Ok(vec![
+        "Cleared Hermes Anthropic OAuth credentials".to_string(),
+    ])
+}
+
+fn remove_env_source_native(
+    hermes_home: &Path,
+    provider: &str,
+    source: &str,
+) -> Result<NativeRemovePlan, Box<dyn Error>> {
+    let env_var = source
+        .strip_prefix("env:")
+        .ok_or("invalid env source")?
+        .trim();
+    if env_var.is_empty() {
+        return Ok((false, vec![source.to_string()], Vec::new(), Vec::new()));
+    }
+    let env_path = hermes_home.join(".env");
+    let env_in_process = std::env::var_os(env_var).is_some();
+    let env_in_dotenv = env_file_contains_key(&env_path, env_var)?;
+    let shell_exported = env_in_process && !env_in_dotenv;
+    let removed = remove_env_file_key(&env_path, env_var)?;
+    let mut cleaned = Vec::new();
+    if removed {
+        cleaned.push(format!("Cleared {env_var} from .env"));
+    }
+    let hints = if shell_exported {
+        vec![
+            format!(
+                "Note: {env_var} is still set in your shell environment (not in ~/.hermes/.env)."
+            ),
+            "  Unset it there (shell profile, systemd EnvironmentFile, launchd plist, etc.) or it will keep being visible to Hermes.".to_string(),
+            format!(
+                "  The pool entry is now suppressed — Hermes will ignore {env_var} until you run `hermes auth add {provider}`."
+            ),
+        ]
+    } else {
+        vec![format!(
+            "Suppressed env:{env_var} — it will not be re-seeded even if the variable is re-exported later."
+        )]
+    };
+    Ok((false, vec![source.to_string()], cleaned, hints))
+}
+
+fn env_file_contains_key(path: &Path, key: &str) -> Result<bool, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(text.lines().any(|line| {
+        line.trim()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with('='))
+    }))
+}
+
+fn remove_env_file_key(path: &Path, key: &str) -> Result<bool, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let lines = fs::read_to_string(path)?
+        .lines()
+        .map(|line| format!("{line}\n"))
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    let filtered = lines
+        .into_iter()
+        .filter(|line| {
+            let matches = line
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with('='));
+            changed |= matches;
+            !matches
+        })
+        .collect::<Vec<_>>();
+    if changed {
+        atomic_write(path, filtered.concat().as_bytes())?;
+        unsafe { std::env::remove_var(key) };
+    }
+    Ok(changed)
+}
+
 fn add_auth_pool_entry(
     hermes_home: &Path,
     provider: &str,
@@ -2898,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_remove_non_manual_uses_python_fallback() {
+    fn auth_remove_unsupported_source_uses_python_fallback() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let temp = temp_path("auth-remove-python");
         let log_path = temp.join("auth-remove.log");
@@ -2914,12 +3045,12 @@ mod tests {
                 "credential_pool": {
                     "openrouter": [
                         {
-                            "id": "env1",
-                            "label": "OPENROUTER_API_KEY",
+                            "id": "ext1",
+                            "label": "external",
                             "auth_type": "api_key",
                             "priority": 0,
-                            "source": "env:OPENROUTER_API_KEY",
-                            "access_token": "sk-env"
+                            "source": "external-helper",
+                            "access_token": "sk-ext"
                         }
                     ]
                 }
@@ -2962,6 +3093,248 @@ mod tests {
         assert!(logged.contains("-c"));
         assert!(logged.contains("auth_remove_command"));
         let _ = fs::remove_dir_all(temp);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_env_source_stays_native_and_clears_dotenv() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-remove-env");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".env"),
+            "OPENROUTER_API_KEY=sk-env\nOTHER_KEY=keep\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "env1",
+                            "label": "OPENROUTER_API_KEY",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "env:OPENROUTER_API_KEY",
+                            "access_token": "sk-env"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "openrouter".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let env_text = fs::read_to_string(home.join(".env")).unwrap();
+        assert!(!env_text.contains("OPENROUTER_API_KEY="));
+        assert!(env_text.contains("OTHER_KEY=keep"));
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["suppressed_sources"]["openrouter"][0],
+            "env:OPENROUTER_API_KEY"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_copilot_env_stays_native_and_suppresses_all_sources() {
+        let home = temp_path("auth-remove-copilot");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "copilot": [
+                        {
+                            "id": "cop1",
+                            "label": "GH_TOKEN",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "env:GH_TOKEN",
+                            "access_token": "gh-token"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "copilot".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let suppressed = persisted["suppressed_sources"]["copilot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<Vec<_>>();
+        assert!(suppressed.contains(&"gh_cli"));
+        assert!(suppressed.contains(&"env:COPILOT_GITHUB_TOKEN"));
+        assert!(suppressed.contains(&"env:GH_TOKEN"));
+        assert!(suppressed.contains(&"env:GITHUB_TOKEN"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_anthropic_claude_code_stays_native() {
+        let home = temp_path("auth-remove-claude");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "anthropic": [
+                        {
+                            "id": "cc1",
+                            "label": "claude_code",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "claude_code",
+                            "access_token": "cc-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "anthropic".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["suppressed_sources"]["anthropic"][0],
+            "claude_code"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_anthropic_hermes_pkce_stays_native() {
+        let home = temp_path("auth-remove-hermes-pkce");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(".anthropic_oauth.json"), "{\"ok\":true}\n").unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "anthropic": [
+                        {
+                            "id": "pk1",
+                            "label": "hermes_pkce",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "hermes_pkce",
+                            "access_token": "pkce-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "anthropic".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(!home.join(".anthropic_oauth.json").exists());
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["suppressed_sources"]["anthropic"][0],
+            "hermes_pkce"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_custom_config_source_stays_native() {
+        let home = temp_path("auth-remove-custom-config");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "custom:demo": [
+                        {
+                            "id": "cfg1",
+                            "label": "demo",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "config:demo",
+                            "access_token": "cfg-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "custom:demo".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["suppressed_sources"]["custom:demo"][0],
+            "config:demo"
+        );
         let _ = fs::remove_dir_all(home);
     }
 
