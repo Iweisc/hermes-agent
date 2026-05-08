@@ -2266,7 +2266,7 @@ fn send_google_gemini_chat_completion(
         return Err(HermesError::State {
             action: "calling Google Code Assist",
             detail:
-                "No Google OAuth access token resolved. Run `hermes auth add google-gemini-cli` in the Python runtime first."
+                "No Google OAuth access token resolved. Run `hermes auth add google-gemini-cli` first."
                     .to_string(),
         });
     }

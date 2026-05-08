@@ -33,8 +33,8 @@ const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const GOOGLE_DEFAULT_CLIENT_ID: &str =
-    "000000000000-hermes-placeholder.apps.googleusercontent.com";
-const GOOGLE_DEFAULT_CLIENT_SECRET: &str = "hermes-placeholder-google-client-secret";
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GOOGLE_DEFAULT_CLIENT_SECRET: &str = "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";
 const MINIMAX_OAUTH_REFRESH_SKEW_SECONDS: i64 = 60;
 const DEFAULT_QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
 const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
@@ -3130,7 +3130,9 @@ mod tests {
             assert!(request_text.contains("grant_type=refresh_token"));
             assert!(request_text.contains("refresh_token=google-refresh-old"));
             assert!(request_text.contains(&format!("client_id={GOOGLE_DEFAULT_CLIENT_ID}")));
-            assert!(request_text.contains(&format!("client_secret={GOOGLE_DEFAULT_CLIENT_SECRET}")));
+            assert!(
+                request_text.contains(&format!("client_secret={GOOGLE_DEFAULT_CLIENT_SECRET}"))
+            );
 
             let body = json!({
                 "access_token": "google-new",

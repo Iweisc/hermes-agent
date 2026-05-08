@@ -49,6 +49,16 @@ const DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v
 const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/0.0.0 (external, cli)";
+const DEFAULT_GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const DEFAULT_GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const DEFAULT_GOOGLE_OAUTH_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo";
+const GOOGLE_OAUTH_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+const GOOGLE_OAUTH_REDIRECT_HOST: &str = "127.0.0.1";
+const GOOGLE_OAUTH_CALLBACK_PATH: &str = "/oauth2callback";
+const GOOGLE_OAUTH_DEFAULT_REDIRECT_PORT: u16 = 8085;
+const GOOGLE_DEFAULT_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GOOGLE_DEFAULT_CLIENT_SECRET: &str = "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";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_OAUTH_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -218,6 +228,9 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     }
     if should_use_native_anthropic_oauth_add(args) {
         return native_auth_add_anthropic_oauth(context, args);
+    }
+    if should_use_native_google_gemini_oauth_add(args) {
+        return native_auth_add_google_gemini_oauth(context, args);
     }
     if should_use_native_runtime_oauth_add(args) {
         return native_auth_add_runtime_oauth(context, args);
@@ -421,7 +434,7 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     };
     if !matches!(
         provider.as_str(),
-        "google-gemini-cli" | "qwen-oauth" | "minimax-oauth" | "nous" | "openai-codex"
+        "qwen-oauth" | "minimax-oauth" | "nous" | "openai-codex"
     ) {
         return false;
     }
@@ -437,6 +450,27 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
                 && args.scope.is_none()
                 && !args.no_browser
                 && args.timeout.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn should_use_native_google_gemini_oauth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    if provider != "google-gemini-cli" {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") | None => {
+            args.api_key.is_none()
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
                 && !args.insecure
                 && args.ca_bundle.is_none()
         }
@@ -677,6 +711,164 @@ fn native_auth_add_anthropic_oauth_with_io(
     )?;
     output.flush()?;
     Ok(())
+}
+
+fn native_auth_add_google_gemini_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    native_auth_add_google_gemini_oauth_with_io(context, args, &mut input, &mut output)
+}
+
+fn native_auth_add_google_gemini_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add google-gemini-cli`.")?;
+    if provider != "google-gemini-cli" {
+        return run_python_auth_add(args);
+    }
+
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if google_gemini_oauth_path(context.hermes_home().as_path()).exists()
+        && let Ok(creds) =
+            resolve_google_gemini_runtime_credentials(context.hermes_home().as_path())
+    {
+        return finalize_google_gemini_auth_add(
+            context,
+            requested_label.as_deref(),
+            &default_label,
+            &creds.access_token,
+            Some(&creds.refresh_token),
+            None,
+            creds.email.as_str(),
+        );
+    }
+
+    let code_verifier = google_code_verifier()?;
+    let code_challenge = spotify_code_challenge(&code_verifier);
+    let state_nonce = google_state_nonce()?;
+    let client_id = google_client_id();
+    let client_secret = google_client_secret();
+    let callback_timeout_seconds = validated_timeout_seconds(args.timeout, 300.0)?;
+    let request_timeout_seconds = args.timeout.unwrap_or(20.0).max(1.0);
+
+    let (callback_result, redirect_uri) = if args.no_browser || is_remote_session() {
+        let redirect_uri = google_default_redirect_uri();
+        let authorize_url =
+            google_build_authorize_url(&client_id, &redirect_uri, &state_nonce, &code_challenge)?;
+        writeln!(output)?;
+        writeln!(
+            output,
+            "Open this URL to authorize Hermes with Google Gemini CLI:"
+        )?;
+        writeln!(output, "{authorize_url}")?;
+        writeln!(output)?;
+        writeln!(
+            output,
+            "After signing in, paste the full callback URL or just the code."
+        )?;
+        output.flush()?;
+        (google_prompt_pasted_callback(input, output)?, redirect_uri)
+    } else {
+        let (listener, redirect_uri) = google_bind_callback_listener()?;
+        let authorize_url =
+            google_build_authorize_url(&client_id, &redirect_uri, &state_nonce, &code_challenge)?;
+        writeln!(output)?;
+        writeln!(
+            output,
+            "Opening your browser to sign in to Google Gemini CLI..."
+        )?;
+        writeln!(
+            output,
+            "If it does not open automatically, visit:\n  {authorize_url}"
+        )?;
+        writeln!(output)?;
+        output.flush()?;
+        if try_open_browser(&authorize_url)? {
+            writeln!(output, "Browser opened for Google authorization.")?;
+        } else {
+            writeln!(
+                output,
+                "Could not open the browser automatically; use the URL above."
+            )?;
+        }
+        writeln!(output)?;
+        output.flush()?;
+
+        let callback = match google_wait_for_callback(listener, callback_timeout_seconds)? {
+            Some(callback) => callback,
+            None => {
+                writeln!(
+                    output,
+                    "Timed out waiting for the local callback. Paste the callback URL or code below."
+                )?;
+                output.flush()?;
+                google_prompt_pasted_callback(input, output)?
+            }
+        };
+        (callback, redirect_uri)
+    };
+
+    if let Some(error) = callback_result.error {
+        let detail = callback_result.error_description.unwrap_or(error);
+        return Err(format!("Google authorization failed: {detail}").into());
+    }
+    if callback_result.state.as_deref() != Some(state_nonce.as_str()) {
+        return Err("Google authorization failed: state mismatch.".into());
+    }
+    let code = callback_result
+        .code
+        .ok_or("Google authorization failed: missing authorization code.")?;
+    let token_payload = google_exchange_code_for_tokens(
+        &client_id,
+        &client_secret,
+        &code,
+        &redirect_uri,
+        &code_verifier,
+        request_timeout_seconds,
+    )?;
+    let access_token = json_string(&token_payload, "access_token")
+        .ok_or("Google token response did not include an access_token.")?;
+    let refresh_token = json_string(&token_payload, "refresh_token")
+        .ok_or("Google token response did not include a refresh_token.")?;
+    let expires_in = token_payload
+        .get("expires_in")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let email = google_fetch_user_email(access_token, request_timeout_seconds).unwrap_or_default();
+    save_google_gemini_oauth_file(
+        context.hermes_home().as_path(),
+        access_token,
+        refresh_token,
+        expires_in,
+        &email,
+    )?;
+    finalize_google_gemini_auth_add(
+        context,
+        requested_label.as_deref(),
+        &default_label,
+        access_token,
+        Some(refresh_token),
+        Some(expires_in),
+        &email,
+    )
 }
 
 fn native_auth_add_openai_codex_oauth(
@@ -3541,6 +3733,338 @@ fn anthropic_exchange_code_for_tokens(
     })
 }
 
+fn google_authorize_url() -> String {
+    env_trimmed("HERMES_AUTH_GOOGLE_AUTH_URL")
+        .unwrap_or_else(|| DEFAULT_GOOGLE_OAUTH_AUTHORIZE_URL.to_string())
+}
+
+fn google_token_url() -> String {
+    env_trimmed("HERMES_AUTH_GOOGLE_TOKEN_URL")
+        .unwrap_or_else(|| DEFAULT_GOOGLE_OAUTH_TOKEN_URL.to_string())
+}
+
+fn google_userinfo_url() -> String {
+    env_trimmed("HERMES_AUTH_GOOGLE_USERINFO_URL")
+        .unwrap_or_else(|| DEFAULT_GOOGLE_OAUTH_USERINFO_URL.to_string())
+}
+
+fn google_client_id() -> String {
+    env_trimmed("HERMES_GEMINI_CLIENT_ID").unwrap_or_else(|| GOOGLE_DEFAULT_CLIENT_ID.to_string())
+}
+
+fn google_client_secret() -> String {
+    env_trimmed("HERMES_GEMINI_CLIENT_SECRET")
+        .unwrap_or_else(|| GOOGLE_DEFAULT_CLIENT_SECRET.to_string())
+}
+
+fn google_code_verifier() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_GOOGLE_TEST_VERIFIER") {
+        return Ok(override_value);
+    }
+    spotify_random_token(64).map(|value| value.chars().take(128).collect())
+}
+
+fn google_state_nonce() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_GOOGLE_TEST_STATE") {
+        return Ok(override_value);
+    }
+    spotify_random_token(16)
+}
+
+fn google_default_redirect_uri() -> String {
+    format!(
+        "http://{}:{}{}",
+        GOOGLE_OAUTH_REDIRECT_HOST, GOOGLE_OAUTH_DEFAULT_REDIRECT_PORT, GOOGLE_OAUTH_CALLBACK_PATH
+    )
+}
+
+fn google_gemini_oauth_path(hermes_home: &Path) -> PathBuf {
+    hermes_home.join("auth").join("google_oauth.json")
+}
+
+fn google_build_authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut url = Url::parse(&google_authorize_url())?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("client_id", client_id);
+        query.append_pair("redirect_uri", redirect_uri);
+        query.append_pair("response_type", "code");
+        query.append_pair("scope", GOOGLE_OAUTH_SCOPES);
+        query.append_pair("state", state);
+        query.append_pair("code_challenge", code_challenge);
+        query.append_pair("code_challenge_method", "S256");
+        query.append_pair("access_type", "offline");
+        query.append_pair("prompt", "consent");
+    }
+    Ok(url.to_string())
+}
+
+fn google_bind_callback_listener() -> Result<(TcpListener, String), Box<dyn Error>> {
+    let listener = TcpListener::bind((
+        GOOGLE_OAUTH_REDIRECT_HOST,
+        GOOGLE_OAUTH_DEFAULT_REDIRECT_PORT,
+    ))
+    .or_else(|_| TcpListener::bind((GOOGLE_OAUTH_REDIRECT_HOST, 0)))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure Google callback server: {error}"))?;
+    let port = listener.local_addr()?.port();
+    Ok((
+        listener,
+        format!(
+            "http://{}:{}{}",
+            GOOGLE_OAUTH_REDIRECT_HOST, port, GOOGLE_OAUTH_CALLBACK_PATH
+        ),
+    ))
+}
+
+fn google_wait_for_callback(
+    listener: TcpListener,
+    timeout_seconds: f64,
+) -> Result<Option<SpotifyCallbackResult>, Box<dyn Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_seconds.max(5.0));
+    let mut buffer = [0u8; 8192];
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let size = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let first_line = request.lines().next().unwrap_or_default();
+                if let Some(target) = first_line
+                    .strip_prefix("GET ")
+                    .and_then(|value| value.split_whitespace().next())
+                {
+                    let parsed = Url::parse(&format!("http://localhost{target}"))?;
+                    if parsed.path() == GOOGLE_OAUTH_CALLBACK_PATH {
+                        let mut result = SpotifyCallbackResult::default();
+                        for (key, value) in parsed.query_pairs() {
+                            match key.as_ref() {
+                                "code" => result.code = Some(value.into_owned()),
+                                "state" => result.state = Some(value.into_owned()),
+                                "error" => result.error = Some(value.into_owned()),
+                                "error_description" => {
+                                    result.error_description = Some(value.into_owned())
+                                }
+                                _ => {}
+                            }
+                        }
+                        let message = if result.error.is_some() {
+                            "Google authorization failed. You can close this tab."
+                        } else {
+                            "Google authorization received. You can close this tab."
+                        };
+                        let html = format!("<html><body><h1>{message}</h1></body></html>");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        return Ok(Some(result));
+                    }
+                }
+                let response =
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 10\r\n\r\nNot found.";
+                let _ = stream.write_all(response);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("Google callback server failed: {error}").into()),
+        }
+    }
+}
+
+fn google_prompt_pasted_callback(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<SpotifyCallbackResult, Box<dyn Error>> {
+    let raw = prompt_line(input, output, "Callback URL or code")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Google setup cancelled: empty authorization code.".into());
+    }
+    let mut result = SpotifyCallbackResult::default();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let parsed = Url::parse(trimmed)?;
+        for (key, value) in parsed.query_pairs() {
+            match key.as_ref() {
+                "code" => result.code = Some(value.into_owned()),
+                "state" => result.state = Some(value.into_owned()),
+                "error" => result.error = Some(value.into_owned()),
+                "error_description" => result.error_description = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        return Ok(result);
+    }
+    if let Some(query) = trimmed.strip_prefix('?') {
+        let parsed = Url::parse(&format!(
+            "http://localhost{GOOGLE_OAUTH_CALLBACK_PATH}?{query}"
+        ))?;
+        for (key, value) in parsed.query_pairs() {
+            match key.as_ref() {
+                "code" => result.code = Some(value.into_owned()),
+                "state" => result.state = Some(value.into_owned()),
+                "error" => result.error = Some(value.into_owned()),
+                "error_description" => result.error_description = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        return Ok(result);
+    }
+    result.code = Some(trimmed.to_string());
+    Ok(result)
+}
+
+fn google_exchange_code_for_tokens(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    timeout_seconds: f64,
+) -> Result<JsonMap<String, JsonValue>, Box<dyn Error>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .build()?;
+    let response = client
+        .post(google_token_url())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", code_verifier),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .map_err(|error| format!("Google token exchange failed: {error}"))?;
+    if response.status().as_u16() >= 400 {
+        let detail = response.text().unwrap_or_default();
+        let suffix = if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" Response: {}", detail.trim())
+        };
+        return Err(format!("Google token exchange failed.{suffix}").into());
+    }
+    let payload: JsonValue = response.json()?;
+    payload
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Google token response was not a JSON object.".into())
+}
+
+fn google_fetch_user_email(
+    access_token: &str,
+    timeout_seconds: f64,
+) -> Result<String, Box<dyn Error>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .build()?;
+    let response = client
+        .get(google_userinfo_url())
+        .query(&[("alt", "json")])
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .map_err(|error| format!("Google userinfo request failed: {error}"))?;
+    if response.status().as_u16() >= 400 {
+        return Ok(String::new());
+    }
+    let payload: JsonValue = response.json()?;
+    Ok(payload
+        .as_object()
+        .and_then(|mapping| json_string(mapping, "email"))
+        .unwrap_or("")
+        .to_string())
+}
+
+fn save_google_gemini_oauth_file(
+    hermes_home: &Path,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in: i64,
+    email: &str,
+) -> Result<(), Box<dyn Error>> {
+    let oauth_path = google_gemini_oauth_path(hermes_home);
+    if let Some(parent) = oauth_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let expires_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0)
+        .saturating_add(expires_in.max(60).saturating_mul(1000));
+    let payload = serde_json::json!({
+        "refresh": refresh_token,
+        "access": access_token,
+        "expires": expires_ms,
+        "email": email,
+    });
+    let rendered = format!("{}\n", serde_json::to_string_pretty(&payload)?);
+    atomic_write(&oauth_path, rendered.as_bytes())
+}
+
+fn finalize_google_gemini_auth_add(
+    context: &HermesContext,
+    requested_label: Option<&str>,
+    default_label: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_in: Option<i64>,
+    email: &str,
+) -> Result<(), Box<dyn Error>> {
+    clear_provider_suppressions(context.hermes_home().as_path(), "google-gemini-cli")?;
+    let label = requested_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if email.trim().is_empty() {
+                default_label.to_string()
+            } else {
+                email.trim().to_string()
+            }
+        });
+    let expires_at_ms = expires_in.map(|seconds| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis() as i64)
+            .unwrap_or(0)
+            .saturating_add(seconds.max(60).saturating_mul(1000))
+    });
+    let count = add_auth_pool_entry(
+        context.hermes_home().as_path(),
+        "google-gemini-cli",
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "manual:google_pkce".to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(ToOwned::to_owned),
+            base_url: None,
+            expires_at_ms,
+            last_refresh: None,
+        },
+    )?;
+    println!(
+        "Added google-gemini-cli OAuth credential #{}: \"{}\"",
+        count, label
+    );
+    Ok(())
+}
+
 fn codex_oauth_issuer() -> String {
     env_trimmed("HERMES_AUTH_CODEX_ISSUER")
         .unwrap_or_else(|| DEFAULT_CODEX_OAUTH_ISSUER.to_string())
@@ -3715,6 +4239,65 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (base_url, request_body, handle)
+    }
+
+    fn spawn_google_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+        email: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let email = email.to_string();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let first_line = request.lines().next().unwrap_or_default().to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let (status_line, payload) = if first_line.starts_with("POST /token ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        json!({
+                            "access_token": access_token,
+                            "refresh_token": refresh_token,
+                            "expires_in": 3600,
+                            "token_type": "Bearer"
+                        })
+                        .to_string(),
+                    )
+                } else if first_line.starts_with("GET /userinfo?alt=json ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        json!({
+                            "email": email
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        json!({
+                            "error": "not_found"
+                        })
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
     }
 
     fn spawn_codex_oauth_server(
@@ -4334,6 +4917,126 @@ mod tests {
         assert_eq!(entry["source"], "manual:google_pkce");
         assert_eq!(entry["access_token"], "google-fresh");
         assert_eq!(entry["refresh_token"], "google-refresh");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_google_gemini_oauth_without_state_uses_native_pkce_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-google-device");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "suppressed_sources": {
+                    "google-gemini-cli": ["manual:google_pkce"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (base_url, requests, server) = spawn_google_oauth_server(
+            "google-access-123",
+            "google-refresh-123",
+            "gemini@example.com",
+        );
+
+        unsafe {
+            std::env::set_var(
+                "HERMES_AUTH_GOOGLE_AUTH_URL",
+                format!("{base_url}/authorize"),
+            );
+            std::env::set_var("HERMES_AUTH_GOOGLE_TOKEN_URL", format!("{base_url}/token"));
+            std::env::set_var(
+                "HERMES_AUTH_GOOGLE_USERINFO_URL",
+                format!("{base_url}/userinfo"),
+            );
+            std::env::set_var("HERMES_AUTH_GOOGLE_TEST_STATE", "google-state-123");
+            std::env::set_var("HERMES_AUTH_GOOGLE_TEST_VERIFIER", "fixed-google-verifier");
+            std::env::set_var("HERMES_GEMINI_CLIENT_ID", "test-google-client");
+            std::env::set_var("HERMES_GEMINI_CLIENT_SECRET", "test-google-secret");
+        }
+        let mut input = Cursor::new(
+            b"http://127.0.0.1:8085/oauth2callback?code=google-code-123&state=google-state-123\n"
+                .to_vec(),
+        );
+        let mut output = Vec::new();
+        let result = native_auth_add_google_gemini_oauth_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "google-gemini-cli".to_string(),
+                auth_type: Some("oauth".to_string()),
+                no_browser: true,
+                timeout: Some(5.0),
+                ..AuthAddArgs::default()
+            },
+            &mut input,
+            &mut output,
+        );
+        unsafe {
+            std::env::remove_var("HERMES_AUTH_GOOGLE_AUTH_URL");
+            std::env::remove_var("HERMES_AUTH_GOOGLE_TOKEN_URL");
+            std::env::remove_var("HERMES_AUTH_GOOGLE_USERINFO_URL");
+            std::env::remove_var("HERMES_AUTH_GOOGLE_TEST_STATE");
+            std::env::remove_var("HERMES_AUTH_GOOGLE_TEST_VERIFIER");
+            std::env::remove_var("HERMES_GEMINI_CLIENT_ID");
+            std::env::remove_var("HERMES_GEMINI_CLIENT_SECRET");
+        }
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].starts_with("POST /token "));
+        assert!(captured[0].contains("grant_type=authorization_code"));
+        assert!(captured[0].contains("code=google-code-123"));
+        assert!(captured[0].contains("code_verifier=fixed-google-verifier"));
+        assert!(captured[0].contains("client_id=test-google-client"));
+        assert!(captured[0].contains("client_secret=test-google-secret"));
+        assert!(
+            captured[0].contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8085%2Foauth2callback")
+        );
+        assert!(captured[1].starts_with("GET /userinfo?alt=json "));
+        assert!(
+            captured[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer google-access-123")
+        );
+
+        let oauth_state: JsonValue = serde_json::from_str(
+            &fs::read_to_string(home.join("auth").join("google_oauth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(oauth_state["access"], "google-access-123");
+        assert_eq!(oauth_state["refresh"], "google-refresh-123");
+        assert_eq!(oauth_state["email"], "gemini@example.com");
+        assert!(oauth_state["expires"].as_i64().unwrap() > 0);
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["google-gemini-cli"][0];
+        assert_eq!(entry["label"], "gemini@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:google_pkce");
+        assert_eq!(entry["access_token"], "google-access-123");
+        assert_eq!(entry["refresh_token"], "google-refresh-123");
+        assert!(entry["expires_at_ms"].as_i64().unwrap() > 0);
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .and_then(|sources| sources.get("google-gemini-cli"))
+                .is_none()
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Open this URL to authorize Hermes with Google Gemini CLI:"));
+        assert!(rendered.contains(&format!("{base_url}/authorize")));
+        assert!(
+            rendered.contains("After signing in, paste the full callback URL or just the code.")
+        );
         let _ = fs::remove_dir_all(home);
     }
 
