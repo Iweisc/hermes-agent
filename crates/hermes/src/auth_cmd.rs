@@ -59,6 +59,13 @@ const GOOGLE_OAUTH_DEFAULT_REDIRECT_PORT: u16 = 8085;
 const GOOGLE_DEFAULT_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
 const GOOGLE_DEFAULT_CLIENT_SECRET: &str = "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";
+const MINIMAX_OAUTH_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
+const MINIMAX_OAUTH_SCOPE: &str = "group_id profile model.completion";
+const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_code";
+const DEFAULT_MINIMAX_OAUTH_PORTAL_BASE_URL: &str = "https://api.minimax.io";
+const DEFAULT_MINIMAX_OAUTH_INFERENCE_BASE_URL: &str = "https://api.minimax.io/anthropic";
+const DEFAULT_MINIMAX_OAUTH_CN_PORTAL_BASE_URL: &str = "https://api.minimaxi.com";
+const DEFAULT_MINIMAX_OAUTH_CN_INFERENCE_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_OAUTH_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -231,6 +238,9 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     }
     if should_use_native_google_gemini_oauth_add(args) {
         return native_auth_add_google_gemini_oauth(context, args);
+    }
+    if should_use_native_minimax_oauth_add(args) {
+        return native_auth_add_minimax_oauth(context, args);
     }
     if should_use_native_runtime_oauth_add(args) {
         return native_auth_add_runtime_oauth(context, args);
@@ -432,10 +442,7 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     let Some(provider) = normalize_provider_name(&args.provider) else {
         return false;
     };
-    if !matches!(
-        provider.as_str(),
-        "qwen-oauth" | "minimax-oauth" | "nous" | "openai-codex"
-    ) {
+    if !matches!(provider.as_str(), "qwen-oauth" | "nous" | "openai-codex") {
         return false;
     }
     match normalize_auth_type(args.auth_type.as_deref()) {
@@ -473,6 +480,21 @@ fn should_use_native_google_gemini_oauth_add(args: &AuthAddArgs) -> bool {
                 && args.scope.is_none()
                 && !args.insecure
                 && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn should_use_native_minimax_oauth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    if provider != "minimax-oauth" {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") | None => {
+            args.api_key.is_none() && !args.insecure && args.ca_bundle.is_none()
         }
         _ => false,
     }
@@ -871,6 +893,186 @@ fn native_auth_add_google_gemini_oauth_with_io(
     )
 }
 
+fn native_auth_add_minimax_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    native_auth_add_minimax_oauth_with_io(context, args, &mut output)
+}
+
+fn native_auth_add_minimax_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add minimax-oauth`.")?;
+    if provider != "minimax-oauth" {
+        return run_python_auth_add(args);
+    }
+
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if provider_state_exists(context.hermes_home().as_path(), &provider)?
+        && !has_explicit_minimax_runtime_overrides(args)
+    {
+        let creds = resolve_minimax_oauth_runtime_credentials(context.hermes_home().as_path())?;
+        let label = requested_label
+            .unwrap_or_else(|| label_from_token(&creds.access_token, &default_label));
+        clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+        let stored_count = add_auth_pool_entry(
+            context.hermes_home().as_path(),
+            &provider,
+            NewPoolEntry {
+                label: label.clone(),
+                auth_type: "oauth".to_string(),
+                source: "manual:minimax_oauth".to_string(),
+                access_token: creds.access_token,
+                refresh_token: None,
+                base_url: non_empty_trimmed_owned(&creds.base_url),
+                expires_at_ms: None,
+                last_refresh: None,
+            },
+        )?;
+        writeln!(
+            output,
+            "Added minimax-oauth OAuth credential #{}: \"{}\"",
+            stored_count, label
+        )?;
+        output.flush()?;
+        return Ok(());
+    }
+
+    let timeout_seconds = validated_timeout_seconds(args.timeout, 15.0)?;
+    let portal_base_url = resolve_minimax_portal_base_url(args)?;
+    let inference_base_url = resolve_minimax_inference_base_url(args, &portal_base_url)?;
+    let client_id = resolve_minimax_client_id(args);
+    let scope = resolve_minimax_scope(args);
+    let code_verifier = minimax_code_verifier()?;
+    let code_challenge = spotify_code_challenge(&code_verifier);
+    let state_nonce = minimax_state_nonce()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .build()?;
+
+    writeln!(output, "Starting Hermes login via MiniMax OAuth...")?;
+    writeln!(output, "Portal: {portal_base_url}")?;
+
+    let code_data = minimax_request_user_code(
+        &client,
+        &portal_base_url,
+        &client_id,
+        &scope,
+        &code_challenge,
+        &state_nonce,
+    )?;
+    let verification_url = json_string(&code_data, "verification_uri")
+        .ok_or("MiniMax OAuth response missing verification_uri.")?
+        .to_string();
+    let user_code = json_string(&code_data, "user_code")
+        .ok_or("MiniMax OAuth response missing user_code.")?
+        .to_string();
+    let expired_in = json_i64(code_data.get("expired_in"))
+        .filter(|value| *value > 0)
+        .ok_or("MiniMax OAuth response missing expired_in.")?;
+    let interval_ms = json_i64(code_data.get("interval"));
+
+    writeln!(output)?;
+    writeln!(output, "To continue:")?;
+    writeln!(output, "  1. Open: {verification_url}")?;
+    writeln!(output, "  2. If prompted, enter code: {user_code}")?;
+    if !args.no_browser && !is_remote_session() {
+        if try_open_browser(&verification_url)? {
+            writeln!(output, "  (Opened browser for verification)")?;
+        } else {
+            writeln!(
+                output,
+                "  Could not open browser automatically -- use the URL above."
+            )?;
+        }
+    }
+    writeln!(output, "Waiting for approval...")?;
+    output.flush()?;
+
+    let token_data = minimax_poll_token(
+        &client,
+        &portal_base_url,
+        &client_id,
+        &user_code,
+        &code_verifier,
+        expired_in,
+        interval_ms,
+    )?;
+    let access_token = json_string(&token_data, "access_token")
+        .ok_or("MiniMax OAuth token payload missing access_token.")?
+        .to_string();
+    let refresh_token = json_string(&token_data, "refresh_token")
+        .ok_or("MiniMax OAuth token payload missing refresh_token.")?
+        .to_string();
+    let expires_in = json_i64(token_data.get("expired_in"))
+        .filter(|value| *value > 0)
+        .ok_or("MiniMax OAuth token payload missing expired_in.")?;
+    let token_type = json_string(&token_data, "token_type").map(ToOwned::to_owned);
+    let resource_url = json_string(&token_data, "resource_url").map(ToOwned::to_owned);
+    save_minimax_provider_state(
+        context.hermes_home().as_path(),
+        &portal_base_url,
+        &inference_base_url,
+        &client_id,
+        &scope,
+        &access_token,
+        &refresh_token,
+        expires_in,
+        token_type.as_deref(),
+        resource_url.as_deref(),
+    )?;
+
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+    let label = requested_label.unwrap_or_else(|| label_from_token(&access_token, &default_label));
+    let expires_at_ms = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis() as i64)
+            .unwrap_or(0)
+            .saturating_add(expires_in.saturating_mul(1000)),
+    );
+    let stored_count = add_auth_pool_entry(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "manual:minimax_oauth".to_string(),
+            access_token,
+            refresh_token: Some(refresh_token),
+            base_url: Some(inference_base_url),
+            expires_at_ms,
+            last_refresh: None,
+        },
+    )?;
+    writeln!(
+        output,
+        "Added minimax-oauth OAuth credential #{}: \"{}\"",
+        stored_count, label
+    )?;
+    if let Some(message) = json_string(&token_data, "notification_message")
+        && !message.trim().is_empty()
+    {
+        writeln!(output, "Note from MiniMax: {}", message.trim())?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 fn native_auth_add_openai_codex_oauth(
     context: &HermesContext,
     args: &AuthAddArgs,
@@ -1071,32 +1273,11 @@ fn native_auth_add_runtime_oauth(
         .map(ToOwned::to_owned);
 
     let (source, access_token, refresh_token, base_url, derived_label) = match provider.as_str() {
-        "google-gemini-cli" => {
-            let creds = resolve_google_gemini_runtime_credentials(context.hermes_home().as_path())?;
-            (
-                "manual:google_pkce".to_string(),
-                creds.access_token,
-                Some(creds.refresh_token),
-                None,
-                creds.email,
-            )
-        }
         "qwen-oauth" => {
             let creds = resolve_qwen_runtime_credentials()?;
             let label = label_from_token(&creds.access_token, &default_label);
             (
                 "manual:qwen_cli".to_string(),
-                creds.access_token,
-                None,
-                non_empty_trimmed_owned(&creds.base_url),
-                label,
-            )
-        }
-        "minimax-oauth" => {
-            let creds = resolve_minimax_oauth_runtime_credentials(context.hermes_home().as_path())?;
-            let label = label_from_token(&creds.access_token, &default_label);
-            (
-                "manual:minimax_oauth".to_string(),
                 creds.access_token,
                 None,
                 non_empty_trimmed_owned(&creds.base_url),
@@ -1690,7 +1871,7 @@ fn try_native_auth_remove(
                 "Run `hermes auth add qwen-oauth` to re-enable if needed.".to_string(),
             ],
         ),
-        "minimax-oauth" if source == "oauth" => (
+        "minimax-oauth" if source == "oauth" || source == "manual:minimax_oauth" => (
             true,
             vec![source.to_string()],
             vec![format!("Cleared {provider} OAuth tokens from auth store")],
@@ -3287,6 +3468,28 @@ fn has_explicit_nous_runtime_overrides(args: &AuthAddArgs) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
+fn has_explicit_minimax_runtime_overrides(args: &AuthAddArgs) -> bool {
+    args.portal_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || args
+            .inference_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || args
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || args
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
 fn validated_timeout_seconds(raw: Option<f64>, default: f64) -> Result<f64, Box<dyn Error>> {
     match raw {
         Some(value) if value > 0.0 => Ok(value),
@@ -3348,6 +3551,57 @@ fn resolve_nous_scope(args: &AuthAddArgs) -> String {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| DEFAULT_NOUS_SCOPE.to_string())
+}
+
+fn resolve_minimax_portal_base_url(args: &AuthAddArgs) -> Result<String, Box<dyn Error>> {
+    let candidate = args
+        .portal_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| DEFAULT_MINIMAX_OAUTH_PORTAL_BASE_URL.to_string());
+    normalize_http_url(&candidate, "portal URL")
+}
+
+fn resolve_minimax_inference_base_url(
+    args: &AuthAddArgs,
+    portal_base_url: &str,
+) -> Result<String, Box<dyn Error>> {
+    let candidate = args
+        .inference_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| match portal_base_url {
+            DEFAULT_MINIMAX_OAUTH_CN_PORTAL_BASE_URL => {
+                DEFAULT_MINIMAX_OAUTH_CN_INFERENCE_BASE_URL.to_string()
+            }
+            DEFAULT_MINIMAX_OAUTH_PORTAL_BASE_URL => {
+                DEFAULT_MINIMAX_OAUTH_INFERENCE_BASE_URL.to_string()
+            }
+            other => format!("{}/anthropic", other.trim_end_matches('/')),
+        });
+    normalize_http_url(&candidate, "inference URL")
+}
+
+fn resolve_minimax_client_id(args: &AuthAddArgs) -> String {
+    args.client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| MINIMAX_OAUTH_CLIENT_ID.to_string())
+}
+
+fn resolve_minimax_scope(args: &AuthAddArgs) -> String {
+    args.scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| MINIMAX_OAUTH_SCOPE.to_string())
 }
 
 fn json_i64(value: Option<&JsonValue>) -> Option<i64> {
@@ -4065,6 +4319,232 @@ fn finalize_google_gemini_auth_add(
     Ok(())
 }
 
+fn minimax_code_verifier() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_MINIMAX_TEST_VERIFIER") {
+        return Ok(override_value);
+    }
+    spotify_random_token(64).map(|value| value.chars().take(96).collect())
+}
+
+fn minimax_state_nonce() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_MINIMAX_TEST_STATE") {
+        return Ok(override_value);
+    }
+    spotify_random_token(16)
+}
+
+fn minimax_request_user_code(
+    client: &Client,
+    portal_base_url: &str,
+    client_id: &str,
+    scope: &str,
+    code_challenge: &str,
+    state: &str,
+) -> Result<JsonMap<String, JsonValue>, Box<dyn Error>> {
+    let response = client
+        .post(format!(
+            "{}/oauth/code",
+            portal_base_url.trim_end_matches('/')
+        ))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .header(
+            "x-request-id",
+            spotify_random_token(12).unwrap_or_else(|_| "hermes-minimax".to_string()),
+        )
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("scope", scope),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+            ("state", state),
+        ])
+        .send()
+        .map_err(|error| format!("MiniMax OAuth authorization failed: {error}"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        let detail = if body.trim().is_empty() {
+            format!("status {}", status.as_u16())
+        } else {
+            body.trim().to_string()
+        };
+        return Err(format!("MiniMax OAuth authorization failed: {detail}").into());
+    }
+    let payload = serde_json::from_str::<JsonValue>(&body).map_err(|error| {
+        format!("MiniMax OAuth authorization response was invalid JSON: {error}")
+    })?;
+    let payload = payload
+        .as_object()
+        .cloned()
+        .ok_or("MiniMax OAuth authorization response was not a JSON object.")?;
+    for field in ["user_code", "verification_uri", "expired_in"] {
+        if !payload.contains_key(field) {
+            return Err(format!("MiniMax OAuth response missing field: {field}").into());
+        }
+    }
+    if json_string(&payload, "state") != Some(state) {
+        return Err("MiniMax OAuth state mismatch (possible CSRF).".into());
+    }
+    Ok(payload)
+}
+
+fn minimax_poll_token(
+    client: &Client,
+    portal_base_url: &str,
+    client_id: &str,
+    user_code: &str,
+    code_verifier: &str,
+    expired_in: i64,
+    interval_ms: Option<i64>,
+) -> Result<JsonMap<String, JsonValue>, Box<dyn Error>> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0);
+    let deadline = if expired_in > now_ms / 2 {
+        UNIX_EPOCH + Duration::from_millis(expired_in.max(1) as u64)
+    } else {
+        SystemTime::now() + Duration::from_secs(expired_in.max(1) as u64)
+    };
+    let interval = Duration::from_millis(interval_ms.unwrap_or(2000).max(2000) as u64);
+
+    while SystemTime::now() < deadline {
+        let response = client
+            .post(format!(
+                "{}/oauth/token",
+                portal_base_url.trim_end_matches('/')
+            ))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .form(&[
+                ("grant_type", MINIMAX_OAUTH_GRANT_TYPE),
+                ("client_id", client_id),
+                ("user_code", user_code),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .map_err(|error| format!("MiniMax OAuth token exchange failed: {error}"))?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        let payload = serde_json::from_str::<JsonValue>(&body).unwrap_or(JsonValue::Null);
+        let payload = payload.as_object().cloned().unwrap_or_default();
+
+        if status.as_u16() != 200 {
+            let detail = payload
+                .get("base_resp")
+                .and_then(JsonValue::as_object)
+                .and_then(|base_resp| json_string(base_resp, "status_msg"))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| body.trim().to_string());
+            let detail = if detail.is_empty() {
+                "unknown".to_string()
+            } else {
+                detail
+            };
+            return Err(format!("MiniMax OAuth error: {detail}").into());
+        }
+
+        match json_string(&payload, "status") {
+            Some("success") => {
+                if !["access_token", "refresh_token", "expired_in"]
+                    .iter()
+                    .all(|field| payload.get(*field).is_some())
+                {
+                    return Err(
+                        "MiniMax OAuth success payload missing required token fields.".into(),
+                    );
+                }
+                return Ok(payload);
+            }
+            Some("error") => {
+                return Err("MiniMax OAuth reported an error. Please try again later.".into());
+            }
+            _ => thread::sleep(interval),
+        }
+    }
+
+    Err("MiniMax OAuth timed out before authorization completed.".into())
+}
+
+fn save_minimax_provider_state(
+    hermes_home: &Path,
+    portal_base_url: &str,
+    inference_base_url: &str,
+    client_id: &str,
+    scope: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in: i64,
+    token_type: Option<&str>,
+    resource_url: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let obtained_at = Utc::now();
+    let expires_at = (obtained_at + ChronoDuration::seconds(expires_in.max(1)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let mut state = JsonMap::new();
+    state.insert(
+        "provider".to_string(),
+        JsonValue::String("minimax-oauth".to_string()),
+    );
+    state.insert(
+        "region".to_string(),
+        JsonValue::String(
+            match portal_base_url {
+                DEFAULT_MINIMAX_OAUTH_CN_PORTAL_BASE_URL => "cn",
+                _ => "global",
+            }
+            .to_string(),
+        ),
+    );
+    state.insert(
+        "portal_base_url".to_string(),
+        JsonValue::String(portal_base_url.to_string()),
+    );
+    state.insert(
+        "inference_base_url".to_string(),
+        JsonValue::String(inference_base_url.to_string()),
+    );
+    state.insert(
+        "client_id".to_string(),
+        JsonValue::String(client_id.to_string()),
+    );
+    state.insert("scope".to_string(), JsonValue::String(scope.to_string()));
+    state.insert(
+        "access_token".to_string(),
+        JsonValue::String(access_token.to_string()),
+    );
+    state.insert(
+        "refresh_token".to_string(),
+        JsonValue::String(refresh_token.to_string()),
+    );
+    state.insert(
+        "obtained_at".to_string(),
+        JsonValue::String(obtained_at.to_rfc3339()),
+    );
+    state.insert("expires_at".to_string(), JsonValue::String(expires_at));
+    state.insert("expires_in".to_string(), JsonValue::from(expires_in.max(1)));
+    if let Some(value) = token_type.map(str::trim).filter(|value| !value.is_empty()) {
+        state.insert(
+            "token_type".to_string(),
+            JsonValue::String(value.to_string()),
+        );
+    }
+    if let Some(value) = resource_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state.insert(
+            "resource_url".to_string(),
+            JsonValue::String(value.to_string()),
+        );
+    }
+    store_provider_state(&mut auth_store, "minimax-oauth", state)?;
+    save_auth_store_json(hermes_home, &auth_store)
+}
+
 fn codex_oauth_issuer() -> String {
     env_trimmed("HERMES_AUTH_CODEX_ISSUER")
         .unwrap_or_else(|| DEFAULT_CODEX_OAUTH_ISSUER.to_string())
@@ -4291,6 +4771,56 @@ mod tests {
                 };
                 let response = format!(
                     "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn spawn_minimax_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+        state: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let state = state.to_string();
+        let base_for_thread = base_url.clone();
+        let handle = thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let payload = match idx {
+                    0 => json!({
+                        "user_code": "MINIMAX-CODE",
+                        "verification_uri": format!("{base_for_thread}/verify"),
+                        "expired_in": 60,
+                        "interval": 100,
+                        "state": state
+                    }),
+                    _ => json!({
+                        "status": "success",
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "expired_in": 3600,
+                        "token_type": "Bearer",
+                        "resource_url": "group-123",
+                        "notification_message": "quota synced"
+                    }),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     payload.len(),
                     payload
                 );
@@ -5128,6 +5658,114 @@ mod tests {
         assert_eq!(entry["auth_type"], "oauth");
         assert_eq!(entry["source"], "manual:minimax_oauth");
         assert_eq!(entry["base_url"], "https://api.minimax.io/anthropic");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_minimax_oauth_without_state_uses_native_login_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-minimax-login");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "suppressed_sources": {
+                    "minimax-oauth": ["manual:minimax_oauth"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (portal_base_url, requests, server) = spawn_minimax_oauth_server(
+            "header.eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJtaW5pbWF4QGV4YW1wbGUuY29tIn0.sig",
+            "minimax-refresh-2",
+            "minimax-state-123",
+        );
+
+        unsafe {
+            std::env::set_var("HERMES_AUTH_MINIMAX_TEST_VERIFIER", "minimax-verifier");
+            std::env::set_var("HERMES_AUTH_MINIMAX_TEST_STATE", "minimax-state-123");
+        }
+        let mut output = Vec::new();
+        let result = native_auth_add_minimax_oauth_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "minimax-oauth".to_string(),
+                auth_type: Some("oauth".to_string()),
+                portal_url: Some(portal_base_url.clone()),
+                inference_url: Some(format!("{portal_base_url}/anthropic")),
+                client_id: Some("minimax-client-test".to_string()),
+                scope: Some("group_id profile model.completion".to_string()),
+                no_browser: true,
+                timeout: Some(5.0),
+                ..AuthAddArgs::default()
+            },
+            &mut output,
+        );
+        unsafe {
+            std::env::remove_var("HERMES_AUTH_MINIMAX_TEST_VERIFIER");
+            std::env::remove_var("HERMES_AUTH_MINIMAX_TEST_STATE");
+        }
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].starts_with("POST /oauth/code "));
+        assert!(captured[0].contains("response_type=code"));
+        assert!(captured[0].contains("client_id=minimax-client-test"));
+        assert!(captured[0].contains("scope=group_id+profile+model.completion"));
+        assert!(captured[0].contains("code_challenge_method=S256"));
+        assert!(captured[0].contains("state=minimax-state-123"));
+        assert!(captured[1].starts_with("POST /oauth/token "));
+        assert!(
+            captured[1].contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Auser_code")
+        );
+        assert!(captured[1].contains("client_id=minimax-client-test"));
+        assert!(captured[1].contains("user_code=MINIMAX-CODE"));
+        assert!(captured[1].contains("code_verifier=minimax-verifier"));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let state = &persisted["providers"]["minimax-oauth"];
+        assert_eq!(state["portal_base_url"], portal_base_url);
+        assert_eq!(
+            state["inference_base_url"],
+            JsonValue::String(format!("{portal_base_url}/anthropic"))
+        );
+        assert_eq!(state["client_id"], "minimax-client-test");
+        assert_eq!(state["scope"], "group_id profile model.completion");
+        assert_eq!(
+            state["access_token"],
+            "header.eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJtaW5pbWF4QGV4YW1wbGUuY29tIn0.sig"
+        );
+        assert_eq!(state["refresh_token"], "minimax-refresh-2");
+        assert_eq!(state["token_type"], "Bearer");
+        assert_eq!(state["resource_url"], "group-123");
+
+        let entry = &persisted["credential_pool"]["minimax-oauth"][0];
+        assert_eq!(entry["label"], "minimax@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:minimax_oauth");
+        assert_eq!(entry["refresh_token"], "minimax-refresh-2");
+        assert_eq!(entry["base_url"], format!("{portal_base_url}/anthropic"));
+        assert!(entry["expires_at_ms"].as_i64().unwrap() > 0);
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .and_then(|sources| sources.get("minimax-oauth"))
+                .is_none()
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Starting Hermes login via MiniMax OAuth..."));
+        assert!(rendered.contains(&format!("Portal: {portal_base_url}")));
+        assert!(rendered.contains("Waiting for approval..."));
+        assert!(rendered.contains("Added minimax-oauth OAuth credential #1"));
+        assert!(rendered.contains("Note from MiniMax: quota synced"));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -6006,6 +6644,64 @@ mod tests {
         assert_eq!(persisted["suppressed_sources"]["qwen-oauth"][0], "qwen-cli");
         assert!(
             persisted["credential_pool"]["qwen-oauth"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_minimax_manual_oauth_stays_native_and_clears_state() {
+        let home = temp_path("auth-remove-minimax");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "active_provider": "minimax-oauth",
+                "providers": {
+                    "minimax-oauth": {
+                        "access_token": "minimax-access",
+                        "refresh_token": "minimax-refresh"
+                    }
+                },
+                "credential_pool": {
+                    "minimax-oauth": [
+                        {
+                            "id": "minimax1",
+                            "label": "MiniMax OAuth",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:minimax_oauth",
+                            "access_token": "minimax-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "minimax-oauth".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert!(persisted["providers"].get("minimax-oauth").is_none());
+        assert_eq!(persisted["active_provider"], JsonValue::Null);
+        assert_eq!(
+            persisted["suppressed_sources"]["minimax-oauth"][0],
+            "manual:minimax_oauth"
+        );
+        assert!(
+            persisted["credential_pool"]["minimax-oauth"]
                 .as_array()
                 .is_some_and(|entries| entries.is_empty())
         );

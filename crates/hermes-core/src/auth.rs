@@ -361,7 +361,7 @@ fn resolve_minimax_oauth_runtime_credentials_with_client(
         .ok_or_else(|| HermesError::State {
             action: "resolving MiniMax OAuth auth",
             detail:
-                "No MiniMax OAuth credentials stored. Authenticate with the Python runtime first."
+                "No MiniMax OAuth credentials stored. Run `hermes auth add minimax-oauth` first."
                     .to_string(),
         })?;
 
@@ -1366,7 +1366,7 @@ fn refresh_minimax_oauth_state(
         return Err(HermesError::State {
             action: "refreshing MiniMax OAuth auth",
             detail: format!(
-                "MiniMax OAuth refresh failed with status {}. Re-authenticate in the Python runtime.",
+                "MiniMax OAuth refresh failed with status {}. Run `hermes auth add minimax-oauth` again.",
                 status.as_u16()
             ),
         });
@@ -2526,7 +2526,7 @@ fn required_object_string(
         .ok_or_else(|| HermesError::State {
             action,
             detail: format!(
-                "MiniMax OAuth state is missing {key}. Re-authenticate in the Python runtime."
+                "MiniMax OAuth state is missing {key}. Run `hermes auth add minimax-oauth` again."
             ),
         })
 }
