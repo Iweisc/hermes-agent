@@ -297,7 +297,7 @@ fn run_native_model_setup(
     ui.line("⚕ Hermes Setup — Inference Provider")?;
     ui.line("Choose a provider and default model.")?;
     ui.line(
-        "Most fresh OAuth login, Copilot/Bedrock, and the advanced model picker remain available through the compatibility flow.",
+        "Some fresh OAuth login, Copilot ACP, and the advanced model picker still use the compatibility flow.",
     )?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
@@ -1049,6 +1049,8 @@ const NATIVE_MODEL_RUNTIME_PROVIDERS: &[&str] = &[
     "nous",
     "openai-codex",
     "google-gemini-cli",
+    "bedrock",
+    "copilot",
     "qwen-oauth",
     "minimax-oauth",
 ];
@@ -1493,6 +1495,24 @@ fn resolved_native_model_provider_base_url(
             .filter(|value| !value.is_empty())
     {
         return Ok(base_url);
+    }
+
+    if provider.name == "bedrock"
+        && let Some(region) = ["AWS_REGION", "AWS_DEFAULT_REGION"]
+            .into_iter()
+            .find_map(|env_var| {
+                std::env::var(env_var)
+                    .ok()
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.chars().all(|ch| {
+                                ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'
+                            })
+                    })
+            })
+    {
+        return Ok(format!("https://bedrock-runtime.{region}.amazonaws.com"));
     }
 
     if provider.base_url.trim().is_empty() {
@@ -2043,15 +2063,17 @@ fn model_provider_order(provider: &str) -> (usize, String) {
         "openai" => 2,
         "openai-codex" => 3,
         "anthropic" => 4,
-        "deepseek" => 5,
-        "gemini" => 6,
-        "google-gemini-cli" => 7,
-        "qwen-oauth" => 8,
-        "minimax" => 9,
-        "minimax-oauth" => 10,
-        "xai" => 11,
-        "zai" => 12,
-        "ai-gateway" => 13,
+        "bedrock" => 5,
+        "copilot" => 6,
+        "deepseek" => 7,
+        "gemini" => 8,
+        "google-gemini-cli" => 9,
+        "qwen-oauth" => 10,
+        "minimax" => 11,
+        "minimax-oauth" => 12,
+        "xai" => 13,
+        "zai" => 14,
+        "ai-gateway" => 15,
         _ => 100,
     };
     (priority, provider.to_string())
@@ -2064,6 +2086,8 @@ fn model_provider_label(provider: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "openai-codex" => "OpenAI Codex".to_string(),
         "anthropic" => "Anthropic".to_string(),
+        "bedrock" => "AWS Bedrock".to_string(),
+        "copilot" => "GitHub Copilot".to_string(),
         "deepseek" => "DeepSeek".to_string(),
         "gemini" => "Google Gemini API".to_string(),
         "google-gemini-cli" => "Google Gemini (OAuth)".to_string(),
@@ -2177,6 +2201,8 @@ fn default_model_for_provider(provider: &str) -> String {
         "openai" => "gpt-5.4".to_string(),
         "openai-codex" => "gpt-5.5".to_string(),
         "anthropic" => "claude-sonnet-4.6".to_string(),
+        "bedrock" => "anthropic.claude-sonnet-4-6-20250514-v1:0".to_string(),
+        "copilot" => "gpt-5.4".to_string(),
         "deepseek" => "deepseek-chat".to_string(),
         "gemini" => "gemini-2.5-flash".to_string(),
         "google-gemini-cli" => "gemini-3.1-pro-preview".to_string(),
@@ -4594,6 +4620,80 @@ exit 9\n",
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Nous Portal credentials: already configured"));
         assert!(rendered.contains("Default model set to: moonshotai/kimi-k2.6 (via Nous Portal)"));
+    }
+
+    #[test]
+    fn setup_model_bedrock_stays_native_when_aws_configured() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        set_env_var("AWS_PROFILE", "test-bedrock");
+        set_env_var("AWS_REGION", "us-west-2");
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let bedrock_choice = providers
+            .iter()
+            .position(|provider| provider.name == "bedrock")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(
+            format!("{bedrock_choice}\nanthropic.claude-sonnet-4-6-20250514-v1:0\n").into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("AWS_PROFILE");
+        remove_env_var("AWS_REGION");
+
+        result.unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: bedrock"));
+        assert!(config_text.contains("default: anthropic.claude-sonnet-4-6-20250514-v1:0"));
+        assert!(config_text.contains("base_url: https://bedrock-runtime.us-west-2.amazonaws.com"));
+        assert!(config_text.contains("api_mode: bedrock_converse"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("AWS Bedrock credentials: already configured"));
+        assert!(rendered.contains(
+            "Default model set to: anthropic.claude-sonnet-4-6-20250514-v1:0 (via AWS Bedrock)"
+        ));
+    }
+
+    #[test]
+    fn setup_model_copilot_stays_native_when_token_present() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        set_env_var("COPILOT_GITHUB_TOKEN", "github_pat_test_token");
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let copilot_choice = providers
+            .iter()
+            .position(|provider| provider.name == "copilot")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(format!("{copilot_choice}\ngpt-5.4\n").into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("COPILOT_GITHUB_TOKEN");
+
+        result.unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: copilot"));
+        assert!(config_text.contains("default: gpt-5.4"));
+        assert!(config_text.contains("base_url: https://api.githubcopilot.com"));
+        assert!(config_text.contains("api_mode: codex_responses"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("GitHub Copilot credentials: already configured"));
+        assert!(rendered.contains("Default model set to: gpt-5.4 (via GitHub Copilot)"));
     }
 
     #[test]
