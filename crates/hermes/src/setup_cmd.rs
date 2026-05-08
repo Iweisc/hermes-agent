@@ -6,7 +6,10 @@ use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
-use hermes_core::{HermesContext, get_auth_status_summary};
+use hermes_core::{
+    HermesContext, get_auth_status_summary, list_provider_profiles, normalize_model_for_provider,
+    resolve_provider_api_mode,
+};
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
 
@@ -46,6 +49,13 @@ pub enum SetupSection {
 }
 
 pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    if should_use_native_model_setup(&args)
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let mut ui = TerminalUi;
+        return run_native_model_setup(context, &mut ui);
+    }
     if should_use_native_agent_setup(&args)
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -143,6 +153,14 @@ fn print_direct_setup_python(section: SetupSection) -> Result<(), Box<dyn Error>
 
 fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Agent))
+        && !args.non_interactive
+        && !args.reset
+        && !args.reconfigure
+        && !args.quick
+}
+
+fn should_use_native_model_setup(args: &SetupArgs) -> bool {
+    matches!(args.section, Some(SetupSection::Model))
         && !args.non_interactive
         && !args.reset
         && !args.reconfigure
@@ -250,6 +268,111 @@ fn run_native_tools_setup(context: &HermesContext) -> Result<(), Box<dyn Error>>
         return Ok(());
     }
     tools_cmd::run_native_tools_interactive(context)
+}
+
+fn run_native_model_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        ui.line(&format_setup_managed_message(&system, "run setup wizard"))?;
+        return Ok(());
+    }
+
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let current_provider =
+        get_nested_string(&root, &["model", "provider"]).unwrap_or_else(|| "auto".to_string());
+    let current_model = get_nested_string(&root, &["model", "default"]).unwrap_or_default();
+    let current_base_url = get_nested_string(&root, &["model", "base_url"]).unwrap_or_default();
+
+    let providers = native_setup_model_providers();
+    let current_label = model_provider_label(&current_provider);
+
+    ui.blank()?;
+    ui.line("⚕ Hermes Setup — Inference Provider")?;
+    ui.line("Choose an API-key provider and default model.")?;
+    ui.line("OAuth providers, custom endpoints, and the advanced model picker remain available through the compatibility flow.")?;
+    ui.blank()?;
+    ui.line(&format!("Current provider: {current_label}"))?;
+    ui.line(&format!(
+        "Current model: {}",
+        if current_model.trim().is_empty() {
+            "(not set)"
+        } else {
+            current_model.trim()
+        }
+    ))?;
+    ui.blank()?;
+
+    for (index, provider) in providers.iter().enumerate() {
+        ui.line(&format!("  {}. {}", index + 1, provider.label))?;
+    }
+    let compatibility_choice = providers.len() + 1;
+    let keep_choice = providers.len() + 2;
+    ui.line(&format!(
+        "  {}. Use compatibility flow (OAuth, custom endpoint, advanced picker)",
+        compatibility_choice
+    ))?;
+    ui.line(&format!("  {}. Keep current", keep_choice))?;
+
+    let default_choice = providers
+        .iter()
+        .position(|provider| provider.name == current_provider)
+        .map(|index| index + 1)
+        .unwrap_or(keep_choice);
+    let selection = prompt_menu_choice(ui, "Select provider: ", keep_choice, default_choice)?;
+
+    if selection == keep_choice {
+        ui.line(&format!(
+            "Keeping current model provider: {}",
+            if current_label.is_empty() {
+                "auto"
+            } else {
+                current_label.as_str()
+            }
+        ))?;
+        return Ok(());
+    }
+
+    if selection == compatibility_choice {
+        return print_direct_setup_python(SetupSection::Model);
+    }
+
+    let selected = &providers[selection - 1];
+    let selected_base_url =
+        if current_provider == selected.name && !current_base_url.trim().is_empty() {
+            current_base_url.clone()
+        } else if !selected.base_url.trim().is_empty() {
+            selected.base_url.to_string()
+        } else {
+            String::new()
+        };
+
+    ensure_model_provider_secret(context, ui, selected)?;
+    let base_url = prompt_model_base_url(ui, selected, &selected_base_url)?;
+    let current_model_for_provider = if current_provider == selected.name {
+        current_model.clone()
+    } else {
+        String::new()
+    };
+    let model_name = prompt_model_name(ui, &selected.name, &current_model_for_provider)?;
+    apply_model_provider_choice(context, &mut root, selected, &model_name, &base_url)?;
+
+    ui.line(&format!(
+        "Default model set to: {} (via {})",
+        normalize_model_for_provider(&model_name, &selected.name),
+        selected.label
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn run_native_model_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut ui = StreamUi { input, output };
+    run_native_model_setup(context, &mut ui)
 }
 
 fn run_native_gateway_setup(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -413,6 +536,16 @@ struct StreamUi<'a> {
     output: &'a mut dyn Write,
 }
 
+#[derive(Debug, Clone)]
+struct NativeModelProvider {
+    name: String,
+    label: String,
+    base_url: &'static str,
+    api_mode: &'static str,
+    api_key_env_var: String,
+    base_url_env_var: Option<String>,
+}
+
 impl SetupUi for StreamUi<'_> {
     fn line(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
         writeln!(self.output, "{text}")?;
@@ -566,6 +699,231 @@ fn run_native_agent_setup(
     write_yaml_mapping(&context.config_path(), &root)?;
     ui.blank()?;
     ui.line("Agent Settings configuration complete!")?;
+    Ok(())
+}
+
+fn native_setup_model_providers() -> Vec<NativeModelProvider> {
+    let mut providers = list_provider_profiles()
+        .into_iter()
+        .filter(|profile| profile.auth_type == "api_key" && profile.name != "custom")
+        .filter_map(|profile| {
+            let api_key_env_var = profile.api_key_env_vars().next()?.to_string();
+            Some(NativeModelProvider {
+                name: profile.name.to_string(),
+                label: model_provider_label(profile.name),
+                base_url: profile.base_url,
+                api_mode: profile.api_mode,
+                api_key_env_var,
+                base_url_env_var: profile.base_url_env_var().map(ToOwned::to_owned),
+            })
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|provider| model_provider_order(&provider.name));
+    providers
+}
+
+fn model_provider_order(provider: &str) -> (usize, String) {
+    let priority = match provider {
+        "openrouter" => 0,
+        "openai" => 1,
+        "anthropic" => 2,
+        "deepseek" => 3,
+        "gemini" => 4,
+        "xai" => 5,
+        "zai" => 6,
+        "minimax" => 7,
+        "ai-gateway" => 8,
+        _ => 100,
+    };
+    (priority, provider.to_string())
+}
+
+fn model_provider_label(provider: &str) -> String {
+    match provider {
+        "openrouter" => "OpenRouter".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "anthropic" => "Anthropic".to_string(),
+        "deepseek" => "DeepSeek".to_string(),
+        "gemini" => "Google Gemini API".to_string(),
+        "xai" => "xAI".to_string(),
+        "zai" => "Z.AI / GLM".to_string(),
+        "minimax" => "MiniMax".to_string(),
+        "minimax-cn" => "MiniMax CN".to_string(),
+        "kimi-coding" => "Kimi Coding".to_string(),
+        "kimi-coding-cn" => "Kimi Coding (China)".to_string(),
+        "ai-gateway" => "Vercel AI Gateway".to_string(),
+        "opencode-zen" => "OpenCode Zen".to_string(),
+        "opencode-go" => "OpenCode Go".to_string(),
+        "lmstudio" => "LM Studio".to_string(),
+        other => other
+            .split('-')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                let mut chars = segment.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn ensure_model_provider_secret(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    provider: &NativeModelProvider,
+) -> Result<(), Box<dyn Error>> {
+    let current = env_value_for_context(context, &provider.api_key_env_var);
+    if current.is_some() {
+        ui.line(&format!("{} API key: already configured", provider.label))?;
+        if !prompt_yes_no(ui, "  Update API key? [y/N]: ", false)? {
+            return Ok(());
+        }
+    } else {
+        ui.line(&format!(
+            "{} requires an API key in {}.",
+            provider.label, provider.api_key_env_var
+        ))?;
+    }
+
+    let api_key = ui.prompt_secret(&format!("{} API key: ", provider.label))?;
+    if api_key.trim().is_empty() {
+        return Err("No API key provided.".into());
+    }
+    save_env_value(
+        context.env_path(),
+        &provider.api_key_env_var,
+        api_key.trim(),
+    )?;
+    ui.line(&format!("Saved {}", provider.api_key_env_var))?;
+    Ok(())
+}
+
+fn prompt_model_base_url(
+    ui: &mut dyn SetupUi,
+    provider: &NativeModelProvider,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    let fallback = if current.trim().is_empty() {
+        provider.base_url
+    } else {
+        current
+    };
+    loop {
+        let value = prompt_with_default(ui, "Base URL", fallback)?;
+        if value.trim().is_empty() {
+            return Err("Base URL must not be empty.".into());
+        }
+        if !looks_like_http_url(&value) {
+            ui.line("Base URL must start with http:// or https://")?;
+            continue;
+        }
+        return Ok(value.trim_end_matches('/').to_string());
+    }
+}
+
+fn prompt_model_name(
+    ui: &mut dyn SetupUi,
+    provider: &str,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    let suggested = if current.trim().is_empty() {
+        default_model_for_provider(provider)
+    } else {
+        current.to_string()
+    };
+    loop {
+        let value = if suggested.trim().is_empty() {
+            ui.prompt("Default model: ")?
+        } else {
+            prompt_with_default(ui, "Default model", &suggested)?
+        };
+        if !value.trim().is_empty() {
+            return Ok(value.trim().to_string());
+        }
+        ui.line("Model name must not be empty.")?;
+    }
+}
+
+fn default_model_for_provider(provider: &str) -> String {
+    match provider {
+        "openrouter" => "openai/gpt-5.4".to_string(),
+        "openai" => "gpt-5.4".to_string(),
+        "anthropic" => "claude-sonnet-4.6".to_string(),
+        "deepseek" => "deepseek-chat".to_string(),
+        "gemini" => "gemini-2.5-flash".to_string(),
+        "xai" => "grok-4-fast-reasoning".to_string(),
+        "zai" => "glm-5".to_string(),
+        "minimax" | "minimax-cn" => "MiniMax-M2.7".to_string(),
+        "ai-gateway" => "anthropic/claude-sonnet-4.6".to_string(),
+        "kimi-coding" | "kimi-coding-cn" => "kimi-k2.6".to_string(),
+        "alibaba" => "qwen-plus".to_string(),
+        "alibaba-coding-plan" => "qwen-plus".to_string(),
+        "arcee" => "trinity-mini".to_string(),
+        "gmi" => "gpt-4.1-mini".to_string(),
+        "huggingface" => "Qwen/Qwen3.5-397B-A17B".to_string(),
+        "kilocode" => "openai/gpt-5.4".to_string(),
+        "lmstudio" => "local-model".to_string(),
+        "nvidia" => "meta/llama-3.1-70b-instruct".to_string(),
+        "ollama-cloud" => "deepseek-r1".to_string(),
+        "opencode-go" => "kimi-k2.6".to_string(),
+        "opencode-zen" => "gpt-5.4".to_string(),
+        "stepfun" => "step-3.5-flash".to_string(),
+        "tencent-tokenhub" => "deepseek-v3.1".to_string(),
+        "xiaomi" => "mimo-v2.5".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn apply_model_provider_choice(
+    context: &HermesContext,
+    root: &mut Mapping,
+    provider: &NativeModelProvider,
+    model_name: &str,
+    base_url: &str,
+) -> Result<(), Box<dyn Error>> {
+    let normalized_model = normalize_model_for_provider(model_name, &provider.name);
+    let model = ensure_mapping(root, "model");
+    model.insert(yaml_key("default"), Value::String(normalized_model));
+    model.insert(yaml_key("provider"), Value::String(provider.name.clone()));
+    model.insert(yaml_key("base_url"), Value::String(base_url.to_string()));
+    if let Some(api_mode) = resolve_provider_api_mode(&provider.name, model_name) {
+        model.insert(yaml_key("api_mode"), Value::String(api_mode.to_string()));
+    } else if !provider.api_mode.trim().is_empty() {
+        model.insert(
+            yaml_key("api_mode"),
+            Value::String(provider.api_mode.to_string()),
+        );
+    } else {
+        model.remove(yaml_key("api_mode"));
+    }
+
+    if let Some(base_url_env_var) = provider.base_url_env_var.as_deref() {
+        save_env_value(context.env_path(), base_url_env_var, base_url)?;
+    }
+    if provider.name != "custom" {
+        let _ = remove_env_key(&context.env_path(), "OPENAI_BASE_URL")?;
+    }
+    clear_active_provider_marker(context.hermes_home().as_path())?;
+    write_yaml_mapping(&context.config_path(), root)?;
+    Ok(())
+}
+
+fn clear_active_provider_marker(hermes_home: &Path) -> Result<(), Box<dyn Error>> {
+    let auth_path = hermes_home.join("auth.json");
+    if !auth_path.exists() {
+        return Ok(());
+    }
+    let mut payload = serde_json::from_str::<JsonValue>(&fs::read_to_string(&auth_path)?)?;
+    let Some(root) = payload.as_object_mut() else {
+        return Ok(());
+    };
+    if root.get("active_provider").is_some() {
+        root.insert("active_provider".to_string(), JsonValue::Null);
+        fs::write(&auth_path, serde_json::to_string_pretty(&payload)?)?;
+    }
     Ok(())
 }
 
@@ -1316,11 +1674,45 @@ fn prompt_yes_no(
     }
 }
 
+fn env_value_for_context(context: &HermesContext, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_env_file_value(&context.env_path(), key))
+}
+
+fn read_env_file_value(path: &PathBuf, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((entry_key, entry_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if entry_key.trim() == key {
+            let value = entry_value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn env_value(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn looks_like_http_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("http://") || normalized.starts_with("https://")
 }
 
 fn nous_auth_present(context: &HermesContext) -> bool {
@@ -1819,6 +2211,31 @@ mod tests {
     }
 
     #[test]
+    fn native_model_setup_only_allows_plain_model() {
+        assert!(should_use_native_model_setup(&SetupArgs {
+            section: Some(SetupSection::Model),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+        assert!(!should_use_native_model_setup(&SetupArgs {
+            section: Some(SetupSection::Model),
+            non_interactive: true,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+        assert!(!should_use_native_model_setup(&SetupArgs {
+            section: Some(SetupSection::Gateway),
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        }));
+    }
+
+    #[test]
     fn native_gateway_setup_only_allows_plain_gateway() {
         assert!(should_use_native_gateway_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
@@ -1945,6 +2362,65 @@ exit 9\n",
         assert!(output.contains("model"));
         assert!(!output.contains("wizard"));
         remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    fn setup_model_native_openrouter_updates_env_config_and_auth_marker() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "model:\n  provider: custom\n  default: llama3\n  base_url: http://old.example/v1\n  api_mode: chat_completions\n",
+        )
+        .unwrap();
+        fs::write(home.join(".env"), "OPENAI_BASE_URL=http://old.example/v1\n").unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": 1,
+                "active_provider": "nous",
+                "providers": {
+                    "nous": {
+                        "access_token": "token"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let openrouter_choice = providers
+            .iter()
+            .position(|provider| provider.name == "openrouter")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(
+            format!("{openrouter_choice}\nsk-openrouter\n\nopenai/gpt-5.4\n").into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: openrouter"));
+        assert!(config_text.contains("default: openai/gpt-5.4"));
+        assert!(config_text.contains("base_url: https://openrouter.ai/api/v1"));
+        assert!(config_text.contains("api_mode: chat_completions"));
+
+        let env_text = fs::read_to_string(home.join(".env")).unwrap();
+        assert!(env_text.contains("OPENROUTER_API_KEY=sk-openrouter"));
+        assert!(!env_text.contains("OPENAI_BASE_URL="));
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert!(auth_json["active_provider"].is_null());
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Choose an API-key provider and default model."));
+        assert!(rendered.contains("Default model set to: openai/gpt-5.4 (via OpenRouter)"));
     }
 
     #[test]
