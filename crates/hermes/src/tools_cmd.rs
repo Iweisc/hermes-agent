@@ -628,38 +628,46 @@ fn reconfigure_web_with_io(
     let current_backend = nested_string(&root, &["web", "backend"]).unwrap_or_default();
     let current_use_gateway = nested_bool(&root, &["web", "use_gateway"]).unwrap_or(false);
     let current_firecrawl_url = env_value_for_context(context, "FIRECRAWL_API_URL");
-    let compatibility_recommended = current_use_gateway
-        || !matches!(
-            current_backend.as_str(),
-            "" | "firecrawl" | "exa" | "parallel" | "tavily" | "searxng"
-        );
+    let managed_known = current_use_gateway && current_backend == "firecrawl";
+    let compatibility_recommended = !managed_known
+        && (current_use_gateway
+            || !matches!(
+                current_backend.as_str(),
+                "" | "firecrawl" | "exa" | "parallel" | "tavily" | "searxng"
+            ));
 
     writeln!(output)?;
     writeln!(output, "Web Search & Scraping")?;
-    let choices = [
+    let mut choices = Vec::new();
+    if managed_known {
+        choices.push("Nous Subscription");
+    }
+    choices.extend([
         "Firecrawl Cloud",
         "Exa",
         "Parallel",
         "Tavily",
         "Firecrawl Self-Hosted",
         "SearXNG",
-        if compatibility_recommended {
-            "Use compatibility flow (recommended)"
-        } else {
-            "Use compatibility flow"
-        },
-    ];
+    ]);
+    choices.push(if compatibility_recommended {
+        "Use compatibility flow (recommended)"
+    } else {
+        "Use compatibility flow"
+    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
         return run_python_tools_reconfigure_toolset("web");
     }
+    let direct_offset = usize::from(managed_known);
 
     {
         let web = ensure_mapping(&mut root, "web");
         web.insert(
             yaml_key("backend"),
             Value::String(
-                match selection {
+                match selection.saturating_sub(direct_offset) {
+                    0 if managed_known => "firecrawl",
                     0 | 4 => "firecrawl",
                     1 => "exa",
                     2 => "parallel",
@@ -670,10 +678,19 @@ fn reconfigure_web_with_io(
                 .to_string(),
             ),
         );
-        web.insert(yaml_key("use_gateway"), Value::Bool(false));
+        web.insert(
+            yaml_key("use_gateway"),
+            Value::Bool(managed_known && selection == 0),
+        );
     }
 
-    match selection {
+    match selection.saturating_sub(direct_offset) {
+        0 if managed_known && selection == 0 => {
+            writeln!(
+                output,
+                "Web requests will use the managed Nous gateway and bill to your subscription."
+            )?;
+        }
         0 => {
             writeln!(output, "Get key at: https://firecrawl.dev")?;
             prompt_secret_env_update(
@@ -746,37 +763,45 @@ fn reconfigure_browser_with_io(
     let current_provider = nested_string(&root, &["browser", "cloud_provider"]).unwrap_or_default();
     let current_use_gateway = nested_bool(&root, &["browser", "use_gateway"]).unwrap_or(false);
     let current_camofox_url = env_value_for_context(context, "CAMOFOX_URL");
-    let compatibility_recommended = current_use_gateway
-        || !matches!(
-            current_provider.as_str(),
-            "" | "local" | "browserbase" | "browser-use" | "firecrawl" | "camofox"
-        );
+    let managed_known = current_use_gateway && current_provider == "browser-use";
+    let compatibility_recommended = !managed_known
+        && (current_use_gateway
+            || !matches!(
+                current_provider.as_str(),
+                "" | "local" | "browserbase" | "browser-use" | "firecrawl" | "camofox"
+            ));
 
     writeln!(output)?;
     writeln!(output, "Browser Automation")?;
-    let choices = [
+    let mut choices = Vec::new();
+    if managed_known {
+        choices.push("Nous Subscription");
+    }
+    choices.extend([
         "Local Browser",
         "Browserbase",
         "Browser Use",
         "Firecrawl",
         "Camofox",
-        if compatibility_recommended {
-            "Use compatibility flow (recommended)"
-        } else {
-            "Use compatibility flow"
-        },
-    ];
+    ]);
+    choices.push(if compatibility_recommended {
+        "Use compatibility flow (recommended)"
+    } else {
+        "Use compatibility flow"
+    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
         return run_python_tools_reconfigure_toolset("browser");
     }
+    let direct_offset = usize::from(managed_known);
 
     {
         let browser = ensure_mapping(&mut root, "browser");
         browser.insert(
             yaml_key("cloud_provider"),
             Value::String(
-                match selection {
+                match selection.saturating_sub(direct_offset) {
+                    0 if managed_known => "browser-use",
                     0 => "local",
                     1 => "browserbase",
                     2 => "browser-use",
@@ -787,10 +812,19 @@ fn reconfigure_browser_with_io(
                 .to_string(),
             ),
         );
-        browser.insert(yaml_key("use_gateway"), Value::Bool(false));
+        browser.insert(
+            yaml_key("use_gateway"),
+            Value::Bool(managed_known && selection == 0),
+        );
     }
 
-    match selection {
+    match selection.saturating_sub(direct_offset) {
+        0 if managed_known && selection == 0 => {
+            writeln!(
+                output,
+                "Browser requests will use the managed Nous gateway and bill to your subscription."
+            )?;
+        }
         0 => {
             writeln!(output, "Browser set to local mode.")?;
         }
@@ -898,32 +932,58 @@ fn reconfigure_image_gen_with_io(
     let mut root = read_raw_yaml_mapping(&context.config_path())?;
     let current_provider = nested_string(&root, &["image_gen", "provider"]).unwrap_or_default();
     let current_use_gateway = nested_bool(&root, &["image_gen", "use_gateway"]).unwrap_or(false);
-    let compatibility_recommended =
-        current_use_gateway || !matches!(current_provider.as_str(), "" | "fal" | "openai" | "xai");
+    let managed_known = current_use_gateway && matches!(current_provider.as_str(), "" | "fal");
+    let compatibility_recommended = !managed_known
+        && (current_use_gateway
+            || !matches!(current_provider.as_str(), "" | "fal" | "openai" | "xai"));
 
     writeln!(output)?;
     writeln!(output, "Image Generation")?;
-    let choices = [
-        "FAL.ai",
-        "OpenAI Images",
-        "xAI Images",
-        if compatibility_recommended {
-            "Use compatibility flow (recommended)"
-        } else {
-            "Use compatibility flow"
-        },
-    ];
+    let mut choices = Vec::new();
+    if managed_known {
+        choices.push("Nous Subscription");
+    }
+    choices.extend(["FAL.ai", "OpenAI Images", "xAI Images"]);
+    choices.push(if compatibility_recommended {
+        "Use compatibility flow (recommended)"
+    } else {
+        "Use compatibility flow"
+    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
         return run_python_tools_reconfigure_toolset("image_gen");
     }
+    let direct_offset = usize::from(managed_known);
 
     {
         let image_gen = ensure_mapping(&mut root, "image_gen");
-        image_gen.insert(yaml_key("use_gateway"), Value::Bool(false));
+        image_gen.insert(
+            yaml_key("use_gateway"),
+            Value::Bool(managed_known && selection == 0),
+        );
     }
 
-    match selection {
+    match selection.saturating_sub(direct_offset) {
+        0 if managed_known && selection == 0 => {
+            let current_model = nested_string(&root, &["image_gen", "model"]);
+            let image_gen = ensure_mapping(&mut root, "image_gen");
+            if !current_model.as_deref().is_some_and(is_known_fal_model) {
+                image_gen.insert(
+                    yaml_key("model"),
+                    Value::String(DEFAULT_FAL_IMAGE_MODEL.to_string()),
+                );
+            }
+            if !matches!(
+                image_gen.get(yaml_key("provider")).and_then(Value::as_str),
+                None | Some("") | Some("fal")
+            ) {
+                image_gen.insert(yaml_key("provider"), Value::String("fal".to_string()));
+            }
+            writeln!(
+                output,
+                "Image generation will use the managed Nous gateway and bill to your subscription."
+            )?;
+        }
         0 => {
             let current_model = nested_string(&root, &["image_gen", "model"]);
             let image_gen = ensure_mapping(&mut root, "image_gen");
@@ -2331,6 +2391,28 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
+    fn tools_reconfigure_web_uses_managed_nous_flow_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-web-nous");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - web\nweb:\n  backend: firecrawl\n  use_gateway: true\n",
+        );
+
+        let mut input = Cursor::new(b"1\n1\n".to_vec());
+        let mut output = Vec::new();
+        run_tools_reconfigure_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("backend: firecrawl"));
+        assert!(saved.contains("use_gateway: true"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Nous Subscription"));
+        assert!(rendered.contains("managed Nous gateway"));
+    }
+
+    #[test]
     fn tools_reconfigure_tts_uses_native_setup_flow() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let home = temp_path("reconfigure-tts");
@@ -2397,6 +2479,25 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
+    fn tools_reconfigure_image_gen_uses_managed_nous_flow_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-image-gen-nous");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(&context.config_path(), "image_gen:\n  use_gateway: true\n");
+
+        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_image_gen_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("use_gateway: true"));
+        assert!(saved.contains("model: fal-ai/flux-2/klein/9b"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Nous Subscription"));
+        assert!(rendered.contains("managed Nous gateway"));
+    }
+
+    #[test]
     fn tools_reconfigure_rl_updates_keys_natively() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let home = temp_path("reconfigure-rl");
@@ -2441,6 +2542,28 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Browser Automation"));
         assert!(rendered.contains("Browser cloud provider set to: browserbase"));
+    }
+
+    #[test]
+    fn tools_reconfigure_browser_uses_managed_nous_flow_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-browser-nous");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        write_config(
+            &context.config_path(),
+            "platform_toolsets:\n  cli:\n    - browser\nbrowser:\n  cloud_provider: browser-use\n  use_gateway: true\n",
+        );
+
+        let mut input = Cursor::new(b"1\n1\n".to_vec());
+        let mut output = Vec::new();
+        run_tools_reconfigure_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("cloud_provider: browser-use"));
+        assert!(saved.contains("use_gateway: true"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Nous Subscription"));
+        assert!(rendered.contains("managed Nous gateway"));
     }
 
     #[test]
