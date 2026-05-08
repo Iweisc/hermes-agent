@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -52,6 +52,10 @@ const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/0.0.0 (external, cli)";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_OAUTH_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const DEFAULT_NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
+const DEFAULT_NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com/v1";
+const DEFAULT_NOUS_CLIENT_ID: &str = "hermes-cli";
+const DEFAULT_NOUS_SCOPE: &str = "inference:mint_agent_key";
 
 const AUTH_ADD_BOOTSTRAP: &str = concat!(
     "import os\n",
@@ -423,6 +427,9 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     }
     match normalize_auth_type(args.auth_type.as_deref()) {
         Some("oauth") | None => {
+            if provider == "nous" {
+                return args.api_key.is_none() && !args.insecure && args.ca_bundle.is_none();
+            }
             args.api_key.is_none()
                 && args.portal_url.is_none()
                 && args.inference_url.is_none()
@@ -859,9 +866,8 @@ fn native_auth_add_runtime_oauth(
 ) -> Result<(), Box<dyn Error>> {
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
-    if provider == "nous" && provider_pool_has_entries(context.hermes_home().as_path(), &provider)?
-    {
-        return run_python_auth_add(args);
+    if provider == "nous" {
+        return native_auth_add_nous_oauth(context, args);
     }
     let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
     let default_label = oauth_default_label(&provider, next_index);
@@ -980,6 +986,311 @@ fn native_auth_add_runtime_oauth(
         "Added {} OAuth credential #{}: \"{}\"",
         provider, stored_count, label
     );
+    Ok(())
+}
+
+fn native_auth_add_nous_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    native_auth_add_nous_oauth_with_io(context, args, &mut output)
+}
+
+fn native_auth_add_nous_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add nous`.")?;
+    if provider != "nous" {
+        return run_python_auth_add(args);
+    }
+
+    let timeout_seconds = validated_timeout_seconds(args.timeout, 15.0)?;
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if provider_state_exists(context.hermes_home().as_path(), "nous")? {
+        if has_explicit_nous_runtime_overrides(args) {
+            let auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+            let mut state = provider_state_json(&auth_store, "nous")
+                .ok_or("Nous auth state is missing before runtime update.")?;
+            state.insert(
+                "portal_base_url".to_string(),
+                JsonValue::String(resolve_nous_portal_base_url(args)?),
+            );
+            state.insert(
+                "inference_base_url".to_string(),
+                JsonValue::String(resolve_nous_inference_base_url(args)?),
+            );
+            state.insert(
+                "client_id".to_string(),
+                JsonValue::String(resolve_nous_client_id(args)),
+            );
+            state.insert(
+                "scope".to_string(),
+                JsonValue::String(resolve_nous_scope(args)),
+            );
+            if let Some(label) = requested_label.as_deref() {
+                state.insert("label".to_string(), JsonValue::String(label.to_string()));
+            }
+            let _ = auth_store;
+            seed_nous_provider_state_and_resolve(
+                context.hermes_home().as_path(),
+                state,
+                timeout_seconds,
+            )?;
+        } else {
+            resolve_nous_runtime_credentials(
+                context.hermes_home().as_path(),
+                300,
+                timeout_seconds,
+            )?;
+        }
+        let (stored_count, label) = finalize_nous_auth_add(
+            context.hermes_home().as_path(),
+            requested_label.as_deref(),
+            &default_label,
+        )?;
+        writeln!(
+            output,
+            "Added nous OAuth credential #{}: \"{}\"",
+            stored_count, label
+        )?;
+        output.flush()?;
+        return Ok(());
+    }
+
+    let portal_base_url = resolve_nous_portal_base_url(args)?;
+    let requested_inference_url = resolve_nous_inference_base_url(args)?;
+    let client_id = resolve_nous_client_id(args);
+    let scope = resolve_nous_scope(args);
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds))
+        .build()?;
+
+    let mut device_form = vec![("client_id".to_string(), client_id.clone())];
+    if !scope.trim().is_empty() {
+        device_form.push(("scope".to_string(), scope.clone()));
+    }
+    let device_response = client
+        .post(format!(
+            "{}/api/oauth/device/code",
+            portal_base_url.trim_end_matches('/')
+        ))
+        .header("Accept", "application/json")
+        .form(&device_form)
+        .send()
+        .map_err(|error| format!("Failed to request Nous device code: {error}"))?;
+    let device_status = device_response.status();
+    let device_body = device_response.text()?;
+    if !device_status.is_success() {
+        return Err(format!(
+            "Nous device code request returned status {}.",
+            device_status.as_u16()
+        )
+        .into());
+    }
+    let device_payload = serde_json::from_str::<JsonValue>(&device_body)?;
+    let device_payload = device_payload
+        .as_object()
+        .ok_or("Nous device code response was not a JSON object.")?;
+    let device_code = json_string(device_payload, "device_code")
+        .ok_or("Nous device code response missing device_code.")?
+        .to_string();
+    let user_code = json_string(device_payload, "user_code")
+        .ok_or("Nous device code response missing user_code.")?
+        .to_string();
+    let verification_url = json_string(device_payload, "verification_uri_complete")
+        .or_else(|| json_string(device_payload, "verification_uri"))
+        .ok_or("Nous device code response missing verification_uri.")?
+        .to_string();
+    let expires_in = json_i64(device_payload.get("expires_in"))
+        .unwrap_or(0)
+        .max(1);
+    let mut poll_interval = json_i64(device_payload.get("interval"))
+        .unwrap_or(5)
+        .clamp(1, 30);
+
+    writeln!(output, "Starting Hermes login via Nous...")?;
+    writeln!(output, "Portal: {portal_base_url}")?;
+    writeln!(output)?;
+    writeln!(output, "To continue:")?;
+    writeln!(output, "  1. Open: {verification_url}")?;
+    writeln!(output, "  2. If prompted, enter code: {user_code}")?;
+    if !args.no_browser && !is_remote_session() {
+        if try_open_browser(&verification_url)? {
+            writeln!(output, "  (Opened browser for verification)")?;
+        } else {
+            writeln!(
+                output,
+                "  Could not open browser automatically — use the URL above."
+            )?;
+        }
+    }
+    writeln!(
+        output,
+        "Waiting for approval (polling every {}s)...",
+        poll_interval
+    )?;
+    output.flush()?;
+
+    let started = std::time::Instant::now();
+    let token_payload = loop {
+        if started.elapsed().as_secs() >= expires_in as u64 {
+            return Err("Timed out waiting for device authorization.".into());
+        }
+        let token_response = client
+            .post(format!(
+                "{}/api/oauth/token",
+                portal_base_url.trim_end_matches('/')
+            ))
+            .header("Accept", "application/json")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", client_id.as_str()),
+                ("device_code", device_code.as_str()),
+            ])
+            .send()
+            .map_err(|error| format!("Nous device auth polling failed: {error}"))?;
+        let status = token_response.status();
+        let body = token_response.text()?;
+        let payload = serde_json::from_str::<JsonValue>(&body).unwrap_or(JsonValue::Null);
+        if status.is_success() {
+            let payload = payload
+                .as_object()
+                .ok_or("Nous token response was not a JSON object.")?
+                .clone();
+            if json_string(&payload, "access_token").is_none() {
+                return Err("Nous token response missing access_token.".into());
+            }
+            break payload;
+        }
+        let Some(error_payload) = payload.as_object() else {
+            return Err(format!("Nous token exchange returned status {}.", status.as_u16()).into());
+        };
+        let error_code = json_string(error_payload, "error").unwrap_or_default();
+        if error_code == "authorization_pending" {
+            thread::sleep(Duration::from_secs(poll_interval as u64));
+            continue;
+        }
+        if error_code == "slow_down" {
+            poll_interval = (poll_interval + 1).min(30);
+            thread::sleep(Duration::from_secs(poll_interval as u64));
+            continue;
+        }
+        let description = json_string(error_payload, "error_description")
+            .unwrap_or("Unknown authentication error");
+        if !error_code.is_empty() {
+            return Err(format!("{error_code}: {description}").into());
+        }
+        return Err(format!("Nous token exchange returned status {}.", status.as_u16()).into());
+    };
+
+    let now = Utc::now();
+    let token_expires_in = json_i64(token_payload.get("expires_in"))
+        .unwrap_or(0)
+        .max(0);
+    let mut resolved_inference_url = requested_inference_url.clone();
+    if let Some(portal_inference_url) = token_payload
+        .get("inference_base_url")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        resolved_inference_url = normalize_http_url(portal_inference_url, "inference URL")?;
+        if resolved_inference_url != requested_inference_url {
+            writeln!(
+                output,
+                "Using portal-provided inference URL: {resolved_inference_url}"
+            )?;
+            output.flush()?;
+        }
+    }
+
+    let mut state = JsonMap::new();
+    state.insert(
+        "portal_base_url".to_string(),
+        JsonValue::String(portal_base_url.clone()),
+    );
+    state.insert(
+        "inference_base_url".to_string(),
+        JsonValue::String(resolved_inference_url),
+    );
+    state.insert("client_id".to_string(), JsonValue::String(client_id));
+    state.insert(
+        "scope".to_string(),
+        JsonValue::String(
+            json_string(&token_payload, "scope")
+                .unwrap_or(scope.as_str())
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "token_type".to_string(),
+        JsonValue::String(
+            json_string(&token_payload, "token_type")
+                .unwrap_or("Bearer")
+                .to_string(),
+        ),
+    );
+    state.insert(
+        "access_token".to_string(),
+        JsonValue::String(
+            json_string(&token_payload, "access_token")
+                .ok_or("Nous token response missing access_token.")?
+                .to_string(),
+        ),
+    );
+    if let Some(refresh_token) = json_string(&token_payload, "refresh_token") {
+        state.insert(
+            "refresh_token".to_string(),
+            JsonValue::String(refresh_token.to_string()),
+        );
+    }
+    state.insert(
+        "obtained_at".to_string(),
+        JsonValue::String(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    state.insert(
+        "expires_at".to_string(),
+        JsonValue::String(
+            (now + ChronoDuration::seconds(token_expires_in))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+    );
+    state.insert("expires_in".to_string(), JsonValue::from(token_expires_in));
+    state.insert("agent_key".to_string(), JsonValue::Null);
+    state.insert("agent_key_id".to_string(), JsonValue::Null);
+    state.insert("agent_key_expires_at".to_string(), JsonValue::Null);
+    state.insert("agent_key_expires_in".to_string(), JsonValue::Null);
+    state.insert("agent_key_reused".to_string(), JsonValue::Null);
+    state.insert("agent_key_obtained_at".to_string(), JsonValue::Null);
+    if let Some(label) = requested_label.as_deref() {
+        state.insert("label".to_string(), JsonValue::String(label.to_string()));
+    }
+
+    seed_nous_provider_state_and_resolve(context.hermes_home().as_path(), state, timeout_seconds)?;
+    let (stored_count, label) = finalize_nous_auth_add(
+        context.hermes_home().as_path(),
+        requested_label.as_deref(),
+        &default_label,
+    )?;
+    writeln!(
+        output,
+        "Added nous OAuth credential #{}: \"{}\"",
+        stored_count, label
+    )?;
+    output.flush()?;
     Ok(())
 }
 
@@ -2589,8 +2900,357 @@ fn add_auth_pool_entry(
     Ok(count)
 }
 
+fn upsert_auth_pool_entry_by_sources(
+    hermes_home: &Path,
+    provider: &str,
+    entry: NewPoolEntry,
+    replace_sources: &[&str],
+) -> Result<usize, Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let root = auth_store
+        .as_object_mut()
+        .ok_or("auth store is not a JSON object")?;
+    if !root.contains_key("version") {
+        root.insert("version".to_string(), JsonValue::from(1));
+    }
+    if !root.contains_key("providers") {
+        root.insert(
+            "providers".to_string(),
+            JsonValue::Object(Default::default()),
+        );
+    }
+    let pool = ensure_json_object(root, "credential_pool")?;
+    let provider_entries = pool
+        .entry(provider.to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let provider_entries = provider_entries
+        .as_array_mut()
+        .ok_or("credential_pool entry is not an array")?;
+
+    let mut first_match_index = None;
+    let mut preserved_id = None;
+    let mut filtered = Vec::with_capacity(provider_entries.len());
+    for (index, value) in provider_entries.iter().enumerate() {
+        let matches = value
+            .as_object()
+            .and_then(|mapping| mapping.get("source"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|source| replace_sources.iter().any(|candidate| *candidate == source));
+        if matches {
+            if first_match_index.is_none() {
+                first_match_index = Some(index);
+                preserved_id = value
+                    .as_object()
+                    .and_then(|mapping| mapping.get("id"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            continue;
+        }
+        filtered.push(value.clone());
+    }
+
+    let insert_at = first_match_index
+        .unwrap_or(filtered.len())
+        .min(filtered.len());
+    let mut payload = JsonMap::new();
+    payload.insert(
+        "id".to_string(),
+        JsonValue::String(preserved_id.unwrap_or_else(generate_short_id)),
+    );
+    payload.insert("label".to_string(), JsonValue::String(entry.label));
+    payload.insert("auth_type".to_string(), JsonValue::String(entry.auth_type));
+    payload.insert("source".to_string(), JsonValue::String(entry.source));
+    payload.insert(
+        "access_token".to_string(),
+        JsonValue::String(entry.access_token),
+    );
+    if let Some(refresh_token) = entry.refresh_token.filter(|value| !value.trim().is_empty()) {
+        payload.insert(
+            "refresh_token".to_string(),
+            JsonValue::String(refresh_token),
+        );
+    }
+    if let Some(base_url) = entry.base_url.filter(|value| !value.trim().is_empty()) {
+        payload.insert("base_url".to_string(), JsonValue::String(base_url));
+    }
+    if let Some(expires_at_ms) = entry.expires_at_ms {
+        payload.insert("expires_at_ms".to_string(), JsonValue::from(expires_at_ms));
+    }
+    if let Some(last_refresh) = entry.last_refresh.filter(|value| !value.trim().is_empty()) {
+        payload.insert("last_refresh".to_string(), JsonValue::String(last_refresh));
+    }
+    filtered.insert(insert_at, JsonValue::Object(payload));
+    for (priority, value) in filtered.iter_mut().enumerate() {
+        if let Some(mapping) = value.as_object_mut() {
+            mapping.insert("priority".to_string(), JsonValue::from(priority as i64));
+            for key in [
+                "last_status",
+                "last_status_at",
+                "last_error_code",
+                "last_error_reason",
+                "last_error_message",
+                "last_error_reset_at",
+            ] {
+                mapping.remove(key);
+            }
+        }
+    }
+    *provider_entries = filtered;
+    save_auth_store_json(hermes_home, &auth_store)?;
+    Ok(insert_at + 1)
+}
+
 fn oauth_default_label(provider: &str, count: usize) -> String {
     format!("{provider}-oauth-{count}")
+}
+
+fn has_explicit_nous_runtime_overrides(args: &AuthAddArgs) -> bool {
+    args.portal_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || args
+            .inference_url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || args
+            .client_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || args
+            .scope
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn validated_timeout_seconds(raw: Option<f64>, default: f64) -> Result<f64, Box<dyn Error>> {
+    match raw {
+        Some(value) if value > 0.0 => Ok(value),
+        Some(_) => Err("timeout must be greater than 0.".into()),
+        None => Ok(default),
+    }
+}
+
+fn normalize_http_url(raw: &str, field: &str) -> Result<String, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} cannot be empty.").into());
+    }
+    let parsed = Url::parse(trimmed).map_err(|error| format!("Invalid {field}: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("{field} must use http or https.").into());
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn resolve_nous_portal_base_url(args: &AuthAddArgs) -> Result<String, Box<dyn Error>> {
+    let candidate = args
+        .portal_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("HERMES_PORTAL_BASE_URL"))
+        .or_else(|| env_trimmed("NOUS_PORTAL_BASE_URL"))
+        .unwrap_or_else(|| DEFAULT_NOUS_PORTAL_URL.to_string());
+    normalize_http_url(&candidate, "portal URL")
+}
+
+fn resolve_nous_inference_base_url(args: &AuthAddArgs) -> Result<String, Box<dyn Error>> {
+    let candidate = args
+        .inference_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| env_trimmed("NOUS_INFERENCE_BASE_URL"))
+        .unwrap_or_else(|| DEFAULT_NOUS_INFERENCE_URL.to_string());
+    normalize_http_url(&candidate, "inference URL")
+}
+
+fn resolve_nous_client_id(args: &AuthAddArgs) -> String {
+    args.client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| DEFAULT_NOUS_CLIENT_ID.to_string())
+}
+
+fn resolve_nous_scope(args: &AuthAddArgs) -> String {
+    args.scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| DEFAULT_NOUS_SCOPE.to_string())
+}
+
+fn json_i64(value: Option<&JsonValue>) -> Option<i64> {
+    match value {
+        Some(JsonValue::Number(number)) => number.as_i64(),
+        Some(JsonValue::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn seed_nous_provider_state_and_resolve(
+    hermes_home: &Path,
+    state: JsonMap<String, JsonValue>,
+    timeout_seconds: f64,
+) -> Result<(), Box<dyn Error>> {
+    let auth_path = hermes_home.join("auth.json");
+    let existed_before = auth_path.exists();
+    let original_auth = load_auth_store_json(hermes_home)?;
+    let mut seeded_auth = original_auth.clone();
+    store_provider_state(&mut seeded_auth, "nous", state)?;
+    save_auth_store_json(hermes_home, &seeded_auth)?;
+    match resolve_nous_runtime_credentials(hermes_home, 300, timeout_seconds) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if existed_before {
+                save_auth_store_json(hermes_home, &original_auth)?;
+            } else if auth_path.exists() {
+                let _ = fs::remove_file(&auth_path);
+            }
+            Err(Box::new(error))
+        }
+    }
+}
+
+fn finalize_nous_auth_add(
+    hermes_home: &Path,
+    requested_label: Option<&str>,
+    default_label: &str,
+) -> Result<(usize, String), Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let mut state = provider_state_json(&auth_store, "nous")
+        .ok_or("Nous auth state is missing after runtime resolution.")?;
+    if let Some(label) = requested_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state.insert("label".to_string(), JsonValue::String(label.to_string()));
+        store_provider_state(&mut auth_store, "nous", state.clone())?;
+        save_auth_store_json(hermes_home, &auth_store)?;
+    }
+    let access_token = json_string(&state, "access_token")
+        .ok_or("Nous auth state is missing access_token after runtime resolution.")?
+        .to_string();
+    let label = json_string(&state, "label")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| label_from_token(&access_token, default_label));
+    write_shared_nous_state(&state);
+    clear_provider_suppressions(hermes_home, "nous")?;
+    let stored_count = upsert_auth_pool_entry_by_sources(
+        hermes_home,
+        "nous",
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "device_code".to_string(),
+            access_token,
+            refresh_token: json_string(&state, "refresh_token").map(ToOwned::to_owned),
+            base_url: json_string(&state, "inference_base_url").map(ToOwned::to_owned),
+            expires_at_ms: None,
+            last_refresh: None,
+        },
+        &["device_code", "manual:device_code"],
+    )?;
+    Ok((stored_count, label))
+}
+
+fn nous_shared_store_path() -> PathBuf {
+    if let Some(path) = env_trimmed("HERMES_SHARED_AUTH_DIR") {
+        return PathBuf::from(path).join("nous_auth.json");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".hermes")
+        .join("shared")
+        .join("nous_auth.json")
+}
+
+fn write_shared_nous_state(state: &JsonMap<String, JsonValue>) {
+    let Some(access_token) = json_string(state, "access_token") else {
+        return;
+    };
+    let Some(refresh_token) = json_string(state, "refresh_token") else {
+        return;
+    };
+    let mut payload = JsonMap::new();
+    payload.insert("_schema".to_string(), JsonValue::from(1));
+    payload.insert(
+        "access_token".to_string(),
+        JsonValue::String(access_token.to_string()),
+    );
+    payload.insert(
+        "refresh_token".to_string(),
+        JsonValue::String(refresh_token.to_string()),
+    );
+    payload.insert(
+        "token_type".to_string(),
+        JsonValue::String(
+            json_string(state, "token_type")
+                .unwrap_or("Bearer")
+                .to_string(),
+        ),
+    );
+    payload.insert(
+        "scope".to_string(),
+        JsonValue::String(
+            json_string(state, "scope")
+                .unwrap_or(DEFAULT_NOUS_SCOPE)
+                .to_string(),
+        ),
+    );
+    payload.insert(
+        "client_id".to_string(),
+        JsonValue::String(
+            json_string(state, "client_id")
+                .unwrap_or(DEFAULT_NOUS_CLIENT_ID)
+                .to_string(),
+        ),
+    );
+    payload.insert(
+        "portal_base_url".to_string(),
+        JsonValue::String(
+            json_string(state, "portal_base_url")
+                .unwrap_or(DEFAULT_NOUS_PORTAL_URL)
+                .to_string(),
+        ),
+    );
+    payload.insert(
+        "inference_base_url".to_string(),
+        JsonValue::String(
+            json_string(state, "inference_base_url")
+                .unwrap_or(DEFAULT_NOUS_INFERENCE_URL)
+                .to_string(),
+        ),
+    );
+    payload.insert(
+        "obtained_at".to_string(),
+        state.get("obtained_at").cloned().unwrap_or(JsonValue::Null),
+    );
+    payload.insert(
+        "expires_at".to_string(),
+        state.get("expires_at").cloned().unwrap_or(JsonValue::Null),
+    );
+    payload.insert(
+        "updated_at".to_string(),
+        JsonValue::String(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    let path = nous_shared_store_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(rendered) = serde_json::to_string_pretty(&JsonValue::Object(payload)) {
+        let _ = atomic_write(&path, rendered.as_bytes());
+    }
 }
 
 fn label_from_token(token: &str, fallback: &str) -> String {
@@ -2942,6 +3602,62 @@ mod tests {
                 };
                 let response = format!(
                     "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
+    fn spawn_nous_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let base_for_thread = base_url.clone();
+        let handle = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let payload = match idx {
+                    0 => json!({
+                        "device_code": "nous-device-code",
+                        "user_code": "NOUS-CODE",
+                        "verification_uri": format!("{base_for_thread}/verify"),
+                        "verification_uri_complete": format!("{base_for_thread}/verify?code=NOUS-CODE"),
+                        "expires_in": 60,
+                        "interval": 1
+                    }),
+                    1 => json!({
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "token_type": "Bearer",
+                        "scope": "inference:mint_agent_key offline_access",
+                        "expires_in": 3600,
+                        "inference_base_url": format!("{base_for_thread}/portal-inference/v1")
+                    }),
+                    _ => json!({
+                        "api_key": "nous-agent-key",
+                        "key_id": "agent-key-123",
+                        "expires_at": "2999-01-02T00:00:00Z",
+                        "expires_in": 86400,
+                        "inference_base_url": format!("{base_for_thread}/runtime-inference/v1"),
+                        "reused": false
+                    }),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     payload.len(),
                     payload
                 );
@@ -3523,6 +4239,20 @@ mod tests {
                         "agent_key_expires_at": "2999-01-01T00:00:00Z",
                         "label": "Nous Main"
                     }
+                },
+                "credential_pool": {
+                    "nous": [
+                        {
+                            "id": "legacy01",
+                            "label": "legacy-nous",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "legacy-access",
+                            "refresh_token": "legacy-refresh",
+                            "base_url": "https://legacy.nous.test/v1"
+                        }
+                    ]
                 }
             })
             .to_string(),
@@ -3542,7 +4272,9 @@ mod tests {
 
         let persisted: JsonValue =
             serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
-        let entry = &persisted["credential_pool"]["nous"][0];
+        let entries = persisted["credential_pool"]["nous"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
         assert_eq!(entry["label"], "Nous Main");
         assert_eq!(entry["auth_type"], "oauth");
         assert_eq!(entry["source"], "device_code");
@@ -3677,47 +4409,88 @@ mod tests {
     }
 
     #[test]
-    fn auth_add_nous_oauth_without_state_uses_python_fallback() {
+    fn auth_add_nous_oauth_without_state_uses_native_device_flow() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let temp = temp_path("auth-add-nous-bridge");
+        let temp = temp_path("auth-add-nous-device");
         let home = temp.join("home");
-        let log_path = temp.join("auth-add.log");
-        let python = temp.join("python3");
+        let shared = temp.join("shared");
         fs::create_dir_all(&home).unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'provider=%s\\ntype=%s\\n' \"$HERMES_AUTH_ADD_PROVIDER\" \"$HERMES_AUTH_ADD_TYPE\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
-
-        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        let (portal_base_url, requests, server) = spawn_nous_oauth_server(
+            "header.eyJlbWFpbCI6Im5vdXMtZGV2aWNlQGV4YW1wbGUuY29tIn0.sig",
+            "nous-refresh-2",
+        );
+        unsafe { std::env::set_var("HERMES_SHARED_AUTH_DIR", &shared) };
         let result = print_auth_add(
             &context,
             &AuthAddArgs {
                 provider: "nous".to_string(),
                 auth_type: Some("oauth".to_string()),
+                label: Some("Nous Device".to_string()),
+                portal_url: Some(portal_base_url.clone()),
+                inference_url: Some(format!("{portal_base_url}/requested-inference/v1")),
+                client_id: Some("hermes-cli-test".to_string()),
+                scope: Some("inference:mint_agent_key offline_access".to_string()),
+                no_browser: true,
+                timeout: Some(5.0),
                 ..AuthAddArgs::default()
             },
         );
-        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+        unsafe { std::env::remove_var("HERMES_SHARED_AUTH_DIR") };
 
         result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("provider=nous"));
-        assert!(logged.contains("type=oauth"));
-        assert!(logged.contains("auth_add_command"));
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+        assert!(captured[0].starts_with("POST /api/oauth/device/code "));
+        assert!(captured[0].contains("client_id=hermes-cli-test"));
+        assert!(captured[0].contains("scope=inference%3Amint_agent_key+offline_access"));
+        assert!(captured[1].starts_with("POST /api/oauth/token "));
+        assert!(
+            captured[1]
+                .contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code")
+        );
+        assert!(captured[1].contains("device_code=nous-device-code"));
+        assert!(captured[2].starts_with("POST /api/oauth/agent-key "));
+        assert!(captured[2].contains("header.eyJlbWFpbCI6Im5vdXMtZGV2aWNlQGV4YW1wbGUuY29tIn0.sig"));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let state = &persisted["providers"]["nous"];
+        assert_eq!(state["label"], "Nous Device");
+        assert_eq!(state["client_id"], "hermes-cli-test");
+        assert_eq!(
+            state["portal_base_url"],
+            JsonValue::String(portal_base_url.clone())
+        );
+        assert_eq!(
+            state["inference_base_url"],
+            JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
+        );
+        assert_eq!(state["refresh_token"], "nous-refresh-2");
+        assert_eq!(state["agent_key"], "nous-agent-key");
+
+        let entries = persisted["credential_pool"]["nous"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["label"], "Nous Device");
+        assert_eq!(entry["source"], "device_code");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["refresh_token"], "nous-refresh-2");
+        assert_eq!(
+            entry["base_url"],
+            JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
+        );
+
+        let shared_state: JsonValue =
+            serde_json::from_str(&fs::read_to_string(shared.join("nous_auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(shared_state["refresh_token"], "nous-refresh-2");
+        assert_eq!(
+            shared_state["inference_base_url"],
+            JsonValue::String(format!("{portal_base_url}/runtime-inference/v1"))
+        );
+        assert!(shared_state.get("agent_key").is_none());
         let _ = fs::remove_dir_all(temp);
     }
 
