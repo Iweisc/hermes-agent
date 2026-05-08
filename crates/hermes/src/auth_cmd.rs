@@ -1198,7 +1198,7 @@ fn native_auth_add_openai_codex_oauth(
     native_auth_add_openai_codex_oauth_with_io(context, args, &mut output)
 }
 
-fn native_auth_add_openai_codex_oauth_with_io(
+pub(crate) fn native_auth_add_openai_codex_oauth_with_io(
     context: &HermesContext,
     args: &AuthAddArgs,
     output: &mut dyn Write,
@@ -1354,12 +1354,17 @@ fn native_auth_add_openai_codex_oauth_with_io(
             label: label.clone(),
             auth_type: "oauth".to_string(),
             source: "manual:device_code".to_string(),
-            access_token,
-            refresh_token,
+            access_token: access_token.clone(),
+            refresh_token: refresh_token.clone(),
             base_url: Some(codex_base_url()),
             expires_at_ms: None,
             last_refresh: Some(codex_now_rfc3339()),
         },
+    )?;
+    persist_openai_codex_provider_state(
+        context.hermes_home().as_path(),
+        &access_token,
+        refresh_token.as_deref(),
     )?;
     writeln!(
         output,
@@ -1368,6 +1373,40 @@ fn native_auth_add_openai_codex_oauth_with_io(
     )?;
     output.flush()?;
     Ok(())
+}
+
+fn persist_openai_codex_provider_state(
+    hermes_home: &Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let mut state = provider_state_json(&auth_store, "openai-codex").unwrap_or_default();
+    let mut tokens = JsonMap::new();
+    tokens.insert(
+        "access_token".to_string(),
+        JsonValue::String(access_token.to_string()),
+    );
+    if let Some(refresh_token) = refresh_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tokens.insert(
+            "refresh_token".to_string(),
+            JsonValue::String(refresh_token.to_string()),
+        );
+    }
+    state.insert("tokens".to_string(), JsonValue::Object(tokens));
+    state.insert(
+        "auth_mode".to_string(),
+        JsonValue::String("chatgpt".to_string()),
+    );
+    state.insert(
+        "last_refresh".to_string(),
+        JsonValue::String(codex_now_rfc3339()),
+    );
+    store_provider_state(&mut auth_store, "openai-codex", state)?;
+    save_auth_store_json(hermes_home, &auth_store)
 }
 
 fn native_auth_add_runtime_oauth(
@@ -6386,6 +6425,14 @@ mod tests {
         let entry = &persisted["credential_pool"]["openai-codex"][0];
         assert_eq!(entry["label"], "codex-device@example.com");
         assert_eq!(entry["auth_type"], "oauth");
+        let provider_state = &persisted["providers"]["openai-codex"];
+        assert_eq!(provider_state["auth_mode"], "chatgpt");
+        assert_eq!(
+            provider_state["tokens"]["access_token"],
+            "header.eyJlbWFpbCI6ImNvZGV4LWRldmljZUBleGFtcGxlLmNvbSJ9.sig"
+        );
+        assert_eq!(provider_state["tokens"]["refresh_token"], "codex-refresh-2");
+        assert!(provider_state["last_refresh"].as_str().is_some());
         assert_eq!(entry["source"], "manual:device_code");
         assert_eq!(entry["refresh_token"], "codex-refresh-2");
         assert_eq!(

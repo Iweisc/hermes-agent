@@ -14,6 +14,7 @@ use hermes_core::{
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
 
+use crate::auth_cmd::{self, AuthAddArgs};
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::gateway_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
@@ -294,7 +295,7 @@ fn run_native_model_setup(
     ui.line("⚕ Hermes Setup — Inference Provider")?;
     ui.line("Choose a provider and default model.")?;
     ui.line(
-        "Fresh OAuth login, Copilot/Bedrock, and the advanced model picker remain available through the compatibility flow.",
+        "Most fresh OAuth login, Copilot/Bedrock, and the advanced model picker remain available through the compatibility flow.",
     )?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
@@ -429,21 +430,18 @@ fn run_native_model_setup(
     }
 
     let selected = &providers[selection - 1];
+
+    if selected.auth_type == "api_key" {
+        ensure_model_provider_secret(context, ui, selected)?;
+    } else {
+        ensure_runtime_model_provider_credentials(context, ui, selected)?;
+    }
     let selected_base_url = resolved_native_model_provider_base_url(
         context,
         selected,
         &current_provider,
         &current_base_url,
     )?;
-
-    if selected.auth_type == "api_key" {
-        ensure_model_provider_secret(context, ui, selected)?;
-    } else {
-        ui.line(&format!(
-            "{} credentials: already configured",
-            selected.label
-        ))?;
-    }
     let base_url = if selected.auth_type == "api_key" {
         prompt_model_base_url(ui, selected, &selected_base_url)?
     } else {
@@ -945,6 +943,50 @@ struct StreamUi<'a> {
     output: &'a mut dyn Write,
 }
 
+struct SetupUiWriteAdapter<'a> {
+    ui: &'a mut dyn SetupUi,
+    buffer: String,
+}
+
+impl<'a> SetupUiWriteAdapter<'a> {
+    fn new(ui: &'a mut dyn SetupUi) -> Self {
+        Self {
+            ui,
+            buffer: String::new(),
+        }
+    }
+
+    fn flush_buffered_line(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.buffer);
+        self.ui
+            .line(&line)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+impl Write for SetupUiWriteAdapter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        for segment in text.split_inclusive('\n') {
+            if let Some(line) = segment.strip_suffix('\n') {
+                self.buffer
+                    .push_str(line.strip_suffix('\r').unwrap_or(line));
+                self.flush_buffered_line()?;
+            } else {
+                self.buffer.push_str(segment);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffered_line()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NativeModelProvider {
     name: String,
@@ -1230,7 +1272,7 @@ fn native_setup_model_providers(context: &HermesContext) -> Vec<NativeModelProvi
                 });
             }
             if native_runtime_model_provider_supported(profile.name)
-                && provider_available_for_native_model_setup(context, profile.name)
+                && provider_visible_for_native_model_setup(context, profile.name)
             {
                 return Some(NativeModelProvider {
                     name: profile.name.to_string(),
@@ -1253,10 +1295,63 @@ fn native_runtime_model_provider_supported(provider: &str) -> bool {
     NATIVE_MODEL_RUNTIME_PROVIDERS.contains(&provider)
 }
 
+fn provider_visible_for_native_model_setup(context: &HermesContext, provider: &str) -> bool {
+    provider_available_for_native_model_setup(context, provider)
+        || provider_supports_fresh_native_model_setup(provider)
+}
+
 fn provider_available_for_native_model_setup(context: &HermesContext, provider: &str) -> bool {
     get_auth_status_summary(context.hermes_home().as_path(), provider)
         .map(|status| status.configured || status.logged_in)
         .unwrap_or(false)
+}
+
+fn provider_supports_fresh_native_model_setup(provider: &str) -> bool {
+    provider == "openai-codex"
+}
+
+fn ensure_runtime_model_provider_credentials(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    provider: &NativeModelProvider,
+) -> Result<(), Box<dyn Error>> {
+    if provider_available_for_native_model_setup(context, &provider.name) {
+        ui.line(&format!(
+            "{} credentials: already configured",
+            provider.label
+        ))?;
+        return Ok(());
+    }
+
+    match provider.name.as_str() {
+        "openai-codex" => {
+            let mut output = SetupUiWriteAdapter::new(ui);
+            auth_cmd::native_auth_add_openai_codex_oauth_with_io(
+                context,
+                &AuthAddArgs {
+                    provider: provider.name.clone(),
+                    auth_type: Some("oauth".to_string()),
+                    ..AuthAddArgs::default()
+                },
+                &mut output,
+            )?;
+            output.flush()?;
+        }
+        _ => {
+            return Err(
+                format!("{} is not available for fresh native setup", provider.label).into(),
+            );
+        }
+    }
+
+    if !provider_available_for_native_model_setup(context, &provider.name) {
+        return Err(format!(
+            "{} did not persist usable auth state after native setup",
+            provider.label
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn resolved_native_model_provider_base_url(
@@ -1288,6 +1383,15 @@ fn resolved_native_model_provider_base_url(
         _ => None,
     };
     if let Some(base_url) = from_state {
+        return Ok(base_url);
+    }
+
+    if provider.name == "openai-codex"
+        && let Some(base_url) = std::env::var("HERMES_CODEX_BASE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+    {
         return Ok(base_url);
     }
 
@@ -3269,10 +3373,13 @@ mod tests {
     use clap::Parser;
     use std::env;
     use std::fs;
+    use std::io::Read;
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
     use tempfile::TempDir;
 
     #[derive(Parser, Debug)]
@@ -3299,6 +3406,61 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    fn spawn_codex_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let handle = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request);
+                let (status_line, payload) = match idx {
+                    0 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "user_code": "USER-CODE",
+                            "device_auth_id": "device-auth-123",
+                            "interval": 1
+                        })
+                        .to_string(),
+                    ),
+                    1 => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "authorization_code": "auth-code-123",
+                            "code_verifier": "verifier-xyz"
+                        })
+                        .to_string(),
+                    ),
+                    _ => (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "access_token": access_token,
+                            "refresh_token": refresh_token
+                        })
+                        .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
     }
 
     #[derive(Default)]
@@ -3797,6 +3959,75 @@ exit 9\n",
 
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Removed \"Demo Endpoint\" from saved custom providers."));
+    }
+
+    #[test]
+    fn setup_model_openai_codex_fresh_login_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (issuer, requests, server) = spawn_codex_oauth_server(
+            "header.eyJlbWFpbCI6ImNvZGV4LXNldHVwQGV4YW1wbGUuY29tIn0.sig",
+            "codex-refresh-setup",
+        );
+        set_env_var("HERMES_AUTH_CODEX_ISSUER", &issuer);
+        set_env_var(
+            "HERMES_AUTH_CODEX_TOKEN_URL",
+            format!("{issuer}/oauth/token"),
+        );
+        set_env_var("HERMES_AUTH_CODEX_MAX_WAIT_SECONDS", "5");
+        set_env_var(
+            "HERMES_CODEX_BASE_URL",
+            "https://codex.example.test/backend-api/codex",
+        );
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let codex_choice = providers
+            .iter()
+            .position(|provider| provider.name == "openai-codex")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(format!("{codex_choice}\ngpt-5.5\n").into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("HERMES_AUTH_CODEX_ISSUER");
+        remove_env_var("HERMES_AUTH_CODEX_TOKEN_URL");
+        remove_env_var("HERMES_AUTH_CODEX_MAX_WAIT_SECONDS");
+        remove_env_var("HERMES_CODEX_BASE_URL");
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: openai-codex"));
+        assert!(config_text.contains("default: gpt-5.5"));
+        assert!(config_text.contains("base_url: https://codex.example.test/backend-api/codex"));
+        assert!(config_text.contains("api_mode: codex_responses"));
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert_eq!(
+            auth_json["providers"]["openai-codex"]["tokens"]["access_token"],
+            "header.eyJlbWFpbCI6ImNvZGV4LXNldHVwQGV4YW1wbGUuY29tIn0.sig"
+        );
+        assert_eq!(
+            auth_json["providers"]["openai-codex"]["tokens"]["refresh_token"],
+            "codex-refresh-setup"
+        );
+        assert_eq!(
+            auth_json["credential_pool"]["openai-codex"][0]["label"],
+            "codex-setup@example.com"
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Signing in to OpenAI Codex..."));
+        assert!(rendered.contains("Added openai-codex OAuth credential #1"));
+        assert!(rendered.contains("Default model set to: gpt-5.5 (via OpenAI Codex)"));
     }
 
     #[test]
