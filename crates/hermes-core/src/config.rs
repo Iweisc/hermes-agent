@@ -544,7 +544,7 @@ impl HermesContext {
         if api_key.is_empty() && provider != "custom" && profile.auth_type != "aws_sdk" {
             let env_hint = profile.api_key_env_vars().collect::<Vec<_>>().join(", ");
             let detail = if provider == "openai-codex" {
-                "No Codex OAuth token resolved. Run `hermes auth codex`, or pass --api-key."
+                "No Codex OAuth token resolved. Run `hermes auth add openai-codex`, or pass --api-key."
                     .to_string()
             } else {
                 format!(
@@ -1014,6 +1014,29 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "ChatGPT-Account-ID" && value == "acct-codex")
         );
+    }
+
+    #[test]
+    fn resolve_model_runtime_missing_codex_token_points_to_native_auth_add() {
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: gpt-5.4\n  provider: openai-codex\n",
+        )
+        .unwrap();
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let error = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .unwrap_err();
+
+        match error {
+            HermesError::State { detail, .. } => {
+                assert!(detail.contains("hermes auth add openai-codex"));
+            }
+            other => panic!("expected state error, got {other:?}"),
+        }
     }
 
     #[test]

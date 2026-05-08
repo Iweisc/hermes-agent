@@ -775,7 +775,7 @@ fn generate_openai_codex_image(
         Ok(token) => token,
         Err(_) => {
             return provider_error_response(
-                "No Codex/ChatGPT OAuth credentials available. Run `hermes auth codex` to sign in."
+                "No Codex/ChatGPT OAuth credentials available. Run `hermes auth add openai-codex` to sign in."
                     .to_string(),
                 "auth_required",
                 "openai-codex",
@@ -2220,6 +2220,42 @@ mod tests {
         .unwrap();
         assert_eq!(result["success"], false);
         assert_eq!(result["error_type"], "provider_not_registered");
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+    }
+
+    #[test]
+    fn openai_codex_missing_auth_points_to_native_auth_add() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        set_env_var("HERMES_HOME", temp.path());
+        fs::write(
+            temp.path().join("config.yaml"),
+            "image_gen:\n  provider: openai-codex\n",
+        )
+        .unwrap();
+
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw owl"}),
+            &crate::tools::ToolRuntime::new(temp.path()).with_hermes_home(temp.path()),
+        ))
+        .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["error_type"], "auth_required");
+        assert_eq!(result["provider"], "openai-codex");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hermes auth add openai-codex")
+        );
+
         match previous_home {
             Some(value) => set_env_var("HERMES_HOME", value),
             None => remove_env_var("HERMES_HOME"),

@@ -301,7 +301,7 @@ fn resolve_codex_access_token_with_refresh_url(
         .and_then(Value::as_object)
         .ok_or_else(|| HermesError::State {
             action: "resolving Codex auth",
-            detail: "No Codex credentials stored. Run `hermes auth codex` to authenticate."
+            detail: "No Codex credentials stored. Run `hermes auth add openai-codex` first."
                 .to_string(),
         })?;
     let tokens = provider_state
@@ -309,9 +309,8 @@ fn resolve_codex_access_token_with_refresh_url(
         .and_then(Value::as_object)
         .ok_or_else(|| HermesError::State {
             action: "resolving Codex auth",
-            detail:
-                "Codex auth state is missing tokens. Run `hermes auth codex` to re-authenticate."
-                    .to_string(),
+            detail: "Codex auth state is missing tokens. Run `hermes auth add openai-codex` again."
+                .to_string(),
         })?;
     let access_token = tokens
         .get("access_token")
@@ -321,9 +320,8 @@ fn resolve_codex_access_token_with_refresh_url(
         .map(ToOwned::to_owned)
         .ok_or_else(|| HermesError::State {
             action: "resolving Codex auth",
-            detail:
-                "Codex auth is missing access_token. Run `hermes auth codex` to re-authenticate."
-                    .to_string(),
+            detail: "Codex auth is missing access_token. Run `hermes auth add openai-codex` again."
+                .to_string(),
         })?;
     let refresh_token = tokens
         .get("refresh_token")
@@ -334,7 +332,7 @@ fn resolve_codex_access_token_with_refresh_url(
         .ok_or_else(|| HermesError::State {
             action: "resolving Codex auth",
             detail:
-                "Codex auth is missing refresh_token. Run `hermes auth codex` to re-authenticate."
+                "Codex auth is missing refresh_token. Run `hermes auth add openai-codex` again."
                     .to_string(),
         })?;
 
@@ -1236,7 +1234,7 @@ fn refresh_codex_tokens(
         return Err(HermesError::State {
             action: "refreshing Codex auth",
             detail: format!(
-                "Codex token refresh failed with status {}. Run `hermes auth codex` to re-authenticate.",
+                "Codex token refresh failed with status {}. Run `hermes auth add openai-codex` again.",
                 status.as_u16()
             ),
         });
@@ -1451,8 +1449,7 @@ fn resolve_nous_runtime_credentials_with_client(
         .cloned()
         .ok_or_else(|| HermesError::State {
             action: "resolving Nous runtime auth",
-            detail: "No Nous credentials stored. Authenticate with the Python runtime first."
-                .to_string(),
+            detail: "No Nous credentials stored. Run `hermes auth add nous` first.".to_string(),
         })?;
 
     let portal_base_url = provider_state
@@ -1496,9 +1493,8 @@ fn resolve_nous_runtime_credentials_with_client(
         .and_then(non_empty_trimmed)
         .ok_or_else(|| HermesError::State {
             action: "resolving Nous runtime auth",
-            detail:
-                "Nous auth state is missing access_token. Re-authenticate in the Python runtime."
-                    .to_string(),
+            detail: "Nous auth state is missing access_token. Run `hermes auth add nous` again."
+                .to_string(),
         })?;
     let mut refresh_token = provider_state
         .get("refresh_token")
@@ -1515,7 +1511,7 @@ fn resolve_nous_runtime_credentials_with_client(
     ) {
         let current_refresh = refresh_token.clone().ok_or_else(|| HermesError::State {
             action: "resolving Nous runtime auth",
-            detail: "Nous session expired and no refresh_token is available. Re-authenticate in the Python runtime."
+            detail: "Nous session expired and no refresh_token is available. Run `hermes auth add nous` again."
                 .to_string(),
         })?;
         let refreshed = refresh_nous_access_token(
@@ -1673,7 +1669,7 @@ fn refresh_nous_access_token(
         return Err(HermesError::State {
             action: "refreshing Nous auth",
             detail: format!(
-                "Nous OAuth refresh failed with status {}. Re-authenticate in the Python runtime.",
+                "Nous OAuth refresh failed with status {}. Run `hermes auth add nous` again.",
                 status.as_u16()
             ),
         });
@@ -2271,8 +2267,7 @@ fn resolve_qwen_runtime_credentials_from_path_with_refresh_url(
         .map(ToOwned::to_owned)
         .ok_or_else(|| HermesError::State {
             action: "resolving Qwen OAuth auth",
-            detail: "Qwen OAuth access_token missing. Re-authenticate with the Python runtime."
-                .to_string(),
+            detail: "Qwen OAuth access_token missing. Re-run `qwen auth qwen-oauth`.".to_string(),
         })?;
     let base_url = base_url_override.unwrap_or_else(|| DEFAULT_QWEN_BASE_URL.to_string());
     Ok(QwenRuntimeCredentials {
@@ -2286,7 +2281,7 @@ fn load_qwen_tokens(auth_path: &Path) -> Result<Value, HermesError> {
         return Err(HermesError::State {
             action: "resolving Qwen OAuth auth",
             detail: format!(
-                "Qwen CLI credentials not found at {}. Run the Python runtime's Qwen auth flow first.",
+                "Qwen CLI credentials not found at {}. Run `qwen auth qwen-oauth` first.",
                 auth_path.display()
             ),
         });
@@ -2340,8 +2335,7 @@ fn refresh_qwen_tokens(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HermesError::State {
             action: "refreshing Qwen OAuth auth",
-            detail: "Qwen OAuth refresh_token missing. Re-authenticate with the Python runtime."
-                .to_string(),
+            detail: "Qwen OAuth refresh_token missing. Re-run `qwen auth qwen-oauth`.".to_string(),
         })?;
 
     let response = client
@@ -2368,10 +2362,10 @@ fn refresh_qwen_tokens(
         return Err(HermesError::State {
             action: "refreshing Qwen OAuth auth",
             detail: if detail.is_empty() {
-                "Qwen OAuth refresh failed. Re-authenticate with the Python runtime.".to_string()
+                "Qwen OAuth refresh failed. Re-run `qwen auth qwen-oauth`.".to_string()
             } else {
                 format!(
-                    "Qwen OAuth refresh failed. Re-authenticate with the Python runtime. Response: {detail}"
+                    "Qwen OAuth refresh failed. Re-run `qwen auth qwen-oauth`. Response: {detail}"
                 )
             },
         });
@@ -2595,6 +2589,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_codex_access_token_missing_state_points_to_native_auth_add() {
+        let temp = TempDir::new().unwrap();
+        let error = resolve_codex_access_token(temp.path()).unwrap_err();
+        let HermesError::State { detail, .. } = error else {
+            panic!("expected state error");
+        };
+        assert!(detail.contains("hermes auth add openai-codex"));
+    }
+
+    #[test]
     fn resolve_codex_access_token_refreshes_expired_token() {
         let temp = TempDir::new().unwrap();
         let expired = jwt_with_claims(1, "acct-old");
@@ -2727,6 +2731,16 @@ mod tests {
             "https://inference-api.nousresearch.com/v1"
         );
         assert_eq!(resolved.expires_at.as_deref(), Some("2999-01-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_nous_runtime_credentials_missing_state_points_to_native_auth_add() {
+        let temp = TempDir::new().unwrap();
+        let error = resolve_nous_runtime_credentials(temp.path(), 1800, 15.0).unwrap_err();
+        let HermesError::State { detail, .. } = error else {
+            panic!("expected state error");
+        };
+        assert!(detail.contains("hermes auth add nous"));
     }
 
     #[test]
@@ -3276,6 +3290,18 @@ mod tests {
 
         assert_eq!(resolved.access_token, "qwen-fresh");
         assert_eq!(resolved.base_url, "https://portal.qwen.ai/v1");
+    }
+
+    #[test]
+    fn resolve_qwen_runtime_credentials_missing_state_points_to_qwen_cli_login() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("oauth_creds.json");
+        let error = resolve_qwen_runtime_credentials_from_path(&auth_path, &Client::new(), None)
+            .unwrap_err();
+        let HermesError::State { detail, .. } = error else {
+            panic!("expected state error");
+        };
+        assert!(detail.contains("qwen auth qwen-oauth"));
     }
 
     #[test]
