@@ -43,6 +43,12 @@ const DEFAULT_SPOTIFY_SCOPE: &str = "user-modify-playback-state user-read-playba
 const SPOTIFY_DOCS_URL: &str =
     "https://hermes-agent.nousresearch.com/docs/user-guide/features/spotify";
 const SPOTIFY_DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const DEFAULT_ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
+const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/0.0.0 (external, cli)";
 
 const AUTH_ADD_BOOTSTRAP: &str = concat!(
     "import os\n",
@@ -202,6 +208,9 @@ pub fn print_logout(
 fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
     if should_use_native_auth_add(args) {
         return native_auth_add_api_key(context, args);
+    }
+    if should_use_native_anthropic_oauth_add(args) {
+        return native_auth_add_anthropic_oauth(context, args);
     }
     if should_use_native_runtime_oauth_add(args) {
         return native_auth_add_runtime_oauth(context, args);
@@ -422,6 +431,27 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     }
 }
 
+fn should_use_native_anthropic_oauth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    if provider != "anthropic" {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") | None => {
+            args.api_key.is_none()
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
 fn native_auth_add_api_key(
     context: &HermesContext,
     args: &AuthAddArgs,
@@ -436,6 +466,7 @@ fn native_auth_add_api_key(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or("No API key provided.")?;
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
     let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
     let requested_label = args
         .label
@@ -507,6 +538,109 @@ fn native_auth_add_api_key(
         "Added {} credential #{}: \"{}\"",
         provider, entry_count, label
     );
+    Ok(())
+}
+
+fn native_auth_add_anthropic_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    native_auth_add_anthropic_oauth_with_io(context, args, &mut input, &mut output)
+}
+
+fn native_auth_add_anthropic_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add anthropic`.")?;
+    if provider != "anthropic" {
+        return run_python_auth_add(args);
+    }
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let code_verifier = anthropic_code_verifier()?;
+    let code_challenge = spotify_code_challenge(&code_verifier);
+    let authorize_url = anthropic_build_authorize_url(&code_verifier, &code_challenge)?;
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Authorize Hermes with your Claude Pro/Max subscription."
+    )?;
+    writeln!(output)?;
+    writeln!(output, "Open this URL to authorize Hermes:")?;
+    writeln!(output, "{authorize_url}")?;
+    writeln!(output)?;
+    output.flush()?;
+
+    if !args.no_browser && !is_remote_session() {
+        if try_open_browser(&authorize_url)? {
+            writeln!(output, "Browser opened for Anthropic authorization.")?;
+        } else {
+            writeln!(
+                output,
+                "Could not open the browser automatically; use the URL above."
+            )?;
+        }
+        writeln!(output)?;
+        output.flush()?;
+    }
+
+    writeln!(
+        output,
+        "After authorizing, you'll see a code. Paste it below."
+    )?;
+    output.flush()?;
+    let raw_code = prompt_line(input, output, "Authorization code")?;
+    let raw_code = raw_code.trim();
+    if raw_code.is_empty() {
+        return Err("No authorization code provided.".into());
+    }
+    let (code, returned_state) = anthropic_split_pasted_code(raw_code);
+    let tokens = anthropic_exchange_code_for_tokens(
+        code,
+        returned_state,
+        &code_verifier,
+        args.timeout.unwrap_or(15.0).max(1.0),
+    )?;
+
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+    let label =
+        requested_label.unwrap_or_else(|| label_from_token(&tokens.access_token, &default_label));
+    let count = add_auth_pool_entry(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "manual:hermes_pkce".to_string(),
+            access_token: tokens.access_token,
+            refresh_token: Some(tokens.refresh_token),
+            base_url: get_provider_profile("anthropic")
+                .map(|profile| profile.base_url.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            expires_at_ms: Some(tokens.expires_at_ms),
+        },
+    )?;
+    writeln!(
+        output,
+        "Added anthropic OAuth credential #{}: \"{}\"",
+        count, label
+    )?;
+    output.flush()?;
     Ok(())
 }
 
@@ -616,6 +750,7 @@ fn native_auth_add_runtime_oauth(
         }
         _ => return run_python_auth_add(args),
     };
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
     let label = requested_label.unwrap_or(derived_label);
     let stored_count = add_auth_pool_entry(
         context.hermes_home().as_path(),
@@ -627,6 +762,7 @@ fn native_auth_add_runtime_oauth(
             access_token,
             refresh_token,
             base_url,
+            expires_at_ms: None,
         },
     )?;
     println!(
@@ -1926,6 +2062,27 @@ fn save_auth_store_json(hermes_home: &Path, value: &JsonValue) -> Result<(), Box
     atomic_write(&auth_path, rendered.as_bytes())
 }
 
+fn clear_provider_suppressions(hermes_home: &Path, provider: &str) -> Result<bool, Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let Some(root) = auth_store.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(suppressed) = root
+        .get_mut("suppressed_sources")
+        .and_then(JsonValue::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    if suppressed.remove(provider).is_none() {
+        return Ok(false);
+    }
+    if suppressed.is_empty() {
+        root.remove("suppressed_sources");
+    }
+    save_auth_store_json(hermes_home, &auth_store)?;
+    Ok(true)
+}
+
 struct NewPoolEntry {
     label: String,
     auth_type: String,
@@ -1933,6 +2090,7 @@ struct NewPoolEntry {
     access_token: String,
     refresh_token: Option<String>,
     base_url: Option<String>,
+    expires_at_ms: Option<i64>,
 }
 
 fn ensure_json_object<'a>(
@@ -2207,6 +2365,9 @@ fn add_auth_pool_entry(
     if let Some(base_url) = entry.base_url.filter(|value| !value.trim().is_empty()) {
         payload.insert("base_url".to_string(), JsonValue::String(base_url));
     }
+    if let Some(expires_at_ms) = entry.expires_at_ms {
+        payload.insert("expires_at_ms".to_string(), JsonValue::from(expires_at_ms));
+    }
     provider_entries.push(JsonValue::Object(payload));
     let count = provider_entries.len();
     save_auth_store_json(hermes_home, &auth_store)?;
@@ -2230,6 +2391,118 @@ fn label_from_token(token: &str, fallback: &str) -> String {
         }
     }
     fallback.to_string()
+}
+
+fn anthropic_authorize_base_url() -> String {
+    env_trimmed("HERMES_AUTH_ANTHROPIC_AUTHORIZE_URL")
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_OAUTH_AUTHORIZE_URL.to_string())
+}
+
+fn anthropic_token_url() -> String {
+    env_trimmed("HERMES_AUTH_ANTHROPIC_TOKEN_URL")
+        .unwrap_or_else(|| DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL.to_string())
+}
+
+fn anthropic_code_verifier() -> Result<String, Box<dyn Error>> {
+    if let Some(override_value) = env_trimmed("HERMES_AUTH_ANTHROPIC_TEST_VERIFIER") {
+        return Ok(override_value);
+    }
+    spotify_random_token(32)
+}
+
+fn anthropic_build_authorize_url(
+    state: &str,
+    code_challenge: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut url = Url::parse(&anthropic_authorize_base_url())?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("code", "true");
+        query.append_pair("client_id", ANTHROPIC_OAUTH_CLIENT_ID);
+        query.append_pair("response_type", "code");
+        query.append_pair("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI);
+        query.append_pair("scope", ANTHROPIC_OAUTH_SCOPES);
+        query.append_pair("code_challenge", code_challenge);
+        query.append_pair("code_challenge_method", "S256");
+        query.append_pair("state", state);
+    }
+    Ok(url.to_string())
+}
+
+fn anthropic_split_pasted_code(raw: &str) -> (&str, &str) {
+    if let Some((code, state)) = raw.split_once('#') {
+        (code.trim(), state.trim())
+    } else {
+        (raw.trim(), "")
+    }
+}
+
+struct AnthropicOauthTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at_ms: i64,
+}
+
+fn anthropic_exchange_code_for_tokens(
+    code: &str,
+    state: &str,
+    code_verifier: &str,
+    timeout_seconds: f64,
+) -> Result<AnthropicOauthTokens, Box<dyn Error>> {
+    if code.is_empty() {
+        return Err("Anthropic authorization failed: missing authorization code.".into());
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(timeout_seconds.max(1.0)))
+        .build()?;
+    let response = client
+        .post(anthropic_token_url())
+        .header("Content-Type", "application/json")
+        .header("User-Agent", ANTHROPIC_OAUTH_USER_AGENT)
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "code": code,
+            "state": state,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }))
+        .send()
+        .map_err(|error| format!("Anthropic token exchange failed: {error}"))?;
+    if response.status().as_u16() >= 400 {
+        let detail = response.text().unwrap_or_default();
+        let suffix = if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" Response: {}", detail.trim())
+        };
+        return Err(format!("Anthropic token exchange failed.{suffix}").into());
+    }
+    let payload: JsonValue = response.json()?;
+    let payload = payload
+        .as_object()
+        .ok_or("Anthropic token response was not a JSON object.")?;
+    let access_token = json_string(payload, "access_token")
+        .ok_or("Anthropic token response did not include an access_token.")?
+        .to_string();
+    let refresh_token = json_string(payload, "refresh_token")
+        .unwrap_or("")
+        .to_string();
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(3600)
+        .max(0);
+    let expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0)
+        .saturating_add(expires_in.saturating_mul(1000));
+    Ok(AnthropicOauthTokens {
+        access_token,
+        refresh_token,
+        expires_at_ms,
+    })
 }
 
 fn decode_jwt_claims(token: &str) -> Option<JsonMap<String, JsonValue>> {
@@ -2630,6 +2903,18 @@ mod tests {
     fn auth_add_api_key_saves_native_pool_entry() {
         let home = temp_path("auth-add");
         fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "suppressed_sources": {
+                    "openrouter": ["env:OPENROUTER_API_KEY"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
 
         native_auth_add_api_key(
@@ -2652,6 +2937,95 @@ mod tests {
         assert_eq!(entry["source"], "manual");
         assert_eq!(entry["access_token"], "sk-openrouter");
         assert_eq!(entry["base_url"], OPENROUTER_BASE_URL);
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .and_then(|sources| sources.get("openrouter"))
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_anthropic_oauth_uses_native_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-anthropic");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "suppressed_sources": {
+                    "anthropic": ["claude_code", "hermes_pkce"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (token_url, request_body, server) = spawn_spotify_token_server(json!({
+            "access_token": "header.eyJlbWFpbCI6ImNsYXVkZUBleGFtcGxlLmNvbSJ9.sig",
+            "refresh_token": "anth-refresh",
+            "expires_in": 1800
+        }));
+
+        unsafe {
+            std::env::set_var(
+                "HERMES_AUTH_ANTHROPIC_AUTHORIZE_URL",
+                "https://claude.test/oauth/authorize",
+            );
+            std::env::set_var("HERMES_AUTH_ANTHROPIC_TOKEN_URL", &token_url);
+            std::env::set_var("HERMES_AUTH_ANTHROPIC_TEST_VERIFIER", "anth-verifier");
+        }
+        let mut input = Cursor::new(b"grant-code#returned-state\n".to_vec());
+        let mut output = Vec::new();
+        let result = native_auth_add_anthropic_oauth_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "anthropic".to_string(),
+                auth_type: Some("oauth".to_string()),
+                no_browser: true,
+                timeout: Some(5.0),
+                ..AuthAddArgs::default()
+            },
+            &mut input,
+            &mut output,
+        );
+        unsafe {
+            std::env::remove_var("HERMES_AUTH_ANTHROPIC_AUTHORIZE_URL");
+            std::env::remove_var("HERMES_AUTH_ANTHROPIC_TOKEN_URL");
+            std::env::remove_var("HERMES_AUTH_ANTHROPIC_TEST_VERIFIER");
+        }
+
+        result.unwrap();
+        server.join().unwrap();
+        let body = request_body.lock().unwrap().clone();
+        assert!(body.contains("\"grant_type\":\"authorization_code\""));
+        assert!(body.contains("\"client_id\":\"9d1c250a-e61b-44d9-88ed-5944d1962f5e\""));
+        assert!(body.contains("\"code\":\"grant-code\""));
+        assert!(body.contains("\"state\":\"returned-state\""));
+        assert!(body.contains("\"code_verifier\":\"anth-verifier\""));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["anthropic"][0];
+        assert_eq!(entry["label"], "claude@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:hermes_pkce");
+        assert_eq!(entry["refresh_token"], "anth-refresh");
+        assert!(entry["expires_at_ms"].as_i64().unwrap() > 0);
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .and_then(|sources| sources.get("anthropic"))
+                .is_none()
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Authorize Hermes with your Claude Pro/Max subscription."));
+        assert!(rendered.contains("Added anthropic OAuth credential #1"));
         let _ = fs::remove_dir_all(home);
     }
 
