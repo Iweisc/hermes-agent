@@ -868,6 +868,20 @@ fn native_auth_add_google_gemini_oauth_with_io(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
+    native_auth_add_google_gemini_oauth_with_prompt(context, args, output, |output| {
+        prompt_line(input, output, "Callback URL or code")
+    })
+}
+
+pub(crate) fn native_auth_add_google_gemini_oauth_with_prompt<F>(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    output: &mut dyn Write,
+    mut prompt_callback: F,
+) -> Result<(), Box<dyn Error>>
+where
+    F: FnMut(&mut dyn Write) -> Result<String, Box<dyn Error>>,
+{
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add google-gemini-cli`.")?;
     if provider != "google-gemini-cli" {
@@ -922,7 +936,10 @@ fn native_auth_add_google_gemini_oauth_with_io(
             "After signing in, paste the full callback URL or just the code."
         )?;
         output.flush()?;
-        (google_prompt_pasted_callback(input, output)?, redirect_uri)
+        (
+            google_parse_pasted_callback(&prompt_callback(output)?)?,
+            redirect_uri,
+        )
     } else {
         let (listener, redirect_uri) = google_bind_callback_listener()?;
         let authorize_url =
@@ -957,7 +974,7 @@ fn native_auth_add_google_gemini_oauth_with_io(
                     "Timed out waiting for the local callback. Paste the callback URL or code below."
                 )?;
                 output.flush()?;
-                google_prompt_pasted_callback(input, output)?
+                google_parse_pasted_callback(&prompt_callback(output)?)?
             }
         };
         (callback, redirect_uri)
@@ -4475,11 +4492,7 @@ fn google_wait_for_callback(
     }
 }
 
-fn google_prompt_pasted_callback(
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
-) -> Result<SpotifyCallbackResult, Box<dyn Error>> {
-    let raw = prompt_line(input, output, "Callback URL or code")?;
+fn google_parse_pasted_callback(raw: &str) -> Result<SpotifyCallbackResult, Box<dyn Error>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("Google setup cancelled: empty authorization code.".into());

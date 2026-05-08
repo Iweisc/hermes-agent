@@ -1,9 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
@@ -987,6 +989,51 @@ impl Write for SetupUiWriteAdapter<'_> {
     }
 }
 
+struct SharedSetupUiWriteAdapter<'a> {
+    ui: Rc<RefCell<&'a mut dyn SetupUi>>,
+    buffer: String,
+}
+
+impl<'a> SharedSetupUiWriteAdapter<'a> {
+    fn new(ui: Rc<RefCell<&'a mut dyn SetupUi>>) -> Self {
+        Self {
+            ui,
+            buffer: String::new(),
+        }
+    }
+
+    fn flush_buffered_line(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.buffer);
+        self.ui
+            .borrow_mut()
+            .line(&line)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+impl Write for SharedSetupUiWriteAdapter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        for segment in text.split_inclusive('\n') {
+            if let Some(line) = segment.strip_suffix('\n') {
+                self.buffer
+                    .push_str(line.strip_suffix('\r').unwrap_or(line));
+                self.flush_buffered_line()?;
+            } else {
+                self.buffer.push_str(segment);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffered_line()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NativeModelProvider {
     name: String,
@@ -1307,7 +1354,10 @@ fn provider_available_for_native_model_setup(context: &HermesContext, provider: 
 }
 
 fn provider_supports_fresh_native_model_setup(provider: &str) -> bool {
-    matches!(provider, "openai-codex" | "minimax-oauth" | "nous")
+    matches!(
+        provider,
+        "openai-codex" | "minimax-oauth" | "nous" | "google-gemini-cli"
+    )
 }
 
 fn ensure_runtime_model_provider_credentials(
@@ -1360,6 +1410,21 @@ fn ensure_runtime_model_provider_credentials(
                     ..AuthAddArgs::default()
                 },
                 &mut output,
+            )?;
+            output.flush()?;
+        }
+        "google-gemini-cli" => {
+            let shared_ui = Rc::new(RefCell::new(ui));
+            let mut output = SharedSetupUiWriteAdapter::new(Rc::clone(&shared_ui));
+            auth_cmd::native_auth_add_google_gemini_oauth_with_prompt(
+                context,
+                &AuthAddArgs {
+                    provider: provider.name.clone(),
+                    auth_type: Some("oauth".to_string()),
+                    ..AuthAddArgs::default()
+                },
+                &mut output,
+                |_output| shared_ui.borrow_mut().prompt("Callback URL or code"),
             )?;
             output.flush()?;
         }
@@ -3595,6 +3660,65 @@ mod tests {
         (base_url, requests, handle)
     }
 
+    fn spawn_google_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+        email: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let email = email.to_string();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let first_line = request.lines().next().unwrap_or_default().to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let (status_line, payload) = if first_line.starts_with("POST /token ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "access_token": access_token,
+                            "refresh_token": refresh_token,
+                            "expires_in": 3600,
+                            "token_type": "Bearer"
+                        })
+                        .to_string(),
+                    )
+                } else if first_line.starts_with("GET /userinfo?alt=json ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        serde_json::json!({
+                            "email": email
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        serde_json::json!({
+                            "error": "not_found"
+                        })
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
+    }
+
     #[derive(Default)]
     struct TestUi {
         answers: Vec<String>,
@@ -4293,6 +4417,95 @@ exit 9\n",
         assert!(rendered.contains(&format!("Portal: {portal_base_url}")));
         assert!(rendered.contains("Added nous OAuth credential #1"));
         assert!(rendered.contains("Default model set to: moonshotai/kimi-k2.6 (via Nous Portal)"));
+    }
+
+    #[test]
+    fn setup_model_google_gemini_fresh_login_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (base_url, requests, server) = spawn_google_oauth_server(
+            "google-access-setup",
+            "google-refresh-setup",
+            "gemini-setup@example.com",
+        );
+        set_env_var(
+            "HERMES_AUTH_GOOGLE_AUTH_URL",
+            format!("{base_url}/authorize"),
+        );
+        set_env_var("HERMES_AUTH_GOOGLE_TOKEN_URL", format!("{base_url}/token"));
+        set_env_var(
+            "HERMES_AUTH_GOOGLE_USERINFO_URL",
+            format!("{base_url}/userinfo"),
+        );
+        set_env_var("HERMES_AUTH_GOOGLE_TEST_STATE", "google-state-setup");
+        set_env_var(
+            "HERMES_AUTH_GOOGLE_TEST_VERIFIER",
+            "fixed-google-verifier-setup",
+        );
+        set_env_var("HERMES_GEMINI_CLIENT_ID", "test-google-client");
+        set_env_var("HERMES_GEMINI_CLIENT_SECRET", "test-google-secret");
+        set_env_var("SSH_TTY", "1");
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let google_choice = providers
+            .iter()
+            .position(|provider| provider.name == "google-gemini-cli")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(
+            format!(
+                "{google_choice}\nhttp://127.0.0.1:8085/oauth2callback?code=google-code-setup&state=google-state-setup\ngemini-3.1-pro-preview\n"
+            )
+            .into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("HERMES_AUTH_GOOGLE_AUTH_URL");
+        remove_env_var("HERMES_AUTH_GOOGLE_TOKEN_URL");
+        remove_env_var("HERMES_AUTH_GOOGLE_USERINFO_URL");
+        remove_env_var("HERMES_AUTH_GOOGLE_TEST_STATE");
+        remove_env_var("HERMES_AUTH_GOOGLE_TEST_VERIFIER");
+        remove_env_var("HERMES_GEMINI_CLIENT_ID");
+        remove_env_var("HERMES_GEMINI_CLIENT_SECRET");
+        remove_env_var("SSH_TTY");
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: google-gemini-cli"));
+        assert!(config_text.contains("default: gemini-3.1-pro-preview"));
+        assert!(config_text.contains("base_url: cloudcode-pa://google"));
+        assert!(config_text.contains("api_mode: chat_completions"));
+
+        let oauth_state: JsonValue = serde_json::from_str(
+            &fs::read_to_string(home.join("auth").join("google_oauth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(oauth_state["access"], "google-access-setup");
+        assert_eq!(oauth_state["refresh"], "google-refresh-setup");
+        assert_eq!(oauth_state["email"], "gemini-setup@example.com");
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert_eq!(
+            auth_json["credential_pool"]["google-gemini-cli"][0]["label"],
+            "gemini-setup@example.com"
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Open this URL to authorize Hermes with Google Gemini CLI:"));
+        assert!(
+            rendered.contains(
+                "Default model set to: gemini-3.1-pro-preview (via Google Gemini (OAuth))"
+            )
+        );
     }
 
     #[test]
