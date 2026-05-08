@@ -230,6 +230,11 @@ pub fn print_logout(
 }
 
 fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
+    if let Some(custom_provider) =
+        resolve_custom_provider_api_key_target(context.config_path().as_path(), args)?
+    {
+        return native_auth_add_custom_api_key(context, args, &custom_provider);
+    }
     if should_use_native_auth_add(args) {
         return native_auth_add_api_key(context, args);
     }
@@ -419,23 +424,7 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     if profile.name == "custom" || profile.auth_type != "api_key" {
         return false;
     }
-    match normalize_auth_type(args.auth_type.as_deref()) {
-        Some("oauth") => false,
-        Some("api_key") | None => {
-            args.api_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-                && args.portal_url.is_none()
-                && args.inference_url.is_none()
-                && args.client_id.is_none()
-                && args.scope.is_none()
-                && !args.no_browser
-                && args.timeout.is_none()
-                && !args.insecure
-                && args.ca_bundle.is_none()
-        }
-        _ => false,
-    }
+    auth_add_uses_api_key_shape(args)
 }
 
 fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
@@ -627,6 +616,100 @@ fn native_auth_add_api_key(
     println!(
         "Added {} credential #{}: \"{}\"",
         provider, entry_count, label
+    );
+    Ok(())
+}
+
+fn native_auth_add_custom_api_key(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    custom_provider: &ResolvedCustomProvider,
+) -> Result<(), Box<dyn Error>> {
+    let api_key = args
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("No API key provided.")?;
+    clear_provider_suppressions(
+        context.hermes_home().as_path(),
+        custom_provider.pool_key.as_str(),
+    )?;
+    let mut auth_store = load_auth_store_json(context.hermes_home().as_path())?;
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let (entry_count, label) = {
+        let root = auth_store
+            .as_object_mut()
+            .ok_or("auth store is not a JSON object")?;
+        if !root.contains_key("version") {
+            root.insert("version".to_string(), JsonValue::from(1));
+        }
+        if !root.contains_key("providers") {
+            root.insert(
+                "providers".to_string(),
+                JsonValue::Object(Default::default()),
+            );
+        }
+        let pool = ensure_json_object(root, "credential_pool")?;
+        let provider_entries = pool
+            .entry(custom_provider.pool_key.clone())
+            .or_insert_with(|| JsonValue::Array(Vec::new()));
+        let provider_entries = provider_entries
+            .as_array_mut()
+            .ok_or("credential_pool entry is not an array")?;
+        let existing = provider_entries
+            .iter()
+            .filter_map(parse_pool_entry)
+            .collect::<Vec<_>>();
+        let next_index = existing.len() + 1;
+        let priority = existing
+            .iter()
+            .map(|entry| entry.priority)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+        let label = requested_label
+            .clone()
+            .unwrap_or_else(|| format!("api-key-{next_index}"));
+        let mut entry = serde_json::Map::new();
+        entry.insert("id".to_string(), JsonValue::String(generate_short_id()));
+        entry.insert("label".to_string(), JsonValue::String(label.clone()));
+        entry.insert(
+            "auth_type".to_string(),
+            JsonValue::String("api_key".to_string()),
+        );
+        entry.insert("priority".to_string(), JsonValue::from(priority));
+        entry.insert(
+            "source".to_string(),
+            JsonValue::String("manual".to_string()),
+        );
+        entry.insert(
+            "access_token".to_string(),
+            JsonValue::String(api_key.to_string()),
+        );
+        if let Some(base_url) = custom_provider
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            entry.insert(
+                "base_url".to_string(),
+                JsonValue::String(base_url.trim_end_matches('/').to_string()),
+            );
+        }
+        provider_entries.push(JsonValue::Object(entry));
+        (provider_entries.len(), label)
+    };
+    save_auth_store_json(context.hermes_home().as_path(), &auth_store)?;
+    println!(
+        "Added {} credential #{}: \"{}\"",
+        custom_provider.pool_key, entry_count, label
     );
     Ok(())
 }
@@ -3446,6 +3529,158 @@ fn oauth_default_label(provider: &str, count: usize) -> String {
     format!("{provider}-oauth-{count}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCustomProvider {
+    pool_key: String,
+    provider_key: Option<String>,
+    base_url: Option<String>,
+}
+
+fn auth_add_uses_api_key_shape(args: &AuthAddArgs) -> bool {
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") => false,
+        Some("api_key") | None => {
+            args.api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
+                && !args.no_browser
+                && args.timeout.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn resolve_custom_provider_api_key_target(
+    config_path: &Path,
+    args: &AuthAddArgs,
+) -> Result<Option<ResolvedCustomProvider>, Box<dyn Error>> {
+    if !auth_add_uses_api_key_shape(args) {
+        return Ok(None);
+    }
+    resolve_custom_provider_target(config_path, &args.provider)
+}
+
+fn resolve_custom_provider_target(
+    config_path: &Path,
+    raw_provider: &str,
+) -> Result<Option<ResolvedCustomProvider>, Box<dyn Error>> {
+    let normalized = raw_provider.trim().to_ascii_lowercase();
+    if normalized.is_empty() || matches!(normalized.as_str(), "or" | "open-router") {
+        return Ok(None);
+    }
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(config_path)?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let parsed = serde_yaml::from_str::<Value>(&raw)?;
+    let requested = normalized
+        .strip_prefix("custom:")
+        .unwrap_or(normalized.as_str())
+        .trim();
+    if requested.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(resolved) = parsed
+        .as_mapping()
+        .and_then(|root| root.get(yaml_string_value("custom_providers")))
+        .and_then(Value::as_sequence)
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                custom_provider_entry(entry.as_mapping()?, "").and_then(|resolved| {
+                    custom_provider_matches(requested, &resolved).then_some(resolved)
+                })
+            })
+        })
+    {
+        return Ok(Some(resolved));
+    }
+
+    Ok(parsed
+        .as_mapping()
+        .and_then(|root| root.get(yaml_string_value("providers")))
+        .and_then(Value::as_mapping)
+        .and_then(|providers| {
+            providers.iter().find_map(|(key, value)| {
+                let provider_key = key.as_str()?.trim();
+                custom_provider_entry(value.as_mapping()?, provider_key).and_then(|resolved| {
+                    custom_provider_matches(requested, &resolved).then_some(resolved)
+                })
+            })
+        }))
+}
+
+fn custom_provider_entry(
+    mapping: &serde_yaml::Mapping,
+    provider_key: &str,
+) -> Option<ResolvedCustomProvider> {
+    let base_url = yaml_string_alias(mapping, &["base_url", "url", "api", "baseUrl"])?;
+    let name = yaml_string_alias(mapping, &["name"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| provider_key.trim().to_string());
+    let normalized_name = normalize_custom_provider_key(&name);
+    if normalized_name.is_empty() {
+        return None;
+    }
+    let provider_key = provider_key
+        .trim()
+        .to_ascii_lowercase()
+        .replace(' ', "-")
+        .trim()
+        .to_string();
+    Some(ResolvedCustomProvider {
+        pool_key: format!("custom:{normalized_name}"),
+        provider_key: if provider_key.is_empty() {
+            None
+        } else {
+            Some(provider_key)
+        },
+        base_url: Some(base_url.trim().trim_end_matches('/').to_string()),
+    })
+}
+
+fn custom_provider_matches(requested: &str, provider: &ResolvedCustomProvider) -> bool {
+    let requested = normalize_custom_provider_key(requested);
+    if requested.is_empty() {
+        return false;
+    }
+    if provider.pool_key == format!("custom:{requested}") {
+        return true;
+    }
+    provider
+        .provider_key
+        .as_deref()
+        .is_some_and(|provider_key| provider_key == requested)
+}
+
+fn normalize_custom_provider_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(' ', "-")
+}
+
+fn yaml_string_alias(mapping: &serde_yaml::Mapping, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        mapping
+            .get(yaml_string_value(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn yaml_string_value(key: &str) -> Value {
+    Value::String(key.to_string())
+}
+
 fn has_explicit_nous_runtime_overrides(args: &AuthAddArgs) -> bool {
     args.portal_url
         .as_deref()
@@ -5281,6 +5516,58 @@ mod tests {
                 .get("suppressed_sources")
                 .and_then(JsonValue::as_object)
                 .and_then(|sources| sources.get("openrouter"))
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_custom_api_key_from_provider_key_stays_native() {
+        let home = temp_path("auth-add-custom");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "providers:\n  demo-endpoint:\n    name: Demo Provider\n    api: https://demo.example/v1/\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "suppressed_sources": {
+                    "custom:demo-provider": ["config:demo-provider"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "demo-endpoint".to_string(),
+                label: Some("primary".to_string()),
+                api_key: Some("sk-demo".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["custom:demo-provider"][0];
+        assert_eq!(entry["label"], "primary");
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["source"], "manual");
+        assert_eq!(entry["access_token"], "sk-demo");
+        assert_eq!(entry["base_url"], "https://demo.example/v1");
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .and_then(|sources| sources.get("custom:demo-provider"))
                 .is_none()
         );
         let _ = fs::remove_dir_all(home);
