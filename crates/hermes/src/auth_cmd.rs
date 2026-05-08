@@ -14,7 +14,7 @@ use getrandom::fill as fill_random;
 use hermes_core::{
     AuthStatusSummary, HermesContext, LoadedConfig, OPENROUTER_BASE_URL, clear_provider_auth_state,
     get_active_auth_provider, get_auth_status_summary, get_provider_profile,
-    normalize_provider_alias, resolve_codex_access_token,
+    normalize_provider_alias, resolve_codex_access_token, resolve_copilot_runtime_credentials,
     resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
     resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
 };
@@ -238,6 +238,9 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     if should_use_native_auth_add(args) {
         return native_auth_add_api_key(context, args);
     }
+    if should_use_native_copilot_auth_add(args) {
+        return native_auth_add_copilot(context, args);
+    }
     if should_use_native_anthropic_oauth_add(args) {
         return native_auth_add_anthropic_oauth(context, args);
     }
@@ -427,6 +430,13 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     auth_add_is_plain_api_key_request(args)
 }
 
+fn should_use_native_copilot_auth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    provider == "copilot" && auth_add_is_plain_api_key_request(args) && args.api_key.is_none()
+}
+
 fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
     let Some(provider) = normalize_provider_name(&args.provider) else {
         return false;
@@ -529,6 +539,78 @@ fn should_use_native_codex_oauth_add(args: &AuthAddArgs) -> bool {
         }
         _ => false,
     }
+}
+
+fn native_auth_add_copilot(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add copilot`.")?;
+    if provider != "copilot" {
+        return Err("provider must be copilot".into());
+    }
+
+    let creds = resolve_copilot_runtime_credentials()?;
+    let (source, default_label) = resolve_copilot_auth_add_source()?;
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+    let label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(default_label);
+    let count = upsert_auth_pool_entry_by_sources(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "api_key".to_string(),
+            source,
+            access_token: creds.api_key,
+            refresh_token: None,
+            base_url: get_provider_profile("copilot")
+                .map(|profile| profile.base_url.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            expires_at_ms: None,
+            last_refresh: None,
+        },
+        &[
+            "gh_cli",
+            "env:COPILOT_GITHUB_TOKEN",
+            "env:GH_TOKEN",
+            "env:GITHUB_TOKEN",
+        ],
+    )?;
+    println!("Added copilot credential #{}: \"{}\"", count, label);
+    Ok(())
+}
+
+fn resolve_copilot_auth_add_source() -> Result<(String, String), Box<dyn Error>> {
+    for env_var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if std::env::var(env_var)
+            .ok()
+            .as_deref()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty() && !trimmed.starts_with("ghp_")).then_some(trimmed)
+            })
+            .is_some()
+        {
+            return Ok((format!("env:{env_var}"), env_var.to_string()));
+        }
+    }
+    if env_trimmed("HERMES_COPILOT_GH_PATH").is_some()
+        || Command::new("sh")
+            .arg("-c")
+            .arg("command -v gh >/dev/null 2>&1")
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        return Ok(("gh_cli".to_string(), "gh auth token".to_string()));
+    }
+    Err("No Copilot auth source found.".into())
 }
 
 fn native_auth_add_api_key(
@@ -5143,6 +5225,47 @@ mod tests {
         (base_url, request_body, handle)
     }
 
+    fn spawn_copilot_exchange_server(
+        expected_token: &'static str,
+        exchanged_token: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("GET /copilot-token "));
+            assert!(request_text.to_ascii_lowercase().contains(
+                &format!("authorization: token {}", expected_token).to_ascii_lowercase()
+            ));
+
+            let body = json!({
+                "token": exchanged_token,
+                "expires_at": 4102444800_u64
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}/copilot-token"), handle)
+    }
+
     fn spawn_google_oauth_server(
         access_token: &str,
         refresh_token: &str,
@@ -6242,6 +6365,145 @@ mod tests {
         assert_eq!(entry["auth_type"], "oauth");
         assert_eq!(entry["source"], "manual:qwen_cli");
         assert_eq!(entry["base_url"], "https://portal.qwen.ai/v1");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn auth_add_copilot_uses_native_env_runtime() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-copilot-env");
+        fs::create_dir_all(&home).unwrap();
+        let (exchange_url, server) =
+            spawn_copilot_exchange_server("gho_envtoken", "copilot-api-token");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        let previous_copilot = std::env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = std::env::var_os("GH_TOKEN");
+        let previous_github = std::env::var_os("GITHUB_TOKEN");
+        let previous_exchange = std::env::var_os("HERMES_COPILOT_TOKEN_EXCHANGE_URL");
+        unsafe {
+            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_envtoken");
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", &exchange_url);
+        }
+
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "copilot".to_string(),
+                ..AuthAddArgs::default()
+            },
+        );
+        server.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { std::env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { std::env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { std::env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
+        match previous_exchange {
+            Some(value) => unsafe { std::env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", value) },
+            None => unsafe { std::env::remove_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL") },
+        }
+        result.unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["copilot"][0];
+        assert_eq!(entry["label"], "COPILOT_GITHUB_TOKEN");
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["source"], "env:COPILOT_GITHUB_TOKEN");
+        assert_eq!(entry["access_token"], "copilot-api-token");
+        assert_eq!(entry["base_url"], "https://api.githubcopilot.com");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_copilot_uses_native_gh_cli_runtime() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-copilot-gh");
+        fs::create_dir_all(&home).unwrap();
+        let temp = temp_path("auth-add-copilot-gh-bin");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"token\" ]; then\n  echo gho_from_gh\n  exit 0\nfi\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gh, perms).unwrap();
+        }
+
+        let (exchange_url, server) =
+            spawn_copilot_exchange_server("gho_from_gh", "copilot-api-token-gh");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        let previous_copilot = std::env::var_os("COPILOT_GITHUB_TOKEN");
+        let previous_gh = std::env::var_os("GH_TOKEN");
+        let previous_github = std::env::var_os("GITHUB_TOKEN");
+        let previous_exchange = std::env::var_os("HERMES_COPILOT_TOKEN_EXCHANGE_URL");
+        let previous_gh_path = std::env::var_os("HERMES_COPILOT_GH_PATH");
+        unsafe {
+            std::env::remove_var("COPILOT_GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", &exchange_url);
+            std::env::set_var("HERMES_COPILOT_GH_PATH", &gh);
+        }
+
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "copilot".to_string(),
+                ..AuthAddArgs::default()
+            },
+        );
+        server.join().unwrap();
+
+        match previous_copilot {
+            Some(value) => unsafe { std::env::set_var("COPILOT_GITHUB_TOKEN", value) },
+            None => unsafe { std::env::remove_var("COPILOT_GITHUB_TOKEN") },
+        }
+        match previous_gh {
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
+        }
+        match previous_github {
+            Some(value) => unsafe { std::env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
+        match previous_exchange {
+            Some(value) => unsafe { std::env::set_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL", value) },
+            None => unsafe { std::env::remove_var("HERMES_COPILOT_TOKEN_EXCHANGE_URL") },
+        }
+        match previous_gh_path {
+            Some(value) => unsafe { std::env::set_var("HERMES_COPILOT_GH_PATH", value) },
+            None => unsafe { std::env::remove_var("HERMES_COPILOT_GH_PATH") },
+        }
+        result.unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["copilot"][0];
+        assert_eq!(entry["label"], "gh auth token");
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["source"], "gh_cli");
+        assert_eq!(entry["access_token"], "copilot-api-token-gh");
+        assert_eq!(entry["base_url"], "https://api.githubcopilot.com");
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(temp);
     }
