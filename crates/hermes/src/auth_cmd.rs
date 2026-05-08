@@ -49,6 +49,9 @@ const DEFAULT_ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v
 const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/0.0.0 (external, cli)";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEFAULT_CODEX_OAUTH_ISSUER: &str = "https://auth.openai.com";
+const DEFAULT_CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 const AUTH_ADD_BOOTSTRAP: &str = concat!(
     "import os\n",
@@ -214,6 +217,9 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     }
     if should_use_native_runtime_oauth_add(args) {
         return native_auth_add_runtime_oauth(context, args);
+    }
+    if should_use_native_codex_oauth_add(args) {
+        return native_auth_add_openai_codex_oauth(context, args);
     }
     run_python_auth_add(args)
 }
@@ -452,6 +458,27 @@ fn should_use_native_anthropic_oauth_add(args: &AuthAddArgs) -> bool {
     }
 }
 
+fn should_use_native_codex_oauth_add(args: &AuthAddArgs) -> bool {
+    let Some(provider) = normalize_provider_name(&args.provider) else {
+        return false;
+    };
+    if provider != "openai-codex" {
+        return false;
+    }
+    match normalize_auth_type(args.auth_type.as_deref()) {
+        Some("oauth") | None => {
+            args.api_key.is_none()
+                && args.portal_url.is_none()
+                && args.inference_url.is_none()
+                && args.client_id.is_none()
+                && args.scope.is_none()
+                && !args.insecure
+                && args.ca_bundle.is_none()
+        }
+        _ => false,
+    }
+}
+
 fn native_auth_add_api_key(
     context: &HermesContext,
     args: &AuthAddArgs,
@@ -633,6 +660,7 @@ fn native_auth_add_anthropic_oauth_with_io(
                 .map(|profile| profile.base_url.trim().to_string())
                 .filter(|value| !value.is_empty()),
             expires_at_ms: Some(tokens.expires_at_ms),
+            last_refresh: None,
         },
     )?;
     writeln!(
@@ -644,14 +672,194 @@ fn native_auth_add_anthropic_oauth_with_io(
     Ok(())
 }
 
+fn native_auth_add_openai_codex_oauth(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    native_auth_add_openai_codex_oauth_with_io(context, args, &mut output)
+}
+
+fn native_auth_add_openai_codex_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add openai-codex`.")?;
+    if provider != "openai-codex" {
+        return run_python_auth_add(args);
+    }
+
+    let issuer = codex_oauth_issuer();
+    let device_url = format!("{}/codex/device", issuer.trim_end_matches('/'));
+    let usercode_endpoint = format!(
+        "{}/api/accounts/deviceauth/usercode",
+        issuer.trim_end_matches('/')
+    );
+    let poll_endpoint = format!(
+        "{}/api/accounts/deviceauth/token",
+        issuer.trim_end_matches('/')
+    );
+    let redirect_uri = format!("{}/deviceauth/callback", issuer.trim_end_matches('/'));
+    let client = Client::builder()
+        .timeout(Duration::from_secs_f64(
+            args.timeout.unwrap_or(15.0).max(1.0),
+        ))
+        .build()?;
+    let device_response = client
+        .post(usercode_endpoint)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+        }))
+        .send()
+        .map_err(|error| format!("Failed to request Codex device code: {error}"))?;
+    if device_response.status().as_u16() != 200 {
+        return Err(format!(
+            "Codex device code request returned status {}.",
+            device_response.status().as_u16()
+        )
+        .into());
+    }
+    let device_payload: JsonValue = device_response.json()?;
+    let device_payload = device_payload
+        .as_object()
+        .ok_or("Codex device code response was not a JSON object.")?;
+    let user_code = json_string(device_payload, "user_code")
+        .ok_or("Codex device code response missing user_code.")?
+        .to_string();
+    let device_auth_id = json_string(device_payload, "device_auth_id")
+        .ok_or("Codex device code response missing device_auth_id.")?
+        .to_string();
+    let poll_interval = device_payload
+        .get("interval")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(5)
+        .max(1) as u64;
+
+    writeln!(output, "Signing in to OpenAI Codex...")?;
+    writeln!(
+        output,
+        "(Hermes creates its own session — won't affect Codex CLI or VS Code)"
+    )?;
+    writeln!(output)?;
+    writeln!(output, "To continue, follow these steps:")?;
+    writeln!(output)?;
+    writeln!(output, "  1. Open this URL in your browser:")?;
+    writeln!(output, "     {device_url}")?;
+    writeln!(output)?;
+    writeln!(output, "  2. Enter this code:")?;
+    writeln!(output, "     {user_code}")?;
+    writeln!(output)?;
+    writeln!(output, "Waiting for sign-in... (press Ctrl+C to cancel)")?;
+    output.flush()?;
+
+    let started = std::time::Instant::now();
+    let max_wait = Duration::from_secs_f64(codex_oauth_max_wait_seconds());
+    let (authorization_code, code_verifier) = loop {
+        let poll_response = client
+            .post(&poll_endpoint)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+            }))
+            .send()
+            .map_err(|error| format!("Codex device auth polling failed: {error}"))?;
+        match poll_response.status().as_u16() {
+            200 => {
+                let payload: JsonValue = poll_response.json()?;
+                let payload = payload
+                    .as_object()
+                    .ok_or("Codex device auth poll response was not a JSON object.")?;
+                let authorization_code = json_string(payload, "authorization_code")
+                    .map(ToOwned::to_owned)
+                    .ok_or("Codex device auth response missing authorization_code.")?;
+                let code_verifier = json_string(payload, "code_verifier")
+                    .map(ToOwned::to_owned)
+                    .ok_or("Codex device auth response missing code_verifier.")?;
+                break (authorization_code, code_verifier);
+            }
+            403 | 404 => {
+                if started.elapsed() >= max_wait {
+                    return Err("Codex login timed out after waiting for device approval.".into());
+                }
+                thread::sleep(Duration::from_secs(poll_interval));
+            }
+            status => {
+                return Err(format!("Codex device auth polling returned status {status}.").into());
+            }
+        }
+    };
+    let token_response = client
+        .post(codex_oauth_token_url())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", authorization_code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+            ("code_verifier", code_verifier.as_str()),
+        ])
+        .send()
+        .map_err(|error| format!("Codex token exchange failed: {error}"))?;
+    if token_response.status().as_u16() != 200 {
+        return Err(format!(
+            "Codex token exchange returned status {}.",
+            token_response.status().as_u16()
+        )
+        .into());
+    }
+    let token_payload: JsonValue = token_response.json()?;
+    let token_payload = token_payload
+        .as_object()
+        .ok_or("Codex token exchange response was not a JSON object.")?;
+    let access_token = json_string(token_payload, "access_token")
+        .ok_or("Codex token exchange did not return an access_token.")?
+        .to_string();
+    let refresh_token = json_string(token_payload, "refresh_token").map(ToOwned::to_owned);
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| label_from_token(&access_token, &default_label));
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+    let stored_count = add_auth_pool_entry(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "manual:device_code".to_string(),
+            access_token,
+            refresh_token,
+            base_url: Some(codex_base_url()),
+            expires_at_ms: None,
+            last_refresh: Some(codex_now_rfc3339()),
+        },
+    )?;
+    writeln!(
+        output,
+        "Added openai-codex OAuth credential #{}: \"{}\"",
+        stored_count, label
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
 fn native_auth_add_runtime_oauth(
     context: &HermesContext,
     args: &AuthAddArgs,
 ) -> Result<(), Box<dyn Error>> {
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
-    if matches!(provider.as_str(), "nous" | "openai-codex")
-        && provider_pool_has_entries(context.hermes_home().as_path(), &provider)?
+    if provider == "nous" && provider_pool_has_entries(context.hermes_home().as_path(), &provider)?
     {
         return run_python_auth_add(args);
     }
@@ -726,8 +934,10 @@ fn native_auth_add_runtime_oauth(
             )
         }
         "openai-codex" => {
-            if !provider_state_exists(context.hermes_home().as_path(), "openai-codex")? {
-                return run_python_auth_add(args);
+            if provider_pool_has_entries(context.hermes_home().as_path(), "openai-codex")?
+                || !provider_state_exists(context.hermes_home().as_path(), "openai-codex")?
+            {
+                return native_auth_add_openai_codex_oauth(context, args);
             }
             let access_token = resolve_codex_access_token(context.hermes_home().as_path())?;
             let auth_store = load_auth_store_json(context.hermes_home().as_path())?;
@@ -763,6 +973,7 @@ fn native_auth_add_runtime_oauth(
             refresh_token,
             base_url,
             expires_at_ms: None,
+            last_refresh: None,
         },
     )?;
     println!(
@@ -2091,6 +2302,7 @@ struct NewPoolEntry {
     refresh_token: Option<String>,
     base_url: Option<String>,
     expires_at_ms: Option<i64>,
+    last_refresh: Option<String>,
 }
 
 fn ensure_json_object<'a>(
@@ -2368,6 +2580,9 @@ fn add_auth_pool_entry(
     if let Some(expires_at_ms) = entry.expires_at_ms {
         payload.insert("expires_at_ms".to_string(), JsonValue::from(expires_at_ms));
     }
+    if let Some(last_refresh) = entry.last_refresh.filter(|value| !value.trim().is_empty()) {
+        payload.insert("last_refresh".to_string(), JsonValue::String(last_refresh));
+    }
     provider_entries.push(JsonValue::Object(payload));
     let count = provider_entries.len();
     save_auth_store_json(hermes_home, &auth_store)?;
@@ -2503,6 +2718,37 @@ fn anthropic_exchange_code_for_tokens(
         refresh_token,
         expires_at_ms,
     })
+}
+
+fn codex_oauth_issuer() -> String {
+    env_trimmed("HERMES_AUTH_CODEX_ISSUER")
+        .unwrap_or_else(|| DEFAULT_CODEX_OAUTH_ISSUER.to_string())
+}
+
+fn codex_oauth_token_url() -> String {
+    env_trimmed("HERMES_AUTH_CODEX_TOKEN_URL")
+        .unwrap_or_else(|| DEFAULT_CODEX_OAUTH_TOKEN_URL.to_string())
+}
+
+fn codex_base_url() -> String {
+    env_trimmed("HERMES_CODEX_BASE_URL")
+        .or_else(|| {
+            get_provider_profile("openai-codex")
+                .map(|profile| profile.base_url.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string())
+}
+
+fn codex_oauth_max_wait_seconds() -> f64 {
+    env_trimmed("HERMES_AUTH_CODEX_MAX_WAIT_SECONDS")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(15.0 * 60.0)
+}
+
+fn codex_now_rfc3339() -> String {
+    Utc::now().to_rfc3339().replace("+00:00", "Z")
 }
 
 fn decode_jwt_claims(token: &str) -> Option<JsonMap<String, JsonValue>> {
@@ -2648,6 +2894,61 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (base_url, request_body, handle)
+    }
+
+    fn spawn_codex_oauth_server(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = Arc::clone(&requests);
+        let access_token = access_token.to_string();
+        let refresh_token = refresh_token.to_string();
+        let handle = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                requests_clone.lock().unwrap().push(request.clone());
+                let (status_line, payload) = match idx {
+                    0 => (
+                        "HTTP/1.1 200 OK",
+                        json!({
+                            "user_code": "USER-CODE",
+                            "device_auth_id": "device-auth-123",
+                            "interval": 1
+                        })
+                        .to_string(),
+                    ),
+                    1 => (
+                        "HTTP/1.1 200 OK",
+                        json!({
+                            "authorization_code": "auth-code-123",
+                            "code_verifier": "verifier-xyz"
+                        })
+                        .to_string(),
+                    ),
+                    _ => (
+                        "HTTP/1.1 200 OK",
+                        json!({
+                            "access_token": access_token,
+                            "refresh_token": refresh_token
+                        })
+                        .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests, handle)
     }
 
     #[test]
@@ -3299,6 +3600,79 @@ mod tests {
         );
         assert_eq!(entry["refresh_token"], "codex-refresh");
         assert_eq!(entry["base_url"], "https://chatgpt.com/backend-api/codex");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_openai_codex_oauth_without_state_uses_native_device_flow() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-codex-device");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let (issuer, requests, server) = spawn_codex_oauth_server(
+            "header.eyJlbWFpbCI6ImNvZGV4LWRldmljZUBleGFtcGxlLmNvbSJ9.sig",
+            "codex-refresh-2",
+        );
+
+        unsafe {
+            std::env::set_var("HERMES_AUTH_CODEX_ISSUER", &issuer);
+            std::env::set_var(
+                "HERMES_AUTH_CODEX_TOKEN_URL",
+                format!("{issuer}/oauth/token"),
+            );
+            std::env::set_var("HERMES_AUTH_CODEX_MAX_WAIT_SECONDS", "5");
+            std::env::set_var(
+                "HERMES_CODEX_BASE_URL",
+                "https://codex.example.test/backend-api/codex",
+            );
+        }
+        let mut output = Vec::new();
+        let result = native_auth_add_openai_codex_oauth_with_io(
+            &context,
+            &AuthAddArgs {
+                provider: "openai-codex".to_string(),
+                auth_type: Some("oauth".to_string()),
+                timeout: Some(5.0),
+                ..AuthAddArgs::default()
+            },
+            &mut output,
+        );
+        unsafe {
+            std::env::remove_var("HERMES_AUTH_CODEX_ISSUER");
+            std::env::remove_var("HERMES_AUTH_CODEX_TOKEN_URL");
+            std::env::remove_var("HERMES_AUTH_CODEX_MAX_WAIT_SECONDS");
+            std::env::remove_var("HERMES_CODEX_BASE_URL");
+        }
+
+        result.unwrap();
+        server.join().unwrap();
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+        assert!(captured[0].starts_with("POST /api/accounts/deviceauth/usercode "));
+        assert!(captured[0].contains("\"client_id\":\"app_EMoamEEZ73f0CkXaXp7hrann\""));
+        assert!(captured[1].starts_with("POST /api/accounts/deviceauth/token "));
+        assert!(captured[1].contains("\"device_auth_id\":\"device-auth-123\""));
+        assert!(captured[1].contains("\"user_code\":\"USER-CODE\""));
+        assert!(captured[2].starts_with("POST /oauth/token "));
+        assert!(captured[2].contains("grant_type=authorization_code"));
+        assert!(captured[2].contains("code=auth-code-123"));
+        assert!(captured[2].contains("code_verifier=verifier-xyz"));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["openai-codex"][0];
+        assert_eq!(entry["label"], "codex-device@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:device_code");
+        assert_eq!(entry["refresh_token"], "codex-refresh-2");
+        assert_eq!(
+            entry["base_url"],
+            "https://codex.example.test/backend-api/codex"
+        );
+        assert!(entry["last_refresh"].as_str().is_some());
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Signing in to OpenAI Codex..."));
+        assert!(rendered.contains("Added openai-codex OAuth credential #1"));
         let _ = fs::remove_dir_all(home);
     }
 
