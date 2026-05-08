@@ -1432,6 +1432,11 @@ fn native_auth_add_runtime_oauth(
 ) -> Result<(), Box<dyn Error>> {
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
+    if provider == "qwen-oauth" {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        return native_auth_add_qwen_oauth_with_io(context, args, &mut output);
+    }
     if provider == "nous" {
         return native_auth_add_nous_oauth(context, args);
     }
@@ -1445,17 +1450,6 @@ fn native_auth_add_runtime_oauth(
         .map(ToOwned::to_owned);
 
     let (source, access_token, refresh_token, base_url, derived_label) = match provider.as_str() {
-        "qwen-oauth" => {
-            let creds = resolve_qwen_runtime_credentials()?;
-            let label = label_from_token(&creds.access_token, &default_label);
-            (
-                "manual:qwen_cli".to_string(),
-                creds.access_token,
-                None,
-                non_empty_trimmed_owned(&creds.base_url),
-                label,
-            )
-        }
         "nous" => {
             if !provider_state_exists(context.hermes_home().as_path(), "nous")? {
                 return run_python_auth_add(args);
@@ -1531,6 +1525,76 @@ fn native_auth_add_runtime_oauth(
         "Added {} OAuth credential #{}: \"{}\"",
         provider, stored_count, label
     );
+    Ok(())
+}
+
+pub(crate) fn native_auth_add_qwen_oauth_with_io(
+    context: &HermesContext,
+    args: &AuthAddArgs,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add qwen-oauth`.")?;
+    if provider != "qwen-oauth" {
+        return Err("provider must be qwen-oauth".into());
+    }
+
+    let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
+    let default_label = oauth_default_label(&provider, next_index);
+    let requested_label = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let creds = match resolve_qwen_runtime_credentials() {
+        Ok(creds) => creds,
+        Err(_) => {
+            let command = env_trimmed("HERMES_QWEN_CLI_PATH").unwrap_or_else(|| "qwen".to_string());
+            writeln!(output, "Starting Qwen CLI login...")?;
+            writeln!(output, "Running: {command} auth qwen-oauth")?;
+            output.flush()?;
+            let status = Command::new(&command)
+                .arg("auth")
+                .arg("qwen-oauth")
+                .status()
+                .map_err(|error| {
+                    format!("Failed to launch `{command} auth qwen-oauth`: {error}")
+                })?;
+            if !status.success() {
+                return Err(
+                    exit_status_message(&format!("{command} auth qwen-oauth"), status).into(),
+                );
+            }
+            resolve_qwen_runtime_credentials()?
+        }
+    };
+
+    clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
+    let label =
+        requested_label.unwrap_or_else(|| label_from_token(&creds.access_token, &default_label));
+    let stored_count = upsert_auth_pool_entry_by_sources(
+        context.hermes_home().as_path(),
+        &provider,
+        NewPoolEntry {
+            label: label.clone(),
+            auth_type: "oauth".to_string(),
+            source: "manual:qwen_cli".to_string(),
+            access_token: creds.access_token,
+            refresh_token: None,
+            base_url: non_empty_trimmed_owned(&creds.base_url),
+            expires_at_ms: None,
+            last_refresh: None,
+        },
+        &["manual:qwen_cli", "qwen-cli"],
+    )?;
+    writeln!(
+        output,
+        "Added qwen-oauth OAuth credential #{}: \"{}\"",
+        stored_count, label
+    )?;
+    output.flush()?;
     Ok(())
 }
 
@@ -2033,16 +2097,23 @@ fn try_native_auth_remove(
                 ],
             )
         }
-        "qwen-oauth" if source == "qwen-cli" => (
-            false,
-            vec![source.to_string()],
-            Vec::new(),
-            vec![
-                "Suppressed qwen-cli credential — it will not be re-seeded.".to_string(),
-                "Note: Qwen CLI credentials still live in ~/.qwen/oauth_creds.json".to_string(),
-                "Run `hermes auth add qwen-oauth` to re-enable if needed.".to_string(),
-            ],
-        ),
+        "qwen-oauth" if source == "qwen-cli" || source == "manual:qwen_cli" => {
+            let mut suppress_sources = vec!["qwen-cli".to_string()];
+            if source != "qwen-cli" {
+                suppress_sources.push(source.to_string());
+            }
+            (
+                false,
+                suppress_sources,
+                Vec::new(),
+                vec![
+                    "Suppressed qwen-cli credential — it will not be re-seeded.".to_string(),
+                    "Note: Qwen CLI credentials still live in ~/.qwen/oauth_creds.json"
+                        .to_string(),
+                    "Run `hermes auth add qwen-oauth` to re-enable if needed.".to_string(),
+                ],
+            )
+        }
         "minimax-oauth" if source == "oauth" || source == "manual:minimax_oauth" => (
             true,
             vec![source.to_string()],
@@ -6115,6 +6186,67 @@ mod tests {
     }
 
     #[test]
+    fn auth_add_qwen_oauth_without_state_uses_native_cli_launcher() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-qwen-launcher");
+        fs::create_dir_all(&home).unwrap();
+        let temp = temp_path("auth-add-qwen-launcher-bin");
+        fs::create_dir_all(&temp).unwrap();
+        let log_path = temp.join("qwen.log");
+        let qwen = temp.join("qwen");
+        fs::write(
+            &qwen,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nmkdir -p \"$HOME/.qwen\"\ncat > \"$HOME/.qwen/oauth_creds.json\" <<'EOF'\n{{\"access_token\":\"header.eyJlbWFpbCI6InF3ZW4tbGF1bmNoQGV4YW1wbGUuY29tIn0.sig\",\"refresh_token\":\"qwen-refresh\",\"token_type\":\"Bearer\",\"resource_url\":\"portal.qwen.ai\",\"expiry_date\":9223372036854}}\nEOF\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&qwen).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&qwen, perms).unwrap();
+        }
+
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let previous_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+        unsafe { std::env::set_var("HERMES_QWEN_CLI_PATH", &qwen) };
+
+        let result = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "qwen-oauth".to_string(),
+                auth_type: Some("oauth".to_string()),
+                ..AuthAddArgs::default()
+            },
+        );
+
+        unsafe { std::env::remove_var("HERMES_QWEN_CLI_PATH") };
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("auth"));
+        assert!(logged.contains("qwen-oauth"));
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["qwen-oauth"][0];
+        assert_eq!(entry["label"], "qwen-launch@example.com");
+        assert_eq!(entry["auth_type"], "oauth");
+        assert_eq!(entry["source"], "manual:qwen_cli");
+        assert_eq!(entry["base_url"], "https://portal.qwen.ai/v1");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn auth_add_minimax_oauth_uses_native_runtime() {
         let home = temp_path("auth-add-minimax");
         fs::create_dir_all(&home).unwrap();
@@ -7147,6 +7279,57 @@ mod tests {
         let persisted: JsonValue =
             serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
         assert_eq!(persisted["suppressed_sources"]["qwen-oauth"][0], "qwen-cli");
+        assert!(
+            persisted["credential_pool"]["qwen-oauth"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_manual_qwen_cli_stays_native_and_suppresses_source() {
+        let home = temp_path("auth-remove-qwen-manual");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "qwen-oauth": [
+                        {
+                            "id": "qwen1",
+                            "label": "Qwen Manual",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:qwen_cli",
+                            "access_token": "qwen-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "qwen-oauth".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(persisted["suppressed_sources"]["qwen-oauth"][0], "qwen-cli");
+        assert_eq!(
+            persisted["suppressed_sources"]["qwen-oauth"][1],
+            "manual:qwen_cli"
+        );
         assert!(
             persisted["credential_pool"]["qwen-oauth"]
                 .as_array()

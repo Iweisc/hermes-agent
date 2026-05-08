@@ -1358,7 +1358,7 @@ fn provider_available_for_native_model_setup(context: &HermesContext, provider: 
 fn provider_supports_fresh_native_model_setup(provider: &str) -> bool {
     matches!(
         provider,
-        "openai-codex" | "minimax-oauth" | "nous" | "google-gemini-cli"
+        "openai-codex" | "minimax-oauth" | "nous" | "google-gemini-cli" | "qwen-oauth"
     )
 }
 
@@ -1427,6 +1427,19 @@ fn ensure_runtime_model_provider_credentials(
                 },
                 &mut output,
                 |_output| shared_ui.borrow_mut().prompt("Callback URL or code"),
+            )?;
+            output.flush()?;
+        }
+        "qwen-oauth" => {
+            let mut output = SetupUiWriteAdapter::new(ui);
+            auth_cmd::native_auth_add_qwen_oauth_with_io(
+                context,
+                &AuthAddArgs {
+                    provider: provider.name.clone(),
+                    auth_type: Some("oauth".to_string()),
+                    ..AuthAddArgs::default()
+                },
+                &mut output,
             )?;
             output.flush()?;
         }
@@ -4532,6 +4545,76 @@ exit 9\n",
                 "Default model set to: gemini-3.1-pro-preview (via Google Gemini (OAuth))"
             )
         );
+    }
+
+    #[test]
+    fn setup_model_qwen_oauth_fresh_login_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let qwen = temp.path().join("qwen");
+        let log_path = temp.path().join("qwen.log");
+        fs::write(
+            &qwen,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nmkdir -p \"$HOME/.qwen\"\ncat > \"$HOME/.qwen/oauth_creds.json\" <<'EOF'\n{{\"access_token\":\"header.eyJlbWFpbCI6InF3ZW4tc2V0dXBAZXhhbXBsZS5jb20ifQ.sig\",\"refresh_token\":\"qwen-refresh\",\"token_type\":\"Bearer\",\"resource_url\":\"portal.qwen.ai\",\"expiry_date\":9223372036854}}\nEOF\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&qwen).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&qwen, perms).unwrap();
+        }
+
+        set_env_var("HOME", &home);
+        set_env_var("HERMES_QWEN_CLI_PATH", &qwen);
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let qwen_choice = providers
+            .iter()
+            .position(|provider| provider.name == "qwen-oauth")
+            .map(|index| index + 1)
+            .unwrap();
+        let mut input = io::Cursor::new(format!("{qwen_choice}\nqwen3-coder-plus\n").into_bytes());
+        let mut output = Vec::new();
+
+        let result = run_native_model_setup_with_io(&context, &mut input, &mut output);
+        remove_env_var("HOME");
+        remove_env_var("HERMES_QWEN_CLI_PATH");
+
+        result.unwrap();
+
+        let logged = fs::read_to_string(log_path).unwrap();
+        assert!(logged.contains("auth"));
+        assert!(logged.contains("qwen-oauth"));
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: qwen-oauth"));
+        assert!(config_text.contains("default: qwen3-coder-plus"));
+        assert!(config_text.contains("base_url: https://portal.qwen.ai/v1"));
+        assert!(config_text.contains("api_mode: chat_completions"));
+
+        let auth_text = fs::read_to_string(home.join("auth.json")).unwrap();
+        let auth_json: JsonValue = serde_json::from_str(&auth_text).unwrap();
+        assert_eq!(
+            auth_json["credential_pool"]["qwen-oauth"][0]["label"],
+            "qwen-setup@example.com"
+        );
+        assert_eq!(
+            auth_json["credential_pool"]["qwen-oauth"][0]["source"],
+            "manual:qwen_cli"
+        );
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Starting Qwen CLI login..."));
+        assert!(rendered.contains("Added qwen-oauth OAuth credential #1"));
+        assert!(rendered.contains("Default model set to: qwen3-coder-plus (via Qwen OAuth)"));
     }
 
     #[test]
