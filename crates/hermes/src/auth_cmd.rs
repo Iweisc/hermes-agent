@@ -307,6 +307,21 @@ fn print_auth_remove(context: &HermesContext, args: &AuthRemoveArgs) -> Result<(
         )
         .into());
     };
+    if let Some(result) =
+        try_native_auth_remove(context.hermes_home().as_path(), &provider, index, entry)?
+    {
+        println!(
+            "Removed {} credential #{} ({})",
+            provider, index, result.label
+        );
+        for line in result.cleaned {
+            println!("{line}");
+        }
+        for line in result.hints {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     if entry_source_is_manual(&entry.source) {
         remove_manual_auth_entry(context.hermes_home().as_path(), &provider, index)?;
         println!(
@@ -696,6 +711,77 @@ fn run_python_auth_remove(provider: &str, target: &str) -> Result<(), Box<dyn Er
         return Ok(());
     }
     Err(exit_status_message("auth remove", status).into())
+}
+
+struct NativeAuthRemoveResult {
+    label: String,
+    cleaned: Vec<String>,
+    hints: Vec<String>,
+}
+
+fn try_native_auth_remove(
+    hermes_home: &Path,
+    provider: &str,
+    index: usize,
+    entry: &PoolEntry,
+) -> Result<Option<NativeAuthRemoveResult>, Box<dyn Error>> {
+    let source = entry.source.trim();
+    let (clear_provider_state, suppress_sources, cleaned, hints) = match provider {
+        "nous" if source == "device_code" => (
+            true,
+            vec![source.to_string()],
+            vec![format!("Cleared {provider} OAuth tokens from auth store")],
+            Vec::new(),
+        ),
+        "openai-codex" if source == "device_code" || source.ends_with(":device_code") => {
+            let mut suppress_sources = vec!["device_code".to_string()];
+            if source != "device_code" {
+                suppress_sources.push(source.to_string());
+            }
+            (
+                true,
+                suppress_sources,
+                vec![format!("Cleared {provider} OAuth tokens from auth store")],
+                vec![
+                    "Suppressed openai-codex device_code source — it will not be re-seeded."
+                        .to_string(),
+                    "Note: Codex CLI credentials still live in ~/.codex/auth.json".to_string(),
+                    "Run `hermes auth add openai-codex` to re-enable if needed.".to_string(),
+                ],
+            )
+        }
+        "qwen-oauth" if source == "qwen-cli" => (
+            false,
+            vec![source.to_string()],
+            Vec::new(),
+            vec![
+                "Suppressed qwen-cli credential — it will not be re-seeded.".to_string(),
+                "Note: Qwen CLI credentials still live in ~/.qwen/oauth_creds.json".to_string(),
+                "Run `hermes auth add qwen-oauth` to re-enable if needed.".to_string(),
+            ],
+        ),
+        "minimax-oauth" if source == "oauth" => (
+            true,
+            vec![source.to_string()],
+            vec![format!("Cleared {provider} OAuth tokens from auth store")],
+            Vec::new(),
+        ),
+        _ => return Ok(None),
+    };
+
+    apply_native_auth_remove_changes(
+        hermes_home,
+        provider,
+        index,
+        clear_provider_state,
+        &suppress_sources,
+    )?;
+
+    Ok(Some(NativeAuthRemoveResult {
+        label: entry.label.clone(),
+        cleaned,
+        hints,
+    }))
 }
 
 fn run_native_spotify_login(
@@ -1870,6 +1956,72 @@ fn provider_state_json(
         .cloned()
 }
 
+fn apply_native_auth_remove_changes(
+    hermes_home: &Path,
+    provider: &str,
+    index: usize,
+    clear_provider_state: bool,
+    suppress_sources: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let mut auth_store = load_auth_store_json(hermes_home)?;
+    let root = auth_store
+        .as_object_mut()
+        .ok_or("auth store is not a JSON object")?;
+
+    let Some(pool) = root
+        .get_mut("credential_pool")
+        .and_then(JsonValue::as_object_mut)
+    else {
+        return Err(format!("No credential #{}.", index).into());
+    };
+    let Some(entries) = pool.get_mut(provider).and_then(JsonValue::as_array_mut) else {
+        return Err(format!("No credential #{}.", index).into());
+    };
+    if index == 0 || index > entries.len() {
+        return Err(format!("No credential #{}.", index).into());
+    }
+    entries.remove(index - 1);
+    for (priority, entry) in entries.iter_mut().enumerate() {
+        if let Some(mapping) = entry.as_object_mut() {
+            mapping.insert("priority".to_string(), JsonValue::from(priority as i64));
+        }
+    }
+
+    if clear_provider_state {
+        if let Some(providers) = root.get_mut("providers").and_then(JsonValue::as_object_mut) {
+            providers.remove(provider);
+        }
+        if root.get("active_provider").and_then(JsonValue::as_str) == Some(provider) {
+            root.insert("active_provider".to_string(), JsonValue::Null);
+        }
+    }
+
+    if !suppress_sources.is_empty() {
+        let suppressed = root
+            .entry("suppressed_sources".to_string())
+            .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+        let suppressed = suppressed
+            .as_object_mut()
+            .ok_or("suppressed_sources is not a JSON object")?;
+        let provider_sources = suppressed
+            .entry(provider.to_string())
+            .or_insert_with(|| JsonValue::Array(Vec::new()));
+        let provider_sources = provider_sources
+            .as_array_mut()
+            .ok_or("suppressed_sources entry is not an array")?;
+        for source in suppress_sources {
+            if !provider_sources
+                .iter()
+                .any(|value| value.as_str() == Some(source.as_str()))
+            {
+                provider_sources.push(JsonValue::String(source.clone()));
+            }
+        }
+    }
+
+    save_auth_store_json(hermes_home, &auth_store)
+}
+
 fn add_auth_pool_entry(
     hermes_home: &Path,
     provider: &str,
@@ -2810,6 +2962,165 @@ mod tests {
         assert!(logged.contains("-c"));
         assert!(logged.contains("auth_remove_command"));
         let _ = fs::remove_dir_all(temp);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_nous_device_code_stays_native_and_clears_state() {
+        let home = temp_path("auth-remove-nous");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "active_provider": "nous",
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access",
+                        "refresh_token": "nous-refresh"
+                    }
+                },
+                "credential_pool": {
+                    "nous": [
+                        {
+                            "id": "nous1",
+                            "label": "Nous Main",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "device_code",
+                            "access_token": "nous-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "nous".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert!(persisted["providers"].get("nous").is_none());
+        assert_eq!(persisted["active_provider"], JsonValue::Null);
+        assert_eq!(persisted["suppressed_sources"]["nous"][0], "device_code");
+        assert!(
+            persisted["credential_pool"]["nous"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_openai_codex_manual_device_code_stays_native() {
+        let home = temp_path("auth-remove-codex");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "codex-access",
+                            "refresh_token": "codex-refresh"
+                        }
+                    }
+                },
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "codex1",
+                            "label": "Codex Main",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "codex-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "openai-codex".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert!(persisted["providers"].get("openai-codex").is_none());
+        assert_eq!(
+            persisted["suppressed_sources"]["openai-codex"][0],
+            "device_code"
+        );
+        assert_eq!(
+            persisted["suppressed_sources"]["openai-codex"][1],
+            "manual:device_code"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_remove_qwen_cli_stays_native_and_suppresses_source() {
+        let home = temp_path("auth-remove-qwen");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "qwen-oauth": [
+                        {
+                            "id": "qwen1",
+                            "label": "Qwen CLI",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "qwen-cli",
+                            "access_token": "qwen-access"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        print_auth_remove(
+            &context,
+            &AuthRemoveArgs {
+                provider: "qwen-oauth".to_string(),
+                target: "1".to_string(),
+            },
+        )
+        .unwrap();
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(persisted["suppressed_sources"]["qwen-oauth"][0], "qwen-cli");
+        assert!(
+            persisted["credential_pool"]["qwen-oauth"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty())
+        );
         let _ = fs::remove_dir_all(home);
     }
 }
