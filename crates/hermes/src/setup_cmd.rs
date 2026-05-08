@@ -294,7 +294,7 @@ fn run_native_model_setup(
     ui.line("⚕ Hermes Setup — Inference Provider")?;
     ui.line("Choose a provider and default model.")?;
     ui.line(
-        "OAuth providers, brand-new custom endpoints, and the advanced model picker remain available through the compatibility flow.",
+        "OAuth providers and the advanced model picker remain available through the compatibility flow.",
     )?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
@@ -327,10 +327,15 @@ fn run_native_model_setup(
             model_hint
         ))?;
     }
-    let compatibility_choice = providers.len() + saved_custom_providers.len() + 1;
+    let custom_endpoint_choice = providers.len() + saved_custom_providers.len() + 1;
+    let compatibility_choice = custom_endpoint_choice + 1;
     let keep_choice = compatibility_choice + 1;
     ui.line(&format!(
-        "  {}. Use compatibility flow (OAuth, new custom endpoint, advanced picker)",
+        "  {}. Custom endpoint (enter URL manually)",
+        custom_endpoint_choice
+    ))?;
+    ui.line(&format!(
+        "  {}. Use compatibility flow (OAuth, advanced picker)",
         compatibility_choice
     ))?;
     ui.line(&format!("  {}. Keep current", keep_choice))?;
@@ -346,6 +351,8 @@ fn run_native_model_setup(
             .position(|provider| provider.base_url == current_base_url.trim_end_matches('/'))
         {
             default_choice = saved_offset + index + 1;
+        } else {
+            default_choice = custom_endpoint_choice;
         }
     }
     let selection = prompt_menu_choice(ui, "Select provider: ", keep_choice, default_choice)?;
@@ -364,6 +371,21 @@ fn run_native_model_setup(
 
     if selection == compatibility_choice {
         return print_direct_setup_python(SetupSection::Model);
+    }
+
+    if selection == custom_endpoint_choice {
+        let current_api_key = get_nested_string(&root, &["model", "api_key"])
+            .or_else(|| env_value_for_context(context, "OPENAI_API_KEY"))
+            .unwrap_or_default();
+        return run_native_custom_model_setup(
+            context,
+            ui,
+            &mut root,
+            &current_provider,
+            &current_model,
+            &current_base_url,
+            &current_api_key,
+        );
     }
 
     if selection > providers.len() {
@@ -943,6 +965,324 @@ fn format_saved_custom_provider_url(base_url: &str) -> String {
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn run_native_custom_model_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+    current_provider: &str,
+    current_model: &str,
+    current_base_url: &str,
+    current_api_key: &str,
+) -> Result<(), Box<dyn Error>> {
+    ui.blank()?;
+    ui.line("Custom OpenAI-compatible endpoint configuration:")?;
+    if !current_base_url.trim().is_empty() {
+        ui.line(&format!("  Current URL: {}", current_base_url.trim()))?;
+    }
+    if !current_api_key.trim().is_empty() {
+        ui.line("  API key: already configured")?;
+    }
+    ui.blank()?;
+
+    let mut base_url = match prompt_custom_endpoint_base_url(ui, current_base_url)? {
+        Some(value) => value,
+        None => {
+            ui.line("No URL provided. Cancelled.")?;
+            return Ok(());
+        }
+    };
+    let api_key = prompt_custom_endpoint_api_key(ui, current_api_key)?;
+    base_url = maybe_add_local_v1_suffix(ui, &base_url)?;
+
+    let suggested_model = if current_provider == "custom" {
+        current_model
+    } else {
+        ""
+    };
+    let model_name = prompt_optional_model_name(ui, suggested_model)?;
+    let context_length = prompt_optional_context_length(ui)?;
+    let display_name =
+        prompt_with_default(ui, "Display name", &auto_custom_provider_name(&base_url))?;
+
+    apply_custom_model_provider_choice(
+        root,
+        &base_url,
+        if api_key.trim().is_empty() {
+            None
+        } else {
+            Some(api_key.trim())
+        },
+        if model_name.trim().is_empty() {
+            None
+        } else {
+            Some(model_name.trim())
+        },
+    )?;
+    save_custom_model_provider(
+        root,
+        &base_url,
+        if api_key.trim().is_empty() {
+            None
+        } else {
+            Some(api_key.trim())
+        },
+        if model_name.trim().is_empty() {
+            None
+        } else {
+            Some(model_name.trim())
+        },
+        context_length,
+        &display_name,
+    );
+    clear_active_provider_marker(context.hermes_home().as_path())?;
+    write_yaml_mapping(&context.config_path(), root)?;
+
+    if model_name.trim().is_empty() {
+        ui.line("Endpoint saved. Use `hermes model` to set a model.")?;
+    } else {
+        ui.line(&format!(
+            "Default model set to: {} (via {})",
+            normalize_model_for_provider(model_name.trim(), "custom"),
+            base_url
+        ))?;
+    }
+    Ok(())
+}
+
+fn prompt_custom_endpoint_base_url(
+    ui: &mut dyn SetupUi,
+    current: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    loop {
+        let prompt = if current.trim().is_empty() {
+            "API base URL [e.g. https://api.example.com/v1]: "
+        } else {
+            "API base URL [press Enter to keep current]: "
+        };
+        let input = ui.prompt(prompt)?;
+        let value = if input.trim().is_empty() {
+            current.trim().to_string()
+        } else {
+            input.trim().to_string()
+        };
+        if value.is_empty() {
+            return Ok(None);
+        }
+        if !looks_like_http_url(&value) {
+            ui.line("Base URL must start with http:// or https://")?;
+            continue;
+        }
+        return Ok(Some(value.trim_end_matches('/').to_string()));
+    }
+}
+
+fn prompt_custom_endpoint_api_key(
+    ui: &mut dyn SetupUi,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    let prompt = if current.trim().is_empty() {
+        "API key [optional]: "
+    } else {
+        "API key [optional, press Enter to keep current]: "
+    };
+    let input = ui.prompt_secret(prompt)?;
+    if input.trim().is_empty() {
+        return Ok(current.trim().to_string());
+    }
+    Ok(input.trim().to_string())
+}
+
+fn maybe_add_local_v1_suffix(
+    ui: &mut dyn SetupUi,
+    base_url: &str,
+) -> Result<String, Box<dyn Error>> {
+    let normalized = base_url.trim_end_matches('/').to_ascii_lowercase();
+    let looks_local = [
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        ":11434",
+        ":8080",
+        ":5000",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if !looks_local || normalized.ends_with("/v1") {
+        return Ok(base_url.trim_end_matches('/').to_string());
+    }
+
+    ui.blank()?;
+    ui.line("Hint: most local model servers require /v1 in the base URL.")?;
+    ui.line(&format!(
+        "  Suggested URL: {}/v1",
+        base_url.trim_end_matches('/')
+    ))?;
+    if prompt_yes_no(ui, "Add /v1? [Y/n]: ", true)? {
+        return Ok(format!("{}/v1", base_url.trim_end_matches('/')));
+    }
+    Ok(base_url.trim_end_matches('/').to_string())
+}
+
+fn prompt_optional_model_name(
+    ui: &mut dyn SetupUi,
+    current: &str,
+) -> Result<String, Box<dyn Error>> {
+    if current.trim().is_empty() {
+        return Ok(ui
+            .prompt("Default model [leave blank to skip]: ")?
+            .trim()
+            .to_string());
+    }
+    let input = ui.prompt(&format!(
+        "Default model [{current}] (leave blank to keep current): "
+    ))?;
+    if input.trim().is_empty() {
+        return Ok(current.trim().to_string());
+    }
+    Ok(input.trim().to_string())
+}
+
+fn prompt_optional_context_length(ui: &mut dyn SetupUi) -> Result<Option<i64>, Box<dyn Error>> {
+    loop {
+        let input = ui.prompt("Context length in tokens [leave blank for auto-detect]: ")?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let normalized = trimmed.replace(',', "");
+        let parsed = if normalized.ends_with('k') || normalized.ends_with('K') {
+            normalized[..normalized.len() - 1]
+                .parse::<i64>()
+                .ok()
+                .and_then(|value| value.checked_mul(1000))
+        } else {
+            normalized.parse::<i64>().ok()
+        };
+        match parsed {
+            Some(value) if value > 0 => return Ok(Some(value)),
+            _ => ui.line("Enter a positive integer, or leave it blank.")?,
+        }
+    }
+}
+
+fn auto_custom_provider_name(base_url: &str) -> String {
+    let mut clean = base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    if clean.ends_with("/v1") {
+        clean.truncate(clean.len() - 3);
+        clean = clean.trim_end_matches('/').to_string();
+    }
+    let host = clean.split('/').next().unwrap_or(clean.as_str()).trim();
+    if host.contains("localhost") || host.contains("127.0.0.1") {
+        return format!("Local ({host})");
+    }
+    if host.to_ascii_lowercase().contains("runpod") {
+        return format!("RunPod ({host})");
+    }
+    let mut chars = host.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::from("Custom endpoint"),
+    }
+}
+
+fn apply_custom_model_provider_choice(
+    root: &mut Mapping,
+    base_url: &str,
+    api_key: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let model = ensure_mapping(root, "model");
+    model.insert(yaml_key("provider"), Value::String(String::from("custom")));
+    model.insert(
+        yaml_key("base_url"),
+        Value::String(base_url.trim_end_matches('/').to_string()),
+    );
+    if let Some(model_name) = model_name {
+        model.insert(
+            yaml_key("default"),
+            Value::String(normalize_model_for_provider(model_name, "custom")),
+        );
+    }
+    if let Some(api_key) = api_key {
+        model.insert(yaml_key("api_key"), Value::String(api_key.to_string()));
+    } else {
+        model.remove(yaml_key("api_key"));
+    }
+    model.remove(yaml_key("api_mode"));
+    Ok(())
+}
+
+fn save_custom_model_provider(
+    root: &mut Mapping,
+    base_url: &str,
+    api_key: Option<&str>,
+    model_name: Option<&str>,
+    context_length: Option<i64>,
+    display_name: &str,
+) {
+    let providers = ensure_sequence(root, "custom_providers");
+    let normalized_base_url = base_url.trim_end_matches('/');
+    for entry in providers.iter_mut() {
+        let Some(mapping) = entry.as_mapping_mut() else {
+            continue;
+        };
+        let Some(existing_base_url) =
+            mapping_string_alias(mapping, &["base_url", "url", "api", "baseUrl"])
+        else {
+            continue;
+        };
+        if existing_base_url.trim_end_matches('/') != normalized_base_url {
+            continue;
+        }
+        if let Some(model_name) = model_name {
+            if mapping_string(mapping, "model").as_deref() != Some(model_name) {
+                mapping.insert(yaml_key("model"), Value::String(model_name.to_string()));
+            }
+            if let Some(context_length) = context_length {
+                let models = ensure_mapping(mapping, "models");
+                let entry = ensure_mapping(models, model_name);
+                entry.insert(
+                    yaml_key("context_length"),
+                    serde_yaml::to_value(context_length).unwrap_or(Value::Null),
+                );
+            }
+        }
+        return;
+    }
+
+    let mut entry = Mapping::new();
+    entry.insert(
+        yaml_key("name"),
+        Value::String(display_name.trim().to_string()),
+    );
+    entry.insert(
+        yaml_key("base_url"),
+        Value::String(normalized_base_url.to_string()),
+    );
+    if let Some(api_key) = api_key {
+        entry.insert(yaml_key("api_key"), Value::String(api_key.to_string()));
+    }
+    if let Some(model_name) = model_name {
+        entry.insert(yaml_key("model"), Value::String(model_name.to_string()));
+        if let Some(context_length) = context_length {
+            let mut models = Mapping::new();
+            let mut model_settings = Mapping::new();
+            model_settings.insert(
+                yaml_key("context_length"),
+                serde_yaml::to_value(context_length).unwrap_or(Value::Null),
+            );
+            models.insert(yaml_key(model_name), Value::Mapping(model_settings));
+            entry.insert(yaml_key("models"), Value::Mapping(models));
+        }
+    }
+    providers.push(Value::Mapping(entry));
 }
 
 fn model_provider_order(provider: &str) -> (usize, String) {
@@ -2300,6 +2640,18 @@ fn ensure_mapping<'a>(root: &'a mut Mapping, key: &str) -> &'a mut Mapping {
     }
 }
 
+fn ensure_sequence<'a>(root: &'a mut Mapping, key: &str) -> &'a mut Vec<Value> {
+    let key_value = yaml_key(key).clone();
+    let replace = !matches!(root.get(&key_value), Some(Value::Sequence(_)));
+    if replace {
+        root.insert(key_value.clone(), Value::Sequence(Vec::new()));
+    }
+    match root.get_mut(&key_value) {
+        Some(Value::Sequence(sequence)) => sequence,
+        _ => unreachable!(),
+    }
+}
+
 fn yaml_key(key: &str) -> Value {
     Value::String(key.to_string())
 }
@@ -2789,6 +3141,40 @@ exit 9\n",
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Demo Endpoint (demo.example/v1)"));
         assert!(rendered.contains("Default model set to: demo-chat-v2 (via Demo Endpoint)"));
+    }
+
+    #[test]
+    fn setup_model_custom_endpoint_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers();
+        let custom_choice = providers.len() + 1;
+        let mut input = io::Cursor::new(
+            format!("{custom_choice}\nhttp://localhost:11434\nsk-local\n\nllama3.1:8b\n64k\n\n")
+                .into_bytes(),
+        );
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: custom"));
+        assert!(config_text.contains("default: llama3.1:8b"));
+        assert!(config_text.contains("base_url: http://localhost:11434/v1"));
+        assert!(config_text.contains("api_key: sk-local"));
+        assert!(config_text.contains("name: Local (localhost:11434)"));
+        assert!(config_text.contains("model: llama3.1:8b"));
+        assert!(config_text.contains("context_length: 64000"));
+        assert!(!config_text.contains("api_mode:"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Custom endpoint (enter URL manually)"));
+        assert!(rendered.contains("Suggested URL: http://localhost:11434/v1"));
+        assert!(
+            rendered.contains("Default model set to: llama3.1:8b (via http://localhost:11434/v1)")
+        );
     }
 
     #[test]
