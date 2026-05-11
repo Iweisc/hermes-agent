@@ -25,7 +25,6 @@ use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config_cmd::save_env_value;
-use crate::python_bridge::{project_root, resolve_repo_python};
 
 const CONFIG_FALLBACK_LOGOUT_PROVIDERS: &[&str] = &[
     "nous",
@@ -73,28 +72,6 @@ const DEFAULT_NOUS_PORTAL_URL: &str = "https://portal.nousresearch.com";
 const DEFAULT_NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com/v1";
 const DEFAULT_NOUS_CLIENT_ID: &str = "hermes-cli";
 const DEFAULT_NOUS_SCOPE: &str = "inference:mint_agent_key";
-
-const AUTH_ADD_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from types import SimpleNamespace\n",
-    "from hermes_cli.auth_commands import auth_add_command\n",
-    "raw_timeout = os.environ.get('HERMES_AUTH_ADD_TIMEOUT', '').strip()\n",
-    "args = SimpleNamespace(\n",
-    "    provider=os.environ.get('HERMES_AUTH_ADD_PROVIDER', ''),\n",
-    "    auth_type=(os.environ.get('HERMES_AUTH_ADD_TYPE', '').strip() or None),\n",
-    "    label=(os.environ.get('HERMES_AUTH_ADD_LABEL', '').strip() or None),\n",
-    "    api_key=(os.environ.get('HERMES_AUTH_ADD_API_KEY', '').strip() or None),\n",
-    "    portal_url=(os.environ.get('HERMES_AUTH_ADD_PORTAL_URL', '').strip() or None),\n",
-    "    inference_url=(os.environ.get('HERMES_AUTH_ADD_INFERENCE_URL', '').strip() or None),\n",
-    "    client_id=(os.environ.get('HERMES_AUTH_ADD_CLIENT_ID', '').strip() or None),\n",
-    "    scope=(os.environ.get('HERMES_AUTH_ADD_SCOPE', '').strip() or None),\n",
-    "    no_browser=(os.environ.get('HERMES_AUTH_ADD_NO_BROWSER', '0') == '1'),\n",
-    "    timeout=(float(raw_timeout) if raw_timeout else None),\n",
-    "    insecure=(os.environ.get('HERMES_AUTH_ADD_INSECURE', '0') == '1'),\n",
-    "    ca_bundle=(os.environ.get('HERMES_AUTH_ADD_CA_BUNDLE', '').strip() or None),\n",
-    ")\n",
-    "auth_add_command(args)\n",
-);
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
@@ -245,7 +222,119 @@ fn print_auth_add(context: &HermesContext, args: &AuthAddArgs) -> Result<(), Box
     if should_use_native_codex_oauth_add(args) {
         return native_auth_add_openai_codex_oauth(context, args);
     }
-    run_python_auth_add(args)
+    unsupported_auth_add_request(args)
+}
+
+fn unsupported_auth_add_request(args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
+    let provider = normalize_provider_name(&args.provider)
+        .ok_or("provider is required. Example: `hermes auth add openrouter`.")?;
+    if let Some(raw_type) = args
+        .auth_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && normalize_auth_type(Some(raw_type)).is_none()
+    {
+        return Err("auth type must be oauth or api-key".into());
+    }
+    let auth_type = requested_auth_add_type(&provider, args);
+    if provider.starts_with("custom:") {
+        return Err("Custom providers only support API-key auth add.".into());
+    }
+    if get_provider_profile(&provider).is_none() {
+        return Err(format!("Unknown provider: {provider}").into());
+    }
+
+    let unsupported = unsupported_native_auth_add_options(&provider, auth_type, args);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "Unsupported option(s) for native auth add {provider} {auth_type}: {}",
+            unsupported.join(", ")
+        )
+        .into());
+    }
+    Err(
+        format!("`hermes auth add {provider}` is not implemented for auth type {auth_type} yet.")
+            .into(),
+    )
+}
+
+fn requested_auth_add_type(provider: &str, args: &AuthAddArgs) -> &'static str {
+    normalize_auth_type(args.auth_type.as_deref()).unwrap_or_else(|| {
+        if oauth_capable_auth_add_provider(provider) {
+            "oauth"
+        } else {
+            "api_key"
+        }
+    })
+}
+
+fn oauth_capable_auth_add_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "anthropic"
+            | "nous"
+            | "openai-codex"
+            | "qwen-oauth"
+            | "google-gemini-cli"
+            | "minimax-oauth"
+    )
+}
+
+fn unsupported_native_auth_add_options(
+    provider: &str,
+    auth_type: &str,
+    args: &AuthAddArgs,
+) -> Vec<&'static str> {
+    let mut options = Vec::new();
+    if auth_type == "oauth"
+        && args
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        options.push("--api-key");
+    }
+    if auth_type == "api_key" {
+        push_auth_add_option(&mut options, args.portal_url.is_some(), "--portal-url");
+        push_auth_add_option(
+            &mut options,
+            args.inference_url.is_some(),
+            "--inference-url",
+        );
+        push_auth_add_option(&mut options, args.client_id.is_some(), "--client-id");
+        push_auth_add_option(&mut options, args.scope.is_some(), "--scope");
+        push_auth_add_option(&mut options, args.no_browser, "--no-browser");
+        push_auth_add_option(&mut options, args.timeout.is_some(), "--timeout");
+    } else {
+        match provider {
+            "nous" | "minimax-oauth" => {}
+            "anthropic" | "google-gemini-cli" | "openai-codex" | "qwen-oauth" => {
+                push_auth_add_option(&mut options, args.portal_url.is_some(), "--portal-url");
+                push_auth_add_option(
+                    &mut options,
+                    args.inference_url.is_some(),
+                    "--inference-url",
+                );
+                push_auth_add_option(&mut options, args.client_id.is_some(), "--client-id");
+                push_auth_add_option(&mut options, args.scope.is_some(), "--scope");
+            }
+            _ => {}
+        }
+        if provider == "qwen-oauth" {
+            push_auth_add_option(&mut options, args.no_browser, "--no-browser");
+            push_auth_add_option(&mut options, args.timeout.is_some(), "--timeout");
+        }
+    }
+    push_auth_add_option(&mut options, args.insecure, "--insecure");
+    push_auth_add_option(&mut options, args.ca_bundle.is_some(), "--ca-bundle");
+    options
+}
+
+fn push_auth_add_option(options: &mut Vec<&'static str>, present: bool, name: &'static str) {
+    if present {
+        options.push(name);
+    }
 }
 
 fn print_auth_list(
@@ -418,8 +507,20 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     let Some(profile) = get_provider_profile(&provider) else {
         return false;
     };
-    if profile.name == "custom" || profile.auth_type != "api_key" {
+    if profile.name == "custom" {
         return false;
+    }
+    if profile.auth_type != "api_key" {
+        let explicit_api_key_request = matches!(
+            normalize_auth_type(args.auth_type.as_deref()),
+            Some("api_key")
+        ) || args
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if !explicit_api_key_request {
+            return false;
+        }
     }
     if profile.name == "anthropic"
         && normalize_auth_type(args.auth_type.as_deref()).is_none()
@@ -448,6 +549,15 @@ fn should_use_native_runtime_oauth_add(args: &AuthAddArgs) -> bool {
         Some("oauth") | None => {
             if provider == "nous" {
                 return args.api_key.is_none() && !args.insecure && args.ca_bundle.is_none();
+            }
+            if provider == "openai-codex" {
+                return args.api_key.is_none()
+                    && args.portal_url.is_none()
+                    && args.inference_url.is_none()
+                    && args.client_id.is_none()
+                    && args.scope.is_none()
+                    && !args.insecure
+                    && args.ca_bundle.is_none();
             }
             args.api_key.is_none()
                 && args.portal_url.is_none()
@@ -849,7 +959,7 @@ fn native_auth_add_anthropic_oauth_with_io(
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add anthropic`.")?;
     if provider != "anthropic" {
-        return run_python_auth_add(args);
+        return Err("provider must be anthropic".into());
     }
     let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
     let default_label = oauth_default_label(&provider, next_index);
@@ -967,7 +1077,7 @@ where
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add google-gemini-cli`.")?;
     if provider != "google-gemini-cli" {
-        return run_python_auth_add(args);
+        return Err("provider must be google-gemini-cli".into());
     }
 
     let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
@@ -1125,7 +1235,7 @@ pub(crate) fn native_auth_add_minimax_oauth_with_io(
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add minimax-oauth`.")?;
     if provider != "minimax-oauth" {
-        return run_python_auth_add(args);
+        return Err("provider must be minimax-oauth".into());
     }
 
     let next_index = next_provider_entry_index(context.hermes_home().as_path(), &provider)?;
@@ -1305,7 +1415,7 @@ pub(crate) fn native_auth_add_openai_codex_oauth_with_io(
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add openai-codex`.")?;
     if provider != "openai-codex" {
-        return run_python_auth_add(args);
+        return Err("provider must be openai-codex".into());
     }
 
     let issuer = codex_oauth_issuer();
@@ -1534,7 +1644,7 @@ fn native_auth_add_runtime_oauth(
     let (source, access_token, refresh_token, base_url, derived_label) = match provider.as_str() {
         "nous" => {
             if !provider_state_exists(context.hermes_home().as_path(), "nous")? {
-                return run_python_auth_add(args);
+                return Err("No Nous OAuth state available.".into());
             }
             let creds =
                 resolve_nous_runtime_credentials(context.hermes_home().as_path(), 300, 15.0)?;
@@ -1585,7 +1695,7 @@ fn native_auth_add_runtime_oauth(
                 label,
             )
         }
-        _ => return run_python_auth_add(args),
+        _ => return Err("provider must be qwen-oauth, nous, or openai-codex".into()),
     };
     clear_provider_suppressions(context.hermes_home().as_path(), &provider)?;
     let label = requested_label.unwrap_or(derived_label);
@@ -1697,7 +1807,7 @@ pub(crate) fn native_auth_add_nous_oauth_with_io(
     let provider = normalize_provider_name(&args.provider)
         .ok_or("provider is required. Example: `hermes auth add nous`.")?;
     if provider != "nous" {
-        return run_python_auth_add(args);
+        return Err("provider must be nous".into());
     }
 
     let timeout_seconds = validated_timeout_seconds(args.timeout, 15.0)?;
@@ -2030,64 +2140,6 @@ pub(crate) fn native_auth_add_nous_oauth_with_io(
     )?;
     output.flush()?;
     Ok(())
-}
-
-fn run_python_auth_add(args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_AUTH_PYTHON"))
-        .ok_or("could not find a Python interpreter for auth")?;
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_AUTH_ADD_PROVIDER", args.provider.trim())
-        .env(
-            "HERMES_AUTH_ADD_TYPE",
-            args.auth_type.as_deref().unwrap_or(""),
-        )
-        .env("HERMES_AUTH_ADD_LABEL", args.label.as_deref().unwrap_or(""))
-        .env(
-            "HERMES_AUTH_ADD_API_KEY",
-            args.api_key.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_ADD_PORTAL_URL",
-            args.portal_url.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_ADD_INFERENCE_URL",
-            args.inference_url.as_deref().unwrap_or(""),
-        )
-        .env(
-            "HERMES_AUTH_ADD_CLIENT_ID",
-            args.client_id.as_deref().unwrap_or(""),
-        )
-        .env("HERMES_AUTH_ADD_SCOPE", args.scope.as_deref().unwrap_or(""))
-        .env(
-            "HERMES_AUTH_ADD_NO_BROWSER",
-            if args.no_browser { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_AUTH_ADD_TIMEOUT",
-            args.timeout
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        )
-        .env(
-            "HERMES_AUTH_ADD_INSECURE",
-            if args.insecure { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_AUTH_ADD_CA_BUNDLE",
-            args.ca_bundle.as_deref().unwrap_or(""),
-        )
-        .arg("-c")
-        .arg(AUTH_ADD_BOOTSTRAP);
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("auth add", status).into())
 }
 
 struct NativeAuthRemoveResult {
@@ -6067,46 +6119,59 @@ mod tests {
     }
 
     #[test]
-    fn auth_add_oauth_uses_python_fallback() {
+    fn auth_add_oauth_rejects_unsupported_options_without_python_fallback() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let temp = temp_path("auth-add-python");
-        let log_path = temp.join("auth-add.log");
-        let python = temp.join("python3");
-        fs::create_dir_all(&temp).unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'provider=%s\\ntype=%s\\nclient_id=%s\\n' \"$HERMES_AUTH_ADD_PROVIDER\" \"$HERMES_AUTH_ADD_TYPE\" \"$HERMES_AUTH_ADD_CLIENT_ID\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
+        let home = temp_path("auth-add-no-python-fallback");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
 
-        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
-        let result = run_python_auth_add(&AuthAddArgs {
-            provider: "openai-codex".to_string(),
-            auth_type: Some("oauth".to_string()),
-            client_id: Some("client-abc".to_string()),
-            ..AuthAddArgs::default()
-        });
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", "/bin/false") };
+        let error = print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "openai-codex".to_string(),
+                auth_type: Some("oauth".to_string()),
+                client_id: Some("client-abc".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
 
-        result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("provider=openai-codex"));
-        assert!(logged.contains("type=oauth"));
-        assert!(logged.contains("client_id=client-abc"));
-        assert!(logged.contains("-c"));
-        assert!(logged.contains("auth_add_command"));
-        let _ = fs::remove_dir_all(temp);
+        assert!(error.contains("Unsupported option(s)"));
+        assert!(error.contains("--client-id"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_oauth_provider_explicit_api_key_stays_native() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("auth-add-oauth-provider-api-key");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", "/bin/false") };
+        print_auth_add(
+            &context,
+            &AuthAddArgs {
+                provider: "openai-codex".to_string(),
+                auth_type: Some("api-key".to_string()),
+                api_key: Some("sk-codex".to_string()),
+                label: Some("codex-key".to_string()),
+                ..AuthAddArgs::default()
+            },
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
+
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        let entry = &persisted["credential_pool"]["openai-codex"][0];
+        assert_eq!(entry["label"], "codex-key");
+        assert_eq!(entry["auth_type"], "api_key");
+        assert_eq!(entry["access_token"], "sk-codex");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
