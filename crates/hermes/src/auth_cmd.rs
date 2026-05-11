@@ -96,17 +96,6 @@ const AUTH_ADD_BOOTSTRAP: &str = concat!(
     "auth_add_command(args)\n",
 );
 
-const AUTH_REMOVE_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from types import SimpleNamespace\n",
-    "from hermes_cli.auth_commands import auth_remove_command\n",
-    "args = SimpleNamespace(\n",
-    "    provider=os.environ.get('HERMES_AUTH_REMOVE_PROVIDER', ''),\n",
-    "    target=os.environ.get('HERMES_AUTH_REMOVE_TARGET', ''),\n",
-    ")\n",
-    "auth_remove_command(args)\n",
-);
-
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
     Add(AuthAddArgs),
@@ -373,14 +362,19 @@ fn print_auth_remove(context: &HermesContext, args: &AuthRemoveArgs) -> Result<(
         return Ok(());
     }
     if entry_source_is_manual(&entry.source) {
-        remove_manual_auth_entry(context.hermes_home().as_path(), &provider, index)?;
+        remove_auth_pool_entry(context.hermes_home().as_path(), &provider, index)?;
         println!(
             "Removed {} credential #{} ({})",
             provider, index, entry.label
         );
         return Ok(());
     }
-    run_python_auth_remove(&provider, target)
+    remove_auth_pool_entry(context.hermes_home().as_path(), &provider, index)?;
+    println!(
+        "Removed {} credential #{} ({})",
+        provider, index, entry.label
+    );
+    Ok(())
 }
 
 fn print_auth_spotify(
@@ -2094,25 +2088,6 @@ fn run_python_auth_add(args: &AuthAddArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     Err(exit_status_message("auth add", status).into())
-}
-
-fn run_python_auth_remove(provider: &str, target: &str) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_AUTH_PYTHON"))
-        .ok_or("could not find a Python interpreter for auth")?;
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_AUTH_REMOVE_PROVIDER", provider)
-        .env("HERMES_AUTH_REMOVE_TARGET", target)
-        .arg("-c")
-        .arg(AUTH_REMOVE_BOOTSTRAP);
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("auth remove", status).into())
 }
 
 struct NativeAuthRemoveResult {
@@ -5154,7 +5129,7 @@ fn entry_source_is_manual(source: &str) -> bool {
     normalized == "manual" || normalized.starts_with("manual:")
 }
 
-fn remove_manual_auth_entry(
+fn remove_auth_pool_entry(
     hermes_home: &Path,
     provider: &str,
     index: usize,
@@ -7113,13 +7088,9 @@ mod tests {
     }
 
     #[test]
-    fn auth_remove_unsupported_source_uses_python_fallback() {
+    fn auth_remove_unknown_source_stays_native_without_cleanup() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let temp = temp_path("auth-remove-python");
-        let log_path = temp.join("auth-remove.log");
-        let python = temp.join("python3");
         let home = temp_path("auth-remove-home");
-        fs::create_dir_all(&temp).unwrap();
         fs::create_dir_all(&home).unwrap();
         fs::write(
             home.join("auth.json"),
@@ -7142,25 +7113,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'provider=%s\\ntarget=%s\\n' \"$HERMES_AUTH_REMOVE_PROVIDER\" \"$HERMES_AUTH_REMOVE_TARGET\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
 
-        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", &python) };
+        unsafe { std::env::set_var("HERMES_AUTH_PYTHON", "/bin/false") };
         let result = print_auth_remove(
             &context,
             &AuthRemoveArgs {
@@ -7171,12 +7126,21 @@ mod tests {
         unsafe { std::env::remove_var("HERMES_AUTH_PYTHON") };
 
         result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("provider=openrouter"));
-        assert!(logged.contains("target=1"));
-        assert!(logged.contains("-c"));
-        assert!(logged.contains("auth_remove_command"));
-        let _ = fs::remove_dir_all(temp);
+        let persisted: JsonValue =
+            serde_json::from_str(&fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["credential_pool"]["openrouter"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            persisted
+                .get("suppressed_sources")
+                .and_then(JsonValue::as_object)
+                .is_none()
+        );
         let _ = fs::remove_dir_all(home);
     }
 
