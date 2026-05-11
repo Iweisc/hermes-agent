@@ -427,6 +427,12 @@ fn should_use_native_auth_add(args: &AuthAddArgs) -> bool {
     if profile.name == "custom" || profile.auth_type != "api_key" {
         return false;
     }
+    if profile.name == "anthropic"
+        && normalize_auth_type(args.auth_type.as_deref()).is_none()
+        && args.api_key.is_none()
+    {
+        return false;
+    }
     auth_add_is_plain_api_key_request(args)
 }
 
@@ -5975,6 +5981,32 @@ mod tests {
                 .contains("Paste your API key:")
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn auth_add_anthropic_default_prefers_native_oauth() {
+        let default_args = AuthAddArgs {
+            provider: "anthropic".to_string(),
+            ..AuthAddArgs::default()
+        };
+        assert!(!should_use_native_auth_add(&default_args));
+        assert!(should_use_native_anthropic_oauth_add(&default_args));
+
+        let explicit_type_args = AuthAddArgs {
+            provider: "anthropic".to_string(),
+            auth_type: Some("api-key".to_string()),
+            ..AuthAddArgs::default()
+        };
+        assert!(should_use_native_auth_add(&explicit_type_args));
+        assert!(!should_use_native_anthropic_oauth_add(&explicit_type_args));
+
+        let explicit_key_args = AuthAddArgs {
+            provider: "anthropic".to_string(),
+            api_key: Some("sk-ant".to_string()),
+            ..AuthAddArgs::default()
+        };
+        assert!(should_use_native_auth_add(&explicit_key_args));
+        assert!(!should_use_native_anthropic_oauth_add(&explicit_key_args));
     }
 
     #[test]
