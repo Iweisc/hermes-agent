@@ -53,12 +53,15 @@ pub enum SetupSection {
 }
 
 pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    if should_use_native_setup_noninteractive(&args) {
+        return print_native_setup_noninteractive(context);
+    }
     if should_use_native_model_setup(&args) {
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             let mut ui = TerminalUi;
             return run_native_model_setup(context, &mut ui);
         }
-        return print_native_model_setup_noninteractive(context);
+        return print_native_setup_noninteractive(context);
     }
     if should_use_native_agent_setup(&args)
         && io::stdin().is_terminal()
@@ -188,6 +191,10 @@ fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
         && !args.reset
         && !args.reconfigure
         && !args.quick
+}
+
+fn should_use_native_setup_noninteractive(args: &SetupArgs) -> bool {
+    args.non_interactive && !args.reset && !args.reconfigure && !args.quick
 }
 
 impl SetupSection {
@@ -2911,13 +2918,13 @@ fn configure_ssh_terminal(
     Ok(())
 }
 
-fn print_native_model_setup_noninteractive(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+fn print_native_setup_noninteractive(context: &HermesContext) -> Result<(), Box<dyn Error>> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    print_native_model_setup_noninteractive_with_output(context, &mut output)
+    print_native_setup_noninteractive_with_output(context, &mut output)
 }
 
-fn print_native_model_setup_noninteractive_with_output(
+fn print_native_setup_noninteractive_with_output(
     context: &HermesContext,
     output: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
@@ -3996,12 +4003,33 @@ exit 9\n",
             },
         )
         .unwrap();
-        print_native_model_setup_noninteractive_with_output(&context, &mut output).unwrap();
+        print_native_setup_noninteractive_with_output(&context, &mut output).unwrap();
 
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Hermes Setup"));
         assert!(rendered.contains("non-interactive environment"));
         assert!(context.hermes_home().exists());
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    fn setup_explicit_noninteractive_uses_native_guidance() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+
+        set_env_var("HERMES_SETUP_PYTHON", "/bin/false");
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Gateway),
+                non_interactive: true,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+        )
+        .unwrap();
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 
