@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand};
 use hermes_core::{
@@ -15,7 +14,6 @@ use serde_yaml::{Mapping, Value};
 use crate::auth_cmd;
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_cmd;
-use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::setup_cmd;
 use crate::{disabled_memory_toolsets, run_clarify_prompt};
 
@@ -287,20 +285,6 @@ const PLATFORMS: &[PlatformDef] = &[
         default_toolset: "hermes-cron",
     },
 ];
-
-const TOOLS_RECONFIGURE_TOOLSET_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from hermes_cli.config import load_config, save_config\n",
-    "from hermes_cli.tools_config import TOOL_CATEGORIES, _configure_tool_category_for_reconfig, _reconfigure_simple_requirements\n",
-    "config = load_config()\n",
-    "toolset = os.environ['HERMES_TOOLS_RECONFIGURE_TOOLSET']\n",
-    "category = TOOL_CATEGORIES.get(toolset)\n",
-    "if category:\n",
-    "    _configure_tool_category_for_reconfig(toolset, category, config)\n",
-    "else:\n",
-    "    _reconfigure_simple_requirements(toolset)\n",
-    "save_config(config)\n",
-);
 
 const RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "web",
@@ -581,7 +565,7 @@ fn run_tools_reconfigure_with_io(
     if native_reconfigurable_toolset(toolset) {
         run_native_tool_reconfigure_with_io(context, toolset, input, output)
     } else {
-        run_python_tools_reconfigure_toolset(toolset)
+        write_retired_compatibility_flow(output, toolset)
     }
 }
 
@@ -615,7 +599,7 @@ fn run_native_tool_reconfigure_with_io(
         "image_gen" => reconfigure_image_gen_with_io(context, input, output),
         "rl" => reconfigure_rl_with_io(context, input, output),
         "spotify" => reconfigure_spotify_with_io(context, input, output),
-        other => run_python_tools_reconfigure_toolset(other),
+        other => write_retired_compatibility_flow(output, other),
     }
 }
 
@@ -657,7 +641,7 @@ fn reconfigure_web_with_io(
     });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
-        return run_python_tools_reconfigure_toolset("web");
+        return write_retired_compatibility_flow(output, "web");
     }
     let direct_offset = usize::from(managed_known);
 
@@ -791,7 +775,7 @@ fn reconfigure_browser_with_io(
     });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
-        return run_python_tools_reconfigure_toolset("browser");
+        return write_retired_compatibility_flow(output, "browser");
     }
     let direct_offset = usize::from(managed_known);
 
@@ -951,7 +935,7 @@ fn reconfigure_image_gen_with_io(
     });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
     if selection == choices.len() - 1 {
-        return run_python_tools_reconfigure_toolset("image_gen");
+        return write_retired_compatibility_flow(output, "image_gen");
     }
     let direct_offset = usize::from(managed_known);
 
@@ -1428,21 +1412,22 @@ fn print_toolset_delta(
     Ok(())
 }
 
-fn run_python_tools_reconfigure_toolset(toolset: &str) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_TOOLS_PYTHON"))
-        .ok_or("could not find a Python interpreter for tools")?;
-    let status = Command::new(&python)
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_TOOLS_RECONFIGURE_TOOLSET", toolset)
-        .arg("-c")
-        .arg(TOOLS_RECONFIGURE_TOOLSET_BOOTSTRAP)
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message(&format!("tools reconfigure {toolset}"), status).into())
+fn write_retired_compatibility_flow(
+    output: &mut dyn Write,
+    toolset: &str,
+) -> Result<(), Box<dyn Error>> {
+    let label = configurable_toolset(toolset)
+        .map(|definition| definition.label)
+        .unwrap_or(toolset);
+    writeln!(
+        output,
+        "Compatibility reconfigure flow for {label} is no longer available."
+    )?;
+    writeln!(
+        output,
+        "Choose one of the native providers above or edit config.yaml directly."
+    )?;
+    Ok(())
 }
 
 fn render_tools_summary(root: &Mapping) -> String {
@@ -2138,13 +2123,6 @@ fn yaml_key(key: &str) -> Value {
     Value::String(key.to_string())
 }
 
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2567,48 +2545,24 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
-    fn tools_reconfigure_browser_uses_python_override_when_requested() {
+    fn tools_reconfigure_browser_reports_retired_compatibility_flow() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
-        let root = project_root();
-        let temp = temp_path("bridge");
-        let log_path = temp.join("tools-bridge.log");
-        let python = temp.join("python3");
         let home = temp_path("reconfigure-browser");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         write_config(
             &context.config_path(),
             "platform_toolsets:\n  cli:\n    - browser\n",
         );
-        fs::create_dir_all(&temp).unwrap();
-        fs::write(
-            &python,
-            format!(
-                "#!/bin/sh\nprintf 'toolset=%s\\n' \"$HERMES_TOOLS_RECONFIGURE_TOOLSET\" > \"{}\"\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
-                log_path.display(),
-                log_path.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
 
-        unsafe { std::env::set_var("HERMES_TOOLS_PYTHON", &python) };
         let mut input = Cursor::new(b"1\n6\n".to_vec());
         let mut output = Vec::new();
-        let result = run_tools_reconfigure_with_io(&context, &mut input, &mut output);
-        unsafe { std::env::remove_var("HERMES_TOOLS_PYTHON") };
+        run_tools_reconfigure_with_io(&context, &mut input, &mut output).unwrap();
 
-        result.unwrap();
-        let logged = fs::read_to_string(log_path).unwrap();
-        assert!(logged.contains("toolset=browser"));
-        assert!(logged.contains("-c"));
-        assert!(logged.contains("_configure_tool_category_for_reconfig"));
-        assert!(root.exists());
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains(
+            "Compatibility reconfigure flow for Browser Automation is no longer available."
+        ));
+        assert!(rendered.contains("Choose one of the native providers above"));
     }
 
     #[test]
