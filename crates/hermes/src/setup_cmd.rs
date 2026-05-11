@@ -53,7 +53,7 @@ pub enum SetupSection {
 }
 
 pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<dyn Error>> {
-    if should_use_native_setup_noninteractive(&args) {
+    if should_use_native_setup_noninteractive(&args, io::stdin().is_terminal()) {
         return print_native_setup_noninteractive(context);
     }
     if should_use_native_model_setup(&args) {
@@ -193,8 +193,8 @@ fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
         && !args.quick
 }
 
-fn should_use_native_setup_noninteractive(args: &SetupArgs) -> bool {
-    args.non_interactive && !args.reset && !args.reconfigure && !args.quick
+fn should_use_native_setup_noninteractive(args: &SetupArgs, stdin_is_terminal: bool) -> bool {
+    (args.non_interactive || !stdin_is_terminal) && !args.reset
 }
 
 impl SetupSection {
@@ -3905,6 +3905,40 @@ mod tests {
     }
 
     #[test]
+    fn native_setup_noninteractive_covers_headless_and_explicit_modes() {
+        assert!(should_use_native_setup_noninteractive(
+            &SetupArgs {
+                section: None,
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+            false
+        ));
+        assert!(should_use_native_setup_noninteractive(
+            &SetupArgs {
+                section: Some(SetupSection::Tools),
+                non_interactive: true,
+                reset: false,
+                reconfigure: true,
+                quick: true,
+            },
+            true
+        ));
+        assert!(!should_use_native_setup_noninteractive(
+            &SetupArgs {
+                section: None,
+                non_interactive: true,
+                reset: true,
+                reconfigure: true,
+                quick: true,
+            },
+            false
+        ));
+    }
+
+    #[test]
     fn native_gateway_setup_only_allows_plain_gateway() {
         assert!(should_use_native_gateway_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
@@ -4027,6 +4061,27 @@ exit 9\n",
                 reset: false,
                 reconfigure: false,
                 quick: false,
+            },
+        )
+        .unwrap();
+        remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    fn setup_explicit_noninteractive_with_extra_flags_uses_native_guidance() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
+
+        set_env_var("HERMES_SETUP_PYTHON", "/bin/false");
+        print_setup(
+            &context,
+            SetupArgs {
+                section: Some(SetupSection::Agent),
+                non_interactive: true,
+                reset: false,
+                reconfigure: true,
+                quick: true,
             },
         )
         .unwrap();
@@ -5227,7 +5282,7 @@ exit 9\n",
     }
 
     #[test]
-    fn agent_setup_with_extra_flags_stays_on_python_path() {
+    fn setup_reset_with_extra_flags_stays_on_python_path() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
@@ -5257,7 +5312,7 @@ exit 9\n",
             SetupArgs {
                 section: Some(SetupSection::Agent),
                 non_interactive: false,
-                reset: false,
+                reset: true,
                 reconfigure: false,
                 quick: true,
             },
