@@ -67,48 +67,46 @@ class ProfileGatewayProcess:
     path: Path
     pid: int
 
-def _get_service_pids() -> set:
-    """Return PIDs currently managed by systemd or launchd gateway services.
 
-    Used to avoid killing freshly-restarted service processes when sweeping
-    for stale manual gateway processes after a service restart.  Relies on the
-    service manager having committed the new PID before the restart command
-    returns (true for both systemd and launchd in practice).
+@dataclass(frozen=True)
+class ProfileGatewayServiceTarget:
+    profile: str
+    path: Path
+    service: str
+
+
+def _get_service_pids() -> set:
+    """Return PIDs currently managed by this profile's gateway service.
+
+    Service names can collide when a development checkout uses a custom
+    HERMES_HOME, so a unit must explicitly reference this profile's
+    HERMES_HOME before we trust or signal its PID.
     """
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
     if supports_systemd_services():
-        for scope_args in [["systemctl", "--user"], ["systemctl"]]:
+        service = get_service_name()
+        for system, scope_args in [(False, ["systemctl", "--user"]), (True, ["systemctl"])]:
+            if not systemd_unit_matches_home(system, get_hermes_home(), service):
+                continue
             try:
-                result = subprocess.run(
-                    scope_args + ["list-units", "hermes-gateway*",
-                                  "--plain", "--no-legend", "--no-pager"],
+                show = subprocess.run(
+                    scope_args + ["show", service, "--property=MainPID", "--value"],
                     capture_output=True, text=True, timeout=5,
                 )
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if not parts or not parts[0].endswith(".service"):
-                        continue
-                    svc = parts[0]
-                    try:
-                        show = subprocess.run(
-                            scope_args + ["show", svc,
-                                          "--property=MainPID", "--value"],
-                            capture_output=True, text=True, timeout=5,
-                        )
-                        pid = int(show.stdout.strip())
-                        if pid > 0:
-                            pids.add(pid)
-                    except (ValueError, subprocess.TimeoutExpired):
-                        pass
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pid = int((show.stdout or "").strip() or "0")
+                if pid > 0:
+                    pids.add(pid)
+            except (ValueError, FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
     # --- launchd (macOS) ---
     if is_macos():
         try:
             label = get_launchd_label()
+            if not launchd_plist_matches_home(get_hermes_home()):
+                return pids
             result = subprocess.run(
                 ["launchctl", "list", label],
                 capture_output=True, text=True, timeout=5,
@@ -389,6 +387,11 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
     """
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
+    if all_profiles:
+        for proc in find_profile_gateway_processes(exclude_pids=_exclude):
+            _append_unique_pid(pids, proc.pid, _exclude)
+        return pids
+
     if not all_profiles:
         try:
             from gateway.status import get_running_pid
@@ -751,7 +754,20 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
         all_profiles: When ``True``, kill across all profiles.  Passed
             through to :func:`find_gateway_pids`.
     """
-    pids = find_gateway_pids(exclude_pids=exclude_pids, all_profiles=all_profiles)
+    _exclude = set(exclude_pids or set())
+    pids: list[int] = []
+    if all_profiles:
+        for proc in find_profile_gateway_processes(exclude_pids=_exclude):
+            _append_unique_pid(pids, proc.pid, _exclude)
+    else:
+        try:
+            from gateway.status import get_running_pid
+
+            _append_unique_pid(pids, get_running_pid(), _exclude)
+        except Exception:
+            pass
+        for pid in _get_service_pids():
+            _append_unique_pid(pids, pid, _exclude)
     killed = 0
     
     for pid in pids:
@@ -882,7 +898,7 @@ _SERVICE_BASE = "hermes-gateway"
 SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 
 
-def _profile_suffix() -> str:
+def _profile_suffix(hermes_home: str | Path | None = None) -> str:
     """Derive a service-name suffix from the current HERMES_HOME.
 
     Returns ``""`` for the default root, the profile name for
@@ -892,7 +908,7 @@ def _profile_suffix() -> str:
     import hashlib
     import re
     from hermes_constants import get_default_hermes_root
-    home = get_hermes_home().resolve()
+    home = Path(hermes_home).resolve() if hermes_home is not None else get_hermes_home().resolve()
     default = get_default_hermes_root().resolve()
     if home == default:
         return ""
@@ -937,25 +953,83 @@ def _profile_arg(hermes_home: str | None = None) -> str:
     return ""
 
 
-def get_service_name() -> str:
+def get_service_name(hermes_home: str | Path | None = None) -> str:
     """Derive a systemd service name scoped to this HERMES_HOME.
 
     Default ``~/.hermes`` returns ``hermes-gateway`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` returns ``hermes-gateway-coder``.
     Any other HERMES_HOME appends a short hash for uniqueness.
     """
-    suffix = _profile_suffix()
+    suffix = _profile_suffix(hermes_home)
     if not suffix:
         return _SERVICE_BASE
     return f"{_SERVICE_BASE}-{suffix}"
 
 
 
-def get_systemd_unit_path(system: bool = False) -> Path:
-    name = get_service_name()
+def get_systemd_unit_path(system: bool = False, service_name: str | None = None) -> Path:
+    name = service_name or get_service_name()
     if system:
         return Path("/etc/systemd/system") / f"{name}.service"
     return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+
+
+def _file_mentions_hermes_home(path: Path, hermes_home: str | Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except (AttributeError, OSError):
+        return False
+    home = str(Path(hermes_home).resolve())
+    return f"HERMES_HOME={home}" in text or home in text
+
+
+def systemd_unit_matches_home(
+    system: bool,
+    hermes_home: str | Path,
+    service_name: str | None = None,
+) -> bool:
+    try:
+        unit_path = get_systemd_unit_path(system=system, service_name=service_name)
+    except TypeError:
+        unit_path = get_systemd_unit_path(system=system)
+    return unit_path.exists() and _file_mentions_hermes_home(unit_path, hermes_home)
+
+
+def launchd_plist_matches_home(hermes_home: str | Path) -> bool:
+    return get_launchd_plist_path().exists() and _file_mentions_hermes_home(
+        get_launchd_plist_path(),
+        hermes_home,
+    )
+
+
+def profile_gateway_service_targets() -> list[ProfileGatewayServiceTarget]:
+    try:
+        from hermes_cli.profiles import list_profiles
+    except Exception:
+        return [
+            ProfileGatewayServiceTarget(
+                profile="default",
+                path=get_hermes_home(),
+                service=get_service_name(),
+            )
+        ]
+
+    targets: list[ProfileGatewayServiceTarget] = []
+    seen: set[tuple[str, str]] = set()
+    for profile in list_profiles():
+        service = get_service_name(profile.path)
+        key = (profile.name, service)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(
+            ProfileGatewayServiceTarget(
+                profile=profile.name,
+                path=profile.path,
+                service=service,
+            )
+        )
+    return targets
 
 
 class UserSystemdUnavailableError(RuntimeError):

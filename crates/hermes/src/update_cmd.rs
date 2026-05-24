@@ -1507,15 +1507,21 @@ exit 0\n",
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
-        let home = temp.path().join("home");
+        let user_home = temp.path().join("user");
+        let home = user_home.join(".hermes");
         let bin = temp.path().join("bin");
         let fake_git = bin.join("git");
         let fake_uv = bin.join("uv");
         let fake_systemctl = bin.join("systemctl");
         let log = home.join("systemctl.log");
+        let profile_home = home.join("profiles").join("coder");
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&profile_home).unwrap();
+        let unit_dir = user_home.join(".config").join("systemd").join("user");
+        fs::create_dir_all(&unit_dir).unwrap();
+        fs::write(unit_dir.join("hermes-gateway.service"), "unit").unwrap();
+        fs::write(unit_dir.join("hermes-gateway-coder.service"), "unit").unwrap();
 
         fs::write(
             &fake_git,
@@ -1552,6 +1558,10 @@ if [ \"$1\" = \"--user\" ] && [ \"$2\" = \"list-units\" ]; then\n\
   printf 'hermes-gateway-coder.service loaded active running Hermes\\n'\n\
   exit 0\n\
 fi\n\
+if [ \"$1\" = \"--user\" ] && [ \"$2\" = \"is-active\" ]; then\n\
+  printf 'active\\n'\n\
+  exit 0\n\
+fi\n\
 if [ \"$1\" = \"list-units\" ]; then\n\
   exit 0\n\
 fi\n\
@@ -1577,7 +1587,7 @@ exit 0\n",
         let original_path = env::var("PATH").unwrap_or_default();
         set_env_var("PATH", format!("{}:{}", bin.display(), original_path));
 
-        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let context = HermesContext::new(&user_home).with_hermes_home_env(Some(home.clone()));
         set_env_var("HERMES_UPDATE_PROJECT_ROOT", &root);
         set_env_var("HERMES_UPDATE_GIT", &fake_git);
         set_env_var("HERMES_UPDATE_UV", &fake_uv);
@@ -1595,8 +1605,8 @@ exit 0\n",
         .unwrap();
 
         let logged = fs::read_to_string(&log).unwrap();
-        assert!(logged.contains("--user restart hermes-gateway"));
-        assert!(logged.contains("--user restart hermes-gateway-coder"));
+        assert!(logged.contains("--user reload-or-restart hermes-gateway"));
+        assert!(logged.contains("--user reload-or-restart hermes-gateway-coder"));
 
         set_env_var("PATH", original_path);
         remove_env_var("HERMES_UPDATE_PROJECT_ROOT");
@@ -1670,7 +1680,19 @@ exit 0\n",
         )
         .unwrap();
 
+        let mut unrelated_gateway = Command::new("bash")
+            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .spawn()
+            .unwrap();
+
         let mut dashboard = Command::new("bash")
+            .current_dir(project_root())
+            .args(["-lc", "exec -a 'hermes dashboard' sleep 30"])
+            .spawn()
+            .unwrap();
+
+        let mut unrelated_dashboard = Command::new("bash")
+            .current_dir(temp.path())
             .args(["-lc", "exec -a 'hermes dashboard' sleep 30"])
             .spawn()
             .unwrap();
@@ -1697,6 +1719,12 @@ exit 0\n",
         let dashboard_status = dashboard.wait().unwrap();
         assert!(!gateway_status.success());
         assert!(!dashboard_status.success());
+        assert!(unrelated_gateway.try_wait().unwrap().is_none());
+        assert!(unrelated_dashboard.try_wait().unwrap().is_none());
+        let _ = unrelated_gateway.kill();
+        let _ = unrelated_gateway.wait();
+        let _ = unrelated_dashboard.kill();
+        let _ = unrelated_dashboard.wait();
 
         let logged = fs::read_to_string(&log).unwrap();
         assert!(logged.contains("--profile coder gateway run --replace"));

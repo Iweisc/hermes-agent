@@ -83,7 +83,7 @@ class TestDashboardStop:
         # First scan: finds two processes.  Second (verification) scan: empty.
         scans = iter([[12345, 12346], []])
         with patch("hermes_cli.main._find_stale_dashboard_pids",
-                   side_effect=lambda: next(scans)), \
+                   side_effect=lambda **_: next(scans)), \
              patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill, \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(stop=True))
@@ -101,7 +101,7 @@ class TestDashboardStop:
         detect that the stop didn't succeed (e.g. permission denied)."""
         scans = iter([[12345], [12345]])  # both scans find the same PID
         with patch("hermes_cli.main._find_stale_dashboard_pids",
-                   side_effect=lambda: next(scans)), \
+                   side_effect=lambda **_: next(scans)), \
              patch("hermes_cli.main._kill_stale_dashboard_processes"), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(stop=True))

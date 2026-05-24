@@ -30,6 +30,7 @@ const LEGACY_UNIT_EXECSTART_MARKERS: &[&str] = &[
     " hermes gateway ",
     "/hermes gateway ",
 ];
+#[cfg(all(test, not(windows)))]
 const GATEWAY_PROCESS_PATTERNS: &[&str] = &[
     "hermes_cli.main gateway",
     "hermes_cli.main --profile",
@@ -211,12 +212,25 @@ pub(crate) fn restart_gateways_after_update(
     context: &HermesContext,
 ) -> Result<GatewayUpdateRestartSummary, Box<dyn Error>> {
     let mut summary = GatewayUpdateRestartSummary::default();
-    let mut service_pids = collect_running_service_gateway_pids(context)?;
+    let profile_homes = collect_profile_homes(context)?;
 
-    for system in [false, true] {
-        for service in list_active_systemd_gateway_services(system)? {
-            match restart_named_systemd_service(system, &service) {
-                Ok(()) => summary.restarted_services.push(service),
+    for (name, home) in &profile_homes {
+        let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
+        for system in [false, true] {
+            if !systemd_unit_path(&profile_context, system).exists()
+                || !systemd_service_active(&profile_context, system)
+            {
+                continue;
+            }
+            let service = gateway_service_name(&profile_context);
+            match restart_systemd_service(&profile_context, system) {
+                Ok(()) => {
+                    summary.restarted_services.push(if name == "default" {
+                        service
+                    } else {
+                        format!("{service} ({name})")
+                    });
+                }
                 Err(error) => {
                     eprintln!("  ⚠ Failed to restart {service}: {error}");
                 }
@@ -224,7 +238,6 @@ pub(crate) fn restart_gateways_after_update(
         }
     }
 
-    let profile_homes = collect_profile_homes(context)?;
     if is_macos() {
         for (name, home) in &profile_homes {
             let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
@@ -249,36 +262,34 @@ pub(crate) fn restart_gateways_after_update(
         }
     }
 
-    service_pids.extend(collect_running_service_gateway_pids(context)?);
-
-    let processes = find_all_gateway_processes()?;
-    let mut manual_processes = Vec::new();
-    for process in &processes {
-        if !service_pids.contains(&process.pid) {
-            manual_processes.push(process.clone());
-        }
-    }
-    if manual_processes.is_empty() {
-        return Ok(summary);
-    }
-
-    let mut mapped_profiles = Vec::new();
-    for (name, home) in profile_homes {
+    let mut mapped_manual = Vec::new();
+    for (name, home) in &profile_homes {
         let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
         if has_any_systemd_unit(&profile_context)
             || (is_macos() && launchd_plist_path(&profile_context).exists())
         {
             continue;
         }
-        let Some(pid) = gateway_pids_for_profile(&home)
-            .into_iter()
-            .find(|pid| manual_processes.iter().any(|process| process.pid == *pid))
-        else {
+        let Some(pid) = gateway_pids_for_profile(home).into_iter().next() else {
             continue;
         };
-        mapped_profiles.push((name, pid));
+        mapped_manual.push((
+            name.clone(),
+            GatewayProcess {
+                pid,
+                command: String::new(),
+            },
+        ));
     }
 
+    if mapped_manual.is_empty() {
+        return Ok(summary);
+    }
+
+    let manual_processes = mapped_manual
+        .iter()
+        .map(|(_, process)| process.clone())
+        .collect::<Vec<_>>();
     let killed = kill_gateway_processes(&manual_processes, false);
     if killed > 0 {
         let manual_pids = manual_processes
@@ -292,12 +303,11 @@ pub(crate) fn restart_gateways_after_update(
         );
     }
 
-    for (profile, _) in &mapped_profiles {
+    for (profile, _) in &mapped_manual {
         if launch_detached_profile_gateway_after_update(context, profile).is_ok() {
             summary.restarted_profiles.push(profile.clone());
         }
     }
-    summary.stopped_manual = manual_processes.len().saturating_sub(mapped_profiles.len());
 
     Ok(summary)
 }
@@ -308,15 +318,16 @@ fn print_gateway_start(
     args: GatewayServiceArgs,
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
-        let processes = find_all_gateway_processes()?;
+        let processes = known_profile_gateway_processes(context)?;
         let killed = kill_gateway_processes(&processes, false);
         if killed > 0 {
             println!("Killed {killed} stale gateway process(es) across all profiles");
+            let pids = processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>();
             let _ = wait_for_processes_exit(
-                &processes
-                    .into_iter()
-                    .map(|process| process.pid)
-                    .collect::<Vec<_>>(),
+                &pids,
                 Duration::from_secs(10),
                 Some(Duration::from_secs(5)),
             );
@@ -365,16 +376,17 @@ fn print_gateway_stop(
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
         let service_stopped = stop_gateway_service_if_available(context, args.system);
-        let processes = find_all_gateway_processes()?;
+        let processes = known_profile_gateway_processes(context)?;
         let killed = kill_gateway_processes(&processes, false);
         let total = killed + usize::from(service_stopped);
         if total > 0 {
             println!("Stopped {total} gateway process(es) across all profiles");
+            let pids = processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>();
             let _ = wait_for_processes_exit(
-                &processes
-                    .into_iter()
-                    .map(|process| process.pid)
-                    .collect::<Vec<_>>(),
+                &pids,
                 Duration::from_secs(10),
                 Some(Duration::from_secs(5)),
             );
@@ -411,20 +423,18 @@ fn print_gateway_restart(
 ) -> Result<(), Box<dyn Error>> {
     if args.all {
         let service_stopped = stop_gateway_service_if_available(context, args.system);
-        let processes = find_all_gateway_processes()?;
+        let processes = known_profile_gateway_processes(context)?;
         let killed = kill_gateway_processes(&processes, false);
         let total = killed + usize::from(service_stopped);
         if total > 0 {
             println!("Stopped {total} gateway process(es) across all profiles");
         }
-        let _ = wait_for_processes_exit(
-            &processes
-                .into_iter()
-                .map(|process| process.pid)
-                .collect::<Vec<_>>(),
-            Duration::from_secs(10),
-            Some(Duration::from_secs(5)),
-        );
+        let pids = processes
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        let _ =
+            wait_for_processes_exit(&pids, Duration::from_secs(10), Some(Duration::from_secs(5)));
         println!("Starting gateway...");
 
         if has_any_systemd_unit(context) {
@@ -1625,26 +1635,6 @@ fn other_profile_gateway_processes(
     Ok(rows)
 }
 
-fn find_all_gateway_processes() -> Result<Vec<GatewayProcess>, Box<dyn Error>> {
-    let exclude = ancestor_pids();
-    #[cfg(windows)]
-    {
-        let _ = exclude;
-        Ok(Vec::new())
-    }
-    #[cfg(not(windows))]
-    {
-        let output = Command::new("ps")
-            .args(["-A", "eww", "-o", "pid=,command="])
-            .output()?;
-        if !output.status.success() {
-            return Ok(Vec::new());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(parse_gateway_ps_processes(&stdout, &exclude))
-    }
-}
-
 fn collect_profile_homes(
     context: &HermesContext,
 ) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
@@ -1674,7 +1664,28 @@ fn collect_profile_homes(
     Ok(homes)
 }
 
-#[cfg(not(windows))]
+fn known_profile_gateway_processes(
+    context: &HermesContext,
+) -> Result<Vec<GatewayProcess>, Box<dyn Error>> {
+    let mut processes = Vec::new();
+    for (_, home) in collect_profile_homes(context)? {
+        for pid in gateway_pids_for_profile(&home) {
+            if processes
+                .iter()
+                .any(|process: &GatewayProcess| process.pid == pid)
+            {
+                continue;
+            }
+            processes.push(GatewayProcess {
+                pid,
+                command: String::new(),
+            });
+        }
+    }
+    Ok(processes)
+}
+
+#[cfg(all(test, not(windows)))]
 fn parse_gateway_ps_processes(output: &str, exclude_pids: &[i64]) -> Vec<GatewayProcess> {
     output
         .lines()
@@ -1692,44 +1703,13 @@ fn parse_gateway_ps_processes(output: &str, exclude_pids: &[i64]) -> Vec<Gateway
         .collect()
 }
 
+#[cfg(all(test, not(windows)))]
 fn gateway_process_matches(pid: i64, command: &str, exclude_pids: &[i64]) -> bool {
     pid > 0
         && !exclude_pids.contains(&pid)
         && GATEWAY_PROCESS_PATTERNS
             .iter()
             .any(|pattern| command.contains(pattern))
-}
-
-fn ancestor_pids() -> Vec<i64> {
-    let mut ancestors = Vec::new();
-    let mut pid = std::process::id() as i64;
-    for _ in 0..64 {
-        if pid <= 0 || ancestors.contains(&pid) {
-            break;
-        }
-        ancestors.push(pid);
-        let Some(parent) = parent_pid(pid) else {
-            break;
-        };
-        pid = parent;
-    }
-    ancestors
-}
-
-fn parent_pid(pid: i64) -> Option<i64> {
-    if pid <= 1 {
-        return None;
-    }
-    let output = Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let parent = stdout.trim().parse::<i64>().ok()?;
-    (parent > 0).then_some(parent)
 }
 
 fn kill_gateway_processes(processes: &[GatewayProcess], force: bool) -> usize {
@@ -1790,96 +1770,6 @@ fn stop_gateway_service_if_available(context: &HermesContext, system: bool) -> b
         return stop_launchd_service(context).is_ok();
     }
     false
-}
-
-fn list_active_systemd_gateway_services(system: bool) -> Result<Vec<String>, Box<dyn Error>> {
-    if which_on_path("systemctl").is_none() {
-        return Ok(Vec::new());
-    }
-    let output = build_systemctl_command(
-        system,
-        &[
-            "list-units",
-            "hermes-gateway*",
-            "--plain",
-            "--no-legend",
-            "--no-pager",
-        ],
-    )
-    .output()?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut services = Vec::new();
-    for line in stdout.lines() {
-        let Some(unit) = line.split_whitespace().next() else {
-            continue;
-        };
-        if !unit.ends_with(".service") {
-            continue;
-        }
-        let service = unit.trim_end_matches(".service").to_string();
-        if !services.iter().any(|value| value == &service) {
-            services.push(service);
-        }
-    }
-    Ok(services)
-}
-
-fn restart_named_systemd_service(system: bool, service: &str) -> Result<(), Box<dyn Error>> {
-    let output = build_systemctl_command(system, &["restart", service]).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(command_failure_message("systemctl", &output).into())
-}
-
-fn systemd_main_pid(system: bool, service: &str) -> Option<i64> {
-    let output =
-        build_systemctl_command(system, &["show", service, "--property=MainPID", "--value"])
-            .output()
-            .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .trim()
-        .parse::<i64>()
-        .ok()
-        .filter(|pid| *pid > 0)
-}
-
-fn collect_running_service_gateway_pids(
-    context: &HermesContext,
-) -> Result<Vec<i64>, Box<dyn Error>> {
-    let mut pids = Vec::new();
-    for system in [false, true] {
-        for service in list_active_systemd_gateway_services(system)? {
-            if let Some(pid) = systemd_main_pid(system, &service)
-                && !pids.contains(&pid)
-            {
-                pids.push(pid);
-            }
-        }
-    }
-    if is_macos() {
-        for (_, home) in collect_profile_homes(context)? {
-            let profile_context = context.clone().with_hermes_home_env(Some(home.clone()));
-            if !(launchd_plist_path(&profile_context).exists()
-                && launchd_service_active(&profile_context))
-            {
-                continue;
-            }
-            for pid in gateway_pids_for_profile(&home) {
-                if !pids.contains(&pid) {
-                    pids.push(pid);
-                }
-            }
-        }
-    }
-    Ok(pids)
 }
 
 fn systemd_service_active(context: &HermesContext, system: bool) -> bool {
@@ -3355,6 +3245,17 @@ exit 9\n",
             .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
             .spawn()
             .unwrap();
+        fs::create_dir_all(ctx.hermes_home()).unwrap();
+        fs::write(
+            ctx.hermes_home().join("gateway.pid"),
+            format!("{{\"pid\":{}}}\n", child.id()),
+        )
+        .unwrap();
+
+        let mut unrelated = Command::new("bash")
+            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .spawn()
+            .unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
         print_gateway(
@@ -3371,6 +3272,9 @@ exit 9\n",
 
         let status = child.wait().unwrap();
         assert!(!status.success());
+        assert!(process_running(unrelated.id() as i64));
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
         let output = fs::read_to_string(&log).unwrap();
         assert!(output.contains("restart verbose=0 quiet=0 replace=0"));
 

@@ -5588,7 +5588,17 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     return True
 
 
-def _find_stale_dashboard_pids() -> list[int]:
+def _dashboard_pid_matches_project(pid: int) -> bool:
+    if sys.platform == "win32":
+        return True
+    try:
+        cwd = Path(f"/proc/{pid}/cwd").resolve()
+    except OSError:
+        return False
+    return cwd == PROJECT_ROOT
+
+
+def _find_stale_dashboard_pids(project_scoped: bool = False) -> list[int]:
     """Return PIDs of ``hermes dashboard`` processes other than ourselves.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
@@ -5639,14 +5649,14 @@ def _find_stale_dashboard_pids() -> list[int]:
                     current_cmd = line[len("CommandLine=") :]
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
-                        try:
-                            dashboard_pids.append(int(pid_str))
-                        except ValueError:
-                            pass
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        current_cmd = ""
+                        continue
+                    if any(p in current_cmd for p in patterns) and pid != self_pid:
+                        if not project_scoped or _dashboard_pid_matches_project(pid):
+                            dashboard_pids.append(pid)
         else:
             # Linux / macOS: scan the process table via ps and match against
             # the same explicit patterns list used on Windows.  Using ps
@@ -5673,7 +5683,14 @@ def _find_stale_dashboard_pids() -> list[int]:
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if (
+                        any(p in command for p in patterns)
+                        and pid != self_pid
+                        and (
+                            not project_scoped
+                            or _dashboard_pid_matches_project(pid)
+                        )
+                    ):
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -5743,7 +5760,7 @@ def _kill_stale_dashboard_processes(
     launch args (--host, --port, --insecure, --tui, --no-open).  The user
     restarts it manually; a hint is printed.
     """
-    pids = _find_stale_dashboard_pids()
+    pids = _find_stale_dashboard_pids(project_scoped=True)
     if not pids:
         return
 
@@ -7490,10 +7507,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 is_macos,
                 supports_systemd_services,
                 _ensure_user_systemd_env,
-                find_gateway_pids,
                 find_profile_gateway_processes,
                 launch_detached_profile_gateway_restart,
-                _get_service_pids,
+                profile_gateway_service_targets,
+                systemd_unit_matches_home,
                 _graceful_restart_via_sigusr1,
             )
             import signal as _signal
@@ -7613,43 +7630,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
             restarted_services = []
             killed_pids = set()
             relaunched_profiles = []
+            service_profiles = set()
 
             # --- Systemd services (Linux) ---
-            # Discover all hermes-gateway* units (default + profiles)
+            # Restart only services whose unit file belongs to this
+            # HERMES_HOME profile tree. Do not sweep every hermes-gateway*
+            # unit on the machine from a dev checkout.
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
                 except Exception:
                     pass
 
+                service_targets = profile_gateway_service_targets()
                 for scope, scope_cmd in [
                     ("user", ["systemctl", "--user"]),
                     ("system", ["systemctl"]),
                 ]:
-                    try:
-                        result = subprocess.run(
-                            scope_cmd
-                            + [
-                                "list-units",
-                                "hermes-gateway*",
-                                "--plain",
-                                "--no-legend",
-                                "--no-pager",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        for line in result.stdout.strip().splitlines():
-                            parts = line.split()
-                            if not parts:
-                                continue
-                            unit = parts[
-                                0
-                            ]  # e.g. hermes-gateway.service or hermes-gateway-coder.service
-                            if not unit.endswith(".service"):
-                                continue
-                            svc_name = unit.removesuffix(".service")
+                    system_scope = scope == "system"
+                    for target in service_targets:
+                        svc_name = target.service
+                        if not systemd_unit_matches_home(
+                            system_scope,
+                            target.path,
+                            svc_name,
+                        ):
+                            continue
+                        try:
                             # Check if active
                             check = subprocess.run(
                                 scope_cmd + ["is-active", svc_name],
@@ -7659,6 +7666,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             )
                             if check.stdout.strip() != "active":
                                 continue
+                            service_profiles.add(target.profile)
 
                             # Prefer a graceful SIGUSR1 restart so in-flight
                             # agent runs drain instead of being SIGKILLed.
@@ -7782,8 +7790,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 print(
                                     f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}"
                                 )
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        pass
+                        except (FileNotFoundError, subprocess.TimeoutExpired):
+                            pass
 
             # --- Launchd services (macOS) ---
             if is_macos():
@@ -7792,10 +7800,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         launchd_restart,
                         get_launchd_label,
                         get_launchd_plist_path,
+                        launchd_plist_matches_home,
                     )
 
                     plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
+                    if plist_path.exists() and launchd_plist_matches_home(
+                        get_hermes_home()
+                    ):
                         check = subprocess.run(
                             ["launchctl", "list", get_launchd_label()],
                             capture_output=True,
@@ -7806,6 +7817,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             try:
                                 launchd_restart()
                                 restarted_services.append(get_launchd_label())
+                                service_profiles.add("default")
                             except subprocess.CalledProcessError as e:
                                 stderr = (getattr(e, "stderr", "") or "").strip()
                                 print(f"  ⚠ Gateway restart failed: {stderr}")
@@ -7813,17 +7825,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     pass
 
             # --- Manual (non-service) gateways ---
-            # Kill any remaining gateway processes not managed by a service.
-            # Exclude PIDs that belong to just-restarted services so we don't
-            # immediately kill the process that systemd/launchd just spawned.
-            service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
-            )
+            # Restart only manual gateways that are mapped to known profile
+            # PID files. Unmapped process-table matches are left alone.
             profile_processes = {
                 proc.pid: proc
-                for proc in find_profile_gateway_processes(exclude_pids=service_pids)
-                if proc.pid in manual_pids
+                for proc in find_profile_gateway_processes()
+                if proc.profile not in service_profiles
             }
             for pid, proc in profile_processes.items():
                 if not launch_detached_profile_gateway_restart(proc.profile, pid):
@@ -7845,15 +7852,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 killed_pids.add(pid)
                 relaunched_profiles.append(proc.profile)
 
-            for pid in manual_pids:
-                if pid in profile_processes:
-                    continue
-                try:
-                    os.kill(pid, _signal.SIGTERM)
-                    killed_pids.add(pid)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
             if restarted_services or killed_pids:
                 print()
                 for svc in restarted_services:
@@ -7861,14 +7859,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if relaunched_profiles:
                     names = ", ".join(relaunched_profiles)
                     print(f"  ✓ Restarting manual gateway profile(s): {names}")
-                unmapped_count = len(killed_pids) - len(relaunched_profiles)
-                if unmapped_count:
-                    print(f"  → Stopped {unmapped_count} manual gateway process(es)")
-                    print("    Restart manually: hermes gateway run")
-                    if unmapped_count > 1:
-                        print(
-                            "    (or: hermes -p <profile> gateway run  for each profile)"
-                        )
 
             if not restarted_services and not killed_pids:
                 # No gateways were running — nothing to do
@@ -8350,7 +8340,7 @@ def cmd_dashboard(args):
 
     # --stop: kill any running dashboards and exit, no deps needed.
     if getattr(args, "stop", False):
-        pids = _find_stale_dashboard_pids()
+        pids = _find_stale_dashboard_pids(project_scoped=True)
         if not pids:
             print("No hermes dashboard processes running.")
             sys.exit(0)
@@ -8358,7 +8348,7 @@ def cmd_dashboard(args):
         _kill_stale_dashboard_processes(reason="requested via --stop")
         # _kill_stale_dashboard_processes prints outcomes itself.  Exit 0 if
         # we killed at least one, 1 if they were all unkillable.
-        remaining = _find_stale_dashboard_pids()
+        remaining = _find_stale_dashboard_pids(project_scoped=True)
         sys.exit(1 if remaining else 0)
 
     try:

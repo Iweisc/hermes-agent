@@ -36,6 +36,20 @@ def _no_restart_verify_sleep(monkeypatch):
     monkeypatch.setattr(_real_time, "sleep", lambda *_a, **_k: None)
 
 
+@pytest.fixture(autouse=True)
+def _mock_service_unit_ownership(monkeypatch):
+    monkeypatch.setattr(
+        gateway_cli,
+        "systemd_unit_matches_home",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "launchd_plist_matches_home",
+        lambda *args, **kwargs: True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -384,13 +398,13 @@ class TestCmdUpdateLaunchdRestart:
             launchctl_loaded=False,
         )
 
-        # Simulate a manual gateway process found by find_gateway_pids
-        with patch.object(gateway_cli, "find_gateway_pids", return_value=[12345]), \
-             patch("os.kill"):
+        with patch.object(gateway_cli, "find_profile_gateway_processes", return_value=[]), \
+             patch("os.kill") as kill:
             cmd_update(mock_args)
 
         captured = capsys.readouterr().out
-        assert "Restart manually: hermes gateway run" in captured
+        assert "Restart manually: hermes gateway run" not in captured
+        kill.assert_not_called()
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -872,14 +886,20 @@ class TestServicePidExclusion:
             launchctl_loaded=True,
         )
 
-        def fake_find(exclude_pids=None, all_profiles=False):
-            _exclude = exclude_pids or set()
-            return [p for p in [SERVICE_PID, MANUAL_PID] if p not in _exclude]
+        manual_process = gateway_cli.ProfileGatewayProcess(
+            profile="coder",
+            path=tmp_path / ".hermes" / "profiles" / "coder",
+            pid=MANUAL_PID,
+        )
 
         with patch.object(
             gateway_cli, "_get_service_pids", return_value={SERVICE_PID}
         ), patch.object(
-            gateway_cli, "find_gateway_pids", side_effect=fake_find,
+            gateway_cli, "find_profile_gateway_processes", return_value=[manual_process],
+        ), patch.object(
+            gateway_cli, "launch_detached_profile_gateway_restart", return_value=True,
+        ), patch.object(
+            gateway_cli, "_graceful_restart_via_sigusr1", return_value=False,
         ), patch("os.kill") as mock_kill:
             cmd_update(mock_args)
 
@@ -891,8 +911,7 @@ class TestServicePidExclusion:
         # Service PID should NOT be killed
         service_kills = [c for c in mock_kill.call_args_list if c.args[0] == SERVICE_PID]
         assert len(service_kills) == 0
-        # Should show manual stop message since manual PID was killed
-        assert "Stopped 1 manual gateway" in captured
+        assert "Restarting manual gateway profile(s): coder" in captured
 
 
 class TestGetServicePids:

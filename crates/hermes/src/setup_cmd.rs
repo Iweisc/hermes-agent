@@ -188,51 +188,27 @@ fn print_model_setup_compatibility_python() -> Result<(), Box<dyn Error>> {
 }
 
 fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Agent))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Agent)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_model_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Model))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Model)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_tts_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Tts))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Tts)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_terminal_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Terminal))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Terminal)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_gateway_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Gateway))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Gateway)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
-    matches!(args.section, Some(SetupSection::Tools))
-        && !args.non_interactive
-        && !args.reset
-        && !args.reconfigure
-        && !args.quick
+    matches!(args.section, Some(SetupSection::Tools)) && !args.non_interactive && !args.reset
 }
 
 fn should_use_native_setup_noninteractive(args: &SetupArgs, stdin_is_terminal: bool) -> bool {
@@ -3897,7 +3873,7 @@ mod tests {
     }
 
     #[test]
-    fn native_tools_setup_only_allows_plain_tools() {
+    fn native_tools_setup_allows_noop_section_flags() {
         assert!(should_use_native_tools_setup(&SetupArgs {
             section: Some(SetupSection::Tools),
             non_interactive: false,
@@ -3905,12 +3881,12 @@ mod tests {
             reconfigure: false,
             quick: false,
         }));
-        assert!(!should_use_native_tools_setup(&SetupArgs {
+        assert!(should_use_native_tools_setup(&SetupArgs {
             section: Some(SetupSection::Tools),
             non_interactive: false,
             reset: false,
             reconfigure: true,
-            quick: false,
+            quick: true,
         }));
         assert!(!should_use_native_tools_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
@@ -3922,13 +3898,20 @@ mod tests {
     }
 
     #[test]
-    fn native_model_setup_only_allows_plain_model() {
+    fn native_model_setup_allows_noop_section_flags() {
         assert!(should_use_native_model_setup(&SetupArgs {
             section: Some(SetupSection::Model),
             non_interactive: false,
             reset: false,
             reconfigure: false,
             quick: false,
+        }));
+        assert!(should_use_native_model_setup(&SetupArgs {
+            section: Some(SetupSection::Model),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: true,
         }));
         assert!(!should_use_native_model_setup(&SetupArgs {
             section: Some(SetupSection::Model),
@@ -3981,7 +3964,7 @@ mod tests {
     }
 
     #[test]
-    fn native_gateway_setup_only_allows_plain_gateway() {
+    fn native_gateway_setup_allows_noop_section_flags() {
         assert!(should_use_native_gateway_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
             non_interactive: false,
@@ -3989,12 +3972,12 @@ mod tests {
             reconfigure: false,
             quick: false,
         }));
-        assert!(!should_use_native_gateway_setup(&SetupArgs {
+        assert!(should_use_native_gateway_setup(&SetupArgs {
             section: Some(SetupSection::Gateway),
             non_interactive: false,
             reset: false,
             reconfigure: true,
-            quick: false,
+            quick: true,
         }));
         assert!(!should_use_native_gateway_setup(&SetupArgs {
             section: Some(SetupSection::Model),
@@ -4002,6 +3985,38 @@ mod tests {
             reset: false,
             reconfigure: false,
             quick: false,
+        }));
+    }
+
+    #[test]
+    fn native_section_setup_allows_noop_flags_for_remaining_sections() {
+        assert!(should_use_native_agent_setup(&SetupArgs {
+            section: Some(SetupSection::Agent),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: true,
+        }));
+        assert!(should_use_native_tts_setup(&SetupArgs {
+            section: Some(SetupSection::Tts),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: true,
+        }));
+        assert!(should_use_native_terminal_setup(&SetupArgs {
+            section: Some(SetupSection::Terminal),
+            non_interactive: false,
+            reset: false,
+            reconfigure: true,
+            quick: true,
+        }));
+        assert!(!should_use_native_agent_setup(&SetupArgs {
+            section: Some(SetupSection::Agent),
+            non_interactive: false,
+            reset: true,
+            reconfigure: true,
+            quick: true,
         }));
     }
 

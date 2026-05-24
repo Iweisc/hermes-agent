@@ -42,12 +42,12 @@ pub fn print_dashboard(args: DashboardArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if args.stop {
-        let pids = find_dashboard_pids()?;
-        if pids.is_empty() {
+        let processes = find_dashboard_processes_for_project(&project_root())?;
+        if processes.is_empty() {
             println!("No hermes dashboard processes running.");
             return Ok(());
         }
-        let result = kill_dashboard_processes("requested via --stop")?;
+        let result = kill_dashboard_processes("requested via --stop", &processes)?;
         if result.failed.is_empty() {
             return Ok(());
         }
@@ -61,7 +61,8 @@ pub fn print_dashboard(args: DashboardArgs) -> Result<(), Box<dyn Error>> {
 }
 
 pub(crate) fn stop_stale_dashboard_processes(reason: &str) -> Result<usize, Box<dyn Error>> {
-    let result = kill_dashboard_processes(reason)?;
+    let processes = find_dashboard_processes_for_project(&project_root())?;
+    let result = kill_dashboard_processes(reason, &processes)?;
     Ok(result.killed.len())
 }
 
@@ -69,6 +70,7 @@ pub(crate) fn stop_stale_dashboard_processes(reason: &str) -> Result<usize, Box<
 struct DashboardProcess {
     pid: i32,
     command: String,
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -92,13 +94,6 @@ fn report_dashboard_status() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
-}
-
-fn find_dashboard_pids() -> Result<Vec<i32>, Box<dyn Error>> {
-    Ok(find_dashboard_processes()?
-        .into_iter()
-        .map(|process| process.pid)
-        .collect())
 }
 
 fn find_dashboard_processes() -> Result<Vec<DashboardProcess>, Box<dyn Error>> {
@@ -145,7 +140,11 @@ fn parse_ps_process_list(output: &str, self_pid: i32) -> Vec<DashboardProcess> {
             let mut parts = stripped.splitn(2, char::is_whitespace);
             let pid = parts.next()?.trim().parse::<i32>().ok()?;
             let command = parts.next().unwrap_or("").trim().to_string();
-            dashboard_matches(pid, &command, self_pid).then_some(DashboardProcess { pid, command })
+            dashboard_matches(pid, &command, self_pid).then_some(DashboardProcess {
+                pid,
+                command,
+                cwd: dashboard_process_cwd(pid),
+            })
         })
         .collect()
 }
@@ -170,6 +169,7 @@ fn parse_wmic_process_list(output: &str, self_pid: i32) -> Vec<DashboardProcess>
             processes.push(DashboardProcess {
                 pid,
                 command: current_command.clone(),
+                cwd: dashboard_process_cwd(pid),
             });
         }
     }
@@ -183,8 +183,48 @@ fn dashboard_matches(pid: i32, command: &str, self_pid: i32) -> bool {
             .any(|pattern| command.contains(pattern))
 }
 
-fn kill_dashboard_processes(reason: &str) -> Result<StopResult, Box<dyn Error>> {
-    let pids = find_dashboard_pids()?;
+fn find_dashboard_processes_for_project(
+    project_root: &Path,
+) -> Result<Vec<DashboardProcess>, Box<dyn Error>> {
+    Ok(find_dashboard_processes()?
+        .into_iter()
+        .filter(|process| dashboard_process_matches_project(process, project_root))
+        .collect())
+}
+
+fn dashboard_process_matches_project(process: &DashboardProcess, project_root: &Path) -> bool {
+    let Some(cwd) = process.cwd.as_ref() else {
+        return false;
+    };
+    let expected = canonicalize_lossy(project_root);
+    let actual = canonicalize_lossy(cwd);
+    actual == expected
+}
+
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn dashboard_process_cwd(pid: i32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn kill_dashboard_processes(
+    reason: &str,
+    processes: &[DashboardProcess],
+) -> Result<StopResult, Box<dyn Error>> {
+    let pids = processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
     if pids.is_empty() {
         return Ok(StopResult::default());
     }
@@ -602,6 +642,37 @@ mod tests {
             "python -m hermes_cli.main dashboard --port 9119",
             100
         ));
+    }
+
+    #[test]
+    fn dashboard_project_filter_requires_matching_cwd() {
+        let temp = temp_path("project-filter");
+        let project = temp.join("project");
+        let other = temp.join("other");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&other).unwrap();
+
+        let matching = DashboardProcess {
+            pid: 10,
+            command: String::from("hermes dashboard"),
+            cwd: Some(project.clone()),
+        };
+        let unrelated = DashboardProcess {
+            pid: 11,
+            command: String::from("hermes dashboard"),
+            cwd: Some(other),
+        };
+        let unknown = DashboardProcess {
+            pid: 12,
+            command: String::from("hermes dashboard"),
+            cwd: None,
+        };
+
+        assert!(dashboard_process_matches_project(&matching, &project));
+        assert!(!dashboard_process_matches_project(&unrelated, &project));
+        assert!(!dashboard_process_matches_project(&unknown, &project));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
