@@ -352,12 +352,6 @@ fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn E
             SKILLS_INSTALL_BOOTSTRAP,
             passthrough,
         ),
-        "inspect" => print_python_skills_command(
-            "inspect",
-            "skills inspect",
-            SKILLS_INSPECT_BOOTSTRAP,
-            passthrough,
-        ),
         "publish" => print_python_skills_command(
             "publish",
             "skills publish",
@@ -406,16 +400,6 @@ const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
     "parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
     "args = parser.parse_args(sys.argv[1:])\n",
     "do_install(args.identifier, category=args.category, force=args.force, skip_confirm=getattr(args, 'yes', False), name_override=getattr(args, 'name', '') or '')\n",
-);
-
-const SKILLS_INSPECT_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_inspect\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills inspect')\n",
-    "parser.add_argument('identifier')\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_inspect(args.identifier)\n",
 );
 
 const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
@@ -533,7 +517,7 @@ fn inspect_skill_command(
             return Ok(());
         }
     }
-    bridge_prefixed("inspect", &[identifier.to_string()])
+    Err(format!("No skill found for identifier: {identifier}").into())
 }
 
 fn browse_skills_command(context: &HermesContext, args: BrowseArgs) -> Result<(), Box<dyn Error>> {
@@ -7595,40 +7579,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn inspect_bridges_when_native_resolution_misses() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp_path("inspect-bridge");
+    fn inspect_reports_unresolved_identifiers_natively() {
+        let home = temp_path("inspect-unresolved");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
 
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        inspect_skill_command(&context, "owner/repo/remote-skill").unwrap();
+        let error = inspect_skill_command(&context, "owner/repo/remote-skill")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("No skill found for identifier: owner/repo/remote-skill"));
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("command=inspect argv=owner/repo/remote-skill"));
-
-        remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
     }
 
