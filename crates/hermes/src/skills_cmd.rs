@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -19,7 +19,7 @@ use serde_yaml::Value as YamlValue;
 use sha2::Digest;
 
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
-use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::python_bridge::project_root;
 use crate::skills_guard::{format_scan_report, install_allowed, resolve_trust_level, scan_skill};
 
 const EXCLUDED_SKILL_DIRS: &[&str] = &[".git", ".github", ".hub", ".archive"];
@@ -80,27 +80,6 @@ pub struct InstallArgs {
     pub force: bool,
     #[arg(short = 'y', long, default_value_t = false)]
     pub yes: bool,
-}
-
-impl InstallArgs {
-    fn to_passthrough(&self) -> Vec<String> {
-        let mut args = vec![self.identifier.clone()];
-        if !self.category.is_empty() {
-            args.push(String::from("--category"));
-            args.push(self.category.clone());
-        }
-        if !self.name_override.is_empty() {
-            args.push(String::from("--name"));
-            args.push(self.name_override.clone());
-        }
-        if self.force {
-            args.push(String::from("--force"));
-        }
-        if self.yes {
-            args.push(String::from("--yes"));
-        }
-        args
-    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -376,65 +355,6 @@ fn print_skills_usage() {
     println!();
     println!("Run 'hermes skills <command> --help' for details.");
     println!();
-}
-
-fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
-    match action {
-        "install" => print_python_skills_command(
-            "install",
-            "skills install",
-            SKILLS_INSTALL_BOOTSTRAP,
-            passthrough,
-        ),
-        _ => Err(format!("unsupported bridged skills action: {action}").into()),
-    }
-}
-
-fn print_python_skills_command(
-    action: &str,
-    command_name: &str,
-    bootstrap: &str,
-    passthrough: &[String],
-) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_SKILLS_PYTHON"))
-        .ok_or("could not find a Python interpreter for skills")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_SKILLS_COMMAND", action)
-        .arg("-c")
-        .arg(bootstrap)
-        .args(passthrough);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message(command_name, status).into())
-}
-
-const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_install\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills install')\n",
-    "parser.add_argument('identifier')\n",
-    "parser.add_argument('--category', default='')\n",
-    "parser.add_argument('--name', default='')\n",
-    "parser.add_argument('--force', action='store_true')\n",
-    "parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_install(args.identifier, category=args.category, force=args.force, skip_confirm=getattr(args, 'yes', False), name_override=getattr(args, 'name', '') or '')\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
 }
 
 fn print_list(context: &HermesContext, args: ListArgs) -> Result<(), Box<dyn Error>> {
@@ -1370,9 +1290,8 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_clawhub_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", &args.to_passthrough());
-        };
+        let skill_name =
+            resolve_install_bundle_name(args, skill_name, name_override.clone(), "ClawHub")?;
         return install_remote_skill_bundle(
             context,
             args,
@@ -1387,9 +1306,8 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_skills_sh_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", &args.to_passthrough());
-        };
+        let skill_name =
+            resolve_install_bundle_name(args, skill_name, name_override.clone(), "skills.sh")?;
         return install_remote_skill_bundle(
             context,
             args,
@@ -1404,9 +1322,12 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_well_known_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", &args.to_passthrough());
-        };
+        let skill_name = resolve_install_bundle_name(
+            args,
+            skill_name,
+            name_override.clone(),
+            "well-known source",
+        )?;
         return install_remote_skill_bundle(
             context,
             args,
@@ -1421,9 +1342,8 @@ fn install_github_skill_command(
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_url_bundle_to_tempdir(&args.identifier)?
     {
-        let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", &args.to_passthrough());
-        };
+        let skill_name =
+            resolve_install_bundle_name(args, skill_name, name_override.clone(), "URL")?;
         return install_remote_skill_bundle(
             context,
             args,
@@ -1435,14 +1355,15 @@ fn install_github_skill_command(
             "URL",
         );
     }
-    if github_app_auth_configured() && resolve_github_publish_token().is_none() {
-        return bridge_prefixed("install", &args.to_passthrough());
-    }
 
     let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_github_bundle_to_tempdir(&args.identifier)?
     else {
-        return bridge_prefixed("install", &args.to_passthrough());
+        return Err(format!(
+            "Could not fetch '{}' from any supported skills source.",
+            args.identifier
+        )
+        .into());
     };
 
     install_remote_skill_bundle(
@@ -1455,6 +1376,38 @@ fn install_github_skill_command(
         "github",
         "GitHub",
     )
+}
+
+fn resolve_install_bundle_name(
+    args: &InstallArgs,
+    discovered_name: Option<String>,
+    name_override: Option<String>,
+    source_label: &str,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(name) = discovered_name {
+        return Ok(name);
+    }
+    if let Some(name) = name_override {
+        return Ok(name);
+    }
+    if args.yes || !io::stdin().is_terminal() {
+        return Err(format!(
+            "Cannot install from {source_label}: the skill bundle has no valid name. Retry with --name <your-name>."
+        )
+        .into());
+    }
+
+    println!("The skill from {source_label} has no valid name.");
+    print!(
+        "Enter a skill name (lowercase letters, digits, hyphens, underscores; starts with a letter): "
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let Some(name) = resolve_optional_install_name_override(&answer)? else {
+        return Err("Installation cancelled.".into());
+    };
+    Ok(name)
 }
 
 fn install_remote_skill_bundle(
@@ -8322,6 +8275,68 @@ mod tests {
     }
 
     #[test]
+    fn install_native_url_skill_requires_name_when_missing() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-url-missing-name-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_url_skill_server(requests.clone());
+        let identifier = format!("{base_url}/SKILL.md");
+
+        let error = install_skill_command(&context, install_args(identifier.clone())).unwrap_err();
+        assert!(error.to_string().contains("--name <your-name>"));
+        assert!(load_hub_lock(&context).unwrap().is_empty());
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /SKILL.md "));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn install_native_url_skill_uses_name_override_when_missing() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("install-url-name-override-home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, handle) = spawn_url_skill_server(requests.clone());
+        let identifier = format!("{base_url}/SKILL.md");
+
+        install_skill_command(
+            &context,
+            InstallArgs {
+                name_override: String::from("url-demo"),
+                ..install_args(identifier.clone())
+            },
+        )
+        .unwrap();
+
+        assert!(
+            home.join("skills")
+                .join("url-demo")
+                .join("SKILL.md")
+                .exists()
+        );
+        let installed = load_hub_lock(&context).unwrap();
+        let entry = installed.get("url-demo").unwrap();
+        assert_eq!(entry.source, "url");
+        assert_eq!(entry.install_path, "url-demo");
+        assert_eq!(
+            entry.raw.get("identifier").and_then(JsonValue::as_str),
+            Some(identifier.as_str())
+        );
+
+        handle.join().unwrap();
+        let logged = requests.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1);
+        assert!(logged[0].starts_with("GET /SKILL.md "));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn install_native_legacy_skills_sh_identifier_resolves_and_installs() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("install-skills-sh-legacy-home");
@@ -10108,6 +10123,12 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                                 "---\nname: shipit\ndescription: Direct URL demo\nmetadata:\n  hermes:\n    tags:\n      - deploy\n---\nbody\n".to_string(),
                                 "text/plain",
                             )
+                        } else if first_line.starts_with("GET /SKILL.md ") {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\ndescription: Missing name demo\n---\nbody\n".to_string(),
+                                "text/plain",
+                            )
                         } else {
                             (
                                 "HTTP/1.1 404 Not Found",
@@ -10325,47 +10346,5 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
         assert!(saved.contains("\"metadata\""));
         assert!(saved.contains("\"foo\": \"bar\""));
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn bridge_prefixed_uses_python_override_and_passes_command_and_args() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        bridge_prefixed(
-            "install",
-            &[
-                String::from("official/mlops/demo"),
-                String::from("--force"),
-                String::from("--yes"),
-            ],
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("command=install argv=official/mlops/demo --force --yes"));
-
-        remove_env_var("HERMES_SKILLS_PYTHON");
     }
 }
