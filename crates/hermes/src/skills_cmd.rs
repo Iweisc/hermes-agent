@@ -6755,8 +6755,6 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -7968,12 +7966,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn install_native_official_skill_ignores_name_override_without_bridging() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("install-official-name-home");
         let optional = temp_path("optional-name-src");
-        let fake_python = temp_path("skills-install-name-python");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
 
         let skill_dir = optional.join("research").join("demo");
@@ -7984,13 +7980,8 @@ mod tests {
         )
         .unwrap();
         fs::write(skill_dir.join("notes.txt"), "hello\n").unwrap();
-        fs::write(&fake_python, "#!/bin/sh\nexit 99\n").unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
 
         install_skill_command(
             &context,
@@ -8013,31 +8004,22 @@ mod tests {
         assert!(installed.contains_key("demo"));
 
         remove_env_var("HERMES_OPTIONAL_SKILLS");
-        remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(optional);
-        let _ = fs::remove_file(fake_python);
     }
 
     #[test]
-    #[cfg(unix)]
     fn install_native_github_skill_ignores_name_override_without_bridging() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("install-github-name-home");
-        let fake_python = temp_path("skills-github-name-python");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (api_base, handle) = spawn_github_install_server(requests);
         let old_api_base = env::var_os("GITHUB_API_BASE_URL");
         let old_github_token = env::var_os("GITHUB_TOKEN");
-        fs::write(&fake_python, "#!/bin/sh\nexit 99\n").unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
 
         install_skill_command(
             &context,
@@ -8062,9 +8044,7 @@ mod tests {
             Some(value) => set_env_var("GITHUB_TOKEN", value),
             None => remove_env_var("GITHUB_TOKEN"),
         }
-        remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
-        let _ = fs::remove_file(fake_python);
     }
 
     #[test]

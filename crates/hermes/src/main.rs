@@ -3,7 +3,6 @@ mod auth_cmd;
 mod backup;
 mod checkpoints_cmd;
 mod claw_cmd;
-mod compat_cmd;
 mod completion;
 mod config_cmd;
 mod curator_cmd;
