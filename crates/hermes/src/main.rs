@@ -49,13 +49,14 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, KanbanDispatchOptions, LoadedConfig,
     LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once,
-    get_tool_definitions, is_container, is_wsl, kanban_has_spawnable_ready, run_cron_job_now,
-    run_due_cron_jobs, run_kanban_task,
+    get_tool_definitions, handle_cronjob, is_container, is_wsl, kanban_has_spawnable_ready,
+    run_cron_job_now, run_due_cron_jobs, run_kanban_task,
 };
+use serde_json::{Value as JsonValue, json};
 
 #[cfg(test)]
 pub(crate) fn cli_test_env_lock() -> &'static Mutex<()> {
@@ -184,7 +185,7 @@ enum Command {
     },
     Cron {
         #[command(subcommand)]
-        command: CronCommand,
+        command: Option<CronCommand>,
     },
     Logs(logs::LogsArgs),
     Kanban {
@@ -245,8 +246,79 @@ enum SessionsCommand {
 
 #[derive(Subcommand, Debug)]
 enum CronCommand {
+    List {
+        #[arg(long = "all", default_value_t = false)]
+        all: bool,
+    },
+    #[command(alias = "add")]
+    Create(CronCreateArgs),
+    Edit(CronEditArgs),
+    Pause {
+        job_id: String,
+    },
+    Resume {
+        job_id: String,
+    },
     Tick,
-    Run { id: String },
+    Run {
+        job_id: String,
+    },
+    #[command(alias = "rm", alias = "delete")]
+    Remove {
+        job_id: String,
+    },
+    Status,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CronCreateArgs {
+    schedule: String,
+    prompt: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    deliver: Option<String>,
+    #[arg(long)]
+    repeat: Option<i64>,
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    #[arg(long)]
+    script: Option<String>,
+    #[arg(long = "no-agent", default_value_t = false)]
+    no_agent: bool,
+    #[arg(long)]
+    workdir: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CronEditArgs {
+    job_id: String,
+    #[arg(long)]
+    schedule: Option<String>,
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    deliver: Option<String>,
+    #[arg(long)]
+    repeat: Option<i64>,
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    #[arg(long = "add-skill")]
+    add_skills: Vec<String>,
+    #[arg(long = "remove-skill")]
+    remove_skills: Vec<String>,
+    #[arg(long = "clear-skills", default_value_t = false)]
+    clear_skills: bool,
+    #[arg(long)]
+    script: Option<String>,
+    #[arg(long = "no-agent", action = clap::ArgAction::SetTrue)]
+    no_agent: bool,
+    #[arg(long = "agent", action = clap::ArgAction::SetTrue)]
+    agent: bool,
+    #[arg(long)]
+    workdir: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -635,15 +707,22 @@ fn run_chat(
 }
 
 fn print_cron(
-    _context: &HermesContext,
+    context: &HermesContext,
     config: &LoadedConfig,
     session_store: &hermes_core::SessionStore,
-    command: CronCommand,
+    command: Option<CronCommand>,
 ) -> Result<(), Box<dyn Error>> {
     let base_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match command {
+    match command.unwrap_or(CronCommand::List { all: false }) {
+        CronCommand::List { all } => print_cron_list(context, all),
+        CronCommand::Create(args) => print_cron_create(context, args),
+        CronCommand::Edit(args) => print_cron_edit(context, args),
+        CronCommand::Pause { job_id } => print_cron_job_action(context, "pause", &job_id, "Paused"),
+        CronCommand::Resume { job_id } => {
+            print_cron_job_action(context, "resume", &job_id, "Resumed")
+        }
         CronCommand::Tick => {
-            let result = run_due_cron_jobs(_context, config, session_store, &base_cwd)?;
+            let result = run_due_cron_jobs(context, config, session_store, &base_cwd)?;
             println!("due={}", result.due_count);
             println!("ran={}", result.ran_count);
             println!("succeeded={}", result.success_count);
@@ -665,12 +744,13 @@ fn print_cron(
                     item.error.unwrap_or_default(),
                 );
             }
+            Ok(())
         }
-        CronCommand::Run { id } => {
-            if id.trim().is_empty() {
+        CronCommand::Run { job_id } => {
+            if job_id.trim().is_empty() {
                 return Err("cron run requires a non-empty job id".into());
             }
-            let item = run_cron_job_now(_context, config, session_store, &base_cwd, &id)?;
+            let item = run_cron_job_now(context, config, session_store, &base_cwd, &job_id)?;
             println!("job_id={}", item.job_id);
             println!("name={}", item.job_name);
             println!("success={}", item.success);
@@ -688,9 +768,372 @@ fn print_cron(
             if !item.final_response.is_empty() {
                 println!("{}", item.final_response);
             }
+            Ok(())
+        }
+        CronCommand::Remove { job_id } => {
+            print_cron_job_action(context, "remove", &job_id, "Removed")
+        }
+        CronCommand::Status => print_cron_status(context),
+    }
+}
+
+fn cron_tool_result(context: &HermesContext, args: JsonValue) -> Result<JsonValue, Box<dyn Error>> {
+    let runtime = ToolRuntime::default().with_hermes_home(context.hermes_home());
+    let raw = handle_cronjob(&args, &runtime);
+    let value: JsonValue = serde_json::from_str(&raw)?;
+    if let Some(error) = value.get("error").and_then(JsonValue::as_str) {
+        return Err(error.to_string().into());
+    }
+    if !value
+        .get("success")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("cron command failed".into());
+    }
+    Ok(value)
+}
+
+fn normalized_cli_strings(values: &[String]) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !output.iter().any(|existing| existing == trimmed) {
+            output.push(trimmed.to_string());
         }
     }
+    output
+}
+
+fn print_cron_list(context: &HermesContext, show_all: bool) -> Result<(), Box<dyn Error>> {
+    let result = cron_tool_result(
+        context,
+        json!({
+            "action": "list",
+            "include_disabled": show_all,
+        }),
+    )?;
+    let jobs = result
+        .get("jobs")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if jobs.is_empty() {
+        println!("No scheduled jobs.");
+        println!("Create one with 'hermes cron create ...' or the /cron command in chat.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<14} {:<12} {:<18} {:<26} Name",
+        "ID", "State", "Schedule", "Next Run"
+    );
+    println!(
+        "{:<14} {:<12} {:<18} {:<26} ----",
+        "--------------", "------------", "------------------", "--------------------------"
+    );
+    for job in &jobs {
+        let job_id = json_string(job, "job_id").unwrap_or_else(|| String::from("?"));
+        let state = json_string(job, "state").unwrap_or_else(|| String::from("?"));
+        let schedule = json_string(job, "schedule").unwrap_or_else(|| String::from("?"));
+        let next_run_at = json_string(job, "next_run_at").unwrap_or_default();
+        let name = json_string(job, "name").unwrap_or_else(|| String::from("(unnamed)"));
+        println!(
+            "{:<14} {:<12} {:<18} {:<26} {}",
+            truncate_plain(&job_id, 14),
+            truncate_plain(&state, 12),
+            truncate_plain(&schedule, 18),
+            truncate_plain(&next_run_at, 26),
+            name
+        );
+    }
+    println!();
+    println!("{} scheduled job(s)", jobs.len());
     Ok(())
+}
+
+fn print_cron_create(context: &HermesContext, args: CronCreateArgs) -> Result<(), Box<dyn Error>> {
+    let mut payload = serde_json::Map::new();
+    payload.insert(String::from("action"), json!("create"));
+    payload.insert(String::from("schedule"), json!(args.schedule));
+    insert_optional_string(&mut payload, "prompt", args.prompt);
+    insert_optional_string(&mut payload, "name", args.name);
+    insert_optional_string(&mut payload, "deliver", args.deliver);
+    if let Some(repeat) = args.repeat {
+        payload.insert(String::from("repeat"), json!(repeat));
+    }
+    let skills = normalized_cli_strings(&args.skills);
+    if !skills.is_empty() {
+        payload.insert(String::from("skills"), json!(skills));
+    }
+    insert_optional_string(&mut payload, "script", args.script);
+    if args.no_agent {
+        payload.insert(String::from("no_agent"), json!(true));
+    }
+    insert_optional_string(&mut payload, "workdir", args.workdir);
+
+    let result = cron_tool_result(context, JsonValue::Object(payload))?;
+    println!("Created job: {}", required_json_string(&result, "job_id")?);
+    println!("  Name: {}", required_json_string(&result, "name")?);
+    println!("  Schedule: {}", required_json_string(&result, "schedule")?);
+    if let Some(skills) = result.get("skills").and_then(JsonValue::as_array)
+        && !skills.is_empty()
+    {
+        println!("  Skills: {}", join_json_strings(skills));
+    }
+    if let Some(job) = result.get("job").and_then(JsonValue::as_object) {
+        if let Some(script) = job.get("script").and_then(JsonValue::as_str) {
+            println!("  Script: {script}");
+        }
+        if job
+            .get("no_agent")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            println!("  Mode: no-agent (script stdout delivered directly)");
+        }
+        if let Some(workdir) = job.get("workdir").and_then(JsonValue::as_str) {
+            println!("  Workdir: {workdir}");
+        }
+    }
+    println!(
+        "  Next run: {}",
+        required_json_string(&result, "next_run_at")?
+    );
+    Ok(())
+}
+
+fn print_cron_edit(context: &HermesContext, args: CronEditArgs) -> Result<(), Box<dyn Error>> {
+    let existing = find_cron_job(context, &args.job_id)?;
+    let mut payload = serde_json::Map::new();
+    payload.insert(String::from("action"), json!("update"));
+    payload.insert(String::from("job_id"), json!(args.job_id));
+    insert_optional_string(&mut payload, "schedule", args.schedule);
+    insert_optional_string(&mut payload, "prompt", args.prompt);
+    insert_optional_string(&mut payload, "name", args.name);
+    insert_optional_string(&mut payload, "deliver", args.deliver);
+    if let Some(repeat) = args.repeat {
+        payload.insert(String::from("repeat"), json!(repeat));
+    }
+
+    if args.clear_skills {
+        payload.insert(String::from("skills"), json!([]));
+    } else {
+        let replacement = normalized_cli_strings(&args.skills);
+        if !replacement.is_empty() {
+            payload.insert(String::from("skills"), json!(replacement));
+        } else {
+            let add = normalized_cli_strings(&args.add_skills);
+            let remove = normalized_cli_strings(&args.remove_skills);
+            if !add.is_empty() || !remove.is_empty() {
+                let mut final_skills = existing_cron_skills(&existing);
+                final_skills.retain(|skill| !remove.iter().any(|item| item == skill));
+                for skill in add {
+                    if !final_skills.iter().any(|existing| existing == &skill) {
+                        final_skills.push(skill);
+                    }
+                }
+                payload.insert(String::from("skills"), json!(final_skills));
+            }
+        }
+    }
+
+    insert_optional_string(&mut payload, "script", args.script);
+    if args.no_agent && args.agent {
+        return Err("cron edit accepts either --no-agent or --agent, not both".into());
+    }
+    if args.no_agent {
+        payload.insert(String::from("no_agent"), json!(true));
+    } else if args.agent {
+        payload.insert(String::from("no_agent"), json!(false));
+    }
+    insert_optional_string(&mut payload, "workdir", args.workdir);
+
+    let result = cron_tool_result(context, JsonValue::Object(payload))?;
+    let updated = result
+        .get("job")
+        .ok_or("cron update result did not include job")?;
+    println!("Updated job: {}", required_json_string(updated, "job_id")?);
+    println!("  Name: {}", required_json_string(updated, "name")?);
+    println!("  Schedule: {}", required_json_string(updated, "schedule")?);
+    let skills = updated
+        .get("skills")
+        .and_then(JsonValue::as_array)
+        .map(|values| join_json_strings(values))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("none"));
+    println!("  Skills: {skills}");
+    if let Some(script) = updated.get("script").and_then(JsonValue::as_str) {
+        println!("  Script: {script}");
+    }
+    if updated
+        .get("no_agent")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        println!("  Mode: no-agent (script stdout delivered directly)");
+    }
+    if let Some(workdir) = updated.get("workdir").and_then(JsonValue::as_str) {
+        println!("  Workdir: {workdir}");
+    }
+    Ok(())
+}
+
+fn print_cron_job_action(
+    context: &HermesContext,
+    action: &str,
+    job_id: &str,
+    success_verb: &str,
+) -> Result<(), Box<dyn Error>> {
+    let result = cron_tool_result(
+        context,
+        json!({
+            "action": action,
+            "job_id": job_id,
+        }),
+    )?;
+    let job = result
+        .get("job")
+        .or_else(|| result.get("removed_job"))
+        .ok_or("cron result did not include job")?;
+    let name = json_string(job, "name").unwrap_or_else(|| job_id.to_string());
+    println!("{success_verb} job: {name} ({job_id})");
+    if matches!(action, "resume" | "run")
+        && let Some(next_run_at) = job.get("next_run_at").and_then(JsonValue::as_str)
+    {
+        println!("  Next run: {next_run_at}");
+    }
+    if action == "run" {
+        println!("  It will run on the next scheduler tick.");
+    }
+    Ok(())
+}
+
+fn print_cron_status(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let result = cron_tool_result(
+        context,
+        json!({
+            "action": "list",
+            "include_disabled": false,
+        }),
+    )?;
+    let jobs = result
+        .get("jobs")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if jobs.is_empty() {
+        println!("No active jobs");
+        return Ok(());
+    }
+
+    println!("{} active job(s)", jobs.len());
+    if let Some(next_run) = jobs
+        .iter()
+        .filter_map(|job| job.get("next_run_at").and_then(JsonValue::as_str))
+        .min()
+    {
+        println!("Next run: {next_run}");
+    }
+    println!("Use `hermes gateway status` to check automatic scheduler availability.");
+    Ok(())
+}
+
+fn find_cron_job(context: &HermesContext, job_id: &str) -> Result<JsonValue, Box<dyn Error>> {
+    let result = cron_tool_result(
+        context,
+        json!({
+            "action": "list",
+            "include_disabled": true,
+        }),
+    )?;
+    let Some(job) = result
+        .get("jobs")
+        .and_then(JsonValue::as_array)
+        .and_then(|jobs| {
+            jobs.iter().find(|job| {
+                job.get("job_id")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|id| id == job_id)
+            })
+        })
+    else {
+        return Err(format!("Job not found: {job_id}").into());
+    };
+    Ok(job.clone())
+}
+
+fn existing_cron_skills(job: &JsonValue) -> Vec<String> {
+    let mut skills = job
+        .get("skills")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if skills.is_empty()
+        && let Some(skill) = job.get("skill").and_then(JsonValue::as_str)
+        && !skill.trim().is_empty()
+    {
+        skills.push(skill.trim().to_string());
+    }
+    skills
+}
+
+fn insert_optional_string(
+    payload: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        payload.insert(key.to_string(), JsonValue::String(value));
+    }
+}
+
+fn required_json_string(value: &JsonValue, key: &str) -> Result<String, Box<dyn Error>> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("cron result missing '{key}'").into())
+}
+
+fn json_string(value: &JsonValue, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+}
+
+fn join_json_strings(values: &[JsonValue]) -> String {
+    values
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn truncate_plain(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    format!(
+        "{}...",
+        value
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>()
+    )
 }
 
 fn print_kanban(
@@ -1025,5 +1468,94 @@ fn emit_warnings(env_report: &EnvLoadReport, config: &LoadedConfig) {
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
         log::warn!(target: "hermes_cli", "{warning}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cron_cli_parses_python_compatible_crud_commands() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "cron",
+            "add",
+            "30m",
+            "check status",
+            "--name",
+            "health",
+            "--skill",
+            "ops",
+            "--script",
+            "health.py",
+            "--workdir",
+            "/tmp",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Cron {
+                command: Some(CronCommand::Create(args)),
+            }) => {
+                assert_eq!(args.schedule, "30m");
+                assert_eq!(args.prompt.as_deref(), Some("check status"));
+                assert_eq!(args.name.as_deref(), Some("health"));
+                assert_eq!(args.skills, vec![String::from("ops")]);
+                assert_eq!(args.script.as_deref(), Some("health.py"));
+                assert_eq!(args.workdir.as_deref(), Some("/tmp"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "cron", "rm", "cron_123"]).unwrap();
+        match cli.command {
+            Some(Command::Cron {
+                command: Some(CronCommand::Remove { job_id }),
+            }) => assert_eq!(job_id, "cron_123"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cron_tool_result_creates_and_lists_jobs_in_profile_home() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home));
+        context.ensure_hermes_home().unwrap();
+
+        let created = cron_tool_result(
+            &context,
+            json!({
+                "action": "create",
+                "schedule": "30m",
+                "prompt": "Summarize deployment health",
+                "name": "deploy-health",
+                "skills": ["ops"],
+            }),
+        )
+        .unwrap();
+        assert_eq!(created["success"], JsonValue::Bool(true));
+        assert_eq!(
+            created["name"],
+            JsonValue::String(String::from("deploy-health"))
+        );
+
+        let listed = cron_tool_result(
+            &context,
+            json!({
+                "action": "list",
+                "include_disabled": true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(listed["count"], JsonValue::from(1));
+        assert_eq!(
+            listed["jobs"][0]["name"],
+            JsonValue::String(String::from("deploy-health"))
+        );
+        assert_eq!(
+            listed["jobs"][0]["skills"][0],
+            JsonValue::String(String::from("ops"))
+        );
     }
 }

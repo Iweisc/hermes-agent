@@ -54,7 +54,8 @@ pub use config::{
     TerminalConfig,
 };
 pub use cronjob::{
-    CronRunResult, CronTickResult, SILENT_MARKER, run_cron_job_now, run_due_cron_jobs,
+    CronRunResult, CronTickResult, SILENT_MARKER, handle_cronjob, run_cron_job_now,
+    run_due_cron_jobs,
 };
 pub use delegate::DelegateExecutor;
 pub use env_loader::EnvLoadReport;
