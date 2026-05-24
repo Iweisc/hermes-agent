@@ -174,19 +174,6 @@ fn print_setup_python_bootstrap(bootstrap: &str, args: SetupArgs) -> Result<(), 
     Err(exit_status_message("setup", status).into())
 }
 
-fn print_model_setup_compatibility_python() -> Result<(), Box<dyn Error>> {
-    print_setup_python_bootstrap(
-        SETUP_MODEL_BOOTSTRAP,
-        SetupArgs {
-            section: Some(SetupSection::Model),
-            non_interactive: false,
-            reset: false,
-            reconfigure: false,
-            quick: false,
-        },
-    )
-}
-
 fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Agent)) && !args.non_interactive && !args.reset
 }
@@ -242,22 +229,6 @@ const SETUP_BOOTSTRAP: &str = concat!(
     "run_setup_wizard(args)\n",
 );
 
-const SETUP_MODEL_BOOTSTRAP: &str = concat!(
-    "from hermes_cli.config import ensure_hermes_home, is_managed, managed_error, load_config, save_config\n",
-    "from hermes_cli.setup import is_interactive_stdin, print_noninteractive_setup_guidance\n",
-    "if is_managed():\n",
-    "    managed_error('run setup wizard')\n",
-    "else:\n",
-    "    ensure_hermes_home()\n",
-    "    if not is_interactive_stdin():\n",
-    "        print_noninteractive_setup_guidance('Running in a non-interactive environment (no TTY detected).')\n",
-    "    else:\n",
-    "        config = load_config()\n",
-    "        from hermes_cli.setup import setup_model_provider\n",
-    "        setup_model_provider(config)\n",
-    "        save_config(config)\n",
-);
-
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("{command} exited with status {code}"),
@@ -298,9 +269,7 @@ fn run_native_model_setup(
     ui.blank()?;
     ui.line("⚕ Hermes Setup — Inference Provider")?;
     ui.line("Choose a provider and default model.")?;
-    ui.line(
-        "Some fresh OAuth login, Copilot ACP, and the advanced model picker still use the compatibility flow.",
-    )?;
+    ui.line("Native OAuth, custom endpoints, auxiliary models, and credential rotation are configured here.")?;
     ui.blank()?;
     ui.line(&format!("Current provider: {current_label}"))?;
     ui.line(&format!(
@@ -336,8 +305,8 @@ fn run_native_model_setup(
     let remove_custom_choice =
         (!saved_custom_providers.is_empty()).then_some(custom_endpoint_choice + 1);
     let auxiliary_choice = remove_custom_choice.unwrap_or(custom_endpoint_choice) + 1;
-    let compatibility_choice = auxiliary_choice + 1;
-    let keep_choice = compatibility_choice + 1;
+    let rotation_choice = auxiliary_choice + 1;
+    let keep_choice = rotation_choice + 1;
     ui.line(&format!(
         "  {}. Custom endpoint (enter URL manually)",
         custom_endpoint_choice
@@ -353,8 +322,8 @@ fn run_native_model_setup(
         auxiliary_choice
     ))?;
     ui.line(&format!(
-        "  {}. Use compatibility flow (OAuth, advanced picker)",
-        compatibility_choice
+        "  {}. Configure credential rotation...",
+        rotation_choice
     ))?;
     ui.line(&format!("  {}. Keep current", keep_choice))?;
 
@@ -387,10 +356,6 @@ fn run_native_model_setup(
         return Ok(());
     }
 
-    if selection == compatibility_choice {
-        return print_model_setup_compatibility_python();
-    }
-
     if selection == custom_endpoint_choice {
         let current_api_key = get_nested_string(&root, &["model", "api_key"])
             .or_else(|| env_value_for_context(context, "OPENAI_API_KEY"))
@@ -412,6 +377,10 @@ fn run_native_model_setup(
 
     if selection == auxiliary_choice {
         return run_native_auxiliary_model_setup(context, ui, &mut root);
+    }
+
+    if selection == rotation_choice {
+        return run_native_credential_rotation_setup(context, ui, &mut root);
     }
 
     if selection > providers.len() {
@@ -522,6 +491,166 @@ fn run_native_auxiliary_model_setup(
 
         configure_auxiliary_model_task(context, ui, root, AUXILIARY_MODEL_TASKS[selection - 1])?;
     }
+}
+
+#[derive(Debug, Clone)]
+struct CredentialPoolEntrySummary {
+    source: String,
+}
+
+fn run_native_credential_rotation_setup(
+    context: &HermesContext,
+    ui: &mut dyn SetupUi,
+    root: &mut Mapping,
+) -> Result<(), Box<dyn Error>> {
+    let provider = get_nested_string(root, &["model", "provider"])
+        .and_then(|provider| canonical_provider_name(&provider))
+        .unwrap_or_else(|| String::from("auto"));
+    if !supports_native_credential_rotation_setup(&provider) {
+        ui.blank()?;
+        ui.line(&format!(
+            "Credential rotation is not available for {}.",
+            if provider.trim().is_empty() {
+                "the current provider"
+            } else {
+                provider.as_str()
+            }
+        ))?;
+        ui.line("Choose a concrete API-key or device-code provider first.")?;
+        return Ok(());
+    }
+
+    let entries = load_credential_pool_entry_summaries(context, &provider)?;
+    let entry_count = entries.len();
+    let manual_count = entries
+        .iter()
+        .filter(|entry| entry.source.trim().starts_with("manual"))
+        .count();
+    let auto_count = entry_count.saturating_sub(manual_count);
+
+    ui.blank()?;
+    ui.line("Same-provider fallback & rotation")?;
+    if auto_count > 0 {
+        ui.line(&format!(
+            "Current pooled credentials for {provider}: {entry_count} ({manual_count} manual, {auto_count} auto-detected from env/shared auth)"
+        ))?;
+    } else {
+        ui.line(&format!(
+            "Current pooled credentials for {provider}: {entry_count}"
+        ))?;
+    }
+
+    if entry_count < 2 {
+        ui.line(&format!(
+            "Add another credential first with: hermes auth add {provider}"
+        ))?;
+        return Ok(());
+    }
+
+    ui.blank()?;
+    let strategies = [
+        (
+            "fill_first",
+            "Fill-first / sticky — use the first healthy credential until exhausted",
+        ),
+        (
+            "round_robin",
+            "Round robin — rotate to the next healthy credential after each selection",
+        ),
+        (
+            "random",
+            "Random — pick a random healthy credential each time",
+        ),
+        (
+            "least_used",
+            "Least used — prefer the healthy credential with the lowest request count",
+        ),
+    ];
+    for (index, (_, label)) in strategies.iter().enumerate() {
+        ui.line(&format!("  {}. {}", index + 1, label))?;
+    }
+
+    let current_strategy = credential_pool_strategy(root, &provider);
+    let default_choice = strategies
+        .iter()
+        .position(|(strategy, _)| *strategy == current_strategy)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let selection = prompt_menu_choice(
+        ui,
+        "Select same-provider rotation strategy: ",
+        strategies.len(),
+        default_choice,
+    )?;
+    let strategy = strategies[selection - 1].0;
+    set_credential_pool_strategy(root, &provider, strategy);
+    write_yaml_mapping(&context.config_path(), root)?;
+    ui.line(&format!("Saved {provider} rotation strategy: {strategy}"))?;
+    Ok(())
+}
+
+fn supports_native_credential_rotation_setup(provider: &str) -> bool {
+    let provider = provider.trim();
+    if provider.is_empty()
+        || provider.eq_ignore_ascii_case("auto")
+        || provider.eq_ignore_ascii_case("custom")
+    {
+        return false;
+    }
+    if provider.eq_ignore_ascii_case("openrouter") {
+        return true;
+    }
+    list_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.name == provider)
+        .is_some_and(|profile| matches!(profile.auth_type, "api_key" | "oauth_device_code"))
+}
+
+fn load_credential_pool_entry_summaries(
+    context: &HermesContext,
+    provider: &str,
+) -> Result<Vec<CredentialPoolEntrySummary>, Box<dyn Error>> {
+    let auth_path = context.hermes_home().join("auth.json");
+    if !auth_path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(auth_path)?;
+    let parsed = serde_json::from_str::<JsonValue>(&raw)?;
+    let Some(entries) = parsed
+        .get("credential_pool")
+        .and_then(JsonValue::as_object)
+        .and_then(|pool| pool.get(provider))
+        .and_then(JsonValue::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(entries
+        .iter()
+        .map(|entry| CredentialPoolEntrySummary {
+            source: entry
+                .get("source")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect())
+}
+
+fn credential_pool_strategy(root: &Mapping, provider: &str) -> String {
+    get_nested_string(root, &["credential_pool_strategies", provider])
+        .filter(|strategy| {
+            matches!(
+                strategy.as_str(),
+                "fill_first" | "round_robin" | "random" | "least_used"
+            )
+        })
+        .unwrap_or_else(|| String::from("fill_first"))
+}
+
+fn set_credential_pool_strategy(root: &mut Mapping, provider: &str, strategy: &str) {
+    let strategies = ensure_mapping(root, "credential_pool_strategies");
+    strategies.insert(yaml_key(provider), Value::String(strategy.to_string()));
 }
 
 fn configure_auxiliary_model_task(
@@ -4298,6 +4427,65 @@ mod tests {
         assert!(
             rendered.contains("Default model set to: llama3.1:8b (via http://localhost:11434/v1)")
         );
+    }
+
+    #[test]
+    fn setup_model_credential_rotation_stays_native() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "model:\n  provider: openrouter\n  default: openai/gpt-5.4\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::json!({
+                "version": 1,
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "primary",
+                            "label": "primary",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "manual",
+                            "access_token": "sk-primary"
+                        },
+                        {
+                            "id": "envkey",
+                            "label": "OPENROUTER_API_KEY",
+                            "auth_type": "api_key",
+                            "priority": 1,
+                            "source": "env:OPENROUTER_API_KEY",
+                            "access_token": "sk-env"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let rotation_choice = providers.len() + 3;
+        let mut input = io::Cursor::new(format!("{rotation_choice}\n2\n").into_bytes());
+        let mut output = Vec::new();
+
+        run_native_model_setup_with_io(&context, &mut input, &mut output).unwrap();
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("credential_pool_strategies:"));
+        assert!(config_text.contains("openrouter: round_robin"));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Configure credential rotation..."));
+        assert!(rendered.contains(
+            "Current pooled credentials for openrouter: 2 (1 manual, 1 auto-detected from env/shared auth)"
+        ));
+        assert!(rendered.contains("Saved openrouter rotation strategy: round_robin"));
+        assert!(!rendered.contains("Use compatibility flow"));
     }
 
     #[test]
