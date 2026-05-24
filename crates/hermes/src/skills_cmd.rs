@@ -43,7 +43,7 @@ pub enum SkillsCommand {
     Config,
     Check(CompatArgs),
     Update(CompatArgs),
-    Audit(CompatArgs),
+    Audit(OptionalSkillNameArgs),
     Uninstall(UninstallArgs),
     Reset(SkillResetArgs),
     Publish(CompatArgs),
@@ -68,6 +68,11 @@ pub struct SearchArgs {
     pub limit: usize,
     #[arg(long, value_enum, default_value_t = SkillsCatalogSource::All)]
     pub source: SkillsCatalogSource,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OptionalSkillNameArgs {
+    pub name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -321,7 +326,7 @@ pub fn print_skills(
         Some(SkillsCommand::Config) => configure_skills(context),
         Some(SkillsCommand::Check(args)) => check_skills_command(context, &args.args),
         Some(SkillsCommand::Update(args)) => update_skills_command(context, &args.args),
-        Some(SkillsCommand::Audit(args)) => audit_skills_command(context, &args.args),
+        Some(SkillsCommand::Audit(args)) => audit_skills_command(context, args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
         Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
         Some(SkillsCommand::Publish(args)) => publish_skill_command(context, &args.args),
@@ -363,12 +368,6 @@ fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn E
             "update",
             "skills update",
             SKILLS_UPDATE_BOOTSTRAP,
-            passthrough,
-        ),
-        "audit" => print_python_skills_command(
-            "audit",
-            "skills audit",
-            SKILLS_AUDIT_BOOTSTRAP,
             passthrough,
         ),
         "publish" => print_python_skills_command(
@@ -449,16 +448,6 @@ const SKILLS_UPDATE_BOOTSTRAP: &str = concat!(
     "parser.add_argument('name', nargs='?')\n",
     "args = parser.parse_args(sys.argv[1:])\n",
     "do_update(name=args.name)\n",
-);
-
-const SKILLS_AUDIT_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_audit\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills audit')\n",
-    "parser.add_argument('name', nargs='?')\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_audit(name=args.name)\n",
 );
 
 const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
@@ -1860,12 +1849,8 @@ fn update_skills_command(
 
 fn audit_skills_command(
     context: &HermesContext,
-    passthrough: &[String],
+    args: OptionalSkillNameArgs,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(name) = parse_single_name_passthrough(passthrough) else {
-        return bridge_prefixed("audit", passthrough);
-    };
-
     let installed = load_hub_lock(context)?;
     if installed.is_empty() {
         println!("No hub-installed skills to audit.");
@@ -1873,9 +1858,9 @@ fn audit_skills_command(
         return Ok(());
     }
 
-    let mut targets = if let Some(name) = name {
+    let mut targets = if let Some(name) = args.name.as_deref() {
         let Some(entry) = installed.get(name) else {
-            println!("Error: '{}' is not a hub-installed skill.", name);
+            println!("Error: '{name}' is not a hub-installed skill.");
             println!();
             return Ok(());
         };
@@ -7547,6 +7532,18 @@ mod tests {
     }
 
     #[test]
+    fn audit_args_parse_natively_and_reject_extra_names() {
+        let parsed = SkillsCommandHarness::try_parse_from(["skills", "audit", "demo"]).unwrap();
+        match parsed.command {
+            SkillsCommand::Audit(args) => assert_eq!(args.name.as_deref(), Some("demo")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            SkillsCommandHarness::try_parse_from(["skills", "audit", "demo", "extra"]).is_err()
+        );
+    }
+
+    #[test]
     fn browse_and_search_reject_unknown_sources_natively() {
         assert!(
             SkillsCommandHarness::try_parse_from([
@@ -9515,7 +9512,7 @@ exit 9\n",
         )
         .unwrap();
 
-        audit_skills_command(&context, &[]).unwrap();
+        audit_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let skills_root = home.join("skills");
         let install_path = validated_install_path(&skills_root, "demo").unwrap();
@@ -9525,44 +9522,6 @@ exit 9\n",
         assert!(rendered.contains("Decision: BLOCKED"));
         assert!(rendered.contains("env_exfil_curl") || rendered.contains("curl"));
 
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn audit_bridges_when_passthrough_shape_is_invalid() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp_path("audit-bridge");
-        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-
-        audit_skills_command(&context, &[String::from("demo"), String::from("extra")]).unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("command=audit argv=demo extra"));
-
-        remove_env_var("HERMES_SKILLS_PYTHON");
         let _ = fs::remove_dir_all(home);
     }
 
