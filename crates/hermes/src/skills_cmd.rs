@@ -41,7 +41,7 @@ pub enum SkillsCommand {
     Inspect(InspectArgs),
     List(ListArgs),
     Config,
-    Check(CompatArgs),
+    Check(OptionalSkillNameArgs),
     Update(CompatArgs),
     Audit(OptionalSkillNameArgs),
     Uninstall(UninstallArgs),
@@ -324,7 +324,7 @@ pub fn print_skills(
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
-        Some(SkillsCommand::Check(args)) => check_skills_command(context, &args.args),
+        Some(SkillsCommand::Check(args)) => check_skills_command(context, args),
         Some(SkillsCommand::Update(args)) => update_skills_command(context, &args.args),
         Some(SkillsCommand::Audit(args)) => audit_skills_command(context, args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
@@ -356,12 +356,6 @@ fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn E
             "inspect",
             "skills inspect",
             SKILLS_INSPECT_BOOTSTRAP,
-            passthrough,
-        ),
-        "check" => print_python_skills_command(
-            "check",
-            "skills check",
-            SKILLS_CHECK_BOOTSTRAP,
             passthrough,
         ),
         "update" => print_python_skills_command(
@@ -428,16 +422,6 @@ const SKILLS_INSPECT_BOOTSTRAP: &str = concat!(
     "parser.add_argument('identifier')\n",
     "args = parser.parse_args(sys.argv[1:])\n",
     "do_inspect(args.identifier)\n",
-);
-
-const SKILLS_CHECK_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_check\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills check')\n",
-    "parser.add_argument('name', nargs='?')\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_check(name=args.name)\n",
 );
 
 const SKILLS_UPDATE_BOOTSTRAP: &str = concat!(
@@ -1715,14 +1699,10 @@ fn parse_publish_args(passthrough: &[String]) -> Result<PublishArgsParsed, Box<d
 
 fn check_skills_command(
     context: &HermesContext,
-    passthrough: &[String],
+    args: OptionalSkillNameArgs,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(name) = parse_single_name_passthrough(passthrough) else {
-        return bridge_prefixed("check", passthrough);
-    };
-
     let installed = load_hub_lock(context)?;
-    let targets = if let Some(name) = name {
+    let targets = if let Some(name) = args.name.as_deref() {
         let Some(entry) = installed.get(name) else {
             println!("No hub-installed skills to check.");
             println!();
@@ -1742,22 +1722,27 @@ fn check_skills_command(
         return Ok(());
     }
 
-    if targets.iter().any(|(_, source)| {
-        source != "official"
-            && source != "github"
-            && source != "lobehub"
-            && source != "clawhub"
-            && source != "skills-sh"
-            && source != "well-known"
-            && source != "url"
-    }) {
-        return bridge_prefixed("check", passthrough);
+    if targets
+        .iter()
+        .any(|(_, source)| !supports_hub_update_source(source))
+    {
+        let (name, source) = targets
+            .iter()
+            .find(|(_, source)| !supports_hub_update_source(source))
+            .expect("unsupported source should be present");
+        return Err(format!(
+            "skills check does not support source '{source}' for installed skill '{name}' yet"
+        )
+        .into());
     }
     if targets.iter().any(|(_, source)| source == "github")
         && github_app_auth_configured()
         && resolve_github_publish_token().is_none()
     {
-        return bridge_prefixed("check", passthrough);
+        return Err(
+            "skills check requires a GitHub token for GitHub sources when GitHub App auth is configured"
+                .into(),
+        );
     }
     let target_names = targets
         .iter()
@@ -2320,6 +2305,16 @@ fn parse_single_name_passthrough<'a>(passthrough: &'a [String]) -> Option<Option
         return None;
     }
     Some(Some(name))
+}
+
+fn supports_hub_update_source(source: &str) -> bool {
+    source == "official"
+        || source == "github"
+        || source == "lobehub"
+        || source == "clawhub"
+        || source == "skills-sh"
+        || source == "well-known"
+        || source == "url"
 }
 
 fn entry_identifier(entry: &HubInstalledEntry) -> String {
@@ -7540,6 +7535,18 @@ mod tests {
         }
         assert!(
             SkillsCommandHarness::try_parse_from(["skills", "audit", "demo", "extra"]).is_err()
+        );
+    }
+
+    #[test]
+    fn check_args_parse_natively_and_reject_extra_names() {
+        let parsed = SkillsCommandHarness::try_parse_from(["skills", "check", "demo"]).unwrap();
+        match parsed.command {
+            SkillsCommand::Check(args) => assert_eq!(args.name.as_deref(), Some("demo")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            SkillsCommandHarness::try_parse_from(["skills", "check", "demo", "extra"]).is_err()
         );
     }
 
