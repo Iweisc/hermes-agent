@@ -42,7 +42,7 @@ pub enum SkillsCommand {
     List(ListArgs),
     Config,
     Check(OptionalSkillNameArgs),
-    Update(CompatArgs),
+    Update(OptionalSkillNameArgs),
     Audit(OptionalSkillNameArgs),
     Uninstall(UninstallArgs),
     Reset(SkillResetArgs),
@@ -325,7 +325,7 @@ pub fn print_skills(
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
         Some(SkillsCommand::Check(args)) => check_skills_command(context, args),
-        Some(SkillsCommand::Update(args)) => update_skills_command(context, &args.args),
+        Some(SkillsCommand::Update(args)) => update_skills_command(context, args),
         Some(SkillsCommand::Audit(args)) => audit_skills_command(context, args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
         Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
@@ -356,12 +356,6 @@ fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn E
             "inspect",
             "skills inspect",
             SKILLS_INSPECT_BOOTSTRAP,
-            passthrough,
-        ),
-        "update" => print_python_skills_command(
-            "update",
-            "skills update",
-            SKILLS_UPDATE_BOOTSTRAP,
             passthrough,
         ),
         "publish" => print_python_skills_command(
@@ -422,16 +416,6 @@ const SKILLS_INSPECT_BOOTSTRAP: &str = concat!(
     "parser.add_argument('identifier')\n",
     "args = parser.parse_args(sys.argv[1:])\n",
     "do_inspect(args.identifier)\n",
-);
-
-const SKILLS_UPDATE_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_update\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills update')\n",
-    "parser.add_argument('name', nargs='?')\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_update(name=args.name)\n",
 );
 
 const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
@@ -1755,34 +1739,30 @@ fn check_skills_command(
 
 fn update_skills_command(
     context: &HermesContext,
-    passthrough: &[String],
+    args: OptionalSkillNameArgs,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(name) = parse_single_name_passthrough(passthrough) else {
-        return bridge_prefixed("update", passthrough);
-    };
-
     let mut installed = load_hub_lock(context)?;
-    let target_names = if let Some(name) = name {
+    let target_names = if let Some(name) = args.name.as_deref() {
         let Some(entry) = installed.get(name) else {
             println!("No updates available.");
             println!();
             return Ok(());
         };
-        if entry.source != "official"
-            && entry.source != "github"
-            && entry.source != "lobehub"
-            && entry.source != "clawhub"
-            && entry.source != "skills-sh"
-            && entry.source != "well-known"
-            && entry.source != "url"
-        {
-            return bridge_prefixed("update", passthrough);
+        if !supports_hub_update_source(&entry.source) {
+            return Err(format!(
+                "skills update does not support source '{}' for installed skill '{}' yet",
+                entry.source, name
+            )
+            .into());
         }
         if entry.source == "github"
             && github_app_auth_configured()
             && resolve_github_publish_token().is_none()
         {
-            return bridge_prefixed("update", passthrough);
+            return Err(
+                "skills update requires a GitHub token for GitHub sources when GitHub App auth is configured"
+                    .into(),
+            );
         }
         vec![name.to_string()]
     } else {
@@ -1791,22 +1771,28 @@ fn update_skills_command(
             println!();
             return Ok(());
         }
-        if installed.values().any(|entry| {
-            entry.source != "official"
-                && entry.source != "github"
-                && entry.source != "lobehub"
-                && entry.source != "clawhub"
-                && entry.source != "skills-sh"
-                && entry.source != "well-known"
-                && entry.source != "url"
-        }) {
-            return bridge_prefixed("update", passthrough);
+        if installed
+            .iter()
+            .any(|(_, entry)| !supports_hub_update_source(&entry.source))
+        {
+            let (name, entry) = installed
+                .iter()
+                .find(|(_, entry)| !supports_hub_update_source(&entry.source))
+                .expect("unsupported source should be present");
+            return Err(format!(
+                "skills update does not support source '{}' for installed skill '{}' yet",
+                entry.source, name
+            )
+            .into());
         }
         if installed.values().any(|entry| entry.source == "github")
             && github_app_auth_configured()
             && resolve_github_publish_token().is_none()
         {
-            return bridge_prefixed("update", passthrough);
+            return Err(
+                "skills update requires a GitHub token for GitHub sources when GitHub App auth is configured"
+                    .into(),
+            );
         }
         let mut names = installed.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -2291,20 +2277,6 @@ fn collect_publish_files_recursive(
         }
     }
     Ok(())
-}
-
-fn parse_single_name_passthrough<'a>(passthrough: &'a [String]) -> Option<Option<&'a str>> {
-    if passthrough.len() > 1 {
-        return None;
-    }
-    let name = passthrough.first().map(String::as_str).map(str::trim);
-    let Some(name) = name else {
-        return Some(None);
-    };
-    if name.is_empty() || name.starts_with('-') {
-        return None;
-    }
-    Some(Some(name))
 }
 
 fn supports_hub_update_source(source: &str) -> bool {
@@ -7551,6 +7523,18 @@ mod tests {
     }
 
     #[test]
+    fn update_args_parse_natively_and_reject_extra_names() {
+        let parsed = SkillsCommandHarness::try_parse_from(["skills", "update", "demo"]).unwrap();
+        match parsed.command {
+            SkillsCommand::Update(args) => assert_eq!(args.name.as_deref(), Some("demo")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            SkillsCommandHarness::try_parse_from(["skills", "update", "demo", "extra"]).is_err()
+        );
+    }
+
+    #[test]
     fn browse_and_search_reject_unknown_sources_natively() {
         assert!(
             SkillsCommandHarness::try_parse_from([
@@ -8999,7 +8983,7 @@ exit 9\n",
         .unwrap();
 
         set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("demo").unwrap();
@@ -9054,7 +9038,7 @@ exit 9\n",
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("shipit").unwrap();
@@ -9113,7 +9097,7 @@ exit 9\n",
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("shipit").unwrap();
@@ -9170,7 +9154,7 @@ exit 9\n",
         let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
         set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("deploy-guide").unwrap();
@@ -9218,7 +9202,7 @@ exit 9\n",
         let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
         set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("deploy-agent").unwrap();
@@ -9280,7 +9264,7 @@ exit 9\n",
         )
         .unwrap();
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("deploy-demo").unwrap();
@@ -9334,7 +9318,7 @@ exit 9\n",
         )
         .unwrap();
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let installed = load_hub_lock(&context).unwrap();
         let entry = installed.get("shipit").unwrap();
@@ -9448,7 +9432,7 @@ exit 9\n",
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        update_skills_command(&context, &[]).unwrap();
+        update_skills_command(&context, OptionalSkillNameArgs { name: None }).unwrap();
 
         let updated = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
         assert_eq!(
