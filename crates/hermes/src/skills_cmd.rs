@@ -18,7 +18,6 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 use sha2::Digest;
 
-use crate::compat_cmd::CompatArgs;
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::skills_guard::{format_scan_report, install_allowed, resolve_trust_level, scan_skill};
@@ -37,7 +36,7 @@ const DEFAULT_GITHUB_SKILL_TAPS: &[(&str, &str)] = &[
 pub enum SkillsCommand {
     Browse(BrowseArgs),
     Search(SearchArgs),
-    Install(CompatArgs),
+    Install(InstallArgs),
     Inspect(InspectArgs),
     List(ListArgs),
     Config,
@@ -68,6 +67,40 @@ pub struct SearchArgs {
     pub limit: usize,
     #[arg(long, value_enum, default_value_t = SkillsCatalogSource::All)]
     pub source: SkillsCatalogSource,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InstallArgs {
+    pub identifier: String,
+    #[arg(long, default_value = "")]
+    pub category: String,
+    #[arg(long = "name", default_value = "")]
+    pub name_override: String,
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+    #[arg(short = 'y', long, default_value_t = false)]
+    pub yes: bool,
+}
+
+impl InstallArgs {
+    fn to_passthrough(&self) -> Vec<String> {
+        let mut args = vec![self.identifier.clone()];
+        if !self.category.is_empty() {
+            args.push(String::from("--category"));
+            args.push(self.category.clone());
+        }
+        if !self.name_override.is_empty() {
+            args.push(String::from("--name"));
+            args.push(self.name_override.clone());
+        }
+        if self.force {
+            args.push(String::from("--force"));
+        }
+        if self.yes {
+            args.push(String::from("--yes"));
+        }
+        args
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -281,15 +314,6 @@ struct SearchCatalogSummary {
     identifier: String,
 }
 
-#[derive(Debug, Clone)]
-struct InstallArgsParsed {
-    identifier: String,
-    category: String,
-    name_override: String,
-    force: bool,
-    yes: bool,
-}
-
 #[derive(Debug)]
 struct OfficialSkillCandidate {
     name: String,
@@ -330,7 +354,7 @@ pub fn print_skills(
         }
         Some(SkillsCommand::Browse(args)) => browse_skills_command(context, args),
         Some(SkillsCommand::Search(args)) => search_skills_command(context, args),
-        Some(SkillsCommand::Install(args)) => install_skill_command(context, &args.args),
+        Some(SkillsCommand::Install(args)) => install_skill_command(context, args),
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
         Some(SkillsCommand::Config) => configure_skills(context),
@@ -1196,11 +1220,8 @@ fn search_skills_command(context: &HermesContext, args: SearchArgs) -> Result<()
 
 fn install_skill_command(
     context: &HermesContext,
-    passthrough: &[String],
+    mut args: InstallArgs,
 ) -> Result<(), Box<dyn Error>> {
-    let Some(mut args) = parse_install_args(passthrough)? else {
-        return bridge_prefixed("install", passthrough);
-    };
     if !args.identifier.contains('/')
         && let Some(resolved) = resolve_single_catalog_skill_identifier(context, &args.identifier)?
     {
@@ -1211,7 +1232,7 @@ fn install_skill_command(
         args.identifier = resolved;
     }
     if !args.identifier.starts_with("official/") {
-        return install_github_skill_command(context, passthrough, &args);
+        return install_github_skill_command(context, &args);
     }
 
     let summary = collect_official_skill_summaries()?
@@ -1329,8 +1350,7 @@ fn install_skill_command(
 
 fn install_github_skill_command(
     context: &HermesContext,
-    passthrough: &[String],
-    args: &InstallArgsParsed,
+    args: &InstallArgs,
 ) -> Result<(), Box<dyn Error>> {
     let name_override = resolve_optional_install_name_override(&args.name_override)?;
     if let Some((bundle_dir, skill_name, trust_level, identifier)) =
@@ -1351,7 +1371,7 @@ fn install_github_skill_command(
         fetch_clawhub_bundle_to_tempdir(&args.identifier)?
     {
         let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", passthrough);
+            return bridge_prefixed("install", &args.to_passthrough());
         };
         return install_remote_skill_bundle(
             context,
@@ -1368,7 +1388,7 @@ fn install_github_skill_command(
         fetch_skills_sh_bundle_to_tempdir(&args.identifier)?
     {
         let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", passthrough);
+            return bridge_prefixed("install", &args.to_passthrough());
         };
         return install_remote_skill_bundle(
             context,
@@ -1385,7 +1405,7 @@ fn install_github_skill_command(
         fetch_well_known_bundle_to_tempdir(&args.identifier)?
     {
         let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", passthrough);
+            return bridge_prefixed("install", &args.to_passthrough());
         };
         return install_remote_skill_bundle(
             context,
@@ -1402,7 +1422,7 @@ fn install_github_skill_command(
         fetch_url_bundle_to_tempdir(&args.identifier)?
     {
         let Some(skill_name) = skill_name.or_else(|| name_override.clone()) else {
-            return bridge_prefixed("install", passthrough);
+            return bridge_prefixed("install", &args.to_passthrough());
         };
         return install_remote_skill_bundle(
             context,
@@ -1416,13 +1436,13 @@ fn install_github_skill_command(
         );
     }
     if github_app_auth_configured() && resolve_github_publish_token().is_none() {
-        return bridge_prefixed("install", passthrough);
+        return bridge_prefixed("install", &args.to_passthrough());
     }
 
     let Some((bundle_dir, skill_name, trust_level, identifier)) =
         fetch_github_bundle_to_tempdir(&args.identifier)?
     else {
-        return bridge_prefixed("install", passthrough);
+        return bridge_prefixed("install", &args.to_passthrough());
     };
 
     install_remote_skill_bundle(
@@ -1439,7 +1459,7 @@ fn install_github_skill_command(
 
 fn install_remote_skill_bundle(
     context: &HermesContext,
-    args: &InstallArgsParsed,
+    args: &InstallArgs,
     bundle_dir: tempfile::TempDir,
     skill_name: String,
     trust_level: String,
@@ -1555,58 +1575,6 @@ fn install_remote_skill_bundle(
     println!("Files: {}", files.join(", "));
     println!();
     Ok(())
-}
-
-fn parse_install_args(passthrough: &[String]) -> Result<Option<InstallArgsParsed>, Box<dyn Error>> {
-    let mut identifier = None::<String>;
-    let mut category = String::new();
-    let mut name_override = String::new();
-    let mut force = false;
-    let mut yes = false;
-
-    let mut index = 0_usize;
-    while index < passthrough.len() {
-        match passthrough[index].as_str() {
-            "--category" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --category".into());
-                };
-                category = value.trim().to_string();
-                index += 2;
-            }
-            "--name" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --name".into());
-                };
-                name_override = value.trim().to_string();
-                index += 2;
-            }
-            "--force" => {
-                force = true;
-                index += 1;
-            }
-            "--yes" | "-y" => {
-                yes = true;
-                index += 1;
-            }
-            flag if flag.starts_with('-') => return Ok(None),
-            value => {
-                if identifier.is_some() {
-                    return Ok(None);
-                }
-                identifier = Some(value.to_string());
-                index += 1;
-            }
-        }
-    }
-
-    Ok(identifier.map(|identifier| InstallArgsParsed {
-        identifier,
-        category,
-        name_override,
-        force,
-        yes,
-    }))
 }
 
 fn check_skills_command(
@@ -3642,17 +3610,17 @@ fn import_skill_snapshot(
             .and_then(JsonValue::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let mut passthrough = vec![identifier.to_string()];
-        if let Some(category) = category {
-            passthrough.push(String::from("--category"));
-            passthrough.push(category.to_string());
-        }
-        if force {
-            passthrough.push(String::from("--force"));
-        }
-
         println!("--- {display_name} ---");
-        install_skill_command(context, &passthrough)?;
+        install_skill_command(
+            context,
+            InstallArgs {
+                identifier: identifier.to_string(),
+                category: category.unwrap_or_default().to_string(),
+                name_override: String::new(),
+                force,
+                yes: false,
+            },
+        )?;
     }
 
     println!("Snapshot import complete.");
@@ -6876,6 +6844,16 @@ mod tests {
         std::env::temp_dir().join(format!("hermes-rs-skills-{label}-{unique}"))
     }
 
+    fn install_args(identifier: impl Into<String>) -> InstallArgs {
+        InstallArgs {
+            identifier: identifier.into(),
+            category: String::new(),
+            name_override: String::new(),
+            force: false,
+            yes: true,
+        }
+    }
+
     #[test]
     fn list_sees_local_builtin_hub_and_disabled_skills() {
         let home = temp_path("list");
@@ -7479,20 +7457,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_install_args_accepts_official_identifier() {
-        let parsed = parse_install_args(&[
-            String::from("official/research/demo"),
-            String::from("--category"),
-            String::from("custom"),
-            String::from("--force"),
-            String::from("--yes"),
+    fn install_args_parse_natively_and_reject_unknown_flags() {
+        let parsed = SkillsCommandHarness::try_parse_from([
+            "skills",
+            "install",
+            "official/research/demo",
+            "--category",
+            "custom",
+            "--force",
+            "--yes",
         ])
-        .unwrap()
         .unwrap();
-        assert_eq!(parsed.identifier, "official/research/demo");
-        assert_eq!(parsed.category, "custom");
-        assert!(parsed.force);
-        assert!(parsed.yes);
+        match parsed.command {
+            SkillsCommand::Install(args) => {
+                assert_eq!(args.identifier, "official/research/demo");
+                assert_eq!(args.category, "custom");
+                assert!(args.force);
+                assert!(args.yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            SkillsCommandHarness::try_parse_from([
+                "skills",
+                "install",
+                "official/research/demo",
+                "--unknown",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -7902,14 +7895,7 @@ mod tests {
         fs::write(source_dir.join("notes.txt"), "hello\n").unwrap();
 
         set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
-        install_skill_command(
-            &context,
-            &[
-                String::from("official/research/demo"),
-                String::from("--yes"),
-            ],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("official/research/demo")).unwrap();
 
         let install_dir = home.join("skills").join("research").join("demo");
         assert_eq!(
@@ -7951,7 +7937,7 @@ mod tests {
         fs::write(source_dir.join("notes.txt"), "hello\n").unwrap();
 
         set_env_var("HERMES_OPTIONAL_SKILLS", &optional);
-        install_skill_command(&context, &[String::from("demo"), String::from("--yes")]).unwrap();
+        install_skill_command(&context, install_args("demo")).unwrap();
 
         let install_dir = home.join("skills").join("research").join("demo");
         assert_eq!(
@@ -7989,11 +7975,7 @@ mod tests {
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        install_skill_command(
-            &context,
-            &[String::from("openai/skills/shipit"), String::from("--yes")],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("openai/skills/shipit")).unwrap();
 
         let install_dir = home.join("skills").join("shipit");
         assert_eq!(
@@ -8059,12 +8041,10 @@ mod tests {
 
         install_skill_command(
             &context,
-            &[
-                String::from("official/research/demo"),
-                String::from("--name"),
-                String::from("renamed"),
-                String::from("--yes"),
-            ],
+            InstallArgs {
+                name_override: String::from("renamed"),
+                ..install_args("official/research/demo")
+            },
         )
         .unwrap();
 
@@ -8108,12 +8088,10 @@ mod tests {
 
         install_skill_command(
             &context,
-            &[
-                String::from("openai/skills/shipit"),
-                String::from("--name"),
-                String::from("renamed"),
-                String::from("--yes"),
-            ],
+            InstallArgs {
+                name_override: String::from("renamed"),
+                ..install_args("openai/skills/shipit")
+            },
         )
         .unwrap();
 
@@ -8148,14 +8126,7 @@ mod tests {
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        install_skill_command(
-            &context,
-            &[
-                String::from("skills-sh/openai/skills/shipit"),
-                String::from("--yes"),
-            ],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("skills-sh/openai/skills/shipit")).unwrap();
 
         let install_dir = home.join("skills").join("shipit");
         assert_eq!(
@@ -8200,11 +8171,7 @@ mod tests {
         let old_base = env::var_os("HERMES_LOBEHUB_BASE_URL");
         set_env_var("HERMES_LOBEHUB_BASE_URL", &base_url);
 
-        install_skill_command(
-            &context,
-            &[String::from("lobehub/deploy-guide"), String::from("--yes")],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("lobehub/deploy-guide")).unwrap();
 
         let install_dir = home.join("skills").join("deploy-guide");
         let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
@@ -8243,11 +8210,7 @@ mod tests {
         let old_base = env::var_os("HERMES_CLAWHUB_BASE_URL");
         set_env_var("HERMES_CLAWHUB_BASE_URL", &base_url);
 
-        install_skill_command(
-            &context,
-            &[String::from("clawhub/deploy-agent"), String::from("--yes")],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("clawhub/deploy-agent")).unwrap();
 
         let install_dir = home.join("skills").join("deploy-agent");
         let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
@@ -8294,7 +8257,7 @@ mod tests {
         let (base_url, handle) = spawn_well_known_server(requests.clone());
         let identifier = format!("well-known:{base_url}/.well-known/skills/deploy-demo");
 
-        install_skill_command(&context, &[identifier.clone(), String::from("--yes")]).unwrap();
+        install_skill_command(&context, install_args(identifier.clone())).unwrap();
 
         let install_dir = home.join("skills").join("deploy-demo");
         let skill_md = fs::read_to_string(install_dir.join("SKILL.md")).unwrap();
@@ -8333,7 +8296,7 @@ mod tests {
         let (base_url, handle) = spawn_url_skill_server(requests.clone());
         let identifier = format!("{base_url}/skills/shipit.md");
 
-        install_skill_command(&context, &[identifier.clone(), String::from("--yes")]).unwrap();
+        install_skill_command(&context, install_args(identifier.clone())).unwrap();
 
         let install_dir = home.join("skills").join("shipit");
         assert_eq!(
@@ -8374,11 +8337,7 @@ mod tests {
         set_env_var("GITHUB_API_BASE_URL", &api_base);
         set_env_var("GITHUB_TOKEN", "test-token");
 
-        install_skill_command(
-            &context,
-            &[String::from("skills-sh/shipit"), String::from("--yes")],
-        )
-        .unwrap();
+        install_skill_command(&context, install_args("skills-sh/shipit")).unwrap();
 
         let install_dir = home.join("skills").join("shipit");
         assert_eq!(
