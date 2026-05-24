@@ -46,7 +46,7 @@ pub enum SkillsCommand {
     Audit(OptionalSkillNameArgs),
     Uninstall(UninstallArgs),
     Reset(SkillResetArgs),
-    Publish(CompatArgs),
+    Publish(PublishArgs),
     Snapshot(SkillSnapshotArgs),
     Tap(SkillTapArgs),
 }
@@ -73,6 +73,23 @@ pub struct SearchArgs {
 #[derive(Args, Debug, Clone)]
 pub struct OptionalSkillNameArgs {
     pub name: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PublishArgs {
+    pub skill_path: String,
+    #[arg(long = "to", value_enum, default_value_t = PublishTarget::Github)]
+    pub target: PublishTarget,
+    #[arg(long, default_value = "")]
+    pub repo: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum PublishTarget {
+    #[value(name = "github")]
+    Github,
+    #[value(name = "clawhub")]
+    Clawhub,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -297,13 +314,6 @@ struct HubInstalledEntry {
 }
 
 #[derive(Debug, Clone)]
-struct PublishArgsParsed {
-    skill_path: String,
-    target: String,
-    repo: String,
-}
-
-#[derive(Debug, Clone)]
 struct TapEntry {
     repo: String,
     raw: JsonMap<String, JsonValue>,
@@ -329,7 +339,7 @@ pub fn print_skills(
         Some(SkillsCommand::Audit(args)) => audit_skills_command(context, args),
         Some(SkillsCommand::Uninstall(args)) => uninstall_skill(context, &args.name),
         Some(SkillsCommand::Reset(args)) => reset_skill(context, args),
-        Some(SkillsCommand::Publish(args)) => publish_skill_command(context, &args.args),
+        Some(SkillsCommand::Publish(args)) => publish_skill_command(context, args),
         Some(SkillsCommand::Snapshot(args)) => print_snapshot(context, args),
         Some(SkillsCommand::Tap(args)) => print_taps(context, args),
     }
@@ -350,12 +360,6 @@ fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn E
             "install",
             "skills install",
             SKILLS_INSTALL_BOOTSTRAP,
-            passthrough,
-        ),
-        "publish" => print_python_skills_command(
-            "publish",
-            "skills publish",
-            SKILLS_PUBLISH_BOOTSTRAP,
             passthrough,
         ),
         _ => Err(format!("unsupported bridged skills action: {action}").into()),
@@ -400,18 +404,6 @@ const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
     "parser.add_argument('--yes', '-y', action='store_true', default=False)\n",
     "args = parser.parse_args(sys.argv[1:])\n",
     "do_install(args.identifier, category=args.category, force=args.force, skip_confirm=getattr(args, 'yes', False), name_override=getattr(args, 'name', '') or '')\n",
-);
-
-const SKILLS_PUBLISH_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_publish\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills publish')\n",
-    "parser.add_argument('skill_path')\n",
-    "parser.add_argument('--to', default='github', choices=['github', 'clawhub'])\n",
-    "parser.add_argument('--repo', default='')\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_publish(args.skill_path, target=getattr(args, 'to', 'github'), repo=getattr(args, 'repo', ''))\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -1617,54 +1609,6 @@ fn parse_install_args(passthrough: &[String]) -> Result<Option<InstallArgsParsed
     }))
 }
 
-fn parse_publish_args(passthrough: &[String]) -> Result<PublishArgsParsed, Box<dyn Error>> {
-    let Some(first) = passthrough.first() else {
-        return Err(
-            "Usage: hermes skills publish <skill-path> [--to github|clawhub] [--repo owner/repo]"
-                .into(),
-        );
-    };
-    let skill_path = first.trim();
-    if skill_path.is_empty() {
-        return Err("skill path cannot be empty".into());
-    }
-
-    let mut target = String::from("github");
-    let mut repo = String::new();
-    let mut index = 1usize;
-    while index < passthrough.len() {
-        match passthrough[index].as_str() {
-            "--to" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("--to requires a value".into());
-                };
-                let normalized = value.trim().to_ascii_lowercase();
-                if normalized != "github" && normalized != "clawhub" {
-                    return Err("target must be 'github' or 'clawhub'".into());
-                }
-                target = normalized;
-                index += 2;
-            }
-            "--repo" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("--repo requires a value".into());
-                };
-                repo = validate_tap_repo(value)?.to_string();
-                index += 2;
-            }
-            flag => {
-                return Err(format!("unknown publish argument: {flag}").into());
-            }
-        }
-    }
-
-    Ok(PublishArgsParsed {
-        skill_path: skill_path.to_string(),
-        target,
-        repo,
-    })
-}
-
 fn check_skills_command(
     context: &HermesContext,
     args: OptionalSkillNameArgs,
@@ -1850,11 +1794,7 @@ fn audit_skills_command(
     Ok(())
 }
 
-fn publish_skill_command(
-    context: &HermesContext,
-    passthrough: &[String],
-) -> Result<(), Box<dyn Error>> {
-    let args = parse_publish_args(passthrough)?;
+fn publish_skill_command(context: &HermesContext, args: PublishArgs) -> Result<(), Box<dyn Error>> {
     let skill_dir = resolve_publish_skill_dir(context, &args.skill_path)?;
     let skill_md = skill_dir.join("SKILL.md");
     if !skill_md.exists() {
@@ -1882,36 +1822,33 @@ fn publish_skill_command(
         return Err("Cannot publish a skill with DANGEROUS verdict.".into());
     }
 
-    match args.target.as_str() {
-        "clawhub" => {
+    match args.target {
+        PublishTarget::Clawhub => {
             println!(
                 "ClawHub publishing is not yet supported. Submit manually at https://clawhub.ai/submit"
             );
             println!();
             Ok(())
         }
-        "github" => {
+        PublishTarget::Github => {
             if args.repo.is_empty() {
                 return Err(
                     "Usage: hermes skills publish <path> --to github --repo owner/repo".into(),
                 );
             }
-            if github_app_auth_configured() && resolve_github_publish_token().is_none() {
-                return bridge_prefixed("publish", passthrough);
-            }
+            let repo = validate_tap_repo(&args.repo)?.to_string();
             let token = resolve_github_publish_token().ok_or_else(|| {
                 format!(
                     "GitHub authentication required. Set GITHUB_TOKEN in {}/.env or run 'gh auth login'.",
                     context.display_hermes_home()
                 )
             })?;
-            println!("Publishing '{}' to {}...", name, args.repo);
-            let pr_url = github_publish_skill(&skill_dir, &name, &args.repo, &token)?;
+            println!("Publishing '{}' to {}...", name, repo);
+            let pr_url = github_publish_skill(&skill_dir, &name, &repo, &token)?;
             println!("PR created: {pr_url}");
             println!();
             Ok(())
         }
-        _ => Err("target must be 'github' or 'clawhub'".into()),
     }
 }
 
@@ -7559,18 +7496,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_publish_args_accepts_repo_and_target() {
-        let parsed = parse_publish_args(&[
-            String::from("demo"),
-            String::from("--to"),
-            String::from("github"),
-            String::from("--repo"),
-            String::from("owner/repo"),
+    fn publish_args_parse_natively_and_reject_unknown_target() {
+        let parsed = SkillsCommandHarness::try_parse_from([
+            "skills",
+            "publish",
+            "demo",
+            "--to",
+            "github",
+            "--repo",
+            "owner/repo",
         ])
         .unwrap();
-        assert_eq!(parsed.skill_path, "demo");
-        assert_eq!(parsed.target, "github");
-        assert_eq!(parsed.repo, "owner/repo");
+        match parsed.command {
+            SkillsCommand::Publish(args) => {
+                assert_eq!(args.skill_path, "demo");
+                assert_eq!(args.target, PublishTarget::Github);
+                assert_eq!(args.repo, "owner/repo");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            SkillsCommandHarness::try_parse_from(["skills", "publish", "demo", "--to", "mystery",])
+                .is_err()
+        );
     }
 
     #[test]
@@ -9602,7 +9550,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            for _ in 0..8 {
+            for _ in 0..7 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 requests.lock().unwrap().push(request.clone());
@@ -10251,11 +10199,11 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
 
         publish_skill_command(
             &context,
-            &[
-                String::from("demo"),
-                String::from("--repo"),
-                String::from("owner/repo"),
-            ],
+            PublishArgs {
+                skill_path: String::from("demo"),
+                target: PublishTarget::Github,
+                repo: String::from("owner/repo"),
+            },
         )
         .unwrap();
 
@@ -10323,17 +10271,17 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
 
         publish_skill_command(
             &context,
-            &[
-                String::from("demo"),
-                String::from("--repo"),
-                String::from("owner/repo"),
-            ],
+            PublishArgs {
+                skill_path: String::from("demo"),
+                target: PublishTarget::Github,
+                repo: String::from("owner/repo"),
+            },
         )
         .unwrap();
 
         handle.join().unwrap();
         let logged = requests.lock().unwrap().clone();
-        assert_eq!(logged.len(), 8);
+        assert_eq!(logged.len(), 7);
         let bearer_requests = logged
             .iter()
             .filter(|request| {
@@ -10342,7 +10290,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                     .contains("authorization: bearer ")
             })
             .count();
-        assert_eq!(bearer_requests, 2);
+        assert_eq!(bearer_requests, 1);
         assert_eq!(
             logged
                 .iter()
@@ -10350,7 +10298,7 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
                     request.starts_with("POST /app/installations/456/access_tokens ")
                 })
                 .count(),
-            2
+            1
         );
         assert_eq!(
             logged
