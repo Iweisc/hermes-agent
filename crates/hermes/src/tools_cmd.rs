@@ -298,18 +298,6 @@ const RECONFIGURABLE_TOOLSETS: &[&str] = &[
     "spotify",
 ];
 
-const NATIVE_RECONFIGURABLE_TOOLSETS: &[&str] = &[
-    "web",
-    "browser",
-    "vision",
-    "moa",
-    "homeassistant",
-    "tts",
-    "image_gen",
-    "rl",
-    "spotify",
-];
-
 const DEFAULT_HASS_URL: &str = "http://homeassistant.local:8123";
 const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
 const DEFAULT_SEARXNG_URL: &str = "http://localhost:8080";
@@ -460,7 +448,7 @@ pub(crate) fn run_native_tools_interactive_with_io(
     writeln!(output, "  Enable or disable built-in tools per platform.")?;
     writeln!(
         output,
-        "  Some provider/API-key reconfiguration paths still use the narrowed compatibility path."
+        "  Reconfigure supported providers with native Rust flows."
     )?;
     writeln!(output)?;
 
@@ -561,12 +549,7 @@ fn run_tools_reconfigure_with_io(
         return Ok(());
     }
 
-    let toolset = configurable[choice].name;
-    if native_reconfigurable_toolset(toolset) {
-        run_native_tool_reconfigure_with_io(context, toolset, input, output)
-    } else {
-        write_retired_compatibility_flow(output, toolset)
-    }
+    run_native_tool_reconfigure_with_io(context, configurable[choice].name, input, output)
 }
 
 fn run_native_tool_reconfigure_with_io(
@@ -599,7 +582,7 @@ fn run_native_tool_reconfigure_with_io(
         "image_gen" => reconfigure_image_gen_with_io(context, input, output),
         "rl" => reconfigure_rl_with_io(context, input, output),
         "spotify" => reconfigure_spotify_with_io(context, input, output),
-        other => write_retired_compatibility_flow(output, other),
+        other => Err(format!("toolset '{other}' is not reconfigurable").into()),
     }
 }
 
@@ -613,12 +596,6 @@ fn reconfigure_web_with_io(
     let current_use_gateway = nested_bool(&root, &["web", "use_gateway"]).unwrap_or(false);
     let current_firecrawl_url = env_value_for_context(context, "FIRECRAWL_API_URL");
     let managed_known = current_use_gateway && current_backend == "firecrawl";
-    let compatibility_recommended = !managed_known
-        && (current_use_gateway
-            || !matches!(
-                current_backend.as_str(),
-                "" | "firecrawl" | "exa" | "parallel" | "tavily" | "searxng"
-            ));
 
     writeln!(output)?;
     writeln!(output, "Web Search & Scraping")?;
@@ -634,15 +611,7 @@ fn reconfigure_web_with_io(
         "Firecrawl Self-Hosted",
         "SearXNG",
     ]);
-    choices.push(if compatibility_recommended {
-        "Use compatibility flow (recommended)"
-    } else {
-        "Use compatibility flow"
-    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
-    if selection == choices.len() - 1 {
-        return write_retired_compatibility_flow(output, "web");
-    }
     let direct_offset = usize::from(managed_known);
 
     {
@@ -748,12 +717,6 @@ fn reconfigure_browser_with_io(
     let current_use_gateway = nested_bool(&root, &["browser", "use_gateway"]).unwrap_or(false);
     let current_camofox_url = env_value_for_context(context, "CAMOFOX_URL");
     let managed_known = current_use_gateway && current_provider == "browser-use";
-    let compatibility_recommended = !managed_known
-        && (current_use_gateway
-            || !matches!(
-                current_provider.as_str(),
-                "" | "local" | "browserbase" | "browser-use" | "firecrawl" | "camofox"
-            ));
 
     writeln!(output)?;
     writeln!(output, "Browser Automation")?;
@@ -768,15 +731,7 @@ fn reconfigure_browser_with_io(
         "Firecrawl",
         "Camofox",
     ]);
-    choices.push(if compatibility_recommended {
-        "Use compatibility flow (recommended)"
-    } else {
-        "Use compatibility flow"
-    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
-    if selection == choices.len() - 1 {
-        return write_retired_compatibility_flow(output, "browser");
-    }
     let direct_offset = usize::from(managed_known);
 
     {
@@ -917,9 +872,6 @@ fn reconfigure_image_gen_with_io(
     let current_provider = nested_string(&root, &["image_gen", "provider"]).unwrap_or_default();
     let current_use_gateway = nested_bool(&root, &["image_gen", "use_gateway"]).unwrap_or(false);
     let managed_known = current_use_gateway && matches!(current_provider.as_str(), "" | "fal");
-    let compatibility_recommended = !managed_known
-        && (current_use_gateway
-            || !matches!(current_provider.as_str(), "" | "fal" | "openai" | "xai"));
 
     writeln!(output)?;
     writeln!(output, "Image Generation")?;
@@ -928,15 +880,7 @@ fn reconfigure_image_gen_with_io(
         choices.push("Nous Subscription");
     }
     choices.extend(["FAL.ai", "OpenAI Images", "xAI Images"]);
-    choices.push(if compatibility_recommended {
-        "Use compatibility flow (recommended)"
-    } else {
-        "Use compatibility flow"
-    });
     let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
-    if selection == choices.len() - 1 {
-        return write_retired_compatibility_flow(output, "image_gen");
-    }
     let direct_offset = usize::from(managed_known);
 
     {
@@ -1412,24 +1356,6 @@ fn print_toolset_delta(
     Ok(())
 }
 
-fn write_retired_compatibility_flow(
-    output: &mut dyn Write,
-    toolset: &str,
-) -> Result<(), Box<dyn Error>> {
-    let label = configurable_toolset(toolset)
-        .map(|definition| definition.label)
-        .unwrap_or(toolset);
-    writeln!(
-        output,
-        "Compatibility reconfigure flow for {label} is no longer available."
-    )?;
-    writeln!(
-        output,
-        "Choose one of the native providers above or edit config.yaml directly."
-    )?;
-    Ok(())
-}
-
 fn render_tools_summary(root: &Mapping) -> String {
     let mut lines = Vec::new();
     let total = CONFIGURABLE_TOOLSETS.len();
@@ -1720,12 +1646,6 @@ fn configured_mcp_server_names(root: &Mapping) -> Vec<String> {
 
 fn reconfigurable_toolset(toolset: &str) -> bool {
     RECONFIGURABLE_TOOLSETS
-        .iter()
-        .any(|value| value == &toolset)
-}
-
-fn native_reconfigurable_toolset(toolset: &str) -> bool {
-    NATIVE_RECONFIGURABLE_TOOLSETS
         .iter()
         .any(|value| value == &toolset)
 }
@@ -2545,7 +2465,7 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
     }
 
     #[test]
-    fn tools_reconfigure_browser_reports_retired_compatibility_flow() {
+    fn tools_reconfigure_browser_omits_compatibility_flow() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let home = temp_path("reconfigure-browser");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -2554,15 +2474,17 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
             "platform_toolsets:\n  cli:\n    - browser\n",
         );
 
-        let mut input = Cursor::new(b"1\n6\n".to_vec());
+        let mut input = Cursor::new(b"1\n1\n".to_vec());
         let mut output = Vec::new();
         run_tools_reconfigure_with_io(&context, &mut input, &mut output).unwrap();
 
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("cloud_provider: local"));
+        assert!(saved.contains("use_gateway: false"));
         let rendered = String::from_utf8(output).unwrap();
-        assert!(rendered.contains(
-            "Compatibility reconfigure flow for Browser Automation is no longer available."
-        ));
-        assert!(rendered.contains("Choose one of the native providers above"));
+        assert!(rendered.contains("Browser Automation"));
+        assert!(!rendered.contains("Use compatibility flow"));
+        assert!(!rendered.contains("Compatibility reconfigure flow"));
     }
 
     #[test]
