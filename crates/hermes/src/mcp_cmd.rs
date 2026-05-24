@@ -16,6 +16,7 @@ use serde_json::{Value as JsonValue, json};
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
+use crate::mcp_server::run_mcp_stdio;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[cfg(test)]
@@ -102,7 +103,7 @@ pub fn print_mcp(
         Some(McpCommand::List) => print_list(context),
         Some(McpCommand::Remove(args)) => remove_server(context, args),
         Some(McpCommand::Add(args)) => add_server(context, args),
-        Some(McpCommand::Serve(args)) => print_mcp_serve(args),
+        Some(McpCommand::Serve(args)) => print_mcp_serve(context, args),
         Some(McpCommand::Test(args)) => test_server(context, args),
         Some(McpCommand::Configure(args)) => configure_server(context, args),
         Some(McpCommand::Login(args)) => login_server(context, args),
@@ -231,29 +232,11 @@ fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn 
     print_python_mcp_login(name)
 }
 
-fn print_mcp_serve(args: ServeArgs) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_MCP_PYTHON"))
-        .ok_or("could not find a Python interpreter for mcp serve")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .arg("-c")
-        .arg(MCP_SERVE_BOOTSTRAP);
-    if args.verbose {
-        command.env("HERMES_MCP_VERBOSE", "1");
-    }
+fn print_mcp_serve(context: &HermesContext, args: ServeArgs) -> Result<(), Box<dyn Error>> {
     if args.accept_hooks {
-        command.env("HERMES_ACCEPT_HOOKS", "1");
+        unsafe { std::env::set_var("HERMES_ACCEPT_HOOKS", "1") };
     }
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("mcp serve", status).into())
+    run_mcp_stdio(context, args.verbose)
 }
 
 fn configure_server_io<R: BufRead, W: Write>(
@@ -1272,12 +1255,6 @@ const MCP_LOGIN_BOOTSTRAP: &str = concat!(
     "from argparse import Namespace\n",
     "from hermes_cli.mcp_config import cmd_mcp_login\n",
     "cmd_mcp_login(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
-);
-
-const MCP_SERVE_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from mcp_serve import run_mcp_server\n",
-    "run_mcp_server(verbose=os.environ.get('HERMES_MCP_VERBOSE') == '1')\n",
 );
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
@@ -2470,45 +2447,6 @@ exit 9\n",
 
         remove_env_var("HERMES_MCP_PYTHON");
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn serve_uses_python_override_and_env_flags() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'verbose=%s accept=%s\\n' \"$HERMES_MCP_VERBOSE\" \"$HERMES_ACCEPT_HOOKS\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_MCP_PYTHON", &fake_python);
-        print_mcp_serve(ServeArgs {
-            verbose: true,
-            accept_hooks: true,
-        })
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("verbose=1"));
-        assert!(output.contains("accept=1"));
-
-        remove_env_var("HERMES_MCP_PYTHON");
     }
 
     #[test]

@@ -75,13 +75,16 @@ def get_safe_write_root() -> Optional[str]:
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
     home = os.path.realpath(os.path.expanduser("~"))
-    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    expanded = os.path.abspath(os.path.expanduser(str(path)))
+    resolved = os.path.realpath(expanded)
+    candidates = {expanded, resolved}
 
-    if resolved in build_write_denied_paths(home):
+    if candidates & build_write_denied_paths(home):
         return True
     for prefix in build_write_denied_prefixes(home):
-        if resolved.startswith(prefix):
-            return True
+        for candidate in candidates:
+            if candidate.startswith(prefix):
+                return True
 
     safe_root = get_safe_write_root()
     if safe_root and not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):

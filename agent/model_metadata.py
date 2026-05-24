@@ -1414,6 +1414,10 @@ def get_model_context_length(
         if ctx:
             return ctx
 
+    exact_default = DEFAULT_CONTEXT_LENGTHS.get(model.lower())
+    if exact_default:
+        return exact_default
+
     # 6. OpenRouter live API metadata (provider-unaware fallback)
     metadata = fetch_model_metadata()
     if model in metadata:

@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+import importlib.util
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import patch
@@ -77,6 +78,8 @@ pytestmark = pytest.mark.skipif(
 
 def _make_server_manager():
     """Create a ServerManager pointing to the local vLLM server."""
+    if importlib.util.find_spec("atroposlib") is None:
+        pytest.skip("atroposlib not installed")
     from atroposlib.envs.server_handling.server_manager import (
         ServerManager,
         APIServerConfig,

@@ -18,6 +18,7 @@ mod insights_cmd;
 mod login_cmd;
 mod logs;
 mod mcp_cmd;
+mod mcp_server;
 mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;

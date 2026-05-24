@@ -627,7 +627,10 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
-    tirith_path = _resolve_tirith_path(cfg["tirith_path"])
+    if os.getenv("HERMES_GATEWAY_SESSION") or os.getenv("HERMES_EXEC_ASK"):
+        tirith_path = ensure_installed(log_failures=False)
+    else:
+        tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
     fail_open = cfg["tirith_fail_open"]
 

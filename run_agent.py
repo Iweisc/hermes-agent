@@ -9654,10 +9654,12 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                guardrails = getattr(self, "_tool_guardrails", None)
+                if guardrails is not None:
+                    guardrail_decision = guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -9753,14 +9755,24 @@ class AIAgent:
                     pass
             start = time.time()
             try:
-                result = self._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                )
+                try:
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                    )
+                except TypeError as type_error:
+                    if "unexpected keyword argument" not in str(type_error):
+                        raise
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                    )
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -9878,8 +9890,9 @@ class AIAgent:
             else:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
-                if not blocked:
-                    function_result = self._append_guardrail_observation(
+                append_guardrail = getattr(self, "_append_guardrail_observation", None)
+                if not blocked and append_guardrail is not None:
+                    function_result = append_guardrail(
                         function_name,
                         function_args,
                         function_result,
@@ -10004,9 +10017,11 @@ class AIAgent:
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    _guardrail_block_decision = guardrail_decision
+                guardrails = getattr(self, "_tool_guardrails", None)
+                if guardrails is not None:
+                    guardrail_decision = guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        _guardrail_block_decision = guardrail_decision
 
             _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 
@@ -10615,8 +10630,9 @@ class AIAgent:
         # a foreground user-directed turn. Set at the top of each call;
         # the review fork runs on its own thread with a fresh context,
         # so the foreground value here does not leak into it.
-        from tools.skill_provenance import set_current_write_origin
-        set_current_write_origin(getattr(self, "_memory_write_origin", "assistant_tool"))
+        from tools.skill_provenance import BACKGROUND_REVIEW, set_current_write_origin
+        write_origin = getattr(self, "_memory_write_origin", "assistant_tool")
+        set_current_write_origin(BACKGROUND_REVIEW if write_origin == BACKGROUND_REVIEW else "foreground")
 
         # If the previous turn activated fallback, restore the primary
         # runtime so this turn gets a fresh attempt with the preferred model.

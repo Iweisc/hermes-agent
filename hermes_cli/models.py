@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 import urllib.error
 import time
@@ -3259,14 +3260,21 @@ def validate_requested_model(
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
+            looks_plausible = bool(
+                re.match(r"^(?:gpt|o[1-9]|codex)[A-Za-z0-9_.:-]*(?:codex)?", requested_for_lookup.lower())
+            )
             return {
-                "accepted": True,
-                "persist": True,
+                "accepted": looks_plausible,
+                "persist": looks_plausible,
                 "recognized": False,
                 "message": (
                     f"Note: `{requested}` was not found in the OpenAI Codex model listing. "
-                    "It may still work if your ChatGPT/Codex account has access to a newer or hidden model ID."
-                    f"{suggestion_text}"
+                    + (
+                        "It may still work if your ChatGPT/Codex account has access to a newer or hidden model ID."
+                        if looks_plausible
+                        else "Use one of the listed OpenAI Codex models."
+                    )
+                    + f"{suggestion_text}"
                 ),
             }
 

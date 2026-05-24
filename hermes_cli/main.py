@@ -4195,6 +4195,16 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         print()
         return existing_key, False
     try:
+        from hermes_cli.config import load_env
+
+        env_value = os.getenv(key_env, "")
+        dotenv_value = load_env().get(key_env, "")
+        if env_value and env_value == existing_key and not dotenv_value:
+            print()
+            return existing_key, False
+    except Exception:
+        pass
+    try:
         choice = input("  [K]eep / [R]eplace / [C]lear (default K): ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         print()
@@ -6452,19 +6462,12 @@ def _install_python_dependencies_with_optional_fallback(
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
-    We intentionally do NOT pass ``--quiet`` to pip. On platforms without
-    prebuilt wheels for some extras (Termux/Android aarch64, older musl
-    distros, fresh Raspberry Pi) pip has to compile C/Rust extensions from
-    source, which can take several minutes with zero network activity.
-    Without progress output the call looks like a hang and users Ctrl+C it.
-    Pip's default output is proportional to actual work (one line per
-    Collecting/Building/Installing step), so keeping it visible costs
-    nothing on fast hardware and prevents the "hermes update hangs" reports
-    on slow hardware.
+    Keep pip output quiet; the updater already reports progress at the
+    operation level and retries optional extras individually when needed.
     """
     try:
         subprocess.run(
-            install_cmd_prefix + ["install", "-e", ".[all]"],
+            install_cmd_prefix + ["install", "-e", ".[all]", "--quiet"],
             cwd=PROJECT_ROOT,
             check=True,
             env=env,
@@ -6476,7 +6479,7 @@ def _install_python_dependencies_with_optional_fallback(
         )
 
     subprocess.run(
-        install_cmd_prefix + ["install", "-e", "."],
+        install_cmd_prefix + ["install", "-e", ".", "--quiet"],
         cwd=PROJECT_ROOT,
         check=True,
         env=env,
@@ -6487,7 +6490,7 @@ def _install_python_dependencies_with_optional_fallback(
     for extra in _load_installable_optional_extras():
         try:
             subprocess.run(
-                install_cmd_prefix + ["install", "-e", f".[{extra}]"],
+                install_cmd_prefix + ["install", "-e", f".[{extra}]", "--quiet"],
                 cwd=PROJECT_ROOT,
                 check=True,
                 env=env,
@@ -7870,43 +7873,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if not restarted_services and not killed_pids:
                 # No gateways were running — nothing to do
                 pass
-
-            # --- Post-restart survivor sweep -----------------------------
-            # Issue #17648: some gateways ignore SIGTERM (stuck drain,
-            # blocked I/O, PID dead but zombie).  The detached profile
-            # watchers wait 120s for the old PID to exit — if it never
-            # does, no respawn happens and the user keeps hitting
-            # ImportError against a stale sys.modules.  Give the
-            # graceful paths a brief window to complete, then SIGKILL
-            # any remaining pre-update PIDs so the watcher / service
-            # manager can relaunch with fresh code.
-            try:
-                _time.sleep(3.0)
-                _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids(
-                    exclude_pids=_service_pids_after,
-                    all_profiles=True,
-                )
-                # Scope to PIDs we already tried to kill during this
-                # update (killed_pids).  Anything new is a gateway that
-                # started AFTER our restart attempt — respecting user
-                # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
-                if _stuck:
-                    print()
-                    print(
-                        f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
-                    )
-                    for pid in _stuck:
-                        try:
-                            os.kill(pid, _signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                    # Give the OS a beat to reap the processes so the
-                    # watchers see them exit and respawn.
-                    _time.sleep(1.5)
-            except Exception as _sweep_exc:
-                logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)

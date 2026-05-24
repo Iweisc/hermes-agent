@@ -55,7 +55,7 @@ _LANGUAGE_ALIASES: dict[str, str] = {
     "turkish": "tr", "türkçe": "tr", "tr-tr": "tr",
 }
 
-_catalog_cache: dict[str, dict[str, str]] = {}
+_catalog_cache: dict[tuple[str, str], dict[str, str]] = {}
 _catalog_lock = threading.Lock()
 
 
@@ -99,16 +99,17 @@ def _load_catalog(lang: str) -> dict[str, str]:
     YAML files can be nested for human readability; this produces the flat
     key space :func:`t` expects.  Cached per-language for the process.
     """
+    path = _locales_dir() / f"{lang}.yaml"
+    cache_key = (lang, str(path))
     with _catalog_lock:
-        cached = _catalog_cache.get(lang)
+        cached = _catalog_cache.get(cache_key)
         if cached is not None:
             return cached
 
-    path = _locales_dir() / f"{lang}.yaml"
     if not path.is_file():
         logger.debug("i18n catalog missing for %s at %s", lang, path)
         with _catalog_lock:
-            _catalog_cache[lang] = {}
+            _catalog_cache[cache_key] = {}
         return {}
 
     try:
@@ -118,13 +119,13 @@ def _load_catalog(lang: str) -> dict[str, str]:
     except Exception as exc:
         logger.warning("Failed to load i18n catalog %s: %s", path, exc)
         with _catalog_lock:
-            _catalog_cache[lang] = {}
+            _catalog_cache[cache_key] = {}
         return {}
 
     flat: dict[str, str] = {}
     _flatten_into(raw, "", flat)
     with _catalog_lock:
-        _catalog_cache[lang] = flat
+        _catalog_cache[cache_key] = flat
     return flat
 
 
