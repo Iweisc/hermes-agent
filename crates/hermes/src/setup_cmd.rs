@@ -22,6 +22,8 @@ use crate::gateway_cmd;
 use crate::python_bridge::{project_root, resolve_repo_python};
 use crate::tools_cmd;
 
+const DEFAULT_CONFIG_YAML: &str = include_str!("default_config.yaml");
+
 #[derive(Args, Debug, Clone)]
 pub struct SetupArgs {
     #[arg(value_enum)]
@@ -52,7 +54,20 @@ pub enum SetupSection {
     Agent,
 }
 
-pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<dyn Error>> {
+pub fn print_setup(context: &HermesContext, mut args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    if args.reset {
+        if let Some(system) = setup_managed_system(context) {
+            println!(
+                "{}",
+                format_setup_managed_message(&system, "run setup wizard")
+            );
+            return Ok(());
+        }
+        reset_config_to_defaults(context)?;
+        println!("✓ Configuration reset to defaults.");
+        args.reset = false;
+    }
+
     if should_use_native_setup_noninteractive(&args, io::stdin().is_terminal()) {
         return print_native_setup_noninteractive(context);
     }
@@ -95,6 +110,33 @@ pub fn print_setup(context: &HermesContext, args: SetupArgs) -> Result<(), Box<d
         return run_native_tools_setup(context);
     }
     print_setup_python(args)
+}
+
+fn reset_config_to_defaults(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    validate_default_config_yaml()?;
+    context.ensure_hermes_home()?;
+    if let Err(error) = atomic_write(&context.config_path(), DEFAULT_CONFIG_YAML.as_bytes()) {
+        return Err(format!(
+            "failed to reset {}: {error}",
+            context.config_path().display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_default_config_yaml() -> Result<(), Box<dyn Error>> {
+    match serde_yaml::from_str::<Value>(DEFAULT_CONFIG_YAML)? {
+        Value::Mapping(mapping) => {
+            for key in ["model", "agent", "terminal", "_config_version"] {
+                if !mapping.contains_key(yaml_key(key)) {
+                    return Err(format!("embedded default config is missing {key}").into());
+                }
+            }
+            Ok(())
+        }
+        _ => Err("embedded default config must be a YAML mapping".into()),
+    }
 }
 
 fn print_setup_python(args: SetupArgs) -> Result<(), Box<dyn Error>> {
@@ -3974,33 +4016,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn setup_uses_python_override_and_env_flags() {
+    fn setup_reset_noninteractive_writes_full_defaults_without_python() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
+        let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'section=%s non_interactive=%s reset=%s reconfigure=%s quick=%s\\n' \\\n\
-    \"$HERMES_SETUP_SECTION\" \"$HERMES_SETUP_NON_INTERACTIVE\" \"$HERMES_SETUP_RESET\" \\\n\
-    \"$HERMES_SETUP_RECONFIGURE\" \"$HERMES_SETUP_QUICK\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            context.config_path(),
+            "model:\n  provider: custom\nagent:\n  max_turns: 7\nupdates:\n  backup_keep: 99\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
 
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
-        let context = HermesContext::new(temp.path());
+        set_env_var("HERMES_SETUP_PYTHON", "/bin/false");
         print_setup(
             &context,
             SetupArgs {
@@ -4013,8 +4040,23 @@ exit 9\n",
         )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("section=gateway non_interactive=1 reset=1 reconfigure=1 quick=1"));
+        let saved = read_raw_yaml_mapping(&context.config_path()).unwrap();
+        assert_eq!(
+            saved.get(yaml_key("model")).and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(get_nested_i64(&saved, &["agent", "max_turns"]), Some(90));
+        assert_eq!(
+            get_nested_i64(&saved, &["agent", "restart_drain_timeout"]),
+            Some(180)
+        );
+        assert_eq!(get_nested_i64(&saved, &["updates", "backup_keep"]), Some(5));
+        assert_eq!(
+            saved
+                .get(yaml_key("_config_version"))
+                .and_then(Value::as_i64),
+            Some(23)
+        );
 
         remove_env_var("HERMES_SETUP_PYTHON");
     }
@@ -5282,31 +5324,14 @@ exit 9\n",
     }
 
     #[test]
-    fn setup_reset_with_extra_flags_stays_on_python_path() {
+    fn setup_reset_with_extra_flags_uses_native_reset_in_headless_mode() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'section=%s quick=%s\\n' \"$HERMES_SETUP_SECTION\" \"$HERMES_SETUP_QUICK\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        #[cfg(unix)]
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_SETUP_PYTHON", &fake_python);
         let context = HermesContext::new(temp.path());
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(context.config_path(), "agent:\n  max_turns: 5\n").unwrap();
+
+        set_env_var("HERMES_SETUP_PYTHON", "/bin/false");
         print_setup(
             &context,
             SetupArgs {
@@ -5319,8 +5344,14 @@ exit 9\n",
         )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("section=agent quick=1"));
+        let saved = read_raw_yaml_mapping(&context.config_path()).unwrap();
+        assert_eq!(get_nested_i64(&saved, &["agent", "max_turns"]), Some(90));
+        assert_eq!(
+            saved
+                .get(yaml_key("_config_version"))
+                .and_then(Value::as_i64),
+            Some(23)
+        );
         remove_env_var("HERMES_SETUP_PYTHON");
     }
 }
