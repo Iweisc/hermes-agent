@@ -35,8 +35,8 @@ const DEFAULT_GITHUB_SKILL_TAPS: &[(&str, &str)] = &[
 
 #[derive(Subcommand, Debug)]
 pub enum SkillsCommand {
-    Browse(CompatArgs),
-    Search(CompatArgs),
+    Browse(BrowseArgs),
+    Search(SearchArgs),
     Install(CompatArgs),
     Inspect(InspectArgs),
     List(ListArgs),
@@ -49,6 +49,60 @@ pub enum SkillsCommand {
     Publish(CompatArgs),
     Snapshot(SkillSnapshotArgs),
     Tap(SkillTapArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BrowseArgs {
+    #[arg(long, default_value_t = 1)]
+    pub page: usize,
+    #[arg(long = "size", default_value_t = 20)]
+    pub page_size: usize,
+    #[arg(long, value_enum, default_value_t = SkillsCatalogSource::All)]
+    pub source: SkillsCatalogSource,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SearchArgs {
+    pub query: String,
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+    #[arg(long, value_enum, default_value_t = SkillsCatalogSource::All)]
+    pub source: SkillsCatalogSource,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SkillsCatalogSource {
+    #[value(name = "all")]
+    All,
+    #[value(name = "official")]
+    Official,
+    #[value(name = "skills-sh")]
+    SkillsSh,
+    #[value(name = "well-known")]
+    WellKnown,
+    #[value(name = "github")]
+    Github,
+    #[value(name = "clawhub")]
+    Clawhub,
+    #[value(name = "claude-marketplace")]
+    ClaudeMarketplace,
+    #[value(name = "lobehub")]
+    Lobehub,
+}
+
+impl SkillsCatalogSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Official => "official",
+            Self::SkillsSh => "skills-sh",
+            Self::WellKnown => "well-known",
+            Self::Github => "github",
+            Self::Clawhub => "clawhub",
+            Self::ClaudeMarketplace => "claude-marketplace",
+            Self::Lobehub => "lobehub",
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -259,8 +313,8 @@ pub fn print_skills(
             print_skills_usage();
             Ok(())
         }
-        Some(SkillsCommand::Browse(args)) => browse_skills_command(context, &args.args),
-        Some(SkillsCommand::Search(args)) => search_skills_command(context, &args.args),
+        Some(SkillsCommand::Browse(args)) => browse_skills_command(context, args),
+        Some(SkillsCommand::Search(args)) => search_skills_command(context, args),
         Some(SkillsCommand::Install(args)) => install_skill_command(context, &args.args),
         Some(SkillsCommand::Inspect(args)) => inspect_skill_command(context, &args.identifier),
         Some(SkillsCommand::List(args)) => print_list(context, args),
@@ -287,18 +341,6 @@ fn print_skills_usage() {
 
 fn bridge_prefixed(action: &str, passthrough: &[String]) -> Result<(), Box<dyn Error>> {
     match action {
-        "browse" => print_python_skills_command(
-            "browse",
-            "skills browse",
-            SKILLS_BROWSE_BOOTSTRAP,
-            passthrough,
-        ),
-        "search" => print_python_skills_command(
-            "search",
-            "skills search",
-            SKILLS_SEARCH_BOOTSTRAP,
-            passthrough,
-        ),
         "install" => print_python_skills_command(
             "install",
             "skills install",
@@ -364,30 +406,6 @@ fn print_python_skills_command(
     }
     Err(exit_status_message(command_name, status).into())
 }
-
-const SKILLS_BROWSE_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_browse\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills browse')\n",
-    "parser.add_argument('--page', type=int, default=1)\n",
-    "parser.add_argument('--size', type=int, default=20)\n",
-    "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_browse(page=args.page, page_size=args.size, source=args.source)\n",
-);
-
-const SKILLS_SEARCH_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import sys\n",
-    "from hermes_cli.skills_hub import do_search\n",
-    "parser = argparse.ArgumentParser(prog='hermes skills search')\n",
-    "parser.add_argument('query')\n",
-    "parser.add_argument('--source', default='all', choices=['all','official','skills-sh','well-known','github','clawhub','claude-marketplace','lobehub'])\n",
-    "parser.add_argument('--limit', type=int, default=10)\n",
-    "args = parser.parse_args(sys.argv[1:])\n",
-    "do_search(args.query, source=args.source, limit=args.limit)\n",
-);
 
 const SKILLS_INSTALL_BOOTSTRAP: &str = concat!(
     "import argparse\n",
@@ -561,13 +579,16 @@ fn inspect_skill_command(
     bridge_prefixed("inspect", &[identifier.to_string()])
 }
 
-fn browse_skills_command(
-    context: &HermesContext,
-    passthrough: &[String],
-) -> Result<(), Box<dyn Error>> {
-    let Some((page, page_size, source)) = parse_browse_args(passthrough)? else {
-        return bridge_prefixed("browse", passthrough);
-    };
+fn browse_skills_command(context: &HermesContext, args: BrowseArgs) -> Result<(), Box<dyn Error>> {
+    if args.page == 0 {
+        return Err("--page must be a positive integer".into());
+    }
+    if args.page_size == 0 {
+        return Err("--size must be a positive integer".into());
+    }
+    let page = args.page;
+    let page_size = args.page_size.min(100);
+    let source = args.source.as_str();
     if source == "all" {
         let skills = collect_all_browse_catalog_summaries(context)?;
         if skills.is_empty() {
@@ -829,7 +850,7 @@ fn browse_skills_command(
         return Ok(());
     }
     if source != "official" {
-        return bridge_prefixed("browse", passthrough);
+        return Err(format!("unsupported skills source: {source}").into());
     }
 
     let skills = collect_official_skill_summaries()?;
@@ -872,17 +893,17 @@ fn browse_skills_command(
     Ok(())
 }
 
-fn search_skills_command(
-    context: &HermesContext,
-    passthrough: &[String],
-) -> Result<(), Box<dyn Error>> {
-    let Some((query, limit, source)) = parse_search_args(passthrough)? else {
-        return bridge_prefixed("search", passthrough);
-    };
+fn search_skills_command(context: &HermesContext, args: SearchArgs) -> Result<(), Box<dyn Error>> {
+    if args.limit == 0 {
+        return Err("--limit must be a positive integer".into());
+    }
+    let query = args.query;
+    let limit = args.limit.min(100);
+    let source = args.source.as_str();
     if source == "all" {
         let needle = query.trim();
         if needle.is_empty() {
-            return bridge_prefixed("search", passthrough);
+            return Err("query cannot be empty".into());
         }
         let matches = search_all_catalog_summaries(context, needle, limit)?;
         if matches.is_empty() {
@@ -922,7 +943,7 @@ fn search_skills_command(
     if source == "github" {
         let needle = query.trim().to_ascii_lowercase();
         if needle.is_empty() {
-            return bridge_prefixed("search", passthrough);
+            return Err("query cannot be empty".into());
         }
         let matches = collect_github_skill_summaries(context)?
             .into_iter()
@@ -975,7 +996,7 @@ fn search_skills_command(
     if source == "skills-sh" {
         let needle = query.trim();
         if needle.is_empty() {
-            return bridge_prefixed("search", passthrough);
+            return Err("query cannot be empty".into());
         }
         let matches = search_skills_sh_summaries(needle, limit)?;
         if matches.is_empty() {
@@ -1015,7 +1036,7 @@ fn search_skills_command(
     if source == "lobehub" {
         let needle = query.trim().to_ascii_lowercase();
         if needle.is_empty() {
-            return bridge_prefixed("search", passthrough);
+            return Err("query cannot be empty".into());
         }
         let matches = collect_lobehub_skill_summaries()?
             .into_iter()
@@ -1140,7 +1161,7 @@ fn search_skills_command(
     if source == "claude-marketplace" {
         let needle = query.trim().to_ascii_lowercase();
         if needle.is_empty() {
-            return bridge_prefixed("search", passthrough);
+            return Err("query cannot be empty".into());
         }
         let matches = collect_claude_marketplace_skill_summaries(limit)?
             .into_iter()
@@ -1184,12 +1205,12 @@ fn search_skills_command(
         return Ok(());
     }
     if source != "official" {
-        return bridge_prefixed("search", passthrough);
+        return Err(format!("unsupported skills source: {source}").into());
     }
 
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
-        return bridge_prefixed("search", passthrough);
+        return Err("query cannot be empty".into());
     }
 
     let skills = collect_official_skill_summaries()?;
@@ -1603,83 +1624,6 @@ fn install_remote_skill_bundle(
     Ok(())
 }
 
-fn parse_browse_args(
-    passthrough: &[String],
-) -> Result<Option<(usize, usize, String)>, Box<dyn Error>> {
-    let mut page = 1_usize;
-    let mut page_size = 20_usize;
-    let mut source = String::from("all");
-
-    let mut index = 0_usize;
-    while index < passthrough.len() {
-        match passthrough[index].as_str() {
-            "--page" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --page".into());
-                };
-                page = parse_positive_usize(value, "--page")?;
-                index += 2;
-            }
-            "--size" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --size".into());
-                };
-                page_size = parse_positive_usize(value, "--size")?.min(100);
-                index += 2;
-            }
-            "--source" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --source".into());
-                };
-                source = value.trim().to_ascii_lowercase();
-                index += 2;
-            }
-            _ => return Ok(None),
-        }
-    }
-
-    Ok(Some((page, page_size.max(1), source)))
-}
-
-fn parse_search_args(
-    passthrough: &[String],
-) -> Result<Option<(String, usize, String)>, Box<dyn Error>> {
-    let mut query = None::<String>;
-    let mut limit = 10_usize;
-    let mut source = String::from("all");
-
-    let mut index = 0_usize;
-    while index < passthrough.len() {
-        let current = passthrough[index].as_str();
-        match current {
-            "--source" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --source".into());
-                };
-                source = value.trim().to_ascii_lowercase();
-                index += 2;
-            }
-            "--limit" => {
-                let Some(value) = passthrough.get(index + 1) else {
-                    return Err("missing value for --limit".into());
-                };
-                limit = parse_positive_usize(value, "--limit")?.min(100);
-                index += 2;
-            }
-            _ if current.starts_with('-') => return Ok(None),
-            _ => {
-                if query.is_some() {
-                    return Ok(None);
-                }
-                query = Some(current.to_string());
-                index += 1;
-            }
-        }
-    }
-
-    Ok(query.map(|query| (query, limit.max(1), source)))
-}
-
 fn parse_install_args(passthrough: &[String]) -> Result<Option<InstallArgsParsed>, Box<dyn Error>> {
     let mut identifier = None::<String>;
     let mut category = String::new();
@@ -1778,17 +1722,6 @@ fn parse_publish_args(passthrough: &[String]) -> Result<PublishArgsParsed, Box<d
         target,
         repo,
     })
-}
-
-fn parse_positive_usize(raw: &str, flag: &str) -> Result<usize, Box<dyn Error>> {
-    let parsed = raw
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| format!("{flag} must be a positive integer"))?;
-    if parsed == 0 {
-        return Err(format!("{flag} must be a positive integer").into());
-    }
-    Ok(parsed)
 }
 
 fn check_skills_command(
@@ -7023,6 +6956,7 @@ fn yaml_key(key: &str) -> YamlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::env;
     use std::fs;
     use std::io::{Read, Write};
@@ -7053,6 +6987,12 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    #[derive(Parser, Debug)]
+    struct SkillsCommandHarness {
+        #[command(subcommand)]
+        command: SkillsCommand,
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -7575,34 +7515,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_browse_args_accepts_official_source() {
-        let parsed = parse_browse_args(&[
-            String::from("--source"),
-            String::from("official"),
-            String::from("--page"),
-            String::from("2"),
-            String::from("--size"),
-            String::from("7"),
+    fn browse_args_parse_natively() {
+        let parsed = SkillsCommandHarness::try_parse_from([
+            "skills", "browse", "--source", "official", "--page", "2", "--size", "7",
         ])
-        .unwrap()
         .unwrap();
-        assert_eq!(parsed, (2, 7, String::from("official")));
+        match parsed.command {
+            SkillsCommand::Browse(args) => {
+                assert_eq!(args.source, SkillsCatalogSource::Official);
+                assert_eq!(args.page, 2);
+                assert_eq!(args.page_size, 7);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
-    fn parse_search_args_accepts_official_source() {
-        let parsed = parse_search_args(&[
-            String::from("deploy"),
-            String::from("--source"),
-            String::from("official"),
-            String::from("--limit"),
-            String::from("4"),
+    fn search_args_parse_natively() {
+        let parsed = SkillsCommandHarness::try_parse_from([
+            "skills", "search", "deploy", "--source", "official", "--limit", "4",
         ])
-        .unwrap()
         .unwrap();
-        assert_eq!(
-            parsed,
-            (String::from("deploy"), 4, String::from("official"))
+        match parsed.command {
+            SkillsCommand::Search(args) => {
+                assert_eq!(args.query, "deploy");
+                assert_eq!(args.source, SkillsCatalogSource::Official);
+                assert_eq!(args.limit, 4);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browse_and_search_reject_unknown_sources_natively() {
+        assert!(
+            SkillsCommandHarness::try_parse_from([
+                "skills",
+                "browse",
+                "--source",
+                "mystery-source",
+            ])
+            .is_err()
+        );
+        assert!(
+            SkillsCommandHarness::try_parse_from([
+                "skills",
+                "search",
+                "deploy",
+                "--source",
+                "mystery-source",
+            ])
+            .is_err()
         );
     }
 
@@ -8026,50 +7989,6 @@ exit 9\n",
         }
         let _ = fs::remove_dir_all(home);
         let _ = fs::remove_dir_all(optional);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn browse_bridges_when_source_is_unsupported() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let context = HermesContext::new("/tmp");
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        browse_skills_command(
-            &context,
-            &[
-                String::from("--source"),
-                String::from("mystery-source"),
-                String::from("--page"),
-                String::from("1"),
-            ],
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("command=browse argv=--source mystery-source --page 1"));
-
-        remove_env_var("HERMES_SKILLS_PYTHON");
     }
 
     #[test]
@@ -8609,49 +8528,6 @@ exit 9\n",
             None => remove_env_var("GITHUB_TOKEN"),
         }
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn search_bridges_when_source_is_unsupported() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  shift 2\n\
-  printf 'command=%s argv=%s\\n' \"$HERMES_SKILLS_COMMAND\" \"$*\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let context = HermesContext::new("/tmp");
-        set_env_var("HERMES_SKILLS_PYTHON", &fake_python);
-        search_skills_command(
-            &context,
-            &[
-                String::from("deploy"),
-                String::from("--source"),
-                String::from("mystery-source"),
-            ],
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("command=search argv=deploy --source mystery-source"));
-
-        remove_env_var("HERMES_SKILLS_PYTHON");
     }
 
     #[test]
