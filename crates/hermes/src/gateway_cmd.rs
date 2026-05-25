@@ -12,7 +12,9 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand};
+use getrandom::fill as fill_random;
 use hermes_core::{HermesContext, is_container, is_wsl};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -1173,6 +1175,13 @@ const WECOM_SETUP_INSTRUCTIONS: &[&str] = &[
     "4. Restrict access with WECOM_ALLOWED_USERS or DM pairing for production use",
 ];
 
+const QQBOT_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Register a QQ Bot application at https://q.qq.com or use QR setup below",
+    "2. Note your App ID and App Secret from the application page",
+    "3. Enable the required intents for direct, group, and guild messages",
+    "4. Restrict access with DM pairing or QQ_ALLOWED_USERS for production use",
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1585,8 +1594,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "QQ Bot",
         emoji: "🐧",
         token_var: "QQ_APP_ID",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: QQBOT_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -1753,6 +1762,16 @@ fn native_gateway_platform_status(
             if val.is_some() && token.is_some() {
                 "configured".to_string()
             } else if val.is_some() || token.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "qqbot" => {
+            let secret = read_effective_env_value(context, "QQ_CLIENT_SECRET");
+            if val.is_some() && secret.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || secret.is_some() {
                 "partially configured".to_string()
             } else {
                 "not configured".to_string()
@@ -2264,6 +2283,10 @@ fn configure_native_gateway_builtin_platform_with_io(
         }
         "wecom" => {
             configure_wecom_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
+        "qqbot" => {
+            configure_qqbot_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -3728,6 +3751,441 @@ fn wecom_nested_json_string(value: &JsonValue, path: &[&str]) -> Option<String> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+#[derive(Debug, Clone)]
+struct QqbotSetupCredentials {
+    app_id: String,
+    client_secret: String,
+    user_openid: Option<String>,
+}
+
+fn configure_qqbot_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_app_id = read_effective_env_value(context, "QQ_APP_ID");
+    let existing_secret = read_effective_env_value(context, "QQ_CLIENT_SECRET");
+    if existing_app_id.is_some() && existing_secret.is_some() {
+        writeln!(output)?;
+        writeln!(output, "QQ Bot is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure QQ Bot?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    let method = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How would you like to set up QQ Bot?",
+        &[
+            "Scan QR code to add bot automatically (recommended)",
+            "Enter existing App ID and App Secret manually",
+        ],
+    )?;
+
+    let credentials = if method == 0 {
+        match qqbot_qr_register_with_io(output) {
+            Ok(Some(credentials)) => Some(credentials),
+            Ok(None) => {
+                writeln!(
+                    output,
+                    "  QR setup did not complete. Continuing with manual input."
+                )?;
+                configure_qqbot_manual_credentials(input, output)?
+            }
+            Err(error) => {
+                writeln!(output, "  QR registration failed: {error}")?;
+                writeln!(output, "  Continuing with manual input.")?;
+                configure_qqbot_manual_credentials(input, output)?
+            }
+        }
+    } else {
+        configure_qqbot_manual_credentials(input, output)?
+    };
+
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+
+    save_env_value(context.env_path(), "QQ_APP_ID", &credentials.app_id)?;
+    save_env_value(
+        context.env_path(),
+        "QQ_CLIENT_SECRET",
+        &credentials.client_secret,
+    )?;
+
+    configure_qqbot_dm_policy(context, input, output, credentials.user_openid.as_deref())?;
+    configure_qqbot_home_channel(context, input, output, credentials.user_openid.as_deref())?;
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    writeln!(output, "  App ID: {}", credentials.app_id)?;
+    Ok(())
+}
+
+fn configure_qqbot_manual_credentials(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<Option<QqbotSetupCredentials>, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Go to https://q.qq.com to register a QQ Bot application."
+    )?;
+    writeln!(
+        output,
+        "  Note your App ID and App Secret from the application page."
+    )?;
+    let Some(app_id) = prompt_gateway_required_line(
+        input,
+        output,
+        "  App ID",
+        "Skipped — QQ Bot won't work without an App ID.",
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(client_secret) = prompt_gateway_required_line(
+        input,
+        output,
+        "  App Secret",
+        "Skipped — QQ Bot won't work without an App Secret.",
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(QqbotSetupCredentials {
+        app_id,
+        client_secret,
+        user_openid: None,
+    }))
+}
+
+fn configure_qqbot_dm_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    user_openid: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    let access_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should direct messages be authorized?",
+        &[
+            "Use DM pairing approval (recommended)",
+            "Allow all direct messages",
+            "Only allow listed user OpenIDs",
+        ],
+    )?;
+    match access_idx {
+        0 => {
+            save_env_value(context.env_path(), "QQ_ALLOW_ALL_USERS", "false")?;
+            if let Some(openid) = user_openid.filter(|value| !value.trim().is_empty()) {
+                writeln!(output)?;
+                if prompt_gateway_yes_no(
+                    input,
+                    output,
+                    format!("Add yourself ({openid}) to the allow list?").as_str(),
+                    true,
+                )? {
+                    save_env_value(context.env_path(), "QQ_ALLOWED_USERS", openid)?;
+                    writeln!(output, "  Allow list set to {openid}")?;
+                } else {
+                    save_env_value(context.env_path(), "QQ_ALLOWED_USERS", "")?;
+                }
+            } else {
+                save_env_value(context.env_path(), "QQ_ALLOWED_USERS", "")?;
+            }
+            writeln!(output, "  DM pairing enabled.")?;
+        }
+        1 => {
+            save_env_value(context.env_path(), "QQ_ALLOW_ALL_USERS", "true")?;
+            save_env_value(context.env_path(), "QQ_ALLOWED_USERS", "")?;
+            writeln!(output, "  Open DM access enabled for QQ Bot.")?;
+        }
+        2 => {
+            let prompt = if let Some(openid) = user_openid.filter(|value| !value.trim().is_empty())
+            {
+                format!("  Allowed user OpenIDs (comma-separated) [{openid}]")
+            } else {
+                String::from("  Allowed user OpenIDs (comma-separated)")
+            };
+            let raw = prompt_gateway_line(input, output, &prompt)?;
+            let allowed = if raw.trim().is_empty() {
+                user_openid.unwrap_or("").to_string()
+            } else {
+                normalize_gateway_allowlist("QQ_ALLOWED_USERS", raw.trim())
+            };
+            save_env_value(context.env_path(), "QQ_ALLOW_ALL_USERS", "false")?;
+            save_env_value(context.env_path(), "QQ_ALLOWED_USERS", &allowed)?;
+            writeln!(output, "  Allowlist saved.")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn configure_qqbot_home_channel(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    user_openid: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(openid) = user_openid.filter(|value| !value.trim().is_empty()) {
+        writeln!(output)?;
+        if prompt_gateway_yes_no(
+            input,
+            output,
+            format!("Use your QQ user ID ({openid}) as the home channel?").as_str(),
+            true,
+        )? {
+            save_env_value(context.env_path(), "QQBOT_HOME_CHANNEL", openid)?;
+            writeln!(output, "  Home channel set to {openid}")?;
+        }
+    } else {
+        writeln!(output)?;
+        let home_channel = prompt_gateway_line(
+            input,
+            output,
+            "  Home channel OpenID (for cron/notifications, or empty)",
+        )?;
+        if !home_channel.trim().is_empty() {
+            save_env_value(
+                context.env_path(),
+                "QQBOT_HOME_CHANNEL",
+                home_channel.trim(),
+            )?;
+            writeln!(output, "  Home channel set to {}", home_channel.trim())?;
+        }
+    }
+    Ok(())
+}
+
+fn qqbot_qr_register_with_io(
+    output: &mut dyn Write,
+) -> Result<Option<QqbotSetupCredentials>, Box<dyn Error>> {
+    let timeout_ms = qqbot_env_u64("QQBOT_ONBOARD_TIMEOUT_MS", 600_000).max(1);
+    let poll_interval =
+        Duration::from_millis(qqbot_env_u64("QQBOT_ONBOARD_POLL_INTERVAL_MS", 2000).max(1));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    for refresh_count in 0..=3 {
+        let (task_id, aes_key) = qqbot_create_bind_task()?;
+        let url = qqbot_connect_url(&task_id);
+        writeln!(output)?;
+        writeln!(output, "  Open this URL in QQ on your phone:")?;
+        writeln!(output, "  {url}")?;
+
+        while Instant::now() < deadline {
+            match qqbot_poll_bind_result(&task_id) {
+                Ok(QqbotBindPoll::Completed {
+                    app_id,
+                    encrypted_secret,
+                    user_openid,
+                }) => {
+                    let client_secret = qqbot_decrypt_secret(&encrypted_secret, &aes_key)?;
+                    writeln!(output)?;
+                    writeln!(output, "  QR scan complete. App ID: {app_id}")?;
+                    if let Some(openid) = user_openid.as_deref() {
+                        writeln!(output, "  Scanner OpenID: {openid}")?;
+                    }
+                    return Ok(Some(QqbotSetupCredentials {
+                        app_id,
+                        client_secret,
+                        user_openid,
+                    }));
+                }
+                Ok(QqbotBindPoll::Expired) => {
+                    if refresh_count >= 3 {
+                        return Ok(None);
+                    }
+                    writeln!(
+                        output,
+                        "  QR code expired, refreshing... ({}/{})",
+                        refresh_count + 1,
+                        3
+                    )?;
+                    break;
+                }
+                Ok(QqbotBindPoll::Pending) | Ok(QqbotBindPoll::None) | Err(_) => {
+                    sleep(poll_interval);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+enum QqbotBindPoll {
+    None,
+    Pending,
+    Completed {
+        app_id: String,
+        encrypted_secret: String,
+        user_openid: Option<String>,
+    },
+    Expired,
+}
+
+fn qqbot_create_bind_task() -> Result<(String, String), Box<dyn Error>> {
+    let key = qqbot_generate_bind_key()?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let data = client
+        .post(format!("{}/lite/create_bind_task", qqbot_portal_base_url()))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({ "key": key }))
+        .send()?
+        .json::<JsonValue>()?;
+    qqbot_require_retcode_ok(&data, "create_bind_task")?;
+    let task_id = data
+        .get("data")
+        .and_then(|data| data.get("task_id"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("create_bind_task response missing task_id")?;
+    Ok((task_id.to_string(), key))
+}
+
+fn qqbot_poll_bind_result(task_id: &str) -> Result<QqbotBindPoll, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let data = client
+        .post(format!("{}/lite/poll_bind_result", qqbot_portal_base_url()))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({ "task_id": task_id }))
+        .send()?
+        .json::<JsonValue>()?;
+    qqbot_require_retcode_ok(&data, "poll_bind_result")?;
+    let body = data.get("data").unwrap_or(&JsonValue::Null);
+    match body.get("status").and_then(JsonValue::as_i64).unwrap_or(0) {
+        1 => Ok(QqbotBindPoll::Pending),
+        2 => {
+            let app_id = body
+                .get("bot_appid")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("poll_bind_result response missing bot_appid")?;
+            let encrypted_secret = body
+                .get("bot_encrypt_secret")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("poll_bind_result response missing bot_encrypt_secret")?;
+            let user_openid = body
+                .get("user_openid")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Ok(QqbotBindPoll::Completed {
+                app_id: app_id.to_string(),
+                encrypted_secret: encrypted_secret.to_string(),
+                user_openid,
+            })
+        }
+        3 => Ok(QqbotBindPoll::Expired),
+        _ => Ok(QqbotBindPoll::None),
+    }
+}
+
+fn qqbot_require_retcode_ok(value: &JsonValue, action: &str) -> Result<(), Box<dyn Error>> {
+    if value.get("retcode").and_then(JsonValue::as_i64) == Some(0) {
+        return Ok(());
+    }
+    let message = value
+        .get("msg")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(action);
+    Err(format!("QQ Bot onboard {action} failed: {message}").into())
+}
+
+fn qqbot_generate_bind_key() -> Result<String, Box<dyn Error>> {
+    let mut key = [0_u8; 32];
+    fill_random(&mut key).map_err(|error| -> Box<dyn Error> {
+        format!("QQ Bot bind key generation failed: {error:?}").into()
+    })?;
+    Ok(BASE64_STANDARD.encode(key))
+}
+
+fn qqbot_decrypt_secret(
+    encrypted_base64: &str,
+    key_base64: &str,
+) -> Result<String, Box<dyn Error>> {
+    let key = BASE64_STANDARD.decode(key_base64)?;
+    if key.len() != 32 {
+        return Err("QQ Bot bind key must decode to 32 bytes".into());
+    }
+    let raw = BASE64_STANDARD.decode(encrypted_base64)?;
+    if raw.len() < 12 + 16 {
+        return Err("QQ Bot encrypted secret is too short".into());
+    }
+    let nonce_bytes: [u8; 12] = raw[..12]
+        .try_into()
+        .map_err(|_| "QQ Bot encrypted secret has an invalid nonce")?;
+    let mut ciphertext = raw[12..].to_vec();
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &key)
+        .map_err(|_| "QQ Bot AES key initialization failed")?;
+    let key = ring::aead::LessSafeKey::new(unbound);
+    let plaintext = key
+        .open_in_place(
+            ring::aead::Nonce::assume_unique_for_key(nonce_bytes),
+            ring::aead::Aad::empty(),
+            &mut ciphertext,
+        )
+        .map_err(|_| "QQ Bot encrypted secret authentication failed")?;
+    Ok(String::from_utf8(plaintext.to_vec())?)
+}
+
+fn qqbot_portal_base_url() -> String {
+    if let Ok(value) = env::var("QQ_PORTAL_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        return value.trim().trim_end_matches('/').to_string();
+    }
+    let host = env::var("QQ_PORTAL_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from("q.qq.com"));
+    format!("https://{}", host.trim().trim_end_matches('/'))
+}
+
+fn qqbot_connect_url(task_id: &str) -> String {
+    let template = env::var("QQBOT_QR_URL_TEMPLATE").unwrap_or_else(|_| {
+        String::from(
+            "https://q.qq.com/qqbot/openclaw/connect.html?task_id={task_id}&_wv=2&source=hermes",
+        )
+    });
+    template.replace("{task_id}", &percent_encode_url_component(task_id))
+}
+
+fn qqbot_env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
@@ -5709,6 +6167,34 @@ mod tests {
         (temp, ctx)
     }
 
+    fn test_json_body_string(request: &[u8], key: &str) -> String {
+        let request = String::from_utf8_lossy(request);
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+        let value: JsonValue = serde_json::from_str(body).unwrap();
+        value
+            .get(key)
+            .and_then(JsonValue::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    fn qqbot_encrypt_secret_for_test(secret: &str, key_base64: &str) -> String {
+        let key = BASE64_STANDARD.decode(key_base64).unwrap();
+        let nonce = [7_u8; 12];
+        let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &key).unwrap();
+        let key = ring::aead::LessSafeKey::new(unbound);
+        let mut in_out = secret.as_bytes().to_vec();
+        key.seal_in_place_append_tag(
+            ring::aead::Nonce::assume_unique_for_key(nonce),
+            ring::aead::Aad::empty(),
+            &mut in_out,
+        )
+        .unwrap();
+        let mut raw = nonce.to_vec();
+        raw.extend_from_slice(&in_out);
+        BASE64_STANDARD.encode(raw)
+    }
+
     #[test]
     fn gateway_args_preserve_accept_hooks_and_status_flags() {
         let parsed = GatewayHarness::try_parse_from([
@@ -5993,6 +6479,13 @@ exit 9\n",
             .unwrap();
         assert!(weixin.has_builtin_setup);
 
+        let qqbot = metadata
+            .iter()
+            .find(|platform| platform.key == "qqbot")
+            .unwrap();
+        assert!(!qqbot.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(qqbot));
+
         let email = metadata
             .iter()
             .find(|platform| platform.key == "email")
@@ -6094,6 +6587,11 @@ exit 9\n",
             "FEISHU_ALLOWED_USERS",
             "FEISHU_GROUP_POLICY",
             "FEISHU_HOME_CHANNEL",
+            "QQ_APP_ID",
+            "QQ_CLIENT_SECRET",
+            "QQ_ALLOW_ALL_USERS",
+            "QQ_ALLOWED_USERS",
+            "QQBOT_HOME_CHANNEL",
             "WECOM_BOT_ID",
             "WECOM_SECRET",
             "WECOM_ALLOWED_USERS",
@@ -6161,6 +6659,11 @@ exit 9\n",
             .find(|platform| platform.key == "feishu")
             .unwrap();
         assert_eq!(feishu.status, "not configured");
+        let qqbot = metadata
+            .iter()
+            .find(|platform| platform.key == "qqbot")
+            .unwrap();
+        assert_eq!(qqbot.status, "not configured");
         let wecom = metadata
             .iter()
             .find(|platform| platform.key == "wecom")
@@ -6655,6 +7158,174 @@ exit 9\n",
         assert!(env_text.contains("FEISHU_HOME_CHANNEL=home-chat"));
 
         remove_env_var("FEISHU_OPEN_BASE_URL");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_qqbot_gateway_platform_uses_native_qr_flow_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "QQ_APP_ID",
+            "QQ_CLIENT_SECRET",
+            "QQ_ALLOW_ALL_USERS",
+            "QQ_ALLOWED_USERS",
+            "QQBOT_HOME_CHANNEL",
+            "QQ_PORTAL_BASE_URL",
+            "QQBOT_QR_URL_TEMPLATE",
+            "QQBOT_ONBOARD_POLL_INTERVAL_MS",
+            "QQBOT_ONBOARD_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("QQ_PORTAL_BASE_URL", format!("http://{addr}"));
+        set_env_var(
+            "QQBOT_QR_URL_TEMPLATE",
+            format!("http://{addr}/connect?task_id={{task_id}}"),
+        );
+        set_env_var("QQBOT_ONBOARD_POLL_INTERVAL_MS", "1");
+        set_env_var("QQBOT_ONBOARD_TIMEOUT_MS", "1000");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut next = 0;
+            let mut bind_key = String::new();
+            while next < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let bytes = stream.read(&mut request).unwrap_or(0);
+                        let body = if next == 0 {
+                            bind_key = test_json_body_string(&request[..bytes], "key");
+                            String::from(r#"{"retcode":0,"data":{"task_id":"task-1"}}"#)
+                        } else {
+                            let encrypted = qqbot_encrypt_secret_for_test("qq-secret", &bind_key);
+                            format!(
+                                r#"{{"retcode":0,"data":{{"status":2,"bot_appid":"qq-app","bot_encrypt_secret":"{}","user_openid":"user-open"}}}}"#,
+                                encrypted
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        next += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "qqbot")
+            .unwrap();
+        let mut input = Cursor::new("1\n1\n\n\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("QQ_APP_ID=qq-app"));
+        assert!(env_text.contains("QQ_CLIENT_SECRET=qq-secret"));
+        assert!(env_text.contains("QQ_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("QQ_ALLOWED_USERS=user-open"));
+        assert!(env_text.contains("QQBOT_HOME_CHANNEL=user-open"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "qqbot")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        for key in [
+            "QQ_PORTAL_BASE_URL",
+            "QQBOT_QR_URL_TEMPLATE",
+            "QQBOT_ONBOARD_POLL_INTERVAL_MS",
+            "QQBOT_ONBOARD_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+    }
+
+    #[test]
+    fn configure_qqbot_gateway_platform_writes_manual_credentials_and_allowlist() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "QQ_APP_ID",
+            "QQ_CLIENT_SECRET",
+            "QQ_ALLOW_ALL_USERS",
+            "QQ_ALLOWED_USERS",
+            "QQBOT_HOME_CHANNEL",
+            "QQ_PORTAL_BASE_URL",
+        ] {
+            remove_env_var(key);
+        }
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "qqbot")
+            .unwrap();
+        let mut input =
+            Cursor::new("2\nmanual-app\nmanual-secret\n3\nuser-a, user-b\nhome-openid\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("QQ_APP_ID=manual-app"));
+        assert!(env_text.contains("QQ_CLIENT_SECRET=manual-secret"));
+        assert!(env_text.contains("QQ_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("QQ_ALLOWED_USERS=user-a,user-b"));
+        assert!(env_text.contains("QQBOT_HOME_CHANNEL=home-openid"));
     }
 
     #[test]
