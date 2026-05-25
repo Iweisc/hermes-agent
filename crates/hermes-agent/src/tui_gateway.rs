@@ -696,6 +696,9 @@ fn handle_native_request(
         "session.save" => handle_session_save(id, &params, store, state)?,
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.compress" => handle_session_compress(id, &params, state, child_stdin)?,
+        "session.history" => {
+            handle_session_bound_child_request(id, "session.history", &params, state, child_stdin)?
+        }
         "rollback.list" => {
             handle_session_bound_child_request(id, "rollback.list", &params, state, child_stdin)?
         }
@@ -722,6 +725,63 @@ fn handle_native_request(
             false,
             Duration::from_secs(45),
         )?,
+        "voice.toggle" => forward_child_request_timeout(
+            id,
+            "voice.toggle",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "voice.record" => forward_child_request_timeout(
+            id,
+            "voice.record",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "voice.tts" => forward_child_request_timeout(
+            id,
+            "voice.tts",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "shell.exec" => forward_child_request_timeout(
+            id,
+            "shell.exec",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(35),
+        )?,
+        "cli.exec" => forward_child_request_timeout(
+            id,
+            "cli.exec",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(240),
+        )?,
+        "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
+        "config.show" => handle_helper_dispatch(id, "config.show", &params, helper)?,
+        "insights.get" => handle_helper_dispatch(id, "insights.get", &params, helper)?,
+        "cron.manage" => handle_helper_dispatch(id, "cron.manage", &params, helper)?,
+        "tools.list" => forward_child_request(id, "tools.list", &params, state, child_stdin, true)?,
+        "tools.show" => forward_child_request(id, "tools.show", &params, state, child_stdin, true)?,
+        "toolsets.list" => {
+            forward_child_request(id, "toolsets.list", &params, state, child_stdin, true)?
+        }
+        "agents.list" => {
+            forward_child_request(id, "agents.list", &params, state, child_stdin, false)?
+        }
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
         "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
@@ -5368,6 +5428,146 @@ mod tests {
 
         assert_eq!(response["id"], json!("r-skills-manage"));
         assert_eq!(response["result"]["skills"]["Built-in"][0], json!("demo"));
+    }
+
+    #[test]
+    fn voice_toggle_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "voice.toggle");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"enabled\":true,\"tts\":false,\"record_key\":\"ctrl+b\"}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-voice-toggle"),
+            "voice.toggle",
+            json!({"action": "status"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("voice.toggle response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-voice-toggle"));
+        assert_eq!(response["result"]["enabled"], json!(true));
+        assert_eq!(response["result"]["record_key"], json!("ctrl+b"));
+    }
+
+    #[test]
+    fn voice_record_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "voice.record");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"recording\"}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-voice-record"),
+            "voice.record",
+            json!({"action": "start"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("voice.record response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-voice-record"));
+        assert_eq!(response["result"]["status"], json!("recording"));
+    }
+
+    #[test]
+    fn shell_exec_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "shell.exec");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"stdout\":\"hello\\n\",\"stderr\":\"\",\"code\":0}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-shell-exec"),
+            "shell.exec",
+            json!({"command": "echo hello"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(35),
+        )
+        .unwrap()
+        .expect("shell.exec response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-shell-exec"));
+        assert_eq!(response["result"]["stdout"], json!("hello\n"));
+        assert_eq!(response["result"]["code"], json!(0));
+    }
+
+    #[test]
+    fn session_history_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-history-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-history", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "session.history");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"count\":1,\"messages\":[{{\"role\":\"user\",\"text\":\"hi\"}}]}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_bound_child_request(
+            json!("r-session-history"),
+            "session.history",
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("session.history response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-session-history"));
+        assert_eq!(response["result"]["count"], json!(1));
+        assert_eq!(response["result"]["messages"][0]["text"], json!("hi"));
     }
 
     #[test]
