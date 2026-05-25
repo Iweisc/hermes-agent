@@ -696,6 +696,15 @@ fn handle_native_request(
         "session.save" => handle_session_save(id, &params, store, state)?,
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.compress" => handle_session_compress(id, &params, state, child_stdin)?,
+        "rollback.list" => {
+            handle_session_bound_child_request(id, "rollback.list", &params, state, child_stdin)?
+        }
+        "rollback.diff" => {
+            handle_session_bound_child_request(id, "rollback.diff", &params, state, child_stdin)?
+        }
+        "rollback.restore" => {
+            handle_session_bound_child_request(id, "rollback.restore", &params, state, child_stdin)?
+        }
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
         "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
@@ -1448,6 +1457,45 @@ fn handle_session_compress(
         child_stdin,
         state,
         "session.compress",
+        Value::Object(forwarded_params),
+        Some(local_id.to_string()),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn handle_session_bound_child_request(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    if !session_exists(state, local_id)? {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    }
+    ensure_child_session(child_stdin, state, local_id)?;
+    let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4001,
+            "child session not materialized",
+        )));
+    };
+
+    let mut forwarded_params = params.clone();
+    forwarded_params.insert("session_id".to_string(), json!(child_id));
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        method,
         Value::Object(forwarded_params),
         Some(local_id.to_string()),
     )?;
@@ -5120,6 +5168,45 @@ mod tests {
             Some("stored-compress-after")
         );
         assert!(!guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
+    fn rollback_restore_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-rollback".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-rollback", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "rollback.restore");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"success\":true,\"history_removed\":2,\"restored_to\":\"abc123\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_bound_child_request(
+            json!("r-rollback-restore"),
+            "rollback.restore",
+            json!({"session_id": local_id, "hash": "abc123"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("rollback.restore response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-rollback-restore"));
+        assert_eq!(response["result"]["success"], json!(true));
+        assert_eq!(response["result"]["history_removed"], json!(2));
+        assert_eq!(response["result"]["restored_to"], json!("abc123"));
     }
 
     #[test]
