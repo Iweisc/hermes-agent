@@ -1,21 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 
 pub(crate) use hermes_core::{
-    DashboardSurface, DiscoveredPlugin, PlatformSurface, PluginCliCommand, PluginKind, PluginSource,
+    DashboardSurface, DiscoveredPlugin, PlatformSurface, PluginCliCommand, PluginSource,
 };
 use hermes_core::{
-    HermesContext, ToolDefinition, ToolRuntime, discover_dashboard_surfaces,
+    HermesContext, ToolDefinition, ToolRuntime, discover_context_engine_plugins,
+    discover_dashboard_surfaces,
+    discover_enabled_general_plugins as core_discover_enabled_general_plugins,
     discover_enabled_plugin_cli_commands, discover_enabled_plugin_platforms,
+    discover_general_plugins as core_discover_general_plugins,
     discover_hook_registrations_from_source,
     discover_memory_provider_plugins as core_discover_memory_provider_plugins,
     discover_platform_surfaces_from_source, discover_plugin_cli_commands_from_source,
     discover_scanned_plugins, discover_tool_definitions_from_source,
 };
 use serde_json::Value as JsonValue;
-
-use crate::plugins_cmd::load_plugin_set;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderOption {
@@ -35,12 +36,8 @@ pub(crate) fn attach_python_plugin_runtime(
     context: &HermesContext,
     runtime: ToolRuntime,
 ) -> Result<ToolRuntime, Box<dyn Error>> {
-    let enabled = load_plugin_set(context, "enabled")?;
-    let disabled = load_plugin_set(context, "disabled")?;
-    let has_enabled_general_plugins = discover_general_plugins(context)?
-        .into_iter()
-        .any(|plugin| is_effectively_enabled(&plugin, &enabled, &disabled));
-    if !has_enabled_general_plugins {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if core_discover_enabled_general_plugins(&context.hermes_home(), &cwd).is_empty() {
         return Ok(runtime);
     }
     hermes_core::attach_python_plugin_runtime(&context.hermes_home(), runtime)
@@ -59,23 +56,19 @@ pub(crate) fn discover_plugin_catalog(
     let dashboards = discover_dashboard_surfaces(&context.hermes_home(), &cwd);
 
     let mut memory = BTreeMap::<String, ProviderOption>::new();
-    let mut context_engines = BTreeMap::<String, ProviderOption>::new();
     for plugin in discover_memory_provider_plugins(context)? {
         memory.entry(plugin.name.clone()).or_insert(ProviderOption {
             name: plugin.name,
             description: plugin.description,
         });
     }
-    for plugin in winners.values() {
-        if plugin.kind == PluginKind::ContextEngine {
-            context_engines
-                .entry(plugin.name.clone())
-                .or_insert(ProviderOption {
-                    name: plugin.name.clone(),
-                    description: plugin.description.clone(),
-                });
-        }
-    }
+    let context_engines = discover_context_engine_plugins(&context.hermes_home(), &cwd)
+        .into_iter()
+        .map(|plugin| ProviderOption {
+            name: plugin.name,
+            description: plugin.description,
+        })
+        .collect::<Vec<_>>();
 
     let mut plugins = winners.into_values().collect::<Vec<_>>();
     plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.key.cmp(&right.key)));
@@ -84,25 +77,15 @@ pub(crate) fn discover_plugin_catalog(
         plugins,
         dashboards,
         memory_providers: memory.into_values().collect(),
-        context_engines: context_engines.into_values().collect(),
+        context_engines,
     })
 }
 
 pub(crate) fn discover_general_plugins(
     context: &HermesContext,
 ) -> Result<Vec<DiscoveredPlugin>, Box<dyn Error>> {
-    let mut plugins = discover_plugin_catalog(context)?
-        .plugins
-        .into_iter()
-        .filter(|plugin| {
-            !matches!(
-                plugin.kind,
-                PluginKind::Exclusive | PluginKind::ModelProvider | PluginKind::ContextEngine
-            )
-        })
-        .collect::<Vec<_>>();
-    plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.key.cmp(&right.key)));
-    Ok(plugins)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Ok(core_discover_general_plugins(&context.hermes_home(), &cwd))
 }
 
 pub(crate) fn discover_enabled_platform_plugins(
@@ -166,20 +149,6 @@ pub(crate) fn discover_context_engines(
     let mut providers = discover_plugin_catalog(context)?.context_engines;
     providers.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(providers)
-}
-
-pub(crate) fn is_effectively_enabled(
-    plugin: &DiscoveredPlugin,
-    enabled: &BTreeSet<String>,
-    disabled: &BTreeSet<String>,
-) -> bool {
-    if disabled.contains(&plugin.name) || disabled.contains(&plugin.key) {
-        return false;
-    }
-    if plugin.kind.is_auto_enabled(plugin.source) {
-        return true;
-    }
-    enabled.contains(&plugin.name) || enabled.contains(&plugin.key)
 }
 
 fn discover_cli_commands(source_text: &str, plugin_name: &str) -> Vec<PluginCliCommand> {
@@ -347,6 +316,11 @@ def register(ctx):
             "name: honcho\ndescription: Memory\n",
             "class MemoryProvider:\n    pass\n",
         );
+        write_plugin(
+            &bundled.join("context_engine").join("custom-engine"),
+            "name: custom-engine\ndescription: Custom context engine\n",
+            "class DemoContext(ContextEngine):\n    pass\n",
+        );
         fs::create_dir_all(bundled.join("example-dashboard").join("dashboard")).unwrap();
         fs::write(
             bundled
@@ -373,6 +347,12 @@ def register(ctx):
                 .memory_providers
                 .iter()
                 .any(|provider| provider.name == "honcho")
+        );
+        assert!(
+            catalog
+                .context_engines
+                .iter()
+                .any(|provider| provider.name == "custom-engine")
         );
         assert!(
             catalog
@@ -623,5 +603,53 @@ def register(ctx):
                 .and_then(JsonValue::as_str)
                 .is_some_and(|value| value == "hook-only context")
         }));
+    }
+
+    #[test]
+    fn attach_python_plugin_runtime_applies_terminal_output_transform_hook() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        let plugin_dir = home.join("plugins").join("normalizer");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: normalizer\ndescription: Terminal output normalizer\nkind: standalone\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+def register(ctx):
+    def transform_terminal_output(**kwargs):
+        if kwargs.get("command") == "printf 'hi from shell\\n'":
+            return "normalized output"
+        return None
+
+    ctx.register_hook("transform_terminal_output", transform_terminal_output)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - normalizer\n",
+        )
+        .unwrap();
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let runtime = attach_python_plugin_runtime(
+            &context,
+            ToolRuntime::new(temp.path()).with_hermes_home(home),
+        )
+        .unwrap();
+
+        let result = dispatch_tool(
+            "terminal",
+            serde_json::json!({"command": "printf 'hi from shell\\n'"}),
+            &runtime,
+        );
+        let parsed: JsonValue = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exit_code"], serde_json::json!(0));
+        assert_eq!(parsed["output"], serde_json::json!("normalized output"));
     }
 }

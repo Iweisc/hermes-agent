@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 use hermes_core::{
-    DelegateExecutor, HermesContext, LoadedConfig, ModelOverrides, ToolRuntime, dispatch_tool,
-    get_tool_definitions, get_tool_definitions_with_runtime, resolve_toolset, validate_toolset,
+    DelegateExecutor, HermesContext, ImageGenPluginProvider, LoadedConfig, ModelOverrides,
+    ToolRuntime, discover_plugin_image_gen_providers, dispatch_tool, get_tool_definitions,
+    get_tool_definitions_with_runtime, resolve_toolset, validate_toolset,
 };
 use serde_yaml::{Mapping, Value};
 
@@ -304,8 +305,6 @@ const DEFAULT_FIRECRAWL_URL: &str = "http://localhost:3002";
 const DEFAULT_SEARXNG_URL: &str = "http://localhost:8080";
 const DEFAULT_CAMOFOX_URL: &str = "http://localhost:9377";
 const DEFAULT_FAL_IMAGE_MODEL: &str = "fal-ai/flux-2/klein/9b";
-const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-2-medium";
-const DEFAULT_XAI_IMAGE_MODEL: &str = "grok-imagine-image";
 
 pub fn print_tools(
     context: &HermesContext,
@@ -489,7 +488,14 @@ pub(crate) fn run_native_tools_interactive_with_io(
                     &current,
                 )?;
                 if let Some(enabled) = selected {
-                    apply_platform_selection(output, context, platform.name, &current, &enabled)?;
+                    apply_platform_selection(
+                        input,
+                        output,
+                        context,
+                        platform.name,
+                        &current,
+                        &enabled,
+                    )?;
                 } else {
                     writeln!(output, "No changes.")?;
                 }
@@ -503,7 +509,7 @@ pub(crate) fn run_native_tools_interactive_with_io(
                 let selected =
                     prompt_toolset_selection(input, output, "All platforms", "cli", &union)?;
                 if let Some(enabled) = selected {
-                    apply_global_selection(output, context, &platforms, &root, &enabled)?;
+                    apply_global_selection(input, output, context, &platforms, &root, &enabled)?;
                 } else {
                     writeln!(output, "No changes.")?;
                 }
@@ -879,19 +885,30 @@ fn reconfigure_image_gen_with_io(
     output: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let plugin_providers =
+        discover_plugin_image_gen_providers(context.hermes_home().as_path(), &cwd)
+            .unwrap_or_default();
     let current_provider = nested_string(&root, &["image_gen", "provider"]).unwrap_or_default();
     let current_use_gateway = nested_bool(&root, &["image_gen", "use_gateway"]).unwrap_or(false);
     let managed_known = current_use_gateway && matches!(current_provider.as_str(), "" | "fal");
 
     writeln!(output)?;
     writeln!(output, "Image Generation")?;
-    let mut choices = Vec::new();
+    let mut choices = Vec::<String>::new();
     if managed_known {
-        choices.push("Nous Subscription");
+        choices.push("Nous Subscription".to_string());
     }
-    choices.extend(["FAL.ai", "OpenAI Images", "xAI Images"]);
-    let selection = prompt_menu_choice(input, output, "Select provider", &choices)?;
+    choices.push("FAL.ai".to_string());
+    choices.extend(
+        plugin_providers
+            .iter()
+            .map(|provider| provider_choice_label(provider)),
+    );
+    let choice_refs = choices.iter().map(String::as_str).collect::<Vec<_>>();
+    let selection = prompt_menu_choice(input, output, "Select provider", &choice_refs)?;
     let direct_offset = usize::from(managed_known);
+    let built_in_count = 1usize;
 
     {
         let image_gen = ensure_mapping(&mut root, "image_gen");
@@ -941,51 +958,154 @@ fn reconfigure_image_gen_with_io(
                     .unwrap_or_else(|| DEFAULT_FAL_IMAGE_MODEL.to_string())
             )?;
         }
-        1 => {
-            let openai_model = nested_string(&root, &["image_gen", "openai", "model"]);
-            let image_gen = ensure_mapping(&mut root, "image_gen");
-            image_gen.insert(yaml_key("provider"), Value::String("openai".to_string()));
-            let openai = ensure_nested_mapping(image_gen, "openai");
-            if !openai_model
-                .as_deref()
-                .is_some_and(is_known_openai_image_model)
-            {
-                openai.insert(
-                    yaml_key("model"),
-                    Value::String(DEFAULT_OPENAI_IMAGE_MODEL.to_string()),
-                );
-            }
-            prompt_secret_env_update(context, input, output, "OPENAI_API_KEY", "OpenAI API key")?;
-            writeln!(
-                output,
-                "Image generation provider set to OpenAI ({})",
-                nested_string(&root, &["image_gen", "openai", "model"])
-                    .unwrap_or_else(|| DEFAULT_OPENAI_IMAGE_MODEL.to_string())
-            )?;
+        index => {
+            let plugin_index = index.saturating_sub(built_in_count);
+            let Some(provider) = plugin_providers.get(plugin_index) else {
+                return Err("invalid image generation provider selection".into());
+            };
+            configure_plugin_image_gen_provider(context, input, output, &mut root, provider)?;
         }
-        2 => {
-            let xai_model = nested_string(&root, &["image_gen", "xai", "model"]);
-            let image_gen = ensure_mapping(&mut root, "image_gen");
-            image_gen.insert(yaml_key("provider"), Value::String("xai".to_string()));
-            let xai = ensure_nested_mapping(image_gen, "xai");
-            if !xai_model.as_deref().is_some_and(is_known_xai_image_model) {
-                xai.insert(
-                    yaml_key("model"),
-                    Value::String(DEFAULT_XAI_IMAGE_MODEL.to_string()),
-                );
-            }
-            prompt_secret_env_update(context, input, output, "XAI_API_KEY", "xAI API key")?;
-            writeln!(
-                output,
-                "Image generation provider set to xAI ({})",
-                nested_string(&root, &["image_gen", "xai", "model"])
-                    .unwrap_or_else(|| DEFAULT_XAI_IMAGE_MODEL.to_string())
-            )?;
-        }
-        _ => unreachable!(),
     }
 
     write_yaml_mapping(&context.config_path(), &root)?;
+    Ok(())
+}
+
+fn provider_choice_label(provider: &ImageGenPluginProvider) -> String {
+    let mut label = provider.name.clone();
+    if !provider.badge.trim().is_empty() {
+        label.push_str(" [");
+        label.push_str(provider.badge.trim());
+        label.push(']');
+    }
+    if !provider.tag.trim().is_empty() {
+        label.push_str(" - ");
+        label.push_str(provider.tag.trim());
+    }
+    label
+}
+
+fn configure_plugin_image_gen_provider(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    root: &mut Mapping,
+    provider: &ImageGenPluginProvider,
+) -> Result<(), Box<dyn Error>> {
+    let image_gen = ensure_mapping(root, "image_gen");
+    image_gen.insert(
+        yaml_key("provider"),
+        Value::String(provider.plugin_name.clone()),
+    );
+    image_gen.insert(yaml_key("use_gateway"), Value::Bool(false));
+
+    if provider.env_vars.is_empty() {
+        writeln!(output, "{} - no configuration needed!", provider.name)?;
+    } else {
+        for env_var in &provider.env_vars {
+            if let Some(url) = env_var.url.as_deref()
+                && !url.trim().is_empty()
+            {
+                writeln!(output, "Get key at: {url}")?;
+            }
+            let label = if env_var.prompt.trim().is_empty() {
+                env_var.key.as_str()
+            } else {
+                env_var.prompt.as_str()
+            };
+            prompt_secret_env_update(context, input, output, &env_var.key, label)?;
+        }
+        writeln!(output, "{} configured!", provider.name)?;
+    }
+
+    configure_plugin_image_gen_model_with_io(input, output, root, provider)?;
+    writeln!(output, "Image generation provider set to {}", provider.name)?;
+    Ok(())
+}
+
+fn configure_plugin_image_gen_model_with_io(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    root: &mut Mapping,
+    provider: &ImageGenPluginProvider,
+) -> Result<(), Box<dyn Error>> {
+    if provider.models.is_empty() {
+        return Ok(());
+    }
+
+    let current_model =
+        nested_string(root, &["image_gen", "model"]).or_else(|| provider.default_model.clone());
+    let current_model = current_model
+        .filter(|model| provider.models.iter().any(|entry| entry.id == *model))
+        .or_else(|| provider.default_model.clone())
+        .unwrap_or_else(|| provider.models[0].id.clone());
+
+    let mut ordered = vec![current_model.clone()];
+    ordered.extend(
+        provider
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .filter(|model| model != &current_model),
+    );
+
+    let model_width = provider
+        .models
+        .iter()
+        .map(|model| model.id.len())
+        .max()
+        .unwrap_or(5);
+    let speed_width = provider
+        .models
+        .iter()
+        .map(|model| model.speed.len())
+        .max()
+        .unwrap_or(5);
+    let strengths_width = provider
+        .models
+        .iter()
+        .map(|model| model.strengths.len())
+        .max()
+        .unwrap_or(9);
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  {:<model_width$}  {:<speed_width$}  {:<strengths_width$}  Price",
+        "Model", "Speed", "Strengths",
+    )?;
+
+    let choices = ordered
+        .iter()
+        .map(|model_id| {
+            let model = provider
+                .models
+                .iter()
+                .find(|entry| entry.id == *model_id)
+                .expect("ordered models come from provider.models");
+            let mut row = format!(
+                "{:<model_width$}  {:<speed_width$}  {:<strengths_width$}  {}",
+                model.id, model.speed, model.strengths, model.price
+            );
+            if model.id == current_model {
+                row.push_str("  <- currently in use");
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let choice_refs = choices.iter().map(String::as_str).collect::<Vec<_>>();
+    let selection = prompt_menu_choice(
+        input,
+        output,
+        &format!("Choose {} model", provider.name),
+        &choice_refs,
+    )?;
+    let chosen = ordered
+        .get(selection)
+        .ok_or("invalid image generation model selection")?;
+    let image_gen = ensure_mapping(root, "image_gen");
+    image_gen.insert(yaml_key("model"), Value::String(chosen.clone()));
+    writeln!(output, "Model set to: {chosen}")?;
     Ok(())
 }
 
@@ -1289,6 +1409,7 @@ fn prompt_line(
 }
 
 fn apply_platform_selection(
+    input: &mut dyn BufRead,
     output: &mut dyn Write,
     context: &HermesContext,
     platform: &str,
@@ -1296,6 +1417,10 @@ fn apply_platform_selection(
     enabled: &BTreeSet<String>,
 ) -> Result<(), Box<dyn Error>> {
     let mut root = read_raw_yaml_mapping(&context.config_path())?;
+    let added = enabled
+        .difference(current)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     save_platform_toolsets(&mut root, platform, enabled)?;
     write_yaml_mapping(&context.config_path(), &root)?;
     print_toolset_delta(
@@ -1304,10 +1429,12 @@ fn apply_platform_selection(
         current,
         enabled,
     )?;
+    configure_newly_enabled_toolsets(input, output, context, &root, &added)?;
     Ok(())
 }
 
 fn apply_global_selection(
+    input: &mut dyn BufRead,
     output: &mut dyn Write,
     context: &HermesContext,
     platforms: &[&'static PlatformDef],
@@ -1331,8 +1458,35 @@ fn apply_global_selection(
     }
     if changed {
         write_yaml_mapping(&context.config_path(), &updated_root)?;
+        let mut added = BTreeSet::new();
+        for platform in platforms {
+            let previous = enabled_builtin_toolsets(root, platform.name);
+            let next = enabled
+                .iter()
+                .filter(|name| toolset_allowed_for_platform(name, platform.name))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            added.extend(next.difference(&previous).cloned());
+        }
+        configure_newly_enabled_toolsets(input, output, context, &updated_root, &added)?;
     } else {
         writeln!(output, "No changes.")?;
+    }
+    Ok(())
+}
+
+fn configure_newly_enabled_toolsets(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    context: &HermesContext,
+    root: &Mapping,
+    added: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    for toolset in added {
+        if !toolset_needs_configuration_prompt(context, root, toolset) {
+            continue;
+        }
+        run_native_tool_reconfigure_with_io(context, toolset, input, output)?;
     }
     Ok(())
 }
@@ -1715,6 +1869,29 @@ fn toolset_has_known_configuration(context: &HermesContext, root: &Mapping, tool
     }
 }
 
+fn toolset_needs_configuration_prompt(
+    context: &HermesContext,
+    root: &Mapping,
+    toolset: &str,
+) -> bool {
+    match toolset {
+        "image_gen" => {
+            if env_value_for_context(context, "FAL_KEY").is_some() {
+                return false;
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            match discover_plugin_image_gen_providers(context.hermes_home().as_path(), &cwd) {
+                Ok(providers) => !providers.into_iter().any(|provider| provider.available),
+                Err(_) => true,
+            }
+        }
+        "web" | "browser" | "tts" | "rl" | "vision" | "moa" | "homeassistant" | "spotify" => {
+            !toolset_has_known_configuration(context, root, toolset)
+        }
+        _ => false,
+    }
+}
+
 fn mcp_server_enabled(config: &Mapping) -> bool {
     match config.get(yaml_key("enabled")) {
         None => true,
@@ -1784,17 +1961,6 @@ fn is_known_fal_model(model: &str) -> bool {
             | "fal-ai/recraft/v4/pro/text-to-image"
             | "fal-ai/qwen-image"
     )
-}
-
-fn is_known_openai_image_model(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-image-2-low" | "gpt-image-2-medium" | "gpt-image-2-high"
-    )
-}
-
-fn is_known_xai_image_model(model: &str) -> bool {
-    model == DEFAULT_XAI_IMAGE_MODEL
 }
 
 fn nested_mapping<'a>(root: &'a Mapping, path: &[&str]) -> Option<&'a Mapping> {
@@ -2408,7 +2574,7 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         write_config(&context.config_path(), "image_gen:\n  provider: fal\n");
 
-        let mut input = Cursor::new(b"2\nsk-openai-image\n".to_vec());
+        let mut input = Cursor::new(b"2\nsk-openai-image\n1\n".to_vec());
         let mut output = Vec::new();
         reconfigure_image_gen_with_io(&context, &mut input, &mut output).unwrap();
 
@@ -2421,6 +2587,92 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Image Generation"));
         assert!(rendered.contains("Image generation provider set to OpenAI"));
+    }
+
+    #[test]
+    fn tools_reconfigure_image_gen_surfaces_plugin_provider_natively() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("reconfigure-image-gen-plugin");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let plugin_dir = home.join("plugins").join("image_gen").join("replicate");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: replicate\nversion: 0.1.0\ndescription: Test image backend\nkind: backend\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, ImageGenProvider, success_response
+import os
+
+class DemoProvider(ImageGenProvider):
+    @property
+    def name(self):
+        return "replicate"
+
+    @property
+    def display_name(self):
+        return "Replicate"
+
+    def is_available(self):
+        return bool((os.environ.get("REPLICATE_API_TOKEN") or "").strip())
+
+    def get_setup_schema(self):
+        return {
+            "name": "Replicate",
+            "badge": "paid",
+            "tag": "Third-party image backend",
+            "env_vars": [{"key": "REPLICATE_API_TOKEN", "prompt": "Replicate API token"}],
+        }
+
+    def list_models(self):
+        return [
+            {
+                "id": "replicate-fast",
+                "display": "Replicate Fast",
+                "speed": "~8s",
+                "strengths": "Fast iteration",
+                "price": "$",
+            }
+        ]
+
+    def default_model(self):
+        return "replicate-fast"
+
+    def generate(self, prompt, aspect_ratio=DEFAULT_ASPECT_RATIO, **kwargs):
+        return success_response(
+            image="/tmp/replicate-test.png",
+            model="replicate-fast",
+            prompt=(prompt or "").strip(),
+            aspect_ratio=aspect_ratio,
+            provider="replicate",
+        )
+
+def register(ctx):
+    ctx.register_image_gen_provider(DemoProvider())
+"#,
+        )
+        .unwrap();
+        write_config(
+            &context.config_path(),
+            "plugins:\n  enabled:\n    - image_gen/replicate\nimage_gen:\n  provider: fal\n",
+        );
+
+        let mut input = Cursor::new(b"4\nreplicate-test-token\n1\n".to_vec());
+        let mut output = Vec::new();
+        reconfigure_image_gen_with_io(&context, &mut input, &mut output).unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("provider: replicate"));
+        assert!(saved.contains("model: replicate-fast"));
+        assert!(saved.contains("use_gateway: false"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("REPLICATE_API_TOKEN=replicate-test-token"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Replicate"));
+        assert!(rendered.contains("Image generation provider set to Replicate"));
     }
 
     #[test]
@@ -2440,6 +2692,184 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Nous Subscription"));
         assert!(rendered.contains("managed Nous gateway"));
+    }
+
+    #[test]
+    fn enabling_image_gen_interactively_triggers_plugin_provider_setup() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("enable-image-gen-plugin");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let plugin_dir = home.join("plugins").join("image_gen").join("replicate");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: replicate\nversion: 0.1.0\ndescription: Test image backend\nkind: backend\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, ImageGenProvider, success_response
+import os
+
+class DemoProvider(ImageGenProvider):
+    @property
+    def name(self):
+        return "replicate"
+
+    @property
+    def display_name(self):
+        return "Replicate"
+
+    def is_available(self):
+        return bool((os.environ.get("REPLICATE_API_TOKEN") or "").strip())
+
+    def get_setup_schema(self):
+        return {
+            "name": "Replicate",
+            "badge": "paid",
+            "tag": "Third-party image backend",
+            "env_vars": [{"key": "REPLICATE_API_TOKEN", "prompt": "Replicate API token"}],
+        }
+
+    def list_models(self):
+        return [
+            {
+                "id": "replicate-fast",
+                "display": "Replicate Fast",
+                "speed": "~8s",
+                "strengths": "Fast iteration",
+                "price": "$",
+            }
+        ]
+
+    def default_model(self):
+        return "replicate-fast"
+
+    def generate(self, prompt, aspect_ratio=DEFAULT_ASPECT_RATIO, **kwargs):
+        return success_response(
+            image="/tmp/replicate-test.png",
+            model="replicate-fast",
+            prompt=(prompt or "").strip(),
+            aspect_ratio=aspect_ratio,
+            provider="replicate",
+        )
+
+def register(ctx):
+    ctx.register_image_gen_provider(DemoProvider())
+"#,
+        )
+        .unwrap();
+        write_config(
+            &context.config_path(),
+            "plugins:\n  enabled:\n    - image_gen/replicate\nplatform_toolsets:\n  cli: []\n",
+        );
+
+        let current = BTreeSet::new();
+        let enabled = BTreeSet::from([String::from("image_gen")]);
+        let mut input = Cursor::new(b"4\nreplicate-live-token\n1\n".to_vec());
+        let mut output = Vec::new();
+
+        apply_platform_selection(&mut input, &mut output, &context, "cli", &current, &enabled)
+            .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("- image_gen"));
+        assert!(saved.contains("provider: replicate"));
+        assert!(saved.contains("model: replicate-fast"));
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("REPLICATE_API_TOKEN=replicate-live-token"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("+ Image Generation"));
+        assert!(rendered.contains("Image generation provider set to Replicate"));
+    }
+
+    #[test]
+    fn enabling_image_gen_skips_setup_when_plugin_provider_is_already_available() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let home = temp_path("enable-image-gen-plugin-ready");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let plugin_dir = home.join("plugins").join("image_gen").join("replicate");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: replicate\nversion: 0.1.0\ndescription: Test image backend\nkind: backend\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, ImageGenProvider, success_response
+import os
+
+class DemoProvider(ImageGenProvider):
+    @property
+    def name(self):
+        return "replicate"
+
+    @property
+    def display_name(self):
+        return "Replicate"
+
+    def is_available(self):
+        return bool((os.environ.get("REPLICATE_API_TOKEN") or "").strip())
+
+    def get_setup_schema(self):
+        return {
+            "name": "Replicate",
+            "badge": "paid",
+            "tag": "Third-party image backend",
+            "env_vars": [{"key": "REPLICATE_API_TOKEN", "prompt": "Replicate API token"}],
+        }
+
+    def list_models(self):
+        return [
+            {
+                "id": "replicate-fast",
+                "display": "Replicate Fast",
+                "speed": "~8s",
+                "strengths": "Fast iteration",
+                "price": "$",
+            }
+        ]
+
+    def default_model(self):
+        return "replicate-fast"
+
+    def generate(self, prompt, aspect_ratio=DEFAULT_ASPECT_RATIO, **kwargs):
+        return success_response(
+            image="/tmp/replicate-test.png",
+            model="replicate-fast",
+            prompt=(prompt or "").strip(),
+            aspect_ratio=aspect_ratio,
+            provider="replicate",
+        )
+
+def register(ctx):
+    ctx.register_image_gen_provider(DemoProvider())
+"#,
+        )
+        .unwrap();
+        fs::write(context.env_path(), "REPLICATE_API_TOKEN=already-set\n").unwrap();
+        write_config(
+            &context.config_path(),
+            "plugins:\n  enabled:\n    - image_gen/replicate\nplatform_toolsets:\n  cli: []\n",
+        );
+
+        let current = BTreeSet::new();
+        let enabled = BTreeSet::from([String::from("image_gen")]);
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        apply_platform_selection(&mut input, &mut output, &context, "cli", &current, &enabled)
+            .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("- image_gen"));
+        assert!(!saved.contains("provider: replicate"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("+ Image Generation"));
+        assert!(!rendered.contains("Image generation provider set to Replicate"));
     }
 
     #[test]

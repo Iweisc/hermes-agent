@@ -12,6 +12,9 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use serde_yaml::Value as YamlValue;
 
+use crate::plugin_runtime::{
+    dispatch_python_plugin_image_generate, python_plugin_image_gen_available,
+};
 use crate::tools::{tool_error, tool_result};
 use crate::{codex_cloudflare_headers, resolve_codex_access_token, resolve_nous_access_token};
 
@@ -423,15 +426,20 @@ fn dispatch_image_backend(
             config,
             hermes_home,
         )),
-        other => tool_result(json!({
-            "success": false,
-            "image": Value::Null,
-            "error": format!(
-                "image_gen.provider='{}' is set but that backend is not ported in the Rust runtime yet.",
-                other
-            ),
-            "error_type": "provider_not_registered",
-        })),
+        _ => match dispatch_python_plugin_image_generate(
+            hermes_home,
+            &env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            prompt,
+            aspect_ratio,
+        ) {
+            Ok(result) => tool_result(result),
+            Err(error) => tool_result(json!({
+                "success": false,
+                "image": Value::Null,
+                "error": format!("plugin image generation bridge failed: {error}"),
+                "error_type": "provider_bridge_error",
+            })),
+        },
     }
 }
 
@@ -455,10 +463,22 @@ fn resolve_image_backend(config: &ImageGenConfig, hermes_home: &Path) -> Option<
 }
 
 fn any_image_backend_available(config: &ImageGenConfig, hermes_home: &Path) -> bool {
-    any_fal_backend_available(hermes_home)
-        || openai_api_key(config).is_some()
-        || xai_api_key(config).is_some()
-        || resolve_codex_access_token(hermes_home).is_ok()
+    match config.provider.as_deref() {
+        Some("openai") => openai_api_key(config).is_some(),
+        Some("openai-codex") => resolve_codex_access_token(hermes_home).is_ok(),
+        Some("xai") => xai_api_key(config).is_some(),
+        Some(provider) if provider != "fal" => python_plugin_image_gen_available(
+            hermes_home,
+            &env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        )
+        .unwrap_or(false),
+        _ => {
+            any_fal_backend_available(hermes_home)
+                || openai_api_key(config).is_some()
+                || xai_api_key(config).is_some()
+                || resolve_codex_access_token(hermes_home).is_ok()
+        }
+    }
 }
 
 fn any_fal_backend_available(hermes_home: &Path) -> bool {
@@ -1437,7 +1457,8 @@ fn resolve_xai_model(config: &ImageGenConfig) -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| config.xai.model.clone());
+        .or_else(|| config.xai.model.clone())
+        .or_else(|| config.model.clone());
     match candidate.as_deref() {
         Some(XAI_IMAGE_API_MODEL) => XAI_IMAGE_API_MODEL.to_string(),
         _ => XAI_IMAGE_DEFAULT_MODEL.to_string(),
