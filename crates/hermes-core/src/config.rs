@@ -6,17 +6,17 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::{
-    HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
-    get_active_auth_provider, get_auth_status_summary, get_provider_profile,
-    infer_api_mode_from_base_url, infer_provider_from_base_url, normalize_model_for_provider,
-    normalize_provider_alias, resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
+    HermesContext, HermesError, anthropic_base_url_supports_oauth, anthropic_oauth_default_headers,
+    anthropic_token_is_oauth, auto_provider_candidates, codex_cloudflare_headers,
+    get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
+    normalize_model_for_provider, normalize_provider_alias, resolve_anthropic_token,
+    resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
     resolve_copilot_runtime_credentials, resolve_google_gemini_runtime_credentials,
     resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
-    resolve_provider_api_mode, resolve_qwen_runtime_credentials, resolve_zai_base_url,
+    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
-const KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding";
 
 const BOOTSTRAP_DIRS: [&str; 5] = ["cron", "sessions", "logs", "logs/curator", "memories"];
 
@@ -101,16 +101,27 @@ impl LoadedConfig {
             .and_then(|mapping| mapping_string(mapping, "api_mode"))
             .map(|value| value.to_ascii_lowercase())
     }
+
+    pub fn configured_model_context_length(&self) -> Option<u64> {
+        self.raw
+            .get("model")
+            .and_then(Value::as_mapping)
+            .and_then(|mapping| mapping_u64(mapping, "context_length"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HermesConfig {
     #[serde(default = "default_model_value")]
     pub model: Value,
+    #[serde(default)]
+    pub fallback_providers: Vec<FallbackProviderConfig>,
     #[serde(default = "default_toolsets")]
     pub toolsets: Vec<String>,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub compression: CompressionConfig,
     #[serde(default)]
     pub delegation: DelegationConfig,
     #[serde(default)]
@@ -131,8 +142,10 @@ impl Default for HermesConfig {
     fn default() -> Self {
         Self {
             model: default_model_value(),
+            fallback_providers: Vec::new(),
             toolsets: default_toolsets(),
             agent: AgentConfig::default(),
+            compression: CompressionConfig::default(),
             delegation: DelegationConfig::default(),
             terminal: TerminalConfig::default(),
             display: DisplayConfig::default(),
@@ -148,6 +161,8 @@ impl Default for HermesConfig {
 pub struct AgentConfig {
     #[serde(default = "default_agent_max_turns")]
     pub max_turns: u64,
+    #[serde(default = "default_agent_api_max_retries")]
+    pub api_max_retries: u64,
     #[serde(default = "default_gateway_timeout")]
     pub gateway_timeout: u64,
 }
@@ -156,7 +171,47 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_turns: default_agent_max_turns(),
+            api_max_retries: default_agent_api_max_retries(),
             gateway_timeout: default_gateway_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FallbackProviderConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_mode: String,
+    #[serde(default)]
+    pub key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_compression_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_compression_target_ratio")]
+    pub target_ratio: f64,
+    #[serde(default = "default_compression_protect_last_n")]
+    pub protect_last_n: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            threshold: default_compression_threshold(),
+            target_ratio: default_compression_target_ratio(),
+            protect_last_n: default_compression_protect_last_n(),
         }
     }
 }
@@ -344,17 +399,7 @@ impl HermesContext {
     pub fn load_config_document(&self) -> Result<LoadedConfig, HermesError> {
         self.ensure_hermes_home()?;
 
-        let ignore_user_config = env::var("HERMES_IGNORE_USER_CONFIG")
-            .ok()
-            .as_deref()
-            .is_some_and(|value| value.trim() == "1");
-        let user_path = self.config_path();
-        let project_path = project_cli_config_path();
-        let path = if user_path.exists() && !ignore_user_config {
-            user_path
-        } else {
-            project_path
-        };
+        let path = self.config_path();
         let mut warnings = Vec::new();
         let mut merged =
             serde_yaml::to_value(HermesConfig::default()).expect("default config serialization");
@@ -430,27 +475,21 @@ impl HermesContext {
 
         let config_base_url = loaded.configured_model_base_url();
         let config_api_key = loaded.configured_model_api_key();
-        let config_provider = loaded
-            .configured_model_provider()
-            .map(|value| value.to_ascii_lowercase());
         let config_api_mode = loaded.configured_model_api_mode();
         let explicit_base_url = overrides.base_url.clone().and_then(non_empty_string);
         let explicit_api_key = overrides.api_key.clone().and_then(non_empty_string);
-        let override_api_mode = overrides
+        let requested_api_mode = overrides
             .api_mode
             .clone()
             .and_then(non_empty_string)
+            .or(config_api_mode.clone())
             .map(|value| value.to_ascii_lowercase());
         let candidate_base_url = explicit_base_url
             .clone()
             .or_else(|| config_base_url.clone());
 
         let provider = match requested_provider.as_str() {
-            "auto" => resolve_auto_provider(
-                &self.hermes_home(),
-                candidate_base_url.as_deref(),
-                explicit_api_key.as_deref(),
-            )?,
+            "auto" => resolve_auto_provider(candidate_base_url.as_deref())?,
             other => normalize_provider_alias(other),
         };
         let profile = get_provider_profile(&provider).ok_or_else(|| HermesError::State {
@@ -508,37 +547,8 @@ impl HermesContext {
         } else {
             None
         };
-
-        let mut api_key = explicit_api_key
-            .or(config_api_key)
-            .or_else(|| (provider == "copilot-acp").then(|| "copilot-acp".to_string()))
-            .or_else(|| copilot_runtime.as_ref().map(|creds| creds.api_key.clone()))
-            .or_else(|| {
-                minimax_oauth
-                    .as_ref()
-                    .map(|creds| creds.access_token.clone())
-            })
-            .or_else(|| nous_runtime.as_ref().map(|creds| creds.api_key.clone()))
-            .or_else(|| {
-                google_gemini
-                    .as_ref()
-                    .map(|creds| creds.access_token.clone())
-            })
-            .or_else(|| qwen_oauth.as_ref().map(|creds| creds.access_token.clone()))
-            .or_else(|| {
-                profile
-                    .api_key_env_vars()
-                    .find_map(|name| env::var(name).ok().and_then(non_empty_string))
-            })
-            .or_else(|| {
-                (provider == "openrouter")
-                    .then(|| env::var("OPENAI_API_KEY").ok().and_then(non_empty_string))
-                    .flatten()
-            })
-            .unwrap_or_default();
-        if api_key.is_empty() && provider == "openai-codex" {
-            api_key = resolve_codex_access_token(&self.hermes_home())?;
-        }
+        let anthropic_runtime_token =
+            (provider == "anthropic" && explicit_api_key.is_none()).then(resolve_anthropic_token);
 
         let base_url = explicit_base_url
             .or(config_base_url)
@@ -557,7 +567,7 @@ impl HermesContext {
                     .then(|| env::var("NOUS_INFERENCE_BASE_URL").ok().and_then(non_empty_string))
                     .flatten()
             })
-            .or_else(|| provider_default_base_url(&self.hermes_home(), &provider, profile, &api_key))
+            .or_else(|| non_empty_string(profile.base_url.to_string()))
             .ok_or_else(|| HermesError::State {
                 action: "resolving model runtime",
                 detail: format!(
@@ -565,6 +575,32 @@ impl HermesContext {
                 ),
             })?;
 
+        let mut api_key = explicit_api_key
+            .or(config_api_key)
+            .or_else(|| (provider == "copilot-acp").then(|| "copilot-acp".to_string()))
+            .or_else(|| copilot_runtime.as_ref().map(|creds| creds.api_key.clone()))
+            .or_else(|| {
+                minimax_oauth
+                    .as_ref()
+                    .map(|creds| creds.access_token.clone())
+            })
+            .or_else(|| nous_runtime.as_ref().map(|creds| creds.api_key.clone()))
+            .or_else(|| {
+                google_gemini
+                    .as_ref()
+                    .map(|creds| creds.access_token.clone())
+            })
+            .or_else(|| anthropic_runtime_token.clone().flatten())
+            .or_else(|| qwen_oauth.as_ref().map(|creds| creds.access_token.clone()))
+            .or_else(|| {
+                profile
+                    .api_key_env_vars()
+                    .find_map(|name| env::var(name).ok().and_then(non_empty_string))
+            })
+            .unwrap_or_default();
+        if api_key.is_empty() && provider == "openai-codex" {
+            api_key = resolve_codex_access_token(&self.hermes_home())?;
+        }
         if api_key.is_empty() && provider != "custom" && profile.auth_type != "aws_sdk" {
             let env_hint = profile.api_key_env_vars().collect::<Vec<_>>().join(", ");
             let detail = if provider == "openai-codex" {
@@ -588,10 +624,7 @@ impl HermesContext {
 
         let inferred_api_mode = infer_api_mode_from_base_url(&base_url).map(ToOwned::to_owned);
         let provider_api_mode = resolve_provider_api_mode(&provider, &model).map(ToOwned::to_owned);
-        let persisted_api_mode = config_api_mode
-            .filter(|_| should_honor_persisted_api_mode(&provider, config_provider.as_deref()));
-        let api_mode = override_api_mode
-            .or(persisted_api_mode)
+        let api_mode = requested_api_mode
             .or_else(|| {
                 matches!(inferred_api_mode.as_deref(), Some("anthropic_messages"))
                     .then(|| "anthropic_messages".to_string())
@@ -615,6 +648,14 @@ impl HermesContext {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<Vec<_>>();
+        let mut auth_type = profile.auth_type.to_string();
+        if provider == "anthropic"
+            && anthropic_base_url_supports_oauth(&base_url)
+            && anthropic_token_is_oauth(&api_key)
+        {
+            auth_type = "oauth_external".to_string();
+            default_headers.extend(anthropic_oauth_default_headers());
+        }
         if provider == "openai-codex" {
             default_headers.extend(codex_cloudflare_headers(&api_key));
         }
@@ -625,21 +666,13 @@ impl HermesContext {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             api_mode,
-            auth_type: profile.auth_type.to_string(),
+            auth_type,
             default_headers,
         })
     }
 }
 
-fn resolve_auto_provider(
-    hermes_home: &Path,
-    base_url: Option<&str>,
-    explicit_api_key: Option<&str>,
-) -> Result<String, HermesError> {
-    if explicit_api_key.and_then(non_empty_trimmed_ref).is_some() {
-        return Ok("openrouter".to_string());
-    }
-
+fn resolve_auto_provider(base_url: Option<&str>) -> Result<String, HermesError> {
     if let Some(base_url) = base_url.and_then(non_empty_trimmed_ref) {
         if let Some(profile) = infer_provider_from_base_url(base_url) {
             return Ok(profile.name.to_string());
@@ -647,31 +680,7 @@ fn resolve_auto_provider(
         return Ok("custom".to_string());
     }
 
-    if let Ok(Some(active_provider)) = get_active_auth_provider(hermes_home)
-        && get_provider_profile(&active_provider).is_some()
-        && get_auth_status_summary(hermes_home, &active_provider)
-            .map(|status| status.logged_in)
-            .unwrap_or(false)
-    {
-        return Ok(active_provider);
-    }
-
-    if env::var("OPENAI_API_KEY")
-        .ok()
-        .and_then(non_empty_string)
-        .is_some()
-        || env::var("OPENROUTER_API_KEY")
-            .ok()
-            .and_then(non_empty_string)
-            .is_some()
-    {
-        return Ok("openrouter".to_string());
-    }
-
     for profile in auto_provider_candidates() {
-        if matches!(profile.name, "openrouter" | "copilot") {
-            continue;
-        }
         if profile
             .api_key_env_vars()
             .any(|name| env::var(name).ok().and_then(non_empty_string).is_some())
@@ -680,46 +689,10 @@ fn resolve_auto_provider(
         }
     }
 
-    if env::var("AWS_ACCESS_KEY_ID")
-        .ok()
-        .and_then(non_empty_string)
-        .is_some()
-        || env::var("AWS_PROFILE")
-            .ok()
-            .and_then(non_empty_string)
-            .is_some()
-    {
-        return Ok("bedrock".to_string());
-    }
-
     Err(HermesError::State {
         action: "resolving model runtime",
         detail: "No provider credentials found. Set a supported provider API key, pass --provider, or pass --base-url/--api-key.".to_string(),
     })
-}
-
-fn provider_default_base_url(
-    hermes_home: &Path,
-    provider: &str,
-    profile: &crate::ProviderProfile,
-    api_key: &str,
-) -> Option<String> {
-    if matches!(provider, "kimi-coding" | "kimi-coding-cn")
-        && api_key.trim().starts_with("sk-kimi-")
-    {
-        return Some(KIMI_CODE_BASE_URL.to_string());
-    }
-    if provider == "zai" {
-        return Some(resolve_zai_base_url(
-            hermes_home,
-            api_key,
-            env::var("HERMES_ZAI_TIMEOUT_SECONDS")
-                .ok()
-                .and_then(|value| value.trim().parse::<f64>().ok())
-                .unwrap_or(8.0),
-        ));
-    }
-    non_empty_string(profile.base_url.to_string())
 }
 
 fn default_model_value() -> Value {
@@ -746,8 +719,24 @@ fn default_agent_max_turns() -> u64 {
     90
 }
 
+fn default_agent_api_max_retries() -> u64 {
+    3
+}
+
 fn default_gateway_timeout() -> u64 {
     1800
+}
+
+fn default_compression_threshold() -> f64 {
+    0.5
+}
+
+fn default_compression_target_ratio() -> f64 {
+    0.2
+}
+
+fn default_compression_protect_last_n() -> usize {
+    20
 }
 
 fn default_terminal_backend() -> String {
@@ -816,19 +805,6 @@ fn non_empty_trimmed_ref(value: &str) -> Option<&str> {
     }
 }
 
-fn should_honor_persisted_api_mode(provider: &str, configured_provider: Option<&str>) -> bool {
-    if matches!(provider, "opencode-zen" | "opencode-go") {
-        return false;
-    }
-    let Some(configured_provider) = configured_provider.and_then(non_empty_trimmed_ref) else {
-        return true;
-    };
-    if provider == "custom" {
-        return configured_provider == "custom" || configured_provider.starts_with("custom:");
-    }
-    normalize_provider_alias(configured_provider) == provider
-}
-
 fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
     mapping
         .get(Value::String(key.to_string()))
@@ -837,25 +813,21 @@ fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
         .and_then(non_empty_string)
 }
 
+fn mapping_u64(mapping: &Mapping, key: &str) -> Option<u64> {
+    let value = mapping.get(Value::String(key.to_string()))?;
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 fn create_dir_all(path: &Path) -> Result<(), HermesError> {
     fs::create_dir_all(path).map_err(|source| HermesError::Io {
         action: "creating",
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn project_cli_config_path() -> PathBuf {
-    if let Some(path) = env::var("HERMES_PROJECT_CLI_CONFIG")
-        .ok()
-        .and_then(non_empty_string)
-    {
-        return PathBuf::from(path);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("cli-config.yaml")
 }
 
 fn normalize_user_config(value: Value) -> Value {
@@ -1010,13 +982,9 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde_json::json;
-    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_context() -> (TempDir, HermesContext) {
         let temp = TempDir::new().expect("tempdir");
@@ -1038,19 +1006,6 @@ mod tests {
             .to_string(),
         );
         format!("{header}.{payload}.sig")
-    }
-
-    fn short_sha256(raw: &str, bytes: usize) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(raw.as_bytes());
-        let digest = hasher.finalize();
-        let take_bytes = bytes.max(1).min(digest.len());
-        let mut encoded = String::with_capacity(take_bytes * 2);
-        for byte in digest.iter().take(take_bytes) {
-            use std::fmt::Write as _;
-            let _ = write!(&mut encoded, "{byte:02x}");
-        }
-        encoded
     }
 
     #[test]
@@ -1103,58 +1058,6 @@ mod tests {
                 .expect("agent.max_turns"),
             &Value::Number(42.into())
         );
-    }
-
-    #[test]
-    fn load_config_document_ignores_user_config_when_requested() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(ctx.config_path(), "logging:\n  level: DEBUG\n").expect("write config");
-        unsafe { env::set_var("HERMES_IGNORE_USER_CONFIG", "1") };
-
-        let loaded = ctx.load_config_document().expect("load config");
-        assert_eq!(loaded.config.logging.level, "INFO");
-
-        unsafe { env::remove_var("HERMES_IGNORE_USER_CONFIG") };
-    }
-
-    #[test]
-    fn load_config_document_falls_back_to_project_cli_config() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let (temp, ctx) = test_context();
-        let project_config = temp.path().join("cli-config.yaml");
-        fs::write(&project_config, "logging:\n  level: DEBUG\n").expect("write project config");
-        unsafe { env::set_var("HERMES_PROJECT_CLI_CONFIG", &project_config) };
-
-        let loaded = ctx.load_config_document().expect("load config");
-        assert_eq!(loaded.path, project_config);
-        assert_eq!(loaded.config.logging.level, "DEBUG");
-
-        unsafe { env::remove_var("HERMES_PROJECT_CLI_CONFIG") };
-    }
-
-    #[test]
-    fn load_config_document_ignore_user_config_uses_project_fallback() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let (temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(ctx.config_path(), "logging:\n  level: ERROR\n").expect("write user config");
-        let project_config = temp.path().join("cli-config.yaml");
-        fs::write(&project_config, "logging:\n  level: DEBUG\n").expect("write project config");
-        unsafe {
-            env::set_var("HERMES_PROJECT_CLI_CONFIG", &project_config);
-            env::set_var("HERMES_IGNORE_USER_CONFIG", "1");
-        }
-
-        let loaded = ctx.load_config_document().expect("load config");
-        assert_eq!(loaded.path, project_config);
-        assert_eq!(loaded.config.logging.level, "DEBUG");
-
-        unsafe {
-            env::remove_var("HERMES_PROJECT_CLI_CONFIG");
-            env::remove_var("HERMES_IGNORE_USER_CONFIG");
-        };
     }
 
     #[test]
@@ -1305,408 +1208,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_runtime_ignores_stale_persisted_api_mode_after_provider_switch() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: claude-sonnet-4.6\n  provider: anthropic\n  api_mode: anthropic_messages\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    provider: Some("xai".to_string()),
-                    model: Some("grok-4".to_string()),
-                    api_key: Some("xai-test-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "xai");
-        assert_eq!(runtime.model, "grok-4");
-        assert_eq!(runtime.api_mode, "codex_responses");
-    }
-
-    #[test]
-    fn resolve_model_runtime_rederives_opencode_mode_despite_persisted_config() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: opencode-zen\n  base_url: https://opencode.ai/zen/v1\n  api_mode: anthropic_messages\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    api_key: Some("test-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "opencode-zen");
-        assert_eq!(runtime.model, "gpt-5.4");
-        assert_eq!(runtime.api_mode, "codex_responses");
-        assert_eq!(runtime.base_url, "https://opencode.ai/zen/v1");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_prefers_active_auth_provider_over_env_keys() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        unsafe {
-            env::set_var("OPENAI_API_KEY", "openai-test-key");
-        }
-        fs::write(
-            ctx.hermes_home().join("auth.json"),
-            json!({
-                "version": 1,
-                "active_provider": "openai-codex",
-                "providers": {
-                    "openai-codex": {
-                        "tokens": {
-                            "access_token": jwt_with_claims(i64::MAX / 2, "acct-codex"),
-                            "refresh_token": "refresh-token"
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write auth");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        unsafe {
-            env::remove_var("OPENAI_API_KEY");
-        }
-
-        assert_eq!(runtime.provider, "openai-codex");
-        assert_eq!(runtime.model, "gpt-5.4");
-        assert_eq!(runtime.api_mode, "codex_responses");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_routes_openai_api_keys_to_openrouter() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        unsafe {
-            env::set_var("OPENAI_API_KEY", "openai-test-key");
-        }
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        unsafe {
-            env::remove_var("OPENAI_API_KEY");
-        }
-
-        assert_eq!(runtime.provider, "openrouter");
-        assert_eq!(runtime.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(runtime.api_key, "openai-test-key");
-        assert_eq!(runtime.model, "openai/gpt-5.4");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_detects_bedrock_from_aws_profile() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        unsafe {
-            env::set_var("AWS_PROFILE", "dev-bedrock");
-        }
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: anthropic.claude-sonnet-4-6-20250514-v1:0\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        unsafe {
-            env::remove_var("AWS_PROFILE");
-        }
-
-        assert_eq!(runtime.provider, "bedrock");
-        assert_eq!(runtime.api_mode, "bedrock_converse");
-        assert_eq!(runtime.auth_type, "aws_sdk");
-        assert!(runtime.api_key.is_empty());
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_uses_explicit_api_key_as_openrouter_selection() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    api_key: Some("explicit-openrouter-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "openrouter");
-        assert_eq!(runtime.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(runtime.api_key, "explicit-openrouter-key");
-        assert_eq!(runtime.model, "openai/gpt-5.4");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_explicit_api_key_beats_active_auth_provider() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.hermes_home().join("auth.json"),
-            json!({
-                "version": 1,
-                "active_provider": "openai-codex",
-                "providers": {
-                    "openai-codex": {
-                        "tokens": {
-                            "access_token": jwt_with_claims(i64::MAX / 2, "acct-codex"),
-                            "refresh_token": "refresh-token"
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write auth");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    api_key: Some("explicit-openrouter-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "openrouter");
-        assert_eq!(runtime.api_key, "explicit-openrouter-key");
-        assert_eq!(runtime.model, "openai/gpt-5.4");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_explicit_api_key_keeps_custom_base_url_on_openrouter_path() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: gpt-5.4\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    base_url: Some("https://llm-proxy.example.test/v1".to_string()),
-                    api_key: Some("explicit-openrouter-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "openrouter");
-        assert_eq!(runtime.base_url, "https://llm-proxy.example.test/v1");
-        assert_eq!(runtime.api_key, "explicit-openrouter-key");
-        assert_eq!(runtime.model, "openai/gpt-5.4");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_explicit_api_key_preserves_url_based_api_mode_on_openrouter_path()
-    {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: claude-sonnet-4.6\n  provider: auto\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(
-                &loaded,
-                &ModelOverrides {
-                    base_url: Some("https://anthropic-proxy.example.test/anthropic".to_string()),
-                    api_key: Some("explicit-openrouter-key".to_string()),
-                    ..ModelOverrides::default()
-                },
-            )
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "openrouter");
-        assert_eq!(
-            runtime.base_url,
-            "https://anthropic-proxy.example.test/anthropic"
-        );
-        assert_eq!(runtime.api_key, "explicit-openrouter-key");
-        assert_eq!(runtime.model, "anthropic/claude-sonnet-4.6");
-        assert_eq!(runtime.api_mode, "anthropic_messages");
-    }
-
-    #[test]
-    fn resolve_model_runtime_routes_sk_kimi_keys_to_coding_endpoint() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: kimi-k2-turbo-preview\n  provider: kimi-coding\n  api_key: sk-kimi-test-key\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "kimi-coding");
-        assert_eq!(runtime.api_key, "sk-kimi-test-key");
-        assert_eq!(runtime.base_url, "https://api.kimi.com/coding");
-        assert_eq!(runtime.api_mode, "anthropic_messages");
-    }
-
-    #[test]
-    fn resolve_model_runtime_keeps_legacy_kimi_keys_on_moonshot_endpoint() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: kimi-k2-turbo-preview\n  provider: kimi-coding\n  api_key: legacy-moonshot-key\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "kimi-coding");
-        assert_eq!(runtime.api_key, "legacy-moonshot-key");
-        assert_eq!(runtime.base_url, "https://api.moonshot.ai/v1");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_auto_detects_kimi_coding_provider_from_base_url() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: kimi-k2-turbo-preview\n  provider: auto\n  base_url: https://api.kimi.com/coding\n  api_key: sk-kimi-test-key\n",
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "kimi-coding");
-        assert_eq!(runtime.base_url, "https://api.kimi.com/coding");
-        assert_eq!(runtime.api_mode, "anthropic_messages");
-        assert_eq!(runtime.api_key, "sk-kimi-test-key");
-    }
-
-    #[test]
-    fn resolve_model_runtime_uses_cached_zai_endpoint_from_auth_store() {
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        let api_key = "zai-runtime-key";
-        let detected_base_url = "https://api.z.ai/api/coding/paas/v4";
-        fs::write(
-            ctx.hermes_home().join("auth.json"),
-            json!({
-                "version": 1,
-                "providers": {
-                    "zai": {
-                        "detected_endpoint": {
-                            "base_url": detected_base_url,
-                            "endpoint_id": "coding-global",
-                            "model": "glm-5.1",
-                            "label": "Global (Coding Plan)",
-                            "key_hash": short_sha256(api_key, 8),
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write auth");
-        fs::write(
-            ctx.config_path(),
-            format!("model:\n  default: glm-5.1\n  provider: zai\n  api_key: {api_key}\n"),
-        )
-        .expect("write config");
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        assert_eq!(runtime.provider, "zai");
-        assert_eq!(runtime.base_url, detected_base_url);
-        assert_eq!(runtime.api_mode, "chat_completions");
-        assert_eq!(runtime.api_key, api_key);
-    }
-
-    #[test]
     fn resolve_model_runtime_keeps_anthropic_url_inference_ahead_of_model_routing() {
         let (_temp, ctx) = test_context();
         ctx.ensure_hermes_home().expect("ensure home");
@@ -1728,154 +1229,6 @@ mod tests {
             .expect("resolve runtime");
 
         assert_eq!(runtime.api_mode, "anthropic_messages");
-    }
-
-    #[test]
-    fn resolve_model_runtime_reads_anthropic_base_url_from_env() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let previous_base = env::var_os("ANTHROPIC_BASE_URL");
-
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: claude-sonnet-4.6\n  provider: anthropic\n  api_key: test-key\n",
-        )
-        .expect("write config");
-
-        unsafe { env::set_var("ANTHROPIC_BASE_URL", "https://claude-proxy.example.test/v1") };
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        match previous_base {
-            Some(value) => unsafe { env::set_var("ANTHROPIC_BASE_URL", value) },
-            None => unsafe { env::remove_var("ANTHROPIC_BASE_URL") },
-        }
-
-        assert_eq!(runtime.provider, "anthropic");
-        assert_eq!(runtime.base_url, "https://claude-proxy.example.test/v1");
-        assert_eq!(runtime.api_mode, "anthropic_messages");
-    }
-
-    #[test]
-    fn resolve_model_runtime_reads_xai_base_url_from_env() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let previous_base = env::var_os("XAI_BASE_URL");
-
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        fs::write(
-            ctx.config_path(),
-            "model:\n  default: grok-4\n  provider: xai\n  api_key: test-key\n",
-        )
-        .expect("write config");
-
-        unsafe { env::set_var("XAI_BASE_URL", "https://xai-proxy.example.test/v1") };
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        match previous_base {
-            Some(value) => unsafe { env::set_var("XAI_BASE_URL", value) },
-            None => unsafe { env::remove_var("XAI_BASE_URL") },
-        }
-
-        assert_eq!(runtime.provider, "xai");
-        assert_eq!(runtime.base_url, "https://xai-proxy.example.test/v1");
-        assert_eq!(runtime.api_mode, "codex_responses");
-    }
-
-    #[test]
-    fn resolve_model_runtime_prefers_glm_base_url_env_over_cached_zai_endpoint() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
-        let previous_base = env::var_os("GLM_BASE_URL");
-
-        let (_temp, ctx) = test_context();
-        ctx.ensure_hermes_home().expect("ensure home");
-        let api_key = "zai-runtime-key";
-        fs::write(
-            ctx.hermes_home().join("auth.json"),
-            json!({
-                "version": 1,
-                "providers": {
-                    "zai": {
-                        "detected_endpoint": {
-                            "base_url": "https://api.z.ai/api/coding/paas/v4",
-                            "endpoint_id": "coding-global",
-                            "model": "glm-5.1",
-                            "label": "Global (Coding Plan)",
-                            "key_hash": short_sha256(api_key, 8),
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .expect("write auth");
-        fs::write(
-            ctx.config_path(),
-            format!("model:\n  default: glm-5.1\n  provider: zai\n  api_key: {api_key}\n"),
-        )
-        .expect("write config");
-
-        unsafe { env::set_var("GLM_BASE_URL", "https://glm-proxy.example.test/v4") };
-
-        let loaded = ctx.load_config_document().expect("load config");
-        let runtime = ctx
-            .resolve_model_runtime(&loaded, &ModelOverrides::default())
-            .expect("resolve runtime");
-
-        match previous_base {
-            Some(value) => unsafe { env::set_var("GLM_BASE_URL", value) },
-            None => unsafe { env::remove_var("GLM_BASE_URL") },
-        }
-
-        assert_eq!(runtime.provider, "zai");
-        assert_eq!(runtime.base_url, "https://glm-proxy.example.test/v4");
-        assert_eq!(runtime.api_mode, "chat_completions");
-    }
-
-    #[test]
-    fn resolve_model_runtime_infers_codex_and_bedrock_modes_from_custom_urls() {
-        let cases = [
-            ("https://api.openai.com/v1", "codex_responses"),
-            ("https://api.x.ai/v1", "codex_responses"),
-            (
-                "https://bedrock-runtime.us-west-2.amazonaws.com",
-                "bedrock_converse",
-            ),
-        ];
-
-        for (base_url, expected_api_mode) in cases {
-            let (_temp, ctx) = test_context();
-            ctx.ensure_hermes_home().expect("ensure home");
-            fs::write(
-                ctx.config_path(),
-                format!(
-                    "model:\n  default: test-model\n  provider: custom\n  base_url: {base_url}\n"
-                ),
-            )
-            .expect("write config");
-
-            let loaded = ctx.load_config_document().expect("load config");
-            let runtime = ctx
-                .resolve_model_runtime(
-                    &loaded,
-                    &ModelOverrides {
-                        api_key: Some("test-key".to_string()),
-                        ..ModelOverrides::default()
-                    },
-                )
-                .expect("resolve runtime");
-
-            assert_eq!(runtime.provider, "custom");
-            assert_eq!(runtime.api_mode, expected_api_mode);
-        }
     }
 
     #[test]
@@ -1948,6 +1301,80 @@ mod tests {
         assert_eq!(runtime.api_mode, "chat_completions");
         assert_eq!(runtime.api_key, "google-runtime-token");
         assert_eq!(runtime.base_url, "cloudcode-pa://google");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_anthropic_runtime_credentials() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_path = env::var_os("HERMES_ANTHROPIC_CREDENTIALS_PATH");
+        let previous_token = env::var_os("ANTHROPIC_TOKEN");
+        let previous_cc = env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
+        let previous_api_key = env::var_os("ANTHROPIC_API_KEY");
+
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        let credentials_path = ctx.hermes_home().join("anthropic_credentials.json");
+        fs::write(
+            &credentials_path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "cc-anthropic-runtime-token",
+                    "refreshToken": "anthropic-runtime-refresh",
+                    "expiresAt": i64::MAX / 2,
+                    "scopes": ["user:inference"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: claude-sonnet-4.6\n  provider: anthropic\n",
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var("HERMES_ANTHROPIC_CREDENTIALS_PATH", &credentials_path);
+            env::remove_var("ANTHROPIC_TOKEN");
+            env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+            env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        match previous_path {
+            Some(value) => unsafe { env::set_var("HERMES_ANTHROPIC_CREDENTIALS_PATH", value) },
+            None => unsafe { env::remove_var("HERMES_ANTHROPIC_CREDENTIALS_PATH") },
+        }
+        match previous_token {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_TOKEN", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_TOKEN") },
+        }
+        match previous_cc {
+            Some(value) => unsafe { env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value) },
+            None => unsafe { env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") },
+        }
+        match previous_api_key {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_API_KEY", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_API_KEY") },
+        }
+
+        assert_eq!(runtime.provider, "anthropic");
+        assert_eq!(runtime.api_mode, "anthropic_messages");
+        assert_eq!(runtime.api_key, "cc-anthropic-runtime-token");
+        assert_eq!(runtime.auth_type, "oauth_external");
+        assert!(runtime.default_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("anthropic-beta") && value.contains("oauth-2025-04-20")
+        }));
+        assert!(
+            runtime
+                .default_headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-app") && value == "cli")
+        );
     }
 
     #[test]

@@ -17,7 +17,21 @@ use crate::{HermesError, providers::get_provider_profile};
 const AUTH_STORE_VERSION: i64 = 1;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_TOKEN_URL_ENV: &str = "HERMES_CODEX_OAUTH_TOKEN_URL";
 const CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_TOKEN_URL_ENV: &str = "HERMES_ANTHROPIC_OAUTH_TOKEN_URL";
+const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_TOKEN_URL_FALLBACK: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_CREDENTIALS_PATH_ENV: &str = "HERMES_ANTHROPIC_CREDENTIALS_PATH";
+const CLAUDE_CODE_USER_AGENT_FALLBACK: &str = "claude-cli/2.1.74 (external, cli)";
+const ANTHROPIC_ACCESS_TOKEN_REFRESH_SKEW_MS: i64 = 120_000;
+const ANTHROPIC_COMMON_BETAS: [&str; 3] = [
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+    "context-1m-2025-08-07",
+];
+const ANTHROPIC_OAUTH_ONLY_BETAS: [&str; 2] = ["claude-code-20250219", "oauth-2025-04-20"];
 const COPILOT_TOKEN_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const COPILOT_EDITOR_VERSION: &str = "vscode/1.104.1";
 const COPILOT_EXCHANGE_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
@@ -28,10 +42,9 @@ const DEFAULT_NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com
 const DEFAULT_NOUS_CLIENT_ID: &str = "hermes-cli";
 const DEFAULT_AGENT_KEY_MIN_TTL_SECONDS: i64 = 30 * 60;
 const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
-const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
-const DEFAULT_ZAI_TIMEOUT_SECONDS: f64 = 8.0;
 const GOOGLE_OAUTH_CLIENT_ID_ENV: &str = "HERMES_GEMINI_CLIENT_ID";
 const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
+const GOOGLE_OAUTH_TOKEN_URL_ENV: &str = "HERMES_GEMINI_TOKEN_URL";
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const GOOGLE_DEFAULT_CLIENT_ID: &str =
@@ -41,55 +54,13 @@ const MINIMAX_OAUTH_REFRESH_SKEW_SECONDS: i64 = 60;
 const DEFAULT_QWEN_BASE_URL: &str = "https://portal.qwen.ai/v1";
 const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_TOKEN_URL: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
+const QWEN_OAUTH_TOKEN_URL_ENV: &str = "HERMES_QWEN_OAUTH_TOKEN_URL";
 const QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
 const COPILOT_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 const COPILOT_CLASSIC_PAT_PREFIX: &str = "ghp_";
 const COPILOT_TOKEN_REFRESH_MARGIN_SECONDS: f64 = 120.0;
 
 static COPILOT_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ZaiEndpoint {
-    id: &'static str,
-    base_url: &'static str,
-    probe_models: &'static [&'static str],
-    label: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ZaiDetectedEndpoint {
-    id: &'static str,
-    base_url: &'static str,
-    model: &'static str,
-    label: &'static str,
-}
-
-const ZAI_ENDPOINTS: &[ZaiEndpoint] = &[
-    ZaiEndpoint {
-        id: "global",
-        base_url: "https://api.z.ai/api/paas/v4",
-        probe_models: &["glm-5"],
-        label: "Global",
-    },
-    ZaiEndpoint {
-        id: "cn",
-        base_url: "https://open.bigmodel.cn/api/paas/v4",
-        probe_models: &["glm-5"],
-        label: "China",
-    },
-    ZaiEndpoint {
-        id: "coding-global",
-        base_url: "https://api.z.ai/api/coding/paas/v4",
-        probe_models: &["glm-5.1", "glm-5v-turbo", "glm-4.7"],
-        label: "Global (Coding Plan)",
-    },
-    ZaiEndpoint {
-        id: "coding-cn",
-        base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
-        probe_models: &["glm-5.1", "glm-5v-turbo", "glm-4.7"],
-        label: "China (Coding Plan)",
-    },
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTokens {
@@ -215,6 +186,21 @@ pub fn clear_provider_auth_state(hermes_home: &Path, provider: &str) -> Result<b
     Ok(changed)
 }
 
+pub fn clear_provider_runtime_cache(provider: &str) -> bool {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "copilot" => {
+            if let Ok(mut cache) = copilot_token_cache().lock() {
+                let changed = !cache.is_empty();
+                cache.clear();
+                changed
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 pub fn get_auth_status_summary(
     hermes_home: &Path,
     provider: &str,
@@ -241,7 +227,67 @@ pub fn get_auth_status_summary(
 }
 
 pub fn resolve_codex_access_token(hermes_home: &Path) -> Result<String, HermesError> {
-    resolve_codex_access_token_with_refresh_url(hermes_home, CODEX_OAUTH_TOKEN_URL)
+    resolve_codex_access_token_with_refresh_url(hermes_home, &codex_oauth_token_url())
+}
+
+pub fn resolve_anthropic_token() -> Option<String> {
+    resolve_anthropic_token_with_client(&Client::new(), false)
+        .ok()
+        .flatten()
+}
+
+pub fn force_refresh_anthropic_token() -> Result<Option<String>, HermesError> {
+    resolve_anthropic_token_with_client(&Client::new(), true)
+}
+
+pub fn anthropic_token_is_oauth(token: &str) -> bool {
+    let trimmed = token.trim();
+    !trimmed.is_empty()
+        && ((trimmed.starts_with("sk-ant-") && !trimmed.starts_with("sk-ant-api"))
+            || trimmed.starts_with("eyJ")
+            || trimmed.starts_with("cc-"))
+}
+
+pub fn anthropic_base_url_supports_oauth(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host.eq_ignore_ascii_case("api.anthropic.com")
+                    || host.eq_ignore_ascii_case("localhost")
+                    || host == "127.0.0.1"
+                    || host == "::1"
+            })
+        })
+        .unwrap_or(false)
+}
+
+pub fn anthropic_oauth_default_headers() -> Vec<(String, String)> {
+    let mut betas = ANTHROPIC_COMMON_BETAS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    betas.extend(
+        ANTHROPIC_OAUTH_ONLY_BETAS
+            .iter()
+            .map(|value| (*value).to_string()),
+    );
+    vec![
+        ("anthropic-beta".to_string(), betas.join(",")),
+        (
+            "user-agent".to_string(),
+            CLAUDE_CODE_USER_AGENT_FALLBACK.to_string(),
+        ),
+        ("x-app".to_string(), "cli".to_string()),
+    ]
+}
+
+pub fn force_refresh_codex_access_token(hermes_home: &Path) -> Result<String, HermesError> {
+    resolve_codex_access_token_with_refresh_url_and_force(
+        hermes_home,
+        &codex_oauth_token_url(),
+        true,
+    )
 }
 
 pub fn codex_cloudflare_headers(access_token: &str) -> Vec<(String, String)> {
@@ -261,7 +307,21 @@ pub fn codex_cloudflare_headers(access_token: &str) -> Vec<(String, String)> {
 pub fn resolve_minimax_oauth_runtime_credentials(
     hermes_home: &Path,
 ) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
-    resolve_minimax_oauth_runtime_credentials_with_client(hermes_home, &Client::new())
+    resolve_minimax_oauth_runtime_credentials_with_client_and_force(
+        hermes_home,
+        &Client::new(),
+        false,
+    )
+}
+
+pub fn force_refresh_minimax_oauth_runtime_credentials(
+    hermes_home: &Path,
+) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
+    resolve_minimax_oauth_runtime_credentials_with_client_and_force(
+        hermes_home,
+        &Client::new(),
+        true,
+    )
 }
 
 pub fn resolve_copilot_acp_runtime_credentials() -> Result<CopilotAcpRuntimeCredentials, HermesError>
@@ -311,6 +371,21 @@ pub fn resolve_nous_runtime_credentials(
         min_key_ttl_seconds,
         timeout_seconds,
         &Client::new(),
+        false,
+    )
+}
+
+pub fn force_refresh_nous_runtime_credentials(
+    hermes_home: &Path,
+    min_key_ttl_seconds: i64,
+    timeout_seconds: f64,
+) -> Result<NousRuntimeCredentials, HermesError> {
+    resolve_nous_runtime_credentials_with_client(
+        hermes_home,
+        min_key_ttl_seconds,
+        timeout_seconds,
+        &Client::new(),
+        true,
     )
 }
 
@@ -321,25 +396,176 @@ pub fn resolve_nous_access_token(
     resolve_nous_access_token_with_client(hermes_home, timeout_seconds, &Client::new())
 }
 
-pub fn resolve_zai_base_url(hermes_home: &Path, api_key: &str, timeout_seconds: f64) -> String {
-    resolve_zai_base_url_with_client_and_endpoints(
-        hermes_home,
-        api_key,
+pub fn force_refresh_nous_credential_pool_entry(
+    entry: &serde_json::Map<String, Value>,
+    min_key_ttl_seconds: i64,
+    timeout_seconds: f64,
+) -> Result<serde_json::Map<String, Value>, HermesError> {
+    let min_key_ttl_seconds = if min_key_ttl_seconds > 0 {
+        min_key_ttl_seconds
+    } else {
+        DEFAULT_AGENT_KEY_MIN_TTL_SECONDS
+    }
+    .max(60);
+    let timeout_seconds = timeout_seconds.max(1.0);
+    let mut provider_state = entry.clone();
+    let portal_base_url = provider_state
+        .get("portal_base_url")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            env::var("HERMES_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .or_else(|| {
+            env::var("NOUS_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_NOUS_PORTAL_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let client_id = provider_state
+        .get("client_id")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| DEFAULT_NOUS_CLIENT_ID.to_string());
+    let mut inference_base_url = provider_state
+        .get("inference_base_url")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            provider_state
+                .get("base_url")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)
+        })
+        .or_else(|| {
+            env::var("NOUS_INFERENCE_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_NOUS_INFERENCE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let mut access_token = required_object_string(
+        &provider_state,
+        "access_token",
+        "refreshing Nous credential pool entry",
+    )?;
+    let refresh_token = provider_state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed);
+    let client = Client::new();
+
+    if let Some(current_refresh) = refresh_token.as_deref() {
+        let refreshed = refresh_nous_access_token(
+            &client,
+            &portal_base_url,
+            &client_id,
+            current_refresh,
+            timeout_seconds,
+        )?;
+        apply_nous_refresh(&mut provider_state, &refreshed, &mut inference_base_url);
+        access_token = refreshed.access_token;
+    }
+
+    let minted = mint_nous_agent_key(
+        &client,
+        &portal_base_url,
+        &access_token,
+        min_key_ttl_seconds,
         timeout_seconds,
-        DEFAULT_ZAI_BASE_URL,
-        &Client::new(),
-        ZAI_ENDPOINTS,
     )
+    .map_err(|error| HermesError::State {
+        action: "minting Nous agent key",
+        detail: error.detail,
+    })?;
+    apply_nous_agent_key(&mut provider_state, &minted, &mut inference_base_url);
+    provider_state.insert(
+        "portal_base_url".to_string(),
+        Value::String(portal_base_url),
+    );
+    provider_state.insert("client_id".to_string(), Value::String(client_id));
+    provider_state.insert(
+        "inference_base_url".to_string(),
+        Value::String(inference_base_url),
+    );
+    provider_state.insert("last_status".to_string(), Value::Null);
+    provider_state.insert("last_status_at".to_string(), Value::Null);
+    provider_state.insert("last_error_code".to_string(), Value::Null);
+    provider_state.insert("last_error_reason".to_string(), Value::Null);
+    provider_state.insert("last_error_message".to_string(), Value::Null);
+    provider_state.insert("last_error_reset_at".to_string(), Value::Null);
+
+    Ok(provider_state)
+}
+
+pub fn force_refresh_codex_credential_pool_entry(
+    entry: &serde_json::Map<String, Value>,
+) -> Result<serde_json::Map<String, Value>, HermesError> {
+    let mut provider_state = entry.clone();
+    let refresh_token = required_object_string(
+        &provider_state,
+        "refresh_token",
+        "refreshing Codex credential pool entry",
+    )?;
+    let refreshed = refresh_codex_tokens(&refresh_token, &codex_oauth_token_url())?;
+    provider_state.insert(
+        "access_token".to_string(),
+        Value::String(refreshed.access_token),
+    );
+    provider_state.insert(
+        "refresh_token".to_string(),
+        Value::String(refreshed.refresh_token),
+    );
+    provider_state.insert(
+        "auth_mode".to_string(),
+        Value::String("chatgpt".to_string()),
+    );
+    provider_state.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    );
+    provider_state.insert("last_status".to_string(), Value::Null);
+    provider_state.insert("last_status_at".to_string(), Value::Null);
+    provider_state.insert("last_error_code".to_string(), Value::Null);
+    provider_state.insert("last_error_reason".to_string(), Value::Null);
+    provider_state.insert("last_error_message".to_string(), Value::Null);
+    provider_state.insert("last_error_reset_at".to_string(), Value::Null);
+    Ok(provider_state)
 }
 
 pub fn resolve_google_gemini_runtime_credentials(
     hermes_home: &Path,
 ) -> Result<GoogleGeminiRuntimeCredentials, HermesError> {
-    resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
+    resolve_google_gemini_runtime_credentials_with_client_and_refresh_url_and_force(
         hermes_home,
         &Client::new(),
-        GOOGLE_OAUTH_TOKEN_URL,
+        &google_oauth_token_url(),
+        false,
     )
+}
+
+pub fn force_refresh_google_gemini_runtime_credentials(
+    hermes_home: &Path,
+) -> Result<GoogleGeminiRuntimeCredentials, HermesError> {
+    resolve_google_gemini_runtime_credentials_with_client_and_refresh_url_and_force(
+        hermes_home,
+        &Client::new(),
+        &google_oauth_token_url(),
+        true,
+    )
+}
+
+fn google_oauth_token_url() -> String {
+    env::var(GOOGLE_OAUTH_TOKEN_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| GOOGLE_OAUTH_TOKEN_URL.to_string())
 }
 
 pub fn resolve_qwen_runtime_credentials() -> Result<QwenRuntimeCredentials, HermesError> {
@@ -348,12 +574,39 @@ pub fn resolve_qwen_runtime_credentials() -> Result<QwenRuntimeCredentials, Herm
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty());
-    resolve_qwen_runtime_credentials_from_path(&auth_path, &Client::new(), base_url_override)
+    resolve_qwen_runtime_credentials_from_path_with_force(
+        &auth_path,
+        &Client::new(),
+        base_url_override,
+        false,
+    )
+}
+
+pub fn force_refresh_qwen_runtime_credentials() -> Result<QwenRuntimeCredentials, HermesError> {
+    let auth_path = qwen_cli_auth_path()?;
+    let base_url_override = std::env::var("HERMES_QWEN_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    resolve_qwen_runtime_credentials_from_path_with_force(
+        &auth_path,
+        &Client::new(),
+        base_url_override,
+        true,
+    )
 }
 
 fn resolve_codex_access_token_with_refresh_url(
     hermes_home: &Path,
     refresh_url: &str,
+) -> Result<String, HermesError> {
+    resolve_codex_access_token_with_refresh_url_and_force(hermes_home, refresh_url, false)
+}
+
+fn resolve_codex_access_token_with_refresh_url_and_force(
+    hermes_home: &Path,
+    refresh_url: &str,
+    force_refresh: bool,
 ) -> Result<String, HermesError> {
     let auth_path = hermes_home.join("auth.json");
     let mut auth_store = load_auth_store(&auth_path)?;
@@ -399,7 +652,7 @@ fn resolve_codex_access_token_with_refresh_url(
                     .to_string(),
         })?;
 
-    if !token_needs_refresh(&access_token) {
+    if !force_refresh && !token_needs_refresh(&access_token) {
         return Ok(access_token);
     }
 
@@ -408,9 +661,18 @@ fn resolve_codex_access_token_with_refresh_url(
     Ok(refreshed.access_token)
 }
 
-fn resolve_minimax_oauth_runtime_credentials_with_client(
+fn codex_oauth_token_url() -> String {
+    env::var(CODEX_OAUTH_TOKEN_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| CODEX_OAUTH_TOKEN_URL.to_string())
+}
+
+fn resolve_minimax_oauth_runtime_credentials_with_client_and_force(
     hermes_home: &Path,
     client: &Client,
+    force_refresh: bool,
 ) -> Result<MinimaxOAuthRuntimeCredentials, HermesError> {
     let auth_path = hermes_home.join("auth.json");
     let mut auth_store = load_auth_store(&auth_path)?;
@@ -441,7 +703,7 @@ fn resolve_minimax_oauth_runtime_credentials_with_client(
         .and_then(Value::as_str)
         .and_then(parse_rfc3339_epoch_seconds);
 
-    if !minimax_token_needs_refresh(expires_at) {
+    if !force_refresh && !minimax_token_needs_refresh(expires_at) {
         return Ok(MinimaxOAuthRuntimeCredentials {
             access_token,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -628,16 +890,11 @@ fn exchange_copilot_token(
 }
 
 fn copilot_token_fingerprint(raw_token: &str) -> String {
-    short_sha256(raw_token, 8)
-}
-
-fn short_sha256(raw: &str, bytes: usize) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(raw.as_bytes());
+    hasher.update(raw_token.as_bytes());
     let digest = hasher.finalize();
-    let take_bytes = bytes.max(1).min(digest.len());
-    let mut encoded = String::with_capacity(take_bytes * 2);
-    for byte in digest.iter().take(take_bytes) {
+    let mut encoded = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
         use std::fmt::Write as _;
         let _ = write!(&mut encoded, "{byte:02x}");
     }
@@ -687,6 +944,318 @@ fn qwen_cli_auth_path() -> Result<std::path::PathBuf, HermesError> {
         detail: "Could not determine the home directory for ~/.qwen/oauth_creds.json.".to_string(),
     })?;
     Ok(home.join(".qwen").join("oauth_creds.json"))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AnthropicCredentials {
+    path: std::path::PathBuf,
+    document: Value,
+    access_token: String,
+    refresh_token: String,
+    expires_at_ms: i64,
+}
+
+fn anthropic_credentials_path() -> Result<std::path::PathBuf, HermesError> {
+    if let Some(path) = env::var(ANTHROPIC_CREDENTIALS_PATH_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+    {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let home = dirs::home_dir().ok_or_else(|| HermesError::State {
+        action: "resolving Anthropic auth",
+        detail: format!(
+            "Could not determine the home directory for ~/.claude/.credentials.json. Set {ANTHROPIC_CREDENTIALS_PATH_ENV} to override."
+        ),
+    })?;
+    Ok(home.join(".claude").join(".credentials.json"))
+}
+
+fn load_anthropic_credentials() -> Result<Option<AnthropicCredentials>, HermesError> {
+    let path = anthropic_credentials_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).map_err(|source| HermesError::Io {
+        action: "reading",
+        path: path.clone(),
+        source,
+    })?;
+    let document = serde_json::from_str::<Value>(&raw).map_err(|error| HermesError::State {
+        action: "parsing Anthropic auth",
+        detail: format!("{}: {error}", path.display()),
+    })?;
+    let oauth = document
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .ok_or_else(|| HermesError::State {
+            action: "parsing Anthropic auth",
+            detail: format!("{} is missing claudeAiOauth credentials.", path.display()),
+        })?;
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if access_token.is_empty() {
+        return Ok(None);
+    }
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let expires_at_ms = oauth
+        .get("expiresAt")
+        .and_then(value_to_i64)
+        .unwrap_or_default();
+    Ok(Some(AnthropicCredentials {
+        path,
+        document,
+        access_token,
+        refresh_token,
+        expires_at_ms,
+    }))
+}
+
+fn anthropic_access_token_needs_refresh(expires_at_ms: i64) -> bool {
+    if expires_at_ms <= 0 {
+        return true;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    now_ms >= expires_at_ms - ANTHROPIC_ACCESS_TOKEN_REFRESH_SKEW_MS
+}
+
+fn anthropic_token_urls() -> Vec<String> {
+    if let Some(url) = env::var(ANTHROPIC_OAUTH_TOKEN_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+    {
+        return vec![url];
+    }
+    vec![
+        ANTHROPIC_OAUTH_TOKEN_URL.to_string(),
+        ANTHROPIC_OAUTH_TOKEN_URL_FALLBACK.to_string(),
+    ]
+}
+
+fn persist_anthropic_credentials(
+    credentials: &AnthropicCredentials,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at_ms: i64,
+) -> Result<(), HermesError> {
+    let mut document = credentials.document.clone();
+    if !document.is_object() {
+        document = json!({});
+    }
+    let scopes = document
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .and_then(|oauth| oauth.get("scopes"))
+        .cloned();
+    let mut oauth = serde_json::Map::new();
+    oauth.insert(
+        "accessToken".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    oauth.insert(
+        "refreshToken".to_string(),
+        Value::String(refresh_token.to_string()),
+    );
+    oauth.insert("expiresAt".to_string(), Value::Number(expires_at_ms.into()));
+    if let Some(scopes) = scopes {
+        oauth.insert("scopes".to_string(), scopes);
+    }
+    document
+        .as_object_mut()
+        .expect("object enforced above")
+        .insert("claudeAiOauth".to_string(), Value::Object(oauth));
+    if let Some(parent) = credentials.path.parent() {
+        fs::create_dir_all(parent).map_err(|source| HermesError::Io {
+            action: "creating",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(&document).map_err(|error| HermesError::State {
+        action: "serializing Anthropic auth",
+        detail: error.to_string(),
+    })?;
+    fs::write(&credentials.path, format!("{payload}\n")).map_err(|source| HermesError::Io {
+        action: "writing",
+        path: credentials.path.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&credentials.path)
+            .map_err(|source| HermesError::Io {
+                action: "reading metadata for",
+                path: credentials.path.clone(),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&credentials.path, permissions).map_err(|source| HermesError::Io {
+            action: "setting permissions on",
+            path: credentials.path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn refresh_anthropic_credentials(
+    client: &Client,
+    credentials: &AnthropicCredentials,
+) -> Result<String, HermesError> {
+    if credentials.refresh_token.trim().is_empty() {
+        return Err(HermesError::State {
+            action: "refreshing Anthropic auth",
+            detail:
+                "Claude Code credentials do not contain a refresh token. Re-run Claude Code login."
+                    .to_string(),
+        });
+    }
+
+    let mut last_error = None;
+    for refresh_url in anthropic_token_urls() {
+        let response = match client
+            .post(&refresh_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT_FALLBACK)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", credentials.refresh_token.as_str()),
+                ("client_id", ANTHROPIC_OAUTH_CLIENT_ID),
+            ])
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(HermesError::State {
+                    action: "refreshing Anthropic auth",
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response.text().map_err(|error| HermesError::State {
+            action: "reading Anthropic OAuth refresh response",
+            detail: error.to_string(),
+        })?;
+        if !status.is_success() {
+            last_error = Some(HermesError::State {
+                action: "refreshing Anthropic auth",
+                detail: format!("HTTP {}: {}", status.as_u16(), body.trim()),
+            });
+            continue;
+        }
+        let payload = serde_json::from_str::<Value>(&body).map_err(|error| HermesError::State {
+            action: "decoding Anthropic OAuth refresh response",
+            detail: format!("{error}: {body}"),
+        })?;
+        let access_token = payload
+            .get("access_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| HermesError::State {
+                action: "refreshing Anthropic auth",
+                detail: "Anthropic refresh response was missing access_token.".to_string(),
+            })?;
+        let refresh_token = payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&credentials.refresh_token);
+        let expires_in_seconds = payload
+            .get("expires_in")
+            .and_then(value_to_i64)
+            .filter(|value| *value > 0)
+            .unwrap_or(3600);
+        let expires_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0)
+            + expires_in_seconds * 1000;
+        persist_anthropic_credentials(credentials, access_token, refresh_token, expires_at_ms)?;
+        return Ok(access_token.to_string());
+    }
+
+    Err(last_error.unwrap_or_else(|| HermesError::State {
+        action: "refreshing Anthropic auth",
+        detail: "Anthropic OAuth refresh failed.".to_string(),
+    }))
+}
+
+fn resolve_anthropic_token_from_credentials(
+    client: &Client,
+    credentials: &AnthropicCredentials,
+    force_refresh: bool,
+) -> Result<Option<String>, HermesError> {
+    if !force_refresh && !anthropic_access_token_needs_refresh(credentials.expires_at_ms) {
+        return Ok(Some(credentials.access_token.clone()));
+    }
+    if credentials.refresh_token.trim().is_empty() {
+        return Ok((!force_refresh).then(|| credentials.access_token.clone()));
+    }
+    refresh_anthropic_credentials(client, credentials).map(Some)
+}
+
+fn resolve_anthropic_token_with_client(
+    client: &Client,
+    force_refresh: bool,
+) -> Result<Option<String>, HermesError> {
+    let credentials = load_anthropic_credentials()?;
+
+    for env_var in ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        if let Some(env_token) = env::var(env_var)
+            .ok()
+            .as_deref()
+            .and_then(non_empty_trimmed)
+        {
+            if anthropic_token_is_oauth(&env_token)
+                && let Some(credentials) = credentials.as_ref()
+                && let Some(preferred) =
+                    resolve_anthropic_token_from_credentials(client, credentials, force_refresh)?
+                && preferred != env_token
+            {
+                return Ok(Some(preferred));
+            }
+            if !force_refresh {
+                return Ok(Some(env_token));
+            }
+        }
+    }
+
+    if let Some(credentials) = credentials.as_ref()
+        && let Some(resolved) =
+            resolve_anthropic_token_from_credentials(client, credentials, force_refresh)?
+    {
+        return Ok(Some(resolved));
+    }
+
+    if !force_refresh {
+        return Ok(env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .as_deref()
+            .and_then(non_empty_trimmed));
+    }
+
+    Ok(None)
 }
 
 fn resolve_command_path(command: &str) -> Option<String> {
@@ -1500,6 +2069,7 @@ fn resolve_nous_runtime_credentials_with_client(
     min_key_ttl_seconds: i64,
     timeout_seconds: f64,
     client: &Client,
+    force_mint: bool,
 ) -> Result<NousRuntimeCredentials, HermesError> {
     let min_key_ttl_seconds = if min_key_ttl_seconds > 0 {
         min_key_ttl_seconds
@@ -1597,7 +2167,7 @@ fn resolve_nous_runtime_credentials_with_client(
         persist_nous_state_with_metadata(&auth_path, &mut auth_store)?;
     }
 
-    if !nous_agent_key_is_usable(&provider_state, min_key_ttl_seconds) {
+    if force_mint || !nous_agent_key_is_usable(&provider_state, min_key_ttl_seconds) {
         let minted = match mint_nous_agent_key(
             client,
             &portal_base_url,
@@ -1780,123 +2350,6 @@ fn resolve_nous_access_token_with_client(
     }
 
     Ok(access_token)
-}
-
-fn resolve_zai_base_url_with_client_and_endpoints(
-    hermes_home: &Path,
-    api_key: &str,
-    timeout_seconds: f64,
-    default_url: &str,
-    client: &Client,
-    endpoints: &[ZaiEndpoint],
-) -> String {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        return default_url.to_string();
-    }
-
-    let auth_path = hermes_home.join("auth.json");
-    let mut auth_store = load_auth_store(&auth_path).unwrap_or_else(|_| {
-        json!({
-            "version": AUTH_STORE_VERSION,
-            "providers": {},
-        })
-    });
-    let key_hash = short_sha256(api_key, 8);
-    if let Some(cached_url) = provider_state(&auth_store, "zai")
-        .and_then(|state| state.get("detected_endpoint"))
-        .and_then(Value::as_object)
-        .and_then(|cached| {
-            let base_url = cached
-                .get("base_url")
-                .and_then(Value::as_str)
-                .and_then(non_empty_trimmed)?;
-            let cached_hash = cached
-                .get("key_hash")
-                .and_then(Value::as_str)
-                .and_then(non_empty_trimmed)?;
-            (cached_hash == key_hash).then_some(base_url)
-        })
-    {
-        return cached_url;
-    }
-
-    let timeout_seconds = if timeout_seconds.is_finite() {
-        timeout_seconds.max(1.0)
-    } else {
-        DEFAULT_ZAI_TIMEOUT_SECONDS
-    };
-    if let Some(detected) =
-        detect_zai_endpoint_with_client(api_key, timeout_seconds, client, endpoints)
-    {
-        let _ = persist_zai_detected_endpoint(&auth_path, &mut auth_store, &key_hash, detected);
-        return detected.base_url.to_string();
-    }
-
-    default_url.to_string()
-}
-
-fn detect_zai_endpoint_with_client<'a>(
-    api_key: &str,
-    timeout_seconds: f64,
-    client: &Client,
-    endpoints: &'a [ZaiEndpoint],
-) -> Option<ZaiDetectedEndpoint> {
-    for endpoint in endpoints {
-        for model in endpoint.probe_models {
-            let response = match client
-                .post(format!("{}/chat/completions", endpoint.base_url))
-                .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
-                .header("Authorization", format!("Bearer {api_key}"))
-                .header("Content-Type", "application/json")
-                .json(&json!({
-                    "model": model,
-                    "stream": false,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}],
-                }))
-                .send()
-            {
-                Ok(response) => response,
-                Err(_) => continue,
-            };
-            if response.status().is_success() {
-                return Some(ZaiDetectedEndpoint {
-                    id: endpoint.id,
-                    base_url: endpoint.base_url,
-                    model,
-                    label: endpoint.label,
-                });
-            }
-        }
-    }
-    None
-}
-
-fn persist_zai_detected_endpoint(
-    auth_path: &Path,
-    auth_store: &mut Value,
-    key_hash: &str,
-    detected: ZaiDetectedEndpoint,
-) -> Result<(), HermesError> {
-    let mut state = provider_state(auth_store, "zai")
-        .cloned()
-        .unwrap_or_default();
-    state.insert(
-        "detected_endpoint".to_string(),
-        json!({
-            "base_url": detected.base_url,
-            "endpoint_id": detected.id,
-            "model": detected.model,
-            "label": detected.label,
-            "key_hash": key_hash,
-        }),
-    );
-    replace_provider_state(auth_store, "zai", &state)?;
-    if let Some(root) = auth_store.as_object_mut() {
-        root.insert("version".to_string(), Value::from(AUTH_STORE_VERSION));
-    }
-    save_auth_store_json(auth_path, auth_store)
 }
 
 fn refresh_nous_access_token(
@@ -2312,14 +2765,15 @@ impl GoogleOAuthState {
     }
 }
 
-fn resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
+fn resolve_google_gemini_runtime_credentials_with_client_and_refresh_url_and_force(
     hermes_home: &Path,
     client: &Client,
     refresh_url: &str,
+    force_refresh: bool,
 ) -> Result<GoogleGeminiRuntimeCredentials, HermesError> {
     let auth_path = google_oauth_path(hermes_home);
     let mut state = load_google_state(&auth_path)?;
-    if google_access_token_needs_refresh(&state) {
+    if force_refresh || google_access_token_needs_refresh(&state) {
         state = refresh_google_state(client, &auth_path, &state, refresh_url)?;
     }
     if state.access_token.trim().is_empty() {
@@ -2502,12 +2956,35 @@ fn resolve_qwen_runtime_credentials_from_path(
     client: &Client,
     base_url_override: Option<String>,
 ) -> Result<QwenRuntimeCredentials, HermesError> {
+    resolve_qwen_runtime_credentials_from_path_with_force(
+        auth_path,
+        client,
+        base_url_override,
+        false,
+    )
+}
+
+fn resolve_qwen_runtime_credentials_from_path_with_force(
+    auth_path: &Path,
+    client: &Client,
+    base_url_override: Option<String>,
+    force_refresh: bool,
+) -> Result<QwenRuntimeCredentials, HermesError> {
     resolve_qwen_runtime_credentials_from_path_with_refresh_url(
         auth_path,
         client,
         base_url_override,
-        QWEN_OAUTH_TOKEN_URL,
+        &qwen_oauth_token_url(),
+        force_refresh,
     )
+}
+
+fn qwen_oauth_token_url() -> String {
+    env::var(QWEN_OAUTH_TOKEN_URL_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| QWEN_OAUTH_TOKEN_URL.to_string())
 }
 
 fn resolve_qwen_runtime_credentials_from_path_with_refresh_url(
@@ -2515,9 +2992,11 @@ fn resolve_qwen_runtime_credentials_from_path_with_refresh_url(
     client: &Client,
     base_url_override: Option<String>,
     refresh_url: &str,
+    force_refresh: bool,
 ) -> Result<QwenRuntimeCredentials, HermesError> {
     let mut tokens = load_qwen_tokens(auth_path)?;
-    let should_refresh = qwen_access_token_needs_refresh(tokens.get("expiry_date"));
+    let should_refresh =
+        force_refresh || qwen_access_token_needs_refresh(tokens.get("expiry_date"));
     if should_refresh {
         tokens = refresh_qwen_tokens(client, auth_path, &tokens, refresh_url)?;
     }
@@ -2793,50 +3272,7 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::thread::JoinHandle;
     use tempfile::TempDir;
-
-    fn spawn_zai_probe_server(statuses: Vec<u16>) -> (String, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for status in statuses {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                loop {
-                    let read = stream.read(&mut buffer).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request_text = String::from_utf8_lossy(&request);
-                assert!(request_text.starts_with("POST /chat/completions "));
-                let body = if status == 200 {
-                    json!({"id": "probe-ok"}).to_string()
-                } else {
-                    json!({"error": "probe-failed"}).to_string()
-                };
-                let reason = match status {
-                    200 => "OK",
-                    401 => "Unauthorized",
-                    404 => "Not Found",
-                    _ => "Error",
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-        });
-        (format!("http://{addr}"), server)
-    }
 
     fn jwt_with_claims(exp: i64, account_id: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2979,6 +3415,163 @@ mod tests {
     }
 
     #[test]
+    fn force_refresh_codex_access_token_refreshes_even_when_token_is_fresh() {
+        let temp = TempDir::new().unwrap();
+        let fresh = jwt_with_claims(i64::MAX / 2, "acct-fresh");
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": fresh,
+                            "refresh_token": "refresh-force",
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let refreshed = jwt_with_claims(i64::MAX / 2, "acct-force");
+        let refreshed_for_server = refreshed.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=refresh-force"));
+
+            let body = json!({
+                "access_token": refreshed_for_server,
+                "refresh_token": "refresh-force-new",
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let resolved = resolve_codex_access_token_with_refresh_url_and_force(
+            temp.path(),
+            &format!("http://{addr}/token"),
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved, refreshed);
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["providers"]["openai-codex"]["tokens"]["refresh_token"],
+            "refresh-force-new"
+        );
+    }
+
+    #[test]
+    fn force_refresh_codex_credential_pool_entry_refreshes_even_when_token_is_fresh() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_refresh_url = env::var_os("HERMES_CODEX_OAUTH_TOKEN_URL");
+        let fresh = jwt_with_claims(i64::MAX / 2, "acct-pool-stale");
+        let refreshed = jwt_with_claims(i64::MAX / 2, "acct-pool-fresh");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let refreshed_for_server = refreshed.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=pool-refresh-old"));
+
+            let body = json!({
+                "access_token": refreshed_for_server,
+                "refresh_token": "pool-refresh-new",
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        unsafe {
+            env::set_var(
+                "HERMES_CODEX_OAUTH_TOKEN_URL",
+                format!("http://{addr}/token"),
+            );
+        }
+
+        let refreshed_entry = force_refresh_codex_credential_pool_entry(
+            &json!({
+                "id": "pool-entry",
+                "priority": 1,
+                "access_token": fresh,
+                "refresh_token": "pool-refresh-old",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "last_status": "exhausted",
+                "last_error_code": 401,
+                "last_error_reset_at": 9999999999_f64,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        match previous_refresh_url {
+            Some(value) => unsafe { env::set_var("HERMES_CODEX_OAUTH_TOKEN_URL", value) },
+            None => unsafe { env::remove_var("HERMES_CODEX_OAUTH_TOKEN_URL") },
+        }
+
+        assert_eq!(refreshed_entry["access_token"], refreshed);
+        assert_eq!(refreshed_entry["refresh_token"], "pool-refresh-new");
+        assert_eq!(refreshed_entry["auth_mode"], "chatgpt");
+        assert!(refreshed_entry["last_refresh"].as_str().is_some());
+        assert!(refreshed_entry["last_status"].is_null());
+        assert!(refreshed_entry["last_error_code"].is_null());
+        assert!(refreshed_entry["last_error_reset_at"].is_null());
+    }
+
+    #[test]
     fn resolve_minimax_oauth_runtime_credentials_reads_fresh_state() {
         let temp = TempDir::new().unwrap();
         fs::write(
@@ -3036,31 +3629,6 @@ mod tests {
             "https://inference-api.nousresearch.com/v1"
         );
         assert_eq!(resolved.expires_at.as_deref(), Some("2999-01-02T00:00:00Z"));
-    }
-
-    #[test]
-    fn resolve_nous_access_token_reads_fresh_token_from_auth_store() {
-        let temp = TempDir::new().unwrap();
-        fs::write(
-            temp.path().join("auth.json"),
-            json!({
-                "version": 1,
-                "providers": {
-                    "nous": {
-                        "access_token": "nous-access",
-                        "refresh_token": "nous-refresh",
-                        "portal_base_url": "https://portal.nousresearch.com",
-                        "client_id": "hermes-cli",
-                        "expires_at": "2999-01-01T00:00:00Z"
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let resolved = resolve_nous_access_token(temp.path(), 15.0).unwrap();
-        assert_eq!(resolved, "nous-access");
     }
 
     #[test]
@@ -3183,7 +3751,8 @@ mod tests {
 
         let client = Client::builder().build().unwrap();
         let resolved =
-            resolve_nous_runtime_credentials_with_client(temp.path(), 1800, 15.0, &client).unwrap();
+            resolve_nous_runtime_credentials_with_client(temp.path(), 1800, 15.0, &client, false)
+                .unwrap();
         server.join().unwrap();
 
         assert_eq!(resolved.api_key, "agent-key-new");
@@ -3207,7 +3776,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_nous_access_token_refreshes_expired_token_without_minting_agent_key() {
+    fn force_refresh_nous_runtime_credentials_mints_even_when_existing_key_is_usable() {
         let temp = TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3217,11 +3786,14 @@ mod tests {
                 "version": 1,
                 "providers": {
                     "nous": {
-                        "access_token": "stale-access",
-                        "refresh_token": "refresh-old",
+                        "access_token": "stable-access",
+                        "refresh_token": "refresh-stable",
                         "portal_base_url": format!("http://{addr}"),
+                        "inference_base_url": format!("http://{addr}/v1"),
                         "client_id": "hermes-cli",
-                        "expires_at": "2000-01-01T00:00:00Z"
+                        "expires_at": "2999-01-01T00:00:00Z",
+                        "agent_key": "agent-key-old",
+                        "agent_key_expires_at": "2999-01-02T00:00:00Z"
                     }
                 }
             })
@@ -3266,16 +3838,21 @@ mod tests {
             }
 
             let request_text = String::from_utf8_lossy(&request);
-            assert!(request_text.starts_with("POST /oauth/token "));
-            assert!(request_text.contains("grant_type=refresh_token"));
-            assert!(request_text.contains("refresh_token=refresh-old"));
+            assert!(request_text.starts_with("POST /api/oauth/agent-key "));
+            assert!(
+                request_text
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer stable-access")
+            );
+            assert!(request_text.contains("\"min_ttl_seconds\":1800"));
 
             let body = json!({
-                "access_token": "access-new",
-                "refresh_token": "refresh-new",
-                "token_type": "Bearer",
-                "scope": "inference:mint_agent_key",
-                "expires_in": 3600
+                "api_key": "agent-key-forced",
+                "key_id": "key-force",
+                "expires_at": "2999-01-03T00:00:00Z",
+                "expires_in": 7200,
+                "inference_base_url": format!("http://{addr}/minted/v1"),
+                "reused": false
             })
             .to_string();
             let response = format!(
@@ -3286,20 +3863,23 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
 
-        let client = Client::builder().build().unwrap();
-        let resolved = resolve_nous_access_token_with_client(temp.path(), 15.0, &client).unwrap();
+        let resolved = force_refresh_nous_runtime_credentials(temp.path(), 1800, 15.0).unwrap();
         server.join().unwrap();
 
-        assert_eq!(resolved, "access-new");
-
+        assert_eq!(resolved.api_key, "agent-key-forced");
+        assert_eq!(resolved.base_url, format!("http://{addr}/minted/v1"));
         let persisted = serde_json::from_str::<Value>(
             &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
         )
         .unwrap();
-        let state = &persisted["providers"]["nous"];
-        assert_eq!(state["access_token"], "access-new");
-        assert_eq!(state["refresh_token"], "refresh-new");
-        assert!(state.get("agent_key").is_none());
+        assert_eq!(
+            persisted["providers"]["nous"]["agent_key"],
+            "agent-key-forced"
+        );
+        assert_eq!(
+            persisted["providers"]["nous"]["inference_base_url"],
+            format!("http://{addr}/minted/v1")
+        );
     }
 
     #[test]
@@ -3508,6 +4088,180 @@ mod tests {
     }
 
     #[test]
+    fn resolve_anthropic_token_prefers_refreshable_credentials_over_static_env_oauth_token() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_token = env::var_os("ANTHROPIC_TOKEN");
+        let previous_cc = env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
+        let previous_api_key = env::var_os("ANTHROPIC_API_KEY");
+        let previous_path = env::var_os(ANTHROPIC_CREDENTIALS_PATH_ENV);
+
+        let temp = TempDir::new().unwrap();
+        let credentials_path = temp.path().join(".credentials.json");
+        fs::write(
+            &credentials_path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "anthropic-file-token",
+                    "refreshToken": "anthropic-file-refresh",
+                    "expiresAt": i64::MAX / 2,
+                    "scopes": ["user:inference"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var(ANTHROPIC_CREDENTIALS_PATH_ENV, &credentials_path);
+            env::set_var("ANTHROPIC_TOKEN", "sk-ant-env-stale");
+            env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+            env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        let resolved = resolve_anthropic_token().unwrap();
+
+        match previous_token {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_TOKEN", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_TOKEN") },
+        }
+        match previous_cc {
+            Some(value) => unsafe { env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value) },
+            None => unsafe { env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") },
+        }
+        match previous_api_key {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_API_KEY", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_API_KEY") },
+        }
+        match previous_path {
+            Some(value) => unsafe { env::set_var(ANTHROPIC_CREDENTIALS_PATH_ENV, value) },
+            None => unsafe { env::remove_var(ANTHROPIC_CREDENTIALS_PATH_ENV) },
+        }
+
+        assert_eq!(resolved, "anthropic-file-token");
+    }
+
+    #[test]
+    fn force_refresh_anthropic_token_refreshes_even_when_token_is_fresh() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_token = env::var_os("ANTHROPIC_TOKEN");
+        let previous_cc = env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
+        let previous_api_key = env::var_os("ANTHROPIC_API_KEY");
+        let previous_path = env::var_os(ANTHROPIC_CREDENTIALS_PATH_ENV);
+        let previous_refresh_url = env::var_os(ANTHROPIC_OAUTH_TOKEN_URL_ENV);
+
+        let temp = TempDir::new().unwrap();
+        let credentials_path = temp.path().join(".credentials.json");
+        fs::write(
+            &credentials_path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "anthropic-old-token",
+                    "refreshToken": "anthropic-refresh-old",
+                    "expiresAt": i64::MAX / 2,
+                    "scopes": ["user:inference", "user:profile"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            let request_lower = request_text.to_ascii_lowercase();
+            assert!(request_text.starts_with("POST /oauth/token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=anthropic-refresh-old"));
+            assert!(request_text.contains(&format!("client_id={ANTHROPIC_OAUTH_CLIENT_ID}")));
+            assert!(request_lower.contains(&format!(
+                "user-agent: {}",
+                CLAUDE_CODE_USER_AGENT_FALLBACK.to_ascii_lowercase()
+            )));
+
+            let body = json!({
+                "access_token": "anthropic-new-token",
+                "refresh_token": "anthropic-refresh-new",
+                "expires_in": 7200,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        unsafe {
+            env::set_var(ANTHROPIC_CREDENTIALS_PATH_ENV, &credentials_path);
+            env::set_var(
+                ANTHROPIC_OAUTH_TOKEN_URL_ENV,
+                format!("http://{addr}/oauth/token"),
+            );
+            env::remove_var("ANTHROPIC_TOKEN");
+            env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+            env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_anthropic_token_with_client(&client, true)
+            .unwrap()
+            .unwrap();
+        server.join().unwrap();
+
+        match previous_token {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_TOKEN", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_TOKEN") },
+        }
+        match previous_cc {
+            Some(value) => unsafe { env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value) },
+            None => unsafe { env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") },
+        }
+        match previous_api_key {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_API_KEY", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_API_KEY") },
+        }
+        match previous_path {
+            Some(value) => unsafe { env::set_var(ANTHROPIC_CREDENTIALS_PATH_ENV, value) },
+            None => unsafe { env::remove_var(ANTHROPIC_CREDENTIALS_PATH_ENV) },
+        }
+        match previous_refresh_url {
+            Some(value) => unsafe { env::set_var(ANTHROPIC_OAUTH_TOKEN_URL_ENV, value) },
+            None => unsafe { env::remove_var(ANTHROPIC_OAUTH_TOKEN_URL_ENV) },
+        }
+
+        assert_eq!(resolved, "anthropic-new-token");
+        let persisted =
+            serde_json::from_str::<Value>(&fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["claudeAiOauth"]["accessToken"],
+            "anthropic-new-token"
+        );
+        assert_eq!(
+            persisted["claudeAiOauth"]["refreshToken"],
+            "anthropic-refresh-new"
+        );
+        assert_eq!(
+            persisted["claudeAiOauth"]["scopes"],
+            json!(["user:inference", "user:profile"])
+        );
+    }
+
+    #[test]
     fn resolve_google_gemini_runtime_credentials_reads_fresh_state() {
         let temp = TempDir::new().unwrap();
         let auth_dir = temp.path().join("auth");
@@ -3589,12 +4343,14 @@ mod tests {
         });
 
         let client = Client::builder().build().unwrap();
-        let resolved = resolve_google_gemini_runtime_credentials_with_client_and_refresh_url(
-            temp.path(),
-            &client,
-            &format!("http://{addr}/token"),
-        )
-        .unwrap();
+        let resolved =
+            resolve_google_gemini_runtime_credentials_with_client_and_refresh_url_and_force(
+                temp.path(),
+                &client,
+                &format!("http://{addr}/token"),
+                false,
+            )
+            .unwrap();
         server.join().unwrap();
 
         assert_eq!(resolved.access_token, "google-new");
@@ -3609,6 +4365,82 @@ mod tests {
         assert_eq!(
             persisted["refresh"],
             "google-refresh-new|proj-old|managed-old"
+        );
+    }
+
+    #[test]
+    fn force_refresh_google_gemini_runtime_credentials_refreshes_even_when_token_is_fresh() {
+        let temp = TempDir::new().unwrap();
+        let auth_dir = temp.path().join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("google_oauth.json"),
+            json!({
+                "refresh": "google-refresh-old|proj-old|managed-old",
+                "access": "google-old",
+                "expires": i64::MAX / 2,
+                "email": "dev@example.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=google-refresh-old"));
+
+            let body = json!({
+                "access_token": "google-force-new",
+                "refresh_token": "google-force-refresh",
+                "expires_in": 7200,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved =
+            resolve_google_gemini_runtime_credentials_with_client_and_refresh_url_and_force(
+                temp.path(),
+                &client,
+                &format!("http://{addr}/token"),
+                true,
+            )
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.access_token, "google-force-new");
+        assert_eq!(resolved.refresh_token, "google-force-refresh");
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(auth_dir.join("google_oauth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["access"], "google-force-new");
+        assert_eq!(
+            persisted["refresh"],
+            "google-force-refresh|proj-old|managed-old"
         );
     }
 
@@ -3687,6 +4519,87 @@ mod tests {
         assert_eq!(
             persisted["providers"]["minimax-oauth"]["access_token"],
             "mini-new"
+        );
+    }
+
+    #[test]
+    fn force_refresh_minimax_oauth_runtime_credentials_refreshes_even_when_token_is_fresh() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "minimax-oauth": {
+                        "access_token": "mini-old",
+                        "refresh_token": "refresh-old",
+                        "portal_base_url": format!("http://{addr}"),
+                        "inference_base_url": "https://api.minimaxi.com/anthropic",
+                        "client_id": "client-mini",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /oauth/token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=refresh-old"));
+
+            let body = json!({
+                "status": "success",
+                "access_token": "mini-force-new",
+                "refresh_token": "refresh-force-new",
+                "expired_in": 3600,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let resolved = resolve_minimax_oauth_runtime_credentials_with_client_and_force(
+            temp.path(),
+            &Client::new(),
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.access_token, "mini-force-new");
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["providers"]["minimax-oauth"]["access_token"],
+            "mini-force-new"
+        );
+        assert_eq!(
+            persisted["providers"]["minimax-oauth"]["refresh_token"],
+            "refresh-force-new"
         );
     }
 
@@ -3789,6 +4702,7 @@ mod tests {
             &client,
             Some("http://127.0.0.1:18000/v1".to_string()),
             &format!("http://{addr}/oauth2/token"),
+            false,
         )
         .unwrap();
         server.join().unwrap();
@@ -3798,6 +4712,76 @@ mod tests {
             serde_json::from_str::<Value>(&fs::read_to_string(&auth_path).unwrap()).unwrap();
         assert_eq!(persisted["access_token"], "qwen-new");
         assert_eq!(persisted["refresh_token"], "qwen-refresh-new");
+    }
+
+    #[test]
+    fn force_refresh_qwen_runtime_credentials_refreshes_even_when_token_is_fresh() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("oauth_creds.json");
+        fs::write(
+            &auth_path,
+            json!({
+                "access_token": "qwen-old",
+                "refresh_token": "qwen-refresh-old",
+                "token_type": "Bearer",
+                "resource_url": "portal.qwen.ai",
+                "expiry_date": i64::MAX / 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /oauth2/token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=qwen-refresh-old"));
+
+            let body = json!({
+                "access_token": "qwen-force-new",
+                "refresh_token": "qwen-force-refresh",
+                "expires_in": 7200,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_qwen_runtime_credentials_from_path_with_refresh_url(
+            &auth_path,
+            &client,
+            Some("http://127.0.0.1:18000/v1".to_string()),
+            &format!("http://{addr}/oauth2/token"),
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved.access_token, "qwen-force-new");
+        let persisted =
+            serde_json::from_str::<Value>(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(persisted["access_token"], "qwen-force-new");
+        assert_eq!(persisted["refresh_token"], "qwen-force-refresh");
     }
 
     #[test]
@@ -3874,129 +4858,5 @@ mod tests {
         assert!(persisted["credential_pool"]["google-gemini-cli"].is_null());
         assert!(persisted["active_provider"].is_null());
         assert!(!temp.path().join("auth").join("google_oauth.json").exists());
-    }
-
-    #[test]
-    fn resolve_zai_base_url_uses_cached_endpoint_for_matching_key() {
-        let temp = TempDir::new().unwrap();
-        let api_key = "zai-cached-key";
-        let cached_url = "https://cached.z.ai/api/paas/v4";
-        fs::write(
-            temp.path().join("auth.json"),
-            json!({
-                "version": 1,
-                "providers": {
-                    "zai": {
-                        "detected_endpoint": {
-                            "base_url": cached_url,
-                            "endpoint_id": "cached",
-                            "model": "glm-5",
-                            "label": "Cached",
-                            "key_hash": short_sha256(api_key, 8),
-                        }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let client = Client::builder().build().unwrap();
-        let resolved = resolve_zai_base_url_with_client_and_endpoints(
-            temp.path(),
-            api_key,
-            1.0,
-            DEFAULT_ZAI_BASE_URL,
-            &client,
-            &[ZaiEndpoint {
-                id: "unreachable",
-                base_url: "http://127.0.0.1:1",
-                probe_models: &["glm-5"],
-                label: "Unreachable",
-            }],
-        );
-
-        assert_eq!(resolved, cached_url);
-    }
-
-    #[test]
-    fn resolve_zai_base_url_continues_after_probe_error_and_persists_success() {
-        let temp = TempDir::new().unwrap();
-        let api_key = "zai-probe-key";
-        let (working_base_url, server) = spawn_zai_probe_server(vec![200]);
-        let working_base_url_static = Box::leak(working_base_url.clone().into_boxed_str());
-        let client = Client::builder().build().unwrap();
-
-        let resolved = resolve_zai_base_url_with_client_and_endpoints(
-            temp.path(),
-            api_key,
-            1.0,
-            DEFAULT_ZAI_BASE_URL,
-            &client,
-            &[
-                ZaiEndpoint {
-                    id: "unreachable",
-                    base_url: "http://127.0.0.1:1",
-                    probe_models: &["glm-5"],
-                    label: "Unreachable",
-                },
-                ZaiEndpoint {
-                    id: "working",
-                    base_url: working_base_url_static,
-                    probe_models: &["glm-5"],
-                    label: "Working",
-                },
-            ],
-        );
-        server.join().unwrap();
-
-        assert_eq!(resolved, working_base_url);
-        let persisted = serde_json::from_str::<Value>(
-            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            persisted["providers"]["zai"]["detected_endpoint"]["base_url"],
-            working_base_url
-        );
-        assert_eq!(
-            persisted["providers"]["zai"]["detected_endpoint"]["endpoint_id"],
-            "working"
-        );
-        assert_eq!(
-            persisted["providers"]["zai"]["detected_endpoint"]["model"],
-            "glm-5"
-        );
-        assert_eq!(
-            persisted["providers"]["zai"]["detected_endpoint"]["key_hash"],
-            short_sha256(api_key, 8)
-        );
-    }
-
-    #[test]
-    fn resolve_zai_base_url_falls_back_when_all_probes_fail() {
-        let temp = TempDir::new().unwrap();
-        let fallback_url = "https://fallback.z.ai/api/paas/v4";
-        let (failing_base_url, server) = spawn_zai_probe_server(vec![401]);
-        let failing_base_url_static = Box::leak(failing_base_url.into_boxed_str());
-        let client = Client::builder().build().unwrap();
-
-        let resolved = resolve_zai_base_url_with_client_and_endpoints(
-            temp.path(),
-            "zai-failing-key",
-            1.0,
-            fallback_url,
-            &client,
-            &[ZaiEndpoint {
-                id: "failing",
-                base_url: failing_base_url_static,
-                probe_models: &["glm-5"],
-                label: "Failing",
-            }],
-        );
-        server.join().unwrap();
-
-        assert_eq!(resolved, fallback_url);
-        assert!(!temp.path().join("auth.json").exists());
     }
 }
