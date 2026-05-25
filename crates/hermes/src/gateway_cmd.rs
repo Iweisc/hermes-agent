@@ -10,7 +10,7 @@ use std::process::{Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand};
@@ -1175,6 +1175,13 @@ const WECOM_SETUP_INSTRUCTIONS: &[&str] = &[
     "4. Restrict access with WECOM_ALLOWED_USERS or DM pairing for production use",
 ];
 
+const WEIXIN_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Hermes opens Tencent iLink QR login in this terminal",
+    "2. Use WeChat to scan and confirm the QR code",
+    "3. Hermes stores the returned account_id/token in your profile .env",
+    "4. This adapter supports native text, image, video, and document delivery",
+];
+
 const QQBOT_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Register a QQ Bot application at https://q.qq.com or use QR setup below",
     "2. Note your App ID and App Secret from the application page",
@@ -1576,8 +1583,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Weixin / WeChat",
         emoji: "💬",
         token_var: "WEIXIN_ACCOUNT_ID",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: WEIXIN_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -2283,6 +2290,10 @@ fn configure_native_gateway_builtin_platform_with_io(
         }
         "wecom" => {
             configure_wecom_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
+        "weixin" => {
+            configure_weixin_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
         "qqbot" => {
@@ -3751,6 +3762,461 @@ fn wecom_nested_json_string(value: &JsonValue, path: &[&str]) -> Option<String> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+const WEIXIN_DEFAULT_ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+const WEIXIN_DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+#[derive(Debug, Clone)]
+struct WeixinSetupCredentials {
+    account_id: String,
+    token: String,
+    base_url: String,
+    user_id: Option<String>,
+}
+
+fn configure_weixin_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_account = read_effective_env_value(context, "WEIXIN_ACCOUNT_ID");
+    let existing_token = read_effective_env_value(context, "WEIXIN_TOKEN");
+    if existing_account.is_some() && existing_token.is_some() {
+        writeln!(output)?;
+        writeln!(output, "Weixin is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure Weixin?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    if !prompt_gateway_yes_no(input, output, "Start QR login now?", true)? {
+        writeln!(output, "  Cancelled.")?;
+        return Ok(());
+    }
+
+    let credentials = match weixin_qr_login_with_io(context, output) {
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => {
+            writeln!(output, "  QR login did not complete.")?;
+            return Ok(());
+        }
+        Err(error) => {
+            writeln!(output, "  QR login failed: {error}")?;
+            return Ok(());
+        }
+    };
+
+    save_env_value(
+        context.env_path(),
+        "WEIXIN_ACCOUNT_ID",
+        &credentials.account_id,
+    )?;
+    save_env_value(context.env_path(), "WEIXIN_TOKEN", &credentials.token)?;
+    if !credentials.base_url.trim().is_empty() {
+        save_env_value(context.env_path(), "WEIXIN_BASE_URL", &credentials.base_url)?;
+    }
+    let cdn_base = read_effective_env_value(context, "WEIXIN_CDN_BASE_URL")
+        .unwrap_or_else(|| WEIXIN_DEFAULT_CDN_BASE_URL.to_string());
+    save_env_value(context.env_path(), "WEIXIN_CDN_BASE_URL", &cdn_base)?;
+
+    configure_weixin_dm_policy(context, input, output, credentials.user_id.as_deref())?;
+    configure_weixin_group_policy(context, input, output)?;
+    if let Some(user_id) = credentials
+        .user_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        writeln!(output)?;
+        if prompt_gateway_yes_no(
+            input,
+            output,
+            format!("Use your Weixin user ID ({user_id}) as the home channel?").as_str(),
+            true,
+        )? {
+            save_env_value(context.env_path(), "WEIXIN_HOME_CHANNEL", user_id)?;
+            writeln!(output, "  Home channel set to {user_id}")?;
+        }
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    writeln!(output, "  Account ID: {}", credentials.account_id)?;
+    if let Some(user_id) = credentials.user_id.as_deref() {
+        writeln!(output, "  User ID: {user_id}")?;
+    }
+    Ok(())
+}
+
+fn configure_weixin_dm_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    user_id: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    let access_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should direct messages be authorized?",
+        &[
+            "Use DM pairing approval (recommended)",
+            "Allow all direct messages",
+            "Only allow listed user IDs",
+            "Disable direct messages",
+        ],
+    )?;
+    match access_idx {
+        0 => {
+            save_env_value(context.env_path(), "WEIXIN_DM_POLICY", "pairing")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOW_ALL_USERS", "false")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOWED_USERS", "")?;
+            writeln!(output, "  DM pairing enabled.")?;
+        }
+        1 => {
+            save_env_value(context.env_path(), "WEIXIN_DM_POLICY", "open")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOW_ALL_USERS", "true")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOWED_USERS", "")?;
+            writeln!(output, "  Open DM access enabled for Weixin.")?;
+        }
+        2 => {
+            let prompt = if let Some(user_id) = user_id.filter(|value| !value.is_empty()) {
+                format!("  Allowed Weixin user IDs (comma-separated) [{user_id}]")
+            } else {
+                String::from("  Allowed Weixin user IDs (comma-separated)")
+            };
+            let raw = prompt_gateway_line(input, output, &prompt)?;
+            let allowlist = if raw.trim().is_empty() {
+                user_id.unwrap_or("").to_string()
+            } else {
+                normalize_gateway_allowlist("WEIXIN_ALLOWED_USERS", raw.trim())
+            };
+            save_env_value(context.env_path(), "WEIXIN_DM_POLICY", "allowlist")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOW_ALL_USERS", "false")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOWED_USERS", &allowlist)?;
+            writeln!(output, "  Weixin allowlist saved.")?;
+        }
+        3 => {
+            save_env_value(context.env_path(), "WEIXIN_DM_POLICY", "disabled")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOW_ALL_USERS", "false")?;
+            save_env_value(context.env_path(), "WEIXIN_ALLOWED_USERS", "")?;
+            writeln!(output, "  Direct messages disabled.")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn configure_weixin_group_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Note: QR login connects an iLink bot identity, not a scriptable personal WeChat account."
+    )?;
+    writeln!(
+        output,
+        "  Ordinary WeChat groups usually cannot invite that identity; these settings only apply if iLink delivers group events."
+    )?;
+    let group_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should group chats be handled?",
+        &[
+            "Disable group chats (recommended)",
+            "Allow all group chats",
+            "Only allow listed group chat IDs",
+        ],
+    )?;
+    match group_idx {
+        0 => {
+            save_env_value(context.env_path(), "WEIXIN_GROUP_POLICY", "disabled")?;
+            save_env_value(context.env_path(), "WEIXIN_GROUP_ALLOWED_USERS", "")?;
+            writeln!(output, "  Group chats disabled.")?;
+        }
+        1 => {
+            save_env_value(context.env_path(), "WEIXIN_GROUP_POLICY", "open")?;
+            save_env_value(context.env_path(), "WEIXIN_GROUP_ALLOWED_USERS", "")?;
+            writeln!(
+                output,
+                "  All group chats enabled if iLink delivers group events."
+            )?;
+        }
+        2 => {
+            let raw = prompt_gateway_line(
+                input,
+                output,
+                "  Allowed group chat IDs (comma-separated, not member user IDs)",
+            )?;
+            let allowlist = normalize_gateway_allowlist("WEIXIN_GROUP_ALLOWED_USERS", raw.trim());
+            save_env_value(context.env_path(), "WEIXIN_GROUP_POLICY", "allowlist")?;
+            save_env_value(context.env_path(), "WEIXIN_GROUP_ALLOWED_USERS", &allowlist)?;
+            writeln!(output, "  Group allowlist saved.")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn weixin_qr_login_with_io(
+    context: &HermesContext,
+    output: &mut dyn Write,
+) -> Result<Option<WeixinSetupCredentials>, Box<dyn Error>> {
+    let base = weixin_ilink_base_url();
+    let request_timeout_ms = weixin_env_u64("WEIXIN_QR_TIMEOUT_MS", 35_000).max(1);
+    let login_timeout_ms = weixin_env_u64("WEIXIN_QR_LOGIN_TIMEOUT_MS", 480_000).max(1);
+    let poll_interval =
+        Duration::from_millis(weixin_env_u64("WEIXIN_QR_POLL_INTERVAL_MS", 1000).max(1));
+    let bot_type = env::var("WEIXIN_QR_BOT_TYPE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "3".to_string());
+
+    let mut qr = weixin_fetch_qr(&base, &bot_type, request_timeout_ms)?;
+    let mut current_base = base.clone();
+    let deadline = Instant::now() + Duration::from_millis(login_timeout_ms);
+    let mut refresh_count = 0;
+
+    loop {
+        let scan_data = qr.scan_url.as_deref().unwrap_or(&qr.qrcode);
+        writeln!(output)?;
+        writeln!(output, "  Use WeChat to scan this QR login URL:")?;
+        writeln!(output, "  {scan_data}")?;
+
+        while Instant::now() < deadline {
+            let poll = match weixin_poll_qr_status(&current_base, &qr.qrcode, request_timeout_ms) {
+                Ok(value) => value,
+                Err(error) => {
+                    writeln!(output, "  QR poll failed: {error}")?;
+                    sleep(poll_interval);
+                    continue;
+                }
+            };
+            match poll {
+                WeixinQrPoll::Wait => sleep(poll_interval),
+                WeixinQrPoll::Scanned => {
+                    writeln!(output, "  QR scanned. Confirm login in WeChat.")?;
+                    sleep(poll_interval);
+                }
+                WeixinQrPoll::Redirect(url) => {
+                    current_base = url;
+                    sleep(poll_interval);
+                }
+                WeixinQrPoll::Expired => {
+                    refresh_count += 1;
+                    if refresh_count > 3 {
+                        return Ok(None);
+                    }
+                    writeln!(
+                        output,
+                        "  QR code expired, refreshing... ({refresh_count}/3)"
+                    )?;
+                    qr = weixin_fetch_qr(&base, &bot_type, request_timeout_ms)?;
+                    current_base = base.clone();
+                    break;
+                }
+                WeixinQrPoll::Confirmed(credentials) => {
+                    weixin_save_account(context, &credentials)?;
+                    writeln!(output)?;
+                    writeln!(
+                        output,
+                        "  Weixin QR login complete. account_id={}",
+                        credentials.account_id
+                    )?;
+                    return Ok(Some(credentials));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+    }
+}
+
+struct WeixinQrCode {
+    qrcode: String,
+    scan_url: Option<String>,
+}
+
+enum WeixinQrPoll {
+    Wait,
+    Scanned,
+    Redirect(String),
+    Expired,
+    Confirmed(WeixinSetupCredentials),
+}
+
+fn weixin_fetch_qr(
+    base_url: &str,
+    bot_type: &str,
+    timeout_ms: u64,
+) -> Result<WeixinQrCode, Box<dyn Error>> {
+    let endpoint = format!(
+        "ilink/bot/get_bot_qrcode?bot_type={}",
+        percent_encode_url_component(bot_type)
+    );
+    let data = weixin_api_get(base_url, &endpoint, timeout_ms)?;
+    let qrcode = weixin_json_string(&data, "qrcode").ok_or("Weixin QR response missing qrcode")?;
+    let scan_url = weixin_json_string(&data, "qrcode_img_content");
+    Ok(WeixinQrCode { qrcode, scan_url })
+}
+
+fn weixin_poll_qr_status(
+    base_url: &str,
+    qrcode: &str,
+    timeout_ms: u64,
+) -> Result<WeixinQrPoll, Box<dyn Error>> {
+    let endpoint = format!(
+        "ilink/bot/get_qrcode_status?qrcode={}",
+        percent_encode_url_component(qrcode)
+    );
+    let data = weixin_api_get(base_url, &endpoint, timeout_ms)?;
+    let status = weixin_json_string(&data, "status").unwrap_or_else(|| "wait".to_string());
+    match status.as_str() {
+        "wait" => Ok(WeixinQrPoll::Wait),
+        "scaned" => Ok(WeixinQrPoll::Scanned),
+        "scaned_but_redirect" => {
+            let redirect = weixin_json_string(&data, "redirect_host").unwrap_or_default();
+            if redirect.trim().is_empty() {
+                return Ok(WeixinQrPoll::Wait);
+            }
+            Ok(WeixinQrPoll::Redirect(weixin_redirect_base_url(&redirect)))
+        }
+        "expired" => Ok(WeixinQrPoll::Expired),
+        "confirmed" => {
+            let account_id = weixin_json_string(&data, "ilink_bot_id")
+                .ok_or("Weixin QR status missing ilink_bot_id")?;
+            let token = weixin_json_string(&data, "bot_token")
+                .ok_or("Weixin QR status missing bot_token")?;
+            let base_url = weixin_json_string(&data, "baseurl")
+                .unwrap_or_else(|| WEIXIN_DEFAULT_ILINK_BASE_URL.to_string());
+            let user_id = weixin_json_string(&data, "ilink_user_id");
+            Ok(WeixinQrPoll::Confirmed(WeixinSetupCredentials {
+                account_id,
+                token,
+                base_url,
+                user_id,
+            }))
+        }
+        _ => Ok(WeixinQrPoll::Wait),
+    }
+}
+
+fn weixin_api_get(
+    base_url: &str,
+    endpoint: &str,
+    timeout_ms: u64,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), endpoint);
+    let response = client
+        .get(&url)
+        .header("iLink-App-Id", "bot")
+        .header("iLink-App-ClientVersion", "131584")
+        .send()?;
+    let status = response.status();
+    let raw = response.text()?;
+    if !status.is_success() {
+        return Err(format!("iLink GET {endpoint} HTTP {status}: {}", raw.trim()).into());
+    }
+    Ok(serde_json::from_str(&raw)?)
+}
+
+fn weixin_save_account(
+    context: &HermesContext,
+    credentials: &WeixinSetupCredentials,
+) -> Result<(), Box<dyn Error>> {
+    let dir = context.hermes_home().join("weixin").join("accounts");
+    fs::create_dir_all(&dir)?;
+    let file_name = credentials
+        .account_id
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let path = dir.join(format!("{file_name}.json"));
+    let saved_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "token": credentials.token,
+        "base_url": credentials.base_url,
+        "user_id": credentials.user_id.as_deref().unwrap_or(""),
+        "saved_at": saved_at.to_string(),
+    });
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&payload)?),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
+}
+
+fn weixin_ilink_base_url() -> String {
+    env::var("WEIXIN_ILINK_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| WEIXIN_DEFAULT_ILINK_BASE_URL.to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn weixin_redirect_base_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+fn weixin_json_string(value: &JsonValue, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn weixin_env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone)]
@@ -6477,7 +6943,8 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "weixin")
             .unwrap();
-        assert!(weixin.has_builtin_setup);
+        assert!(!weixin.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(weixin));
 
         let qqbot = metadata
             .iter()
@@ -6597,6 +7064,16 @@ exit 9\n",
             "WECOM_ALLOWED_USERS",
             "WECOM_DM_POLICY",
             "WECOM_HOME_CHANNEL",
+            "WEIXIN_ACCOUNT_ID",
+            "WEIXIN_TOKEN",
+            "WEIXIN_BASE_URL",
+            "WEIXIN_CDN_BASE_URL",
+            "WEIXIN_DM_POLICY",
+            "WEIXIN_ALLOW_ALL_USERS",
+            "WEIXIN_ALLOWED_USERS",
+            "WEIXIN_GROUP_POLICY",
+            "WEIXIN_GROUP_ALLOWED_USERS",
+            "WEIXIN_HOME_CHANNEL",
         ] {
             remove_env_var(key);
         }
@@ -6669,6 +7146,11 @@ exit 9\n",
             .find(|platform| platform.key == "wecom")
             .unwrap();
         assert_eq!(wecom.status, "not configured");
+        let weixin = metadata
+            .iter()
+            .find(|platform| platform.key == "weixin")
+            .unwrap();
+        assert_eq!(weixin.status, "not configured");
     }
 
     #[test]
@@ -6698,10 +7180,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "weixin").unwrap();
+        run_gateway_platform_setup_bridge(true, "whatsapp").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=weixin"));
+        assert!(log_text.contains("platform accept=1 key=whatsapp"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -7158,6 +7640,154 @@ exit 9\n",
         assert!(env_text.contains("FEISHU_HOME_CHANNEL=home-chat"));
 
         remove_env_var("FEISHU_OPEN_BASE_URL");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_weixin_gateway_platform_uses_native_qr_flow_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "WEIXIN_ACCOUNT_ID",
+            "WEIXIN_TOKEN",
+            "WEIXIN_BASE_URL",
+            "WEIXIN_CDN_BASE_URL",
+            "WEIXIN_DM_POLICY",
+            "WEIXIN_ALLOW_ALL_USERS",
+            "WEIXIN_ALLOWED_USERS",
+            "WEIXIN_GROUP_POLICY",
+            "WEIXIN_GROUP_ALLOWED_USERS",
+            "WEIXIN_HOME_CHANNEL",
+            "WEIXIN_ILINK_BASE_URL",
+            "WEIXIN_QR_POLL_INTERVAL_MS",
+            "WEIXIN_QR_LOGIN_TIMEOUT_MS",
+            "WEIXIN_QR_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("WEIXIN_ILINK_BASE_URL", format!("http://{addr}"));
+        set_env_var("WEIXIN_QR_POLL_INTERVAL_MS", "1");
+        set_env_var("WEIXIN_QR_LOGIN_TIMEOUT_MS", "1000");
+        set_env_var("WEIXIN_QR_TIMEOUT_MS", "1000");
+        let server = std::thread::spawn(move || {
+            let responses = [
+                r#"{"qrcode":"qr-1","qrcode_img_content":"http://scan.example/qr-1"}"#,
+                r#"{"status":"scaned"}"#,
+                r#"{"status":"confirmed","ilink_bot_id":"bot-account","bot_token":"bot-token","baseurl":"http://ilink.example.com","ilink_user_id":"wxid-user"}"#,
+            ];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut next = 0;
+            while next < responses.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = responses[next];
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        next += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "weixin")
+            .unwrap();
+        let mut input = Cursor::new("\n3\n\n3\nroom-a, room-b\n\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("WEIXIN_ACCOUNT_ID=bot-account"));
+        assert!(env_text.contains("WEIXIN_TOKEN=bot-token"));
+        assert!(env_text.contains("WEIXIN_BASE_URL=http://ilink.example.com"));
+        assert!(env_text.contains("WEIXIN_CDN_BASE_URL=https://novac2c.cdn.weixin.qq.com/c2c"));
+        assert!(env_text.contains("WEIXIN_DM_POLICY=allowlist"));
+        assert!(env_text.contains("WEIXIN_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("WEIXIN_ALLOWED_USERS=wxid-user"));
+        assert!(env_text.contains("WEIXIN_GROUP_POLICY=allowlist"));
+        assert!(env_text.contains("WEIXIN_GROUP_ALLOWED_USERS=room-a,room-b"));
+        assert!(env_text.contains("WEIXIN_HOME_CHANNEL=wxid-user"));
+
+        let account_path = context
+            .hermes_home()
+            .join("weixin")
+            .join("accounts")
+            .join("bot-account.json");
+        let account =
+            serde_json::from_str::<JsonValue>(&fs::read_to_string(account_path).unwrap()).unwrap();
+        assert_eq!(
+            account.get("token").and_then(JsonValue::as_str),
+            Some("bot-token")
+        );
+        assert_eq!(
+            account.get("base_url").and_then(JsonValue::as_str),
+            Some("http://ilink.example.com")
+        );
+        assert_eq!(
+            account.get("user_id").and_then(JsonValue::as_str),
+            Some("wxid-user")
+        );
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "weixin")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        for key in [
+            "WEIXIN_ILINK_BASE_URL",
+            "WEIXIN_QR_POLL_INTERVAL_MS",
+            "WEIXIN_QR_LOGIN_TIMEOUT_MS",
+            "WEIXIN_QR_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
     }
 
     #[test]
