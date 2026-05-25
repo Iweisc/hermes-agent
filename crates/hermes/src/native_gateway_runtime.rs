@@ -1,23 +1,28 @@
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::thread;
 use std::time::Duration;
 
 use hermes_core::{HermesContext, LoadedConfig};
 use serde_json::{Value, json};
-use serde_yaml::Value as YamlValue;
+use serde_yaml::{Mapping, Value as YamlValue};
+use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::gateway_cmd::GatewayRunArgs;
+use crate::gateway_cmd::{GATEWAY_RUN_BOOTSTRAP, GatewayRunArgs};
 use crate::native_api_server::{
     NativeApiServerState, load_native_api_server_state, serve_native_api_server,
 };
 use crate::native_webhook_server::{
     NativeWebhookState, load_native_webhook_state, serve_native_webhook_server,
 };
+use crate::python_bridge::{project_root, resolve_repo_python};
 
 pub(crate) fn maybe_run_native_gateway_bundle(
     context: &HermesContext,
@@ -30,7 +35,8 @@ pub(crate) fn maybe_run_native_gateway_bundle(
         return Ok(false);
     }
     if has_non_native_bundle_platforms_enabled(&loaded) {
-        return Ok(false);
+        run_hybrid_gateway_bundle(context, &loaded, api_state, webhook_state, args)?;
+        return Ok(true);
     }
     run_native_gateway_bundle(api_state, webhook_state, args)?;
     Ok(true)
@@ -43,94 +49,239 @@ fn run_native_gateway_bundle(
 ) -> Result<(), Box<dyn Error>> {
     let runtime = Runtime::new()?;
     runtime.block_on(async move {
-        let mut join_set = JoinSet::new();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        if let Some(state) = api_state {
-            let bind_ip: IpAddr = state
-                .settings
-                .host
-                .parse()
-                .map_err(|_| "API_SERVER_HOST must be a valid IP address for native Rust runtime")?;
-            if is_network_accessible(bind_ip) && state.settings.api_key.trim().is_empty() {
-                return Err(
-                    "Refusing to start native API server on a non-loopback address without API_SERVER_KEY"
-                        .into(),
-                );
-            }
-            let listener =
-                tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, state.settings.port)).await?;
-            println!(
-                "Native API server listening on http://{}:{} (model: {})",
-                state.settings.host, state.settings.port, state.settings.model_name
-            );
-            let mut shutdown = shutdown_rx.clone();
-            join_set.spawn(async move {
-                serve_native_api_server(listener, state, async move {
-                    let _ = shutdown.changed().await;
-                })
-                .await
-                .map_err(|error| error.to_string())
-            });
-        }
-
-        if let Some(state) = webhook_state {
-            let bind_ip: IpAddr = state
-                .settings
-                .host
-                .parse()
-                .map_err(|_| "WEBHOOK_HOST must be a valid IP address for native Rust runtime")?;
-            let listener =
-                tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, state.settings.port)).await?;
-            println!(
-                "Native webhook server listening on http://{}:{}",
-                state.settings.host, state.settings.port
-            );
-            let mut shutdown = shutdown_rx.clone();
-            join_set.spawn(async move {
-                serve_native_webhook_server(listener, state, async move {
-                    let _ = shutdown.changed().await;
-                })
-                .await
-                .map_err(|error| error.to_string())
-            });
-        }
-
-        if join_set.is_empty() {
-            return Ok(());
-        }
-
+        let mut server_task = tokio::spawn(serve_native_gateway_bundle(
+            api_state,
+            webhook_state,
+            shutdown_rx,
+        ));
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 let _ = shutdown_tx.send(true);
             }
-            result = join_set.join_next() => {
-                let _ = shutdown_tx.send(true);
-                match result {
-                    Some(Ok(Ok(()))) => {
-                        return Err(io::Error::other("native gateway server exited unexpectedly").into());
+            result = &mut server_task => {
+                return flatten_gateway_task_result(result)
+                    .map_err(|error| io::Error::other(error).into());
+            }
+        }
+        flatten_gateway_task_result(server_task.await)
+            .map_err(|error| io::Error::other(error).into())
+    })
+}
+
+fn run_hybrid_gateway_bundle(
+    _context: &HermesContext,
+    loaded: &LoadedConfig,
+    api_state: Option<NativeApiServerState>,
+    webhook_state: Option<NativeWebhookState>,
+    args: &GatewayRunArgs,
+) -> Result<(), Box<dyn Error>> {
+    let overlay_dir = TempDir::new()?;
+    let overlay_path = write_python_gateway_overlay_config(&overlay_dir, &loaded.raw)?;
+    let mut child = spawn_python_gateway_child(args, &overlay_path)?;
+    let runtime = Runtime::new()?;
+    runtime.block_on(async move {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut server_task =
+            tokio::spawn(serve_native_gateway_bundle(api_state, webhook_state, shutdown_rx));
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = shutdown_tx.send(true);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return flatten_gateway_task_result(server_task.await)
+                        .map_err(|error| io::Error::other(error).into());
+                }
+                result = &mut server_task => {
+                    if child.try_wait()?.is_none() {
+                        let _ = child.kill();
+                        let _ = child.wait();
                     }
-                    Some(Ok(Err(error))) => {
-                        return Err(io::Error::other(error).into());
+                    return flatten_gateway_task_result(result)
+                        .and_then(|_| Err(String::from("native gateway server exited unexpectedly")))
+                        .map_err(|error| io::Error::other(error).into());
+                }
+                _ = poll.tick() => {
+                    if let Some(status) = child.try_wait()? {
+                        let _ = shutdown_tx.send(true);
+                        let server_result = flatten_gateway_task_result(server_task.await);
+                        if status.success() {
+                            return server_result.map_err(|error| io::Error::other(error).into());
+                        }
+                        return Err(io::Error::other(exit_status_message("gateway", status)).into());
                     }
-                    Some(Err(error)) => {
-                        return Err(io::Error::other(error.to_string()).into());
-                    }
-                    None => {}
                 }
             }
         }
+    })
+}
 
-        while let Some(result) = join_set.join_next().await {
+async fn serve_native_gateway_bundle(
+    api_state: Option<NativeApiServerState>,
+    webhook_state: Option<NativeWebhookState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut join_set = JoinSet::new();
+
+    if let Some(state) = api_state {
+        let bind_ip: IpAddr = state.settings.host.parse().map_err(|_| {
+            "API_SERVER_HOST must be a valid IP address for native Rust runtime".to_string()
+        })?;
+        if is_network_accessible(bind_ip) && state.settings.api_key.trim().is_empty() {
+            return Err(
+                "Refusing to start native API server on a non-loopback address without API_SERVER_KEY"
+                    .to_string(),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, state.settings.port))
+            .await
+            .map_err(|error| error.to_string())?;
+        println!(
+            "Native API server listening on http://{}:{} (model: {})",
+            state.settings.host, state.settings.port, state.settings.model_name
+        );
+        let mut shutdown = shutdown_rx.clone();
+        join_set.spawn(async move {
+            serve_native_api_server(listener, state, async move {
+                let _ = shutdown.changed().await;
+            })
+            .await
+            .map_err(|error| error.to_string())
+        });
+    }
+
+    if let Some(state) = webhook_state {
+        let bind_ip: IpAddr = state.settings.host.parse().map_err(|_| {
+            "WEBHOOK_HOST must be a valid IP address for native Rust runtime".to_string()
+        })?;
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, state.settings.port))
+            .await
+            .map_err(|error| error.to_string())?;
+        println!(
+            "Native webhook server listening on http://{}:{}",
+            state.settings.host, state.settings.port
+        );
+        let mut shutdown = shutdown_rx.clone();
+        join_set.spawn(async move {
+            serve_native_webhook_server(listener, state, async move {
+                let _ = shutdown.changed().await;
+            })
+            .await
+            .map_err(|error| error.to_string())
+        });
+    }
+
+    if join_set.is_empty() {
+        return Ok(());
+    }
+
+    tokio::select! {
+        _ = shutdown_rx.changed() => {}
+        result = join_set.join_next() => {
             match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(io::Error::other(error).into()),
-                Err(error) => return Err(io::Error::other(error.to_string()).into()),
+                Some(Ok(Ok(()))) => return Err(String::from("native gateway server exited unexpectedly")),
+                Some(Ok(Err(error))) => return Err(error),
+                Some(Err(error)) => return Err(error.to_string()),
+                None => return Ok(()),
             }
         }
+    }
 
-        Ok(())
-    })
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    Ok(())
+}
+
+fn flatten_gateway_task_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match result {
+        Ok(inner) => inner,
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn spawn_python_gateway_child(
+    args: &GatewayRunArgs,
+    overlay_path: &Path,
+) -> Result<std::process::Child, Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
+        .ok_or("could not find a Python interpreter for gateway launch")?;
+    let mut command = Command::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .env("HERMES_GATEWAY_VERBOSE", args.verbose.to_string())
+        .env("HERMES_GATEWAY_QUIET", if args.quiet { "1" } else { "0" })
+        .env(
+            "HERMES_GATEWAY_REPLACE",
+            if args.replace { "1" } else { "0" },
+        )
+        .env("HERMES_GATEWAY_CONFIG_PATH", overlay_path)
+        .env_remove("API_SERVER_ENABLED")
+        .env_remove("API_SERVER_KEY")
+        .env_remove("API_SERVER_CORS_ORIGINS")
+        .env_remove("API_SERVER_PORT")
+        .env_remove("API_SERVER_HOST")
+        .env_remove("API_SERVER_MODEL_NAME")
+        .env_remove("WEBHOOK_ENABLED")
+        .env_remove("WEBHOOK_PORT")
+        .env_remove("WEBHOOK_SECRET")
+        .arg("-c")
+        .arg(GATEWAY_RUN_BOOTSTRAP);
+    Ok(command.spawn()?)
+}
+
+fn write_python_gateway_overlay_config(
+    temp_dir: &TempDir,
+    raw: &YamlValue,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let filtered = filtered_python_gateway_config(raw.clone());
+    let path = temp_dir.path().join("gateway-overlay.yaml");
+    fs::write(&path, serde_yaml::to_string(&filtered)?)?;
+    Ok(path)
+}
+
+fn filtered_python_gateway_config(mut raw: YamlValue) -> YamlValue {
+    let Some(root) = raw.as_mapping_mut() else {
+        return raw;
+    };
+    let Some(platforms) = root
+        .get_mut(YamlValue::String("platforms".to_string()))
+        .and_then(YamlValue::as_mapping_mut)
+    else {
+        return raw;
+    };
+    for platform_name in ["api_server", "webhook"] {
+        let key = YamlValue::String(platform_name.to_string());
+        let entry = platforms
+            .entry(key)
+            .or_insert_with(|| YamlValue::Mapping(Mapping::new()));
+        if let Some(mapping) = entry.as_mapping_mut() {
+            mapping.insert(
+                YamlValue::String("enabled".to_string()),
+                YamlValue::Bool(false),
+            );
+        }
+    }
+    raw
+}
+
+fn exit_status_message(label: &str, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{label} exited with status {code}"),
+        None => format!("{label} terminated by signal"),
+    }
 }
 
 fn has_non_native_bundle_platforms_enabled(loaded: &LoadedConfig) -> bool {

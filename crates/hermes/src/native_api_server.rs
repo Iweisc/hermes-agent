@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -13,14 +16,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermes_core::{
-    DelegateExecutor, HermesContext, LoadedConfig, ModelOverrides, ToolRuntime,
-    get_tool_definitions,
+    AgentProgressCallback, AgentProgressEvent, DelegateExecutor, HermesContext, LoadedConfig,
+    ModelOverrides, ToolRuntime, get_tool_definitions,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml::{Mapping, Value as YamlValue};
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::gateway_cmd::GatewayRunArgs;
 
@@ -60,7 +64,14 @@ struct StoredResponse {
 
 #[derive(Default)]
 struct RunStore {
-    runs: BTreeMap<String, Value>,
+    runs: BTreeMap<String, StoredRun>,
+}
+
+struct StoredRun {
+    status: Value,
+    events: Vec<Value>,
+    broadcaster: broadcast::Sender<Value>,
+    interrupt_requested: Arc<AtomicBool>,
 }
 
 enum ResponsesMessagesError {
@@ -202,6 +213,14 @@ where
             "/v1/runs/{run_id}",
             get(handle_get_run).options(handle_options),
         )
+        .route(
+            "/v1/runs/{run_id}/events",
+            get(handle_run_events).options(handle_options),
+        )
+        .route(
+            "/v1/runs/{run_id}/stop",
+            post(handle_stop_run).options(handle_options),
+        )
         .with_state(Arc::new(state));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -259,7 +278,12 @@ async fn handle_capabilities(
         StatusCode::OK,
         json!({
             "object": "hermes.api_server.capabilities",
+            "platform": "hermes-agent",
             "model": state.settings.model_name,
+            "auth": {
+                "type": "bearer",
+                "required": !state.settings.api_key.trim().is_empty(),
+            },
             "features": {
                 "chat_completions": true,
                 "chat_completions_streaming": true,
@@ -267,10 +291,17 @@ async fn handle_capabilities(
                 "responses_streaming": true,
                 "stored_responses": true,
                 "runs_api": true,
-                "run_events": false,
-                "run_stop": false,
+                "run_submission": true,
+                "run_status": true,
+                "run_events": true,
+                "run_events_sse": true,
+                "run_stop": true,
+                "tool_progress_events": true,
+                "cors": !state.settings.cors_origins.is_empty(),
             },
             "endpoints": {
+                "health": { "method": "GET", "path": "/health" },
+                "health_v1": { "method": "GET", "path": "/v1/health" },
                 "models": { "method": "GET", "path": "/v1/models" },
                 "capabilities": { "method": "GET", "path": "/v1/capabilities" },
                 "chat_completions": { "method": "POST", "path": "/v1/chat/completions" },
@@ -279,6 +310,8 @@ async fn handle_capabilities(
                 "response_delete": { "method": "DELETE", "path": "/v1/responses/{response_id}" },
                 "runs": { "method": "POST", "path": "/v1/runs" },
                 "run_status": { "method": "GET", "path": "/v1/runs/{run_id}" },
+                "run_events": { "method": "GET", "path": "/v1/runs/{run_id}/events" },
+                "run_stop": { "method": "POST", "path": "/v1/runs/{run_id}/stop" },
             }
         }),
         &state.settings,
@@ -299,6 +332,8 @@ async fn handle_chat_completions(
             Arc::clone(&state),
             request.model,
             request.messages,
+            None,
+            None,
         )
         .await
         {
@@ -323,7 +358,15 @@ async fn handle_chat_completions(
             headers.get(ORIGIN),
         );
     }
-    match run_agent_for_messages_async(Arc::clone(&state), request.model, request.messages).await {
+    match run_agent_for_messages_async(
+        Arc::clone(&state),
+        request.model,
+        request.messages,
+        None,
+        None,
+    )
+    .await
+    {
         Ok(result) => {
             let response_id = format!("chatcmpl-rs-{:x}", unix_ts_nanos());
             json_response(
@@ -395,6 +438,8 @@ async fn handle_responses(
             Arc::clone(&state),
             request.model,
             messages.clone(),
+            None,
+            None,
         )
         .await
         {
@@ -430,7 +475,15 @@ async fn handle_responses(
             return response_not_found_response(&state.settings, headers.get(ORIGIN), &response_id);
         }
     };
-    match run_agent_for_messages_async(Arc::clone(&state), request.model, messages.clone()).await {
+    match run_agent_for_messages_async(
+        Arc::clone(&state),
+        request.model,
+        messages.clone(),
+        None,
+        None,
+    )
+    .await
+    {
         Ok(result) => {
             let response_body = build_completed_responses_payload(
                 &state.settings.model_name,
@@ -544,15 +597,18 @@ async fn handle_runs(
         .clone()
         .unwrap_or_else(|| state.settings.model_name.clone());
     let queued_model_name = model_name.clone();
-    update_run_status(
+    let interrupt_requested = Arc::new(AtomicBool::new(false));
+    initialize_run(
         &state,
         &run_id,
+        "run.queued",
         json!({
             "run_id": run_id,
             "status": "queued",
             "created_at": created_at,
             "model": queued_model_name,
         }),
+        Arc::clone(&interrupt_requested),
     );
 
     let state_for_task = Arc::clone(&state);
@@ -560,10 +616,31 @@ async fn handle_runs(
     let messages_for_task = messages.clone();
     let model_for_task = request.model.clone();
     let running_model_name = model_name.clone();
+    let interrupt_requested_for_task = Arc::clone(&interrupt_requested);
+    let progress_callback: AgentProgressCallback = {
+        let state = Arc::clone(&state);
+        let run_id = run_id.clone();
+        Arc::new(move |event| append_progress_run_event(&state, &run_id, event))
+    };
     tokio::spawn(async move {
-        update_run_status(
+        if interrupt_requested_for_task.load(Ordering::SeqCst) {
+            record_run_status(
+                &state_for_task,
+                &run_id_for_task,
+                "run.cancelled",
+                json!({
+                    "run_id": run_id_for_task,
+                    "status": "cancelled",
+                    "created_at": created_at,
+                    "model": running_model_name,
+                }),
+            );
+            return;
+        }
+        record_run_status(
             &state_for_task,
             &run_id_for_task,
+            "run.running",
             json!({
                 "run_id": run_id_for_task,
                 "status": "running",
@@ -575,14 +652,17 @@ async fn handle_runs(
             state_for_task.clone(),
             model_for_task,
             messages_for_task.clone(),
+            Some(Arc::clone(&interrupt_requested_for_task)),
+            Some(progress_callback),
         )
         .await
         {
             Ok(result) => {
                 let final_response = result.final_response;
-                update_run_status(
+                record_run_status(
                     &state_for_task,
                     &run_id_for_task,
+                    "run.completed",
                     json!({
                         "run_id": run_id_for_task,
                         "status": "completed",
@@ -593,9 +673,26 @@ async fn handle_runs(
                 );
             }
             Err(error) => {
-                update_run_status(
+                if interrupt_requested_for_task.load(Ordering::SeqCst)
+                    || error.trim() == "running agent turn: Run interrupted."
+                {
+                    record_run_status(
+                        &state_for_task,
+                        &run_id_for_task,
+                        "run.cancelled",
+                        json!({
+                            "run_id": run_id_for_task,
+                            "status": "cancelled",
+                            "created_at": created_at,
+                            "model": model_name,
+                        }),
+                    );
+                    return;
+                }
+                record_run_status(
                     &state_for_task,
                     &run_id_for_task,
+                    "run.failed",
                     json!({
                         "run_id": run_id_for_task,
                         "status": "failed",
@@ -631,20 +728,149 @@ async fn handle_get_run(
         .run_store
         .lock()
         .ok()
-        .and_then(|store| store.runs.get(&run_id).cloned())
+        .and_then(|store| store.runs.get(&run_id).map(|run| run.status.clone()))
     else {
         return run_not_found_response(&state.settings, headers.get(ORIGIN), &run_id);
     };
     json_response(StatusCode::OK, status, &state.settings, headers.get(ORIGIN))
 }
 
+async fn handle_run_events(
+    State(state): State<Arc<NativeApiServerState>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ensure_authorized(&state.settings, &headers) {
+        return response;
+    }
+    let Some((history, mut subscriber)) = state.run_store.lock().ok().and_then(|store| {
+        store
+            .runs
+            .get(&run_id)
+            .map(|run| (run.events.clone(), run.broadcaster.subscribe()))
+    }) else {
+        return run_not_found_response(&state.settings, headers.get(ORIGIN), &run_id);
+    };
+
+    let (tx, rx) = mpsc::channel::<String>(16);
+    tokio::spawn(async move {
+        for event in history {
+            if tx.send(format_run_event_chunk(&event)).await.is_err() {
+                return;
+            }
+            if run_event_is_terminal(&event) {
+                let _ = tx.send(": stream closed\n\n".to_string()).await;
+                return;
+            }
+        }
+
+        loop {
+            match subscriber.recv().await {
+                Ok(event) => {
+                    let terminal = run_event_is_terminal(&event);
+                    if tx.send(format_run_event_chunk(&event)).await.is_err() {
+                        return;
+                    }
+                    if terminal {
+                        let _ = tx.send(": stream closed\n\n".to_string()).await;
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    let _ = tx.send(": stream closed\n\n".to_string()).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(
+        ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>),
+    ));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    apply_cors_headers(response.headers_mut(), &state.settings, headers.get(ORIGIN));
+    response
+}
+
+async fn handle_stop_run(
+    State(state): State<Arc<NativeApiServerState>>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ensure_authorized(&state.settings, &headers) {
+        return response;
+    }
+    let Some((status, interrupt_requested)) = state.run_store.lock().ok().and_then(|store| {
+        store
+            .runs
+            .get(&run_id)
+            .map(|run| (run.status.clone(), Arc::clone(&run.interrupt_requested)))
+    }) else {
+        return run_not_found_response(&state.settings, headers.get(ORIGIN), &run_id);
+    };
+
+    if run_status_is_terminal(&status) {
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({ "error": { "message": format!("Run is already terminal: {run_id}") } }),
+            &state.settings,
+            headers.get(ORIGIN),
+        );
+    }
+
+    interrupt_requested.store(true, Ordering::SeqCst);
+    record_run_status(
+        &state,
+        &run_id,
+        "run.stopping",
+        json!({
+            "run_id": run_id,
+            "status": "stopping",
+            "created_at": status.get("created_at").cloned().unwrap_or_else(|| json!(unix_ts_secs())),
+            "model": status
+                .get("model")
+                .cloned()
+                .unwrap_or_else(|| json!(state.settings.model_name.clone())),
+        }),
+    );
+    json_response(
+        StatusCode::OK,
+        json!({
+            "run_id": run_id,
+            "status": "stopping",
+        }),
+        &state.settings,
+        headers.get(ORIGIN),
+    )
+}
+
 async fn run_agent_for_messages_async(
     state: Arc<NativeApiServerState>,
     model: Option<String>,
     messages: Vec<Value>,
+    interrupt_requested: Option<Arc<AtomicBool>>,
+    progress_callback: Option<AgentProgressCallback>,
 ) -> Result<hermes_core::AgentTurnResult, String> {
     tokio::task::spawn_blocking(move || {
-        run_agent_for_messages(&state, model, &messages).map_err(|error| error.to_string())
+        run_agent_for_messages(
+            &state,
+            model,
+            &messages,
+            interrupt_requested,
+            progress_callback,
+        )
+        .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -671,6 +897,8 @@ fn run_agent_for_messages(
     state: &NativeApiServerState,
     model: Option<String>,
     messages: &[Value],
+    interrupt_requested: Option<Arc<AtomicBool>>,
+    progress_callback: Option<AgentProgressCallback>,
 ) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
     let enabled_toolsets = state.loaded.config.toolsets.clone();
     let delegate = DelegateExecutor::new(
@@ -697,12 +925,14 @@ fn run_agent_for_messages(
         model,
         ..ModelOverrides::default()
     };
-    Ok(state.context.run_chat_turn_with_messages(
+    Ok(state.context.run_chat_turn_with_messages_interruptible(
         &state.loaded,
         messages,
         &runtime,
         Some(&enabled_toolsets),
         &overrides,
+        interrupt_requested.as_ref(),
+        progress_callback.as_ref(),
     )?)
 }
 
@@ -1003,11 +1233,168 @@ fn store_response_snapshot(
     }
 }
 
-fn update_run_status(state: &NativeApiServerState, run_id: &str, status: Value) {
+fn initialize_run(
+    state: &NativeApiServerState,
+    run_id: &str,
+    event_name: &str,
+    mut status: Value,
+    interrupt_requested: Arc<AtomicBool>,
+) {
+    let Some(status_object) = status.as_object_mut() else {
+        return;
+    };
+    status_object.insert("last_event".to_string(), json!(event_name));
+    status_object.insert("updated_at".to_string(), json!(unix_ts_secs()));
+
+    let mut event = status.clone();
+    let Some(event_object) = event.as_object_mut() else {
+        return;
+    };
+    event_object.insert("event".to_string(), json!(event_name));
+    event_object.insert("timestamp".to_string(), json!(unix_ts_secs()));
+
+    let (broadcaster, _) = broadcast::channel(32);
     let Ok(mut store) = state.run_store.lock() else {
         return;
     };
-    store.runs.insert(run_id.to_string(), status);
+    store.runs.insert(
+        run_id.to_string(),
+        StoredRun {
+            status,
+            events: vec![event],
+            broadcaster,
+            interrupt_requested,
+        },
+    );
+}
+
+fn record_run_status(
+    state: &NativeApiServerState,
+    run_id: &str,
+    event_name: &str,
+    mut status: Value,
+) {
+    let Some(status_object) = status.as_object_mut() else {
+        return;
+    };
+    status_object.insert("last_event".to_string(), json!(event_name));
+    status_object.insert("updated_at".to_string(), json!(unix_ts_secs()));
+
+    let mut event = status.clone();
+    let Some(event_object) = event.as_object_mut() else {
+        return;
+    };
+    event_object.insert("event".to_string(), json!(event_name));
+    event_object.insert("timestamp".to_string(), json!(unix_ts_secs()));
+
+    let Ok(mut store) = state.run_store.lock() else {
+        return;
+    };
+    if let Some(run) = store.runs.get_mut(run_id) {
+        run.status = status;
+        run.events.push(event.clone());
+        let _ = run.broadcaster.send(event);
+        return;
+    }
+
+    let (broadcaster, _) = broadcast::channel(32);
+    store.runs.insert(
+        run_id.to_string(),
+        StoredRun {
+            status,
+            events: vec![event],
+            broadcaster,
+            interrupt_requested: Arc::new(AtomicBool::new(false)),
+        },
+    );
+}
+
+fn append_progress_run_event(
+    state: &NativeApiServerState,
+    run_id: &str,
+    event: AgentProgressEvent,
+) {
+    let (event_name, payload) = match event {
+        AgentProgressEvent::MessageDelta { delta } => (
+            "message.delta",
+            json!({
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": unix_ts_secs(),
+                "delta": delta,
+            }),
+        ),
+        AgentProgressEvent::ToolStarted { tool_name, preview } => (
+            "tool.started",
+            json!({
+                "event": "tool.started",
+                "run_id": run_id,
+                "timestamp": unix_ts_secs(),
+                "tool": tool_name,
+                "preview": preview,
+            }),
+        ),
+        AgentProgressEvent::ToolCompleted {
+            tool_name,
+            duration_secs,
+            is_error,
+        } => (
+            "tool.completed",
+            json!({
+                "event": "tool.completed",
+                "run_id": run_id,
+                "timestamp": unix_ts_secs(),
+                "tool": tool_name,
+                "duration": (duration_secs * 1000.0).round() / 1000.0,
+                "error": is_error,
+            }),
+        ),
+        AgentProgressEvent::ReasoningAvailable { text } => (
+            "reasoning.available",
+            json!({
+                "event": "reasoning.available",
+                "run_id": run_id,
+                "timestamp": unix_ts_secs(),
+                "text": text,
+            }),
+        ),
+    };
+
+    let Ok(mut store) = state.run_store.lock() else {
+        return;
+    };
+    let Some(run) = store.runs.get_mut(run_id) else {
+        return;
+    };
+    if let Some(status_object) = run.status.as_object_mut() {
+        status_object.insert("last_event".to_string(), json!(event_name));
+        status_object.insert("updated_at".to_string(), json!(unix_ts_secs()));
+    }
+    run.events.push(payload.clone());
+    let _ = run.broadcaster.send(payload);
+}
+
+fn format_run_event_chunk(event: &Value) -> String {
+    match event.get("event").and_then(Value::as_str) {
+        Some(event_name) => format!("event: {event_name}\ndata: {event}\n\n"),
+        None => format!("data: {event}\n\n"),
+    }
+}
+
+fn run_event_is_terminal(event: &Value) -> bool {
+    event
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(|event_name| {
+            matches!(event_name, "run.completed" | "run.failed" | "run.cancelled")
+        })
+}
+
+fn run_status_is_terminal(status: &Value) -> bool {
+    status
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"))
 }
 
 fn response_not_found_response(
@@ -1360,6 +1747,51 @@ mod tests {
                     break;
                 }
             }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{}", addr), join)
+    }
+
+    fn mock_model_server_with_delay(
+        response_body: String,
+        delay: std::time::Duration,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(stream) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if start.elapsed() > std::time::Duration::from_secs(2) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                }
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
@@ -1757,8 +2189,25 @@ mod tests {
             .unwrap()
             .json()
             .unwrap();
+        assert_eq!(capabilities["platform"], json!("hermes-agent"));
+        assert_eq!(capabilities["auth"]["type"], json!("bearer"));
+        assert_eq!(capabilities["auth"]["required"], json!(false));
         assert_eq!(capabilities["features"]["stored_responses"], json!(true));
         assert_eq!(capabilities["features"]["runs_api"], json!(true));
+        assert_eq!(capabilities["features"]["run_submission"], json!(true));
+        assert_eq!(capabilities["features"]["run_status"], json!(true));
+        assert_eq!(capabilities["features"]["run_events"], json!(true));
+        assert_eq!(capabilities["features"]["run_events_sse"], json!(true));
+        assert_eq!(capabilities["features"]["run_stop"], json!(true));
+        assert_eq!(
+            capabilities["features"]["tool_progress_events"],
+            json!(true)
+        );
+        assert_eq!(capabilities["features"]["cors"], json!(false));
+        assert_eq!(
+            capabilities["endpoints"]["health"]["path"],
+            json!("/health")
+        );
         assert_eq!(
             capabilities["endpoints"]["response_get"]["path"],
             json!("/v1/responses/{response_id}")
@@ -1766,6 +2215,14 @@ mod tests {
         assert_eq!(
             capabilities["endpoints"]["run_status"]["path"],
             json!("/v1/runs/{run_id}")
+        );
+        assert_eq!(
+            capabilities["endpoints"]["run_events"]["path"],
+            json!("/v1/runs/{run_id}/events")
+        );
+        assert_eq!(
+            capabilities["endpoints"]["run_stop"]["path"],
+            json!("/v1/runs/{run_id}/stop")
         );
 
         let response_body: Value = client
@@ -1889,6 +2346,323 @@ mod tests {
         }
         assert_eq!(status["status"], json!("completed"));
         assert_eq!(status["output"], json!("run hello"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_run_events_stream_lifecycle_updates() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "id": "chatcmpl-run-events",
+            "choices": [{
+                "message": {
+                    "content": "run stream hello"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) = mock_model_server(response_body);
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "say hi",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
+
+        let response = client
+            .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+            .send()
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/event-stream"
+        );
+        let body = response.text().unwrap();
+        assert!(body.contains("event: run.queued"));
+        assert!(body.contains("event: run.running"));
+        assert!(body.contains("event: run.completed"));
+        assert!(body.contains("\"output\":\"run stream hello\""));
+        assert!(body.contains(": stream closed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_run_events_include_tool_and_message_updates() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_todo_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "todo",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "tool-backed hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |_| {},
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "say hi",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
+
+        let response = client
+            .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+            .send()
+            .unwrap();
+        let body = response.text().unwrap();
+        assert!(body.contains("event: tool.started"));
+        assert!(body.contains("\"tool\":\"todo\""));
+        assert!(body.contains("event: tool.completed"));
+        assert!(body.contains("\"error\":false"));
+        assert!(body.contains("event: message.delta"));
+        assert!(body.contains("\"delta\":\"tool-backed hello\""));
+        assert!(body.contains("event: run.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_runs_can_be_stopped() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "id": "chatcmpl-run-stop",
+            "choices": [{
+                "message": {
+                    "content": "run stop hello"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) =
+            mock_model_server_with_delay(response_body, std::time::Duration::from_millis(250));
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "say hi",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+
+        let mut running_status = Value::Null;
+        for _ in 0..40 {
+            running_status = client
+                .get(format!("http://{addr}/v1/runs/{run_id}"))
+                .send()
+                .unwrap()
+                .json()
+                .unwrap();
+            if running_status["status"] == json!("running") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(running_status["status"], json!("running"));
+
+        let stopping: Value = client
+            .post(format!("http://{addr}/v1/runs/{run_id}/stop"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(stopping["status"], json!("stopping"));
+
+        let mut status = Value::Null;
+        for _ in 0..60 {
+            status = client
+                .get(format!("http://{addr}/v1/runs/{run_id}"))
+                .send()
+                .unwrap()
+                .json()
+                .unwrap();
+            if status["status"] == json!("cancelled") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(status["status"], json!("cancelled"));
+        assert_eq!(status["last_event"], json!("run.cancelled"));
+
+        let events = client
+            .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(events.contains("event: run.stopping"));
+        assert!(events.contains("event: run.cancelled"));
 
         let _ = shutdown_tx.send(());
         server_thread.join().unwrap();

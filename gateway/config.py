@@ -20,6 +20,7 @@ from hermes_cli.config import get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+_OVERRIDE_CONFIG_PATH_ENV = "HERMES_GATEWAY_CONFIG_PATH"
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -650,7 +651,8 @@ def load_gateway_config() -> GatewayConfig:
     # Primary source: config.yaml
     try:
         import yaml
-        config_yaml_path = _home / "config.yaml"
+        config_yaml_override = os.getenv(_OVERRIDE_CONFIG_PATH_ENV, "").strip()
+        config_yaml_path = Path(config_yaml_override) if config_yaml_override else (_home / "config.yaml")
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}

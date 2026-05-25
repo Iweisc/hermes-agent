@@ -4,7 +4,11 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +40,7 @@ use crate::{
 
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
 const MAX_HTTP_ERROR_BODY_CHARS: usize = 4000;
+const RUN_INTERRUPTED_DETAIL: &str = "Run interrupted.";
 const KANBAN_GUIDANCE: &str = "# Kanban task execution protocol\nUse kanban_show first to orient on the assigned task. Work inside HERMES_KANBAN_WORKSPACE unless the task explicitly requires otherwise. Heartbeat during long-running work, block when you need human input you cannot infer, and finish with kanban_complete(summary=..., metadata=...) or kanban_block(reason=...). Use kanban_create for real follow-up work instead of silently scope-creeping into it.";
 const COPILOT_ACP_MARKER_BASE_URL: &str = "acp://copilot";
 const GOOGLE_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -61,6 +66,27 @@ pub struct AgentTurnResult {
     pub base_url: String,
     pub session_id: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentProgressEvent {
+    MessageDelta {
+        delta: String,
+    },
+    ToolStarted {
+        tool_name: String,
+        preview: String,
+    },
+    ToolCompleted {
+        tool_name: String,
+        duration_secs: f64,
+        is_error: bool,
+    },
+    ReasoningAvailable {
+        text: String,
+    },
+}
+
+pub type AgentProgressCallback = Arc<dyn Fn(AgentProgressEvent) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct PendingToolCall {
@@ -388,6 +414,27 @@ impl HermesContext {
         enabled_toolsets: Option<&[String]>,
         overrides: &ModelOverrides,
     ) -> Result<AgentTurnResult, HermesError> {
+        self.run_chat_turn_with_messages_interruptible(
+            loaded,
+            input_messages,
+            runtime,
+            enabled_toolsets,
+            overrides,
+            None,
+            None,
+        )
+    }
+
+    pub fn run_chat_turn_with_messages_interruptible(
+        &self,
+        loaded: &LoadedConfig,
+        input_messages: &[Value],
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        interrupt_requested: Option<&Arc<AtomicBool>>,
+        progress_callback: Option<&AgentProgressCallback>,
+    ) -> Result<AgentTurnResult, HermesError> {
         if !input_messages.iter().any(|message| {
             message
                 .get("role")
@@ -427,17 +474,31 @@ impl HermesContext {
         let mut tool_calls = 0_u64;
 
         for _ in 0..loaded.config.agent.max_turns {
+            ensure_run_not_interrupted(interrupt_requested)?;
             api_calls += 1;
             let response = send_model_request(&client, &runtime_model, &messages, &tools, None)?;
+            ensure_run_not_interrupted(interrupt_requested)?;
             let NormalizedAssistantResponse {
                 content: assistant_content,
                 tool_calls: pending_tool_calls,
                 finish_reason: _finish_reason,
-                reasoning: _reasoning,
+                reasoning,
                 reasoning_details: _reasoning_details,
                 codex_reasoning_items: _codex_reasoning_items,
                 codex_message_items: _codex_message_items,
             } = response;
+            if let Some(reasoning) = reasoning
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ReasoningAvailable {
+                        text: reasoning.to_string(),
+                    },
+                );
+            }
 
             if pending_tool_calls.is_empty() {
                 let final_response = assistant_content
@@ -449,6 +510,12 @@ impl HermesContext {
                         detail: "Assistant response had no text content.".to_string(),
                     })?
                     .to_string();
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::MessageDelta {
+                        delta: final_response.clone(),
+                    },
+                );
                 return Ok(AgentTurnResult {
                     final_response,
                     api_calls,
@@ -481,8 +548,28 @@ impl HermesContext {
             }));
 
             for tool_call in pending_tool_calls {
+                ensure_run_not_interrupted(interrupt_requested)?;
                 tool_calls += 1;
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ToolStarted {
+                        tool_name: tool_call.name.clone(),
+                        preview: tool_call.arguments_raw.clone(),
+                    },
+                );
+                let started_at = Instant::now();
                 let result = dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                let duration_secs = started_at.elapsed().as_secs_f64();
+                let is_error = tool_result_indicates_error(&result);
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ToolCompleted {
+                        tool_name: tool_call.name.clone(),
+                        duration_secs,
+                        is_error,
+                    },
+                );
+                ensure_run_not_interrupted(interrupt_requested)?;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -499,6 +586,35 @@ impl HermesContext {
             ),
         })
     }
+}
+
+fn ensure_run_not_interrupted(
+    interrupt_requested: Option<&Arc<AtomicBool>>,
+) -> Result<(), HermesError> {
+    if interrupt_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(HermesError::State {
+            action: "running agent turn",
+            detail: RUN_INTERRUPTED_DETAIL.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn emit_progress_event(
+    progress_callback: Option<&AgentProgressCallback>,
+    event: AgentProgressEvent,
+) {
+    if let Some(callback) = progress_callback {
+        callback(event);
+    }
+}
+
+fn tool_result_indicates_error(result: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    parsed.get("error").is_some_and(|value| !value.is_null())
+        || parsed.get("success").and_then(Value::as_bool) == Some(false)
 }
 
 fn content_has_meaningful_user_input(content: &Value) -> bool {
@@ -4891,6 +5007,88 @@ for raw in sys.stdin:
 
         assert_eq!(result.final_response, "message-array ok");
         assert!(result.session_id.is_none());
+    }
+
+    #[test]
+    fn interruptible_chat_turn_emits_progress_events() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_todo_progress_1",
+                            "type": "function",
+                            "function": {
+                                "name": "todo",
+                                "arguments": "{}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Progress hello."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let captured = Arc::new(Mutex::new(Vec::<AgentProgressEvent>::new()));
+        let callback: AgentProgressCallback = {
+            let captured = Arc::clone(&captured);
+            Arc::new(move |event| captured.lock().unwrap().push(event))
+        };
+
+        let result = context
+            .run_chat_turn_with_messages_interruptible(
+                &loaded,
+                &[json!({
+                    "role": "user",
+                    "content": "Need progress events",
+                })],
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&callback),
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Progress hello.");
+        let events = captured.lock().unwrap().clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentProgressEvent::ToolStarted { tool_name, .. } if tool_name == "todo"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentProgressEvent::ToolCompleted {
+                tool_name,
+                is_error: false,
+                ..
+            } if tool_name == "todo"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentProgressEvent::MessageDelta { delta } if delta == "Progress hello."
+        )));
     }
 
     #[test]
