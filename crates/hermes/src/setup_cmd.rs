@@ -4,14 +4,14 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
 use hermes_core::{
-    HermesContext, get_auth_status_summary, list_provider_profiles, normalize_model_for_provider,
-    resolve_provider_api_mode,
+    HermesContext, get_active_auth_provider, get_auth_status_summary, list_provider_profiles,
+    normalize_model_for_provider, resolve_provider_api_mode,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Value};
@@ -55,6 +55,9 @@ pub enum SetupSection {
 }
 
 pub fn print_setup(context: &HermesContext, mut args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+
     if args.reset {
         if let Some(system) = setup_managed_system(context) {
             println!(
@@ -68,48 +71,38 @@ pub fn print_setup(context: &HermesContext, mut args: SetupArgs) -> Result<(), B
         args.reset = false;
     }
 
-    if should_use_native_setup_noninteractive(&args, io::stdin().is_terminal()) {
+    if should_use_native_setup_noninteractive(&args, stdin_is_terminal, stdout_is_terminal) {
         return print_native_setup_noninteractive(context);
     }
     if should_use_native_model_setup(&args) {
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        if stdin_is_terminal && stdout_is_terminal {
             let mut ui = TerminalUi;
             return run_native_model_setup(context, &mut ui);
         }
         return print_native_setup_noninteractive(context);
     }
-    if should_use_native_agent_setup(&args)
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-    {
+    if should_use_native_agent_setup(&args) && stdin_is_terminal && stdout_is_terminal {
         let mut ui = TerminalUi;
         return run_native_agent_setup(context, &mut ui);
     }
-    if should_use_native_tts_setup(&args) && io::stdin().is_terminal() && io::stdout().is_terminal()
-    {
+    if should_use_native_tts_setup(&args) && stdin_is_terminal && stdout_is_terminal {
         let mut ui = TerminalUi;
         return run_native_tts_setup(context, &mut ui);
     }
-    if should_use_native_terminal_setup(&args)
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-    {
+    if should_use_native_terminal_setup(&args) && stdin_is_terminal && stdout_is_terminal {
         let mut ui = TerminalUi;
         return run_native_terminal_setup(context, &mut ui);
     }
-    if should_use_native_gateway_setup(&args)
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-    {
+    if should_use_native_gateway_setup(&args) && stdin_is_terminal && stdout_is_terminal {
         return run_native_gateway_setup(context);
     }
-    if should_use_native_tools_setup(&args)
-        && io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-    {
+    if should_use_native_tools_setup(&args) && stdin_is_terminal && stdout_is_terminal {
         return run_native_tools_setup(context);
     }
-    print_setup_python(args)
+    if should_use_native_full_setup(&args, stdin_is_terminal, stdout_is_terminal) {
+        return run_native_setup_wizard(context, &args);
+    }
+    print_native_setup_noninteractive(context)
 }
 
 fn reset_config_to_defaults(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -139,41 +132,6 @@ fn validate_default_config_yaml() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn print_setup_python(args: SetupArgs) -> Result<(), Box<dyn Error>> {
-    print_setup_python_bootstrap(SETUP_BOOTSTRAP, args)
-}
-
-fn print_setup_python_bootstrap(bootstrap: &str, args: SetupArgs) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_SETUP_PYTHON"))
-        .ok_or("could not find a Python interpreter for setup")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env(
-            "HERMES_SETUP_NON_INTERACTIVE",
-            if args.non_interactive { "1" } else { "0" },
-        )
-        .env("HERMES_SETUP_RESET", if args.reset { "1" } else { "0" })
-        .env(
-            "HERMES_SETUP_RECONFIGURE",
-            if args.reconfigure { "1" } else { "0" },
-        )
-        .env("HERMES_SETUP_QUICK", if args.quick { "1" } else { "0" });
-    if let Some(section) = args.section {
-        command.env("HERMES_SETUP_SECTION", section.as_str());
-    }
-    command.arg("-c").arg(bootstrap);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("setup", status).into())
-}
-
 fn should_use_native_agent_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Agent)) && !args.non_interactive && !args.reset
 }
@@ -198,8 +156,24 @@ fn should_use_native_tools_setup(args: &SetupArgs) -> bool {
     matches!(args.section, Some(SetupSection::Tools)) && !args.non_interactive && !args.reset
 }
 
-fn should_use_native_setup_noninteractive(args: &SetupArgs, stdin_is_terminal: bool) -> bool {
-    (args.non_interactive || !stdin_is_terminal) && !args.reset
+fn should_use_native_setup_noninteractive(
+    args: &SetupArgs,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    (args.non_interactive || !stdin_is_terminal || !stdout_is_terminal) && !args.reset
+}
+
+fn should_use_native_full_setup(
+    args: &SetupArgs,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    args.section.is_none()
+        && !args.non_interactive
+        && !args.reset
+        && stdin_is_terminal
+        && stdout_is_terminal
 }
 
 impl SetupSection {
@@ -212,27 +186,6 @@ impl SetupSection {
             SetupSection::Tools => "tools",
             SetupSection::Agent => "agent",
         }
-    }
-}
-
-const SETUP_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "from hermes_cli.setup import run_setup_wizard\n",
-    "args = argparse.Namespace(\n",
-    "    section=(os.environ.get('HERMES_SETUP_SECTION') or None),\n",
-    "    non_interactive=(os.environ.get('HERMES_SETUP_NON_INTERACTIVE') == '1'),\n",
-    "    reset=(os.environ.get('HERMES_SETUP_RESET') == '1'),\n",
-    "    reconfigure=(os.environ.get('HERMES_SETUP_RECONFIGURE') == '1'),\n",
-    "    quick=(os.environ.get('HERMES_SETUP_QUICK') == '1'),\n",
-    ")\n",
-    "run_setup_wizard(args)\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
     }
 }
 
@@ -960,6 +913,257 @@ fn run_native_tools_setup_with_io(
         return Ok(());
     }
     tools_cmd::run_native_tools_interactive_with_io(context, input, output)
+}
+
+fn run_native_setup_wizard(
+    context: &HermesContext,
+    args: &SetupArgs,
+) -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    run_native_setup_wizard_with_io(context, &mut input, &mut output, args)
+}
+
+fn run_native_setup_wizard_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    args: &SetupArgs,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(system) = setup_managed_system(context) {
+        writeln!(
+            output,
+            "{}",
+            format_setup_managed_message(&system, "run setup wizard")
+        )?;
+        return Ok(());
+    }
+
+    context.ensure_hermes_home()?;
+    let backup_path = backup_existing_setup_config(context)?;
+    let existing = native_setup_has_existing_configuration(context);
+
+    {
+        let mut ui = StreamUi { input, output };
+        print_native_setup_banner(&mut ui)?;
+        print_native_setup_locations(&mut ui, context)?;
+    }
+
+    let quick = if args.quick {
+        true
+    } else if args.reconfigure || existing {
+        {
+            let mut ui = StreamUi { input, output };
+            ui.blank()?;
+            ui.line("Reconfigure")?;
+            ui.line("Existing settings were found. Running the full wizard.")?;
+            ui.line("Press Enter to keep the current value at each prompt.")?;
+        }
+        false
+    } else {
+        let mut ui = StreamUi { input, output };
+        ui.blank()?;
+        ui.line("How would you like to set up Hermes?")?;
+        ui.line("  1. Quick setup - provider, model, and optional messaging")?;
+        ui.line("  2. Full setup - configure every major section")?;
+        prompt_menu_choice(&mut ui, "Select setup mode [1]: ", 2, 1)? == 1
+    };
+
+    if quick {
+        run_native_quick_setup_with_io(context, input, output)?;
+    } else {
+        run_native_full_setup_with_io(context, input, output)?;
+    }
+
+    {
+        let mut ui = StreamUi { input, output };
+        if let Some(path) = backup_path {
+            ui.blank()?;
+            ui.line(&format!("Previous config backed up to: {}", path.display()))?;
+        }
+        print_native_setup_summary(&mut ui, context)?;
+        ui.blank()?;
+        ui.line("Run 'hermes chat' to start a chat session.")?;
+    }
+    Ok(())
+}
+
+fn run_native_quick_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    {
+        let mut ui = StreamUi { input, output };
+        ui.blank()?;
+        ui.line("Quick Setup")?;
+        ui.line("Configure the model provider, then optionally connect messaging.")?;
+    }
+
+    run_native_model_setup_with_io(context, input, output)?;
+    apply_native_quick_defaults(context)?;
+
+    let configure_gateway = {
+        let mut ui = StreamUi { input, output };
+        ui.blank()?;
+        prompt_yes_no(&mut ui, "Set up messaging now? [Y/n]: ", true)?
+    };
+    if configure_gateway {
+        run_native_gateway_setup_with_io(context, input, output)?;
+    }
+
+    {
+        let mut ui = StreamUi { input, output };
+        ui.blank()?;
+        ui.line("Setup complete! You're ready to go.")?;
+        ui.line("Configure all settings later with 'hermes setup'.")?;
+        if !configure_gateway {
+            ui.line("Connect messaging later with 'hermes setup gateway'.")?;
+        }
+    }
+    Ok(())
+}
+
+fn run_native_full_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    run_native_model_setup_with_io(context, input, output)?;
+    {
+        let mut ui = StreamUi { input, output };
+        ui.blank()?;
+    }
+    {
+        let mut ui = StreamUi { input, output };
+        run_native_tts_setup(context, &mut ui)?;
+    }
+    {
+        let mut ui = StreamUi { input, output };
+        run_native_terminal_setup(context, &mut ui)?;
+    }
+    {
+        let mut ui = StreamUi { input, output };
+        run_native_agent_setup(context, &mut ui)?;
+    }
+    run_native_gateway_setup_with_io(context, input, output)?;
+    run_native_tools_setup_with_io(context, input, output)?;
+    Ok(())
+}
+
+fn apply_native_quick_defaults(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(&context.config_path())?;
+
+    let terminal = ensure_mapping(&mut root, "terminal");
+    if !terminal.contains_key(yaml_key("backend")) {
+        terminal.insert(yaml_key("backend"), Value::String("local".to_string()));
+    }
+
+    let agent = ensure_mapping(&mut root, "agent");
+    if !agent.contains_key(yaml_key("max_turns")) {
+        agent.insert(yaml_key("max_turns"), Value::Number(90.into()));
+    }
+
+    let display = ensure_mapping(&mut root, "display");
+    if !display.contains_key(yaml_key("tool_progress")) {
+        display.insert(yaml_key("tool_progress"), Value::String("all".to_string()));
+    }
+
+    let compression = ensure_mapping(&mut root, "compression");
+    if !compression.contains_key(yaml_key("enabled")) {
+        compression.insert(yaml_key("enabled"), Value::Bool(true));
+    }
+    if !compression.contains_key(yaml_key("threshold")) {
+        compression.insert(yaml_key("threshold"), Value::Number(0.5.into()));
+    }
+
+    write_yaml_mapping(&context.config_path(), &root)
+}
+
+fn print_native_setup_banner(ui: &mut dyn SetupUi) -> Result<(), Box<dyn Error>> {
+    ui.blank()?;
+    ui.line("┌─────────────────────────────────────────────────────────┐")?;
+    ui.line("│             ⚕ Hermes Agent Setup Wizard                │")?;
+    ui.line("├─────────────────────────────────────────────────────────┤")?;
+    ui.line("│  Configure your Hermes Agent installation.             │")?;
+    ui.line("│  Press Ctrl+C at any time to exit.                     │")?;
+    ui.line("└─────────────────────────────────────────────────────────┘")?;
+    Ok(())
+}
+
+fn print_native_setup_locations(
+    ui: &mut dyn SetupUi,
+    context: &HermesContext,
+) -> Result<(), Box<dyn Error>> {
+    ui.blank()?;
+    ui.line("Configuration Location")?;
+    ui.line(&format!(
+        "Config file:  {}",
+        context.config_path().display()
+    ))?;
+    ui.line(&format!("Secrets file: {}", context.env_path().display()))?;
+    ui.line(&format!(
+        "Data folder:  {}",
+        context.hermes_home().display()
+    ))?;
+    ui.line(&format!("Install dir:  {}", project_root().display()))?;
+    ui.line("Use 'hermes config edit' for direct edits.")?;
+    Ok(())
+}
+
+fn print_native_setup_summary(
+    ui: &mut dyn SetupUi,
+    context: &HermesContext,
+) -> Result<(), Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let provider =
+        get_nested_string(&root, &["model", "provider"]).unwrap_or_else(|| "auto".to_string());
+    let model = get_nested_string(&root, &["model", "default"]).unwrap_or_default();
+    let terminal =
+        get_nested_string(&root, &["terminal", "backend"]).unwrap_or_else(|| "local".to_string());
+
+    ui.blank()?;
+    ui.line("Setup Summary")?;
+    ui.line(&format!("Provider: {}", model_provider_label(&provider)))?;
+    ui.line(&format!(
+        "Model: {}",
+        if model.trim().is_empty() {
+            "(not set)"
+        } else {
+            model.trim()
+        }
+    ))?;
+    ui.line(&format!("Terminal: {terminal}"))?;
+    Ok(())
+}
+
+fn native_setup_has_existing_configuration(context: &HermesContext) -> bool {
+    env_value_for_context(context, "OPENROUTER_API_KEY").is_some()
+        || env_value_for_context(context, "OPENAI_BASE_URL").is_some()
+        || get_active_auth_provider(context.hermes_home().as_path())
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+fn backup_existing_setup_config(
+    context: &HermesContext,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let path = context.config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup = path.with_extension(format!("yaml.bak.{stamp}"));
+    match fs::copy(&path, &backup) {
+        Ok(_) => Ok(Some(backup)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn setup_managed_system(context: &HermesContext) -> Option<String> {
@@ -4068,6 +4272,7 @@ mod tests {
                 reconfigure: false,
                 quick: false,
             },
+            false,
             false
         ));
         assert!(should_use_native_setup_noninteractive(
@@ -4078,7 +4283,19 @@ mod tests {
                 reconfigure: true,
                 quick: true,
             },
+            true,
             true
+        ));
+        assert!(should_use_native_setup_noninteractive(
+            &SetupArgs {
+                section: None,
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: false,
+            },
+            true,
+            false
         ));
         assert!(!should_use_native_setup_noninteractive(
             &SetupArgs {
@@ -4088,7 +4305,37 @@ mod tests {
                 reconfigure: true,
                 quick: true,
             },
+            false,
             false
+        ));
+    }
+
+    #[test]
+    fn native_full_setup_requires_interactive_top_level() {
+        let args = SetupArgs {
+            section: None,
+            non_interactive: false,
+            reset: false,
+            reconfigure: false,
+            quick: false,
+        };
+        assert!(should_use_native_full_setup(&args, true, true));
+        assert!(!should_use_native_full_setup(&args, true, false));
+        assert!(!should_use_native_full_setup(
+            &SetupArgs {
+                section: Some(SetupSection::Model),
+                ..args.clone()
+            },
+            true,
+            true
+        ));
+        assert!(!should_use_native_full_setup(
+            &SetupArgs {
+                non_interactive: true,
+                ..args
+            },
+            true,
+            true
         ));
     }
 
@@ -4272,6 +4519,59 @@ mod tests {
         )
         .unwrap();
         remove_env_var("HERMES_SETUP_PYTHON");
+    }
+
+    #[test]
+    fn setup_top_level_quick_runs_native_without_python_fallback() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "model:\n  provider: auto\n  default: test-model\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let providers = native_setup_model_providers(&context);
+        let keep_choice = providers.len() + 4;
+        let mut input = io::Cursor::new(format!("{keep_choice}\nn\n").into_bytes());
+        let mut output = Vec::new();
+
+        set_env_var("HERMES_SETUP_PYTHON", "/bin/false");
+        run_native_setup_wizard_with_io(
+            &context,
+            &mut input,
+            &mut output,
+            &SetupArgs {
+                section: None,
+                non_interactive: false,
+                reset: false,
+                reconfigure: false,
+                quick: true,
+            },
+        )
+        .unwrap();
+        remove_env_var("HERMES_SETUP_PYTHON");
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Hermes Agent Setup Wizard"));
+        assert!(rendered.contains("Quick Setup"));
+        assert!(rendered.contains("Setup complete! You're ready to go."));
+        assert!(rendered.contains("Setup Summary"));
+
+        let config_text = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("provider: auto"));
+        assert!(config_text.contains("default: test-model"));
+        assert!(config_text.contains("backend: local"));
+        assert!(config_text.contains("tool_progress: all"));
+        assert!(fs::read_dir(&home).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.yaml.bak.")
+        }));
     }
 
     #[test]
