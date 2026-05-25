@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +11,9 @@ use hermes_core::{
     ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
     spawn_chat_turn_with_events,
 };
+use regex::Regex;
 use serde_json::{Value, json};
+use serde_yaml::Value as YamlValue;
 
 #[derive(Debug, Clone)]
 struct NativeGatewaySessionState {
@@ -207,6 +210,8 @@ impl<'a> NativeGatewayServer<'a> {
                 "matched": false,
                 "text": params.get("text").and_then(Value::as_str).unwrap_or_default(),
             })),
+            "complete.path" => self.handle_complete_path(params),
+            "complete.slash" => self.handle_complete_slash(params),
             "prompt.submit" => {
                 return match self.handle_prompt_submit(writer, params) {
                     Ok(value) => write_jsonrpc_result(writer, id, value),
@@ -470,6 +475,30 @@ impl<'a> NativeGatewayServer<'a> {
         }
         Ok(json!({"ok": true}))
     }
+
+    fn handle_complete_path(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let word = params
+            .get("word")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Ok(json!({
+            "items": complete_path_items(word, &cwd),
+        }))
+    }
+
+    fn handle_complete_slash(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let text = params
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (items, replace_from) =
+            complete_slash_items(text, &self.config.raw).map_err(|error| (-32603, error, None))?;
+        Ok(json!({
+            "items": items,
+            "replace_from": replace_from,
+        }))
+    }
 }
 
 fn required_session_id(params: &Value) -> Result<String, (i64, String, Option<Value>)> {
@@ -549,6 +578,472 @@ fn session_info_payload(config: &LoadedConfig) -> Value {
         "tools": {},
         "version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+fn complete_path_items(word: &str, cwd: &Path) -> Vec<Value> {
+    if word.is_empty() {
+        return Vec::new();
+    }
+
+    if word == "@" {
+        return static_context_items();
+    }
+
+    if let Some(query) = word.strip_prefix('@') {
+        if query.is_empty() {
+            return static_context_items();
+        }
+        if !query.contains('/') && !query.contains(':') {
+            let prefixed = static_context_items()
+                .into_iter()
+                .filter(|item| {
+                    item["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(word))
+                })
+                .collect::<Vec<_>>();
+            if !prefixed.is_empty() {
+                return prefixed;
+            }
+        }
+        if query == "file" || query == "folder" {
+            return list_path_items("", cwd, Some(query));
+        }
+        if let Some(path_part) = query.strip_prefix("file:") {
+            return list_path_items(path_part, cwd, Some("file"));
+        }
+        if let Some(path_part) = query.strip_prefix("folder:") {
+            return list_path_items(path_part, cwd, Some("folder"));
+        }
+    }
+
+    list_path_items(word, cwd, None)
+}
+
+fn static_context_items() -> Vec<Value> {
+    vec![
+        json!({"text":"@diff","display":"@diff","meta":"git diff"}),
+        json!({"text":"@staged","display":"@staged","meta":"staged diff"}),
+        json!({"text":"@file:","display":"@file:","meta":"attach file"}),
+        json!({"text":"@folder:","display":"@folder:","meta":"attach folder"}),
+        json!({"text":"@url:","display":"@url:","meta":"fetch url"}),
+        json!({"text":"@git:","display":"@git:","meta":"git log"}),
+    ]
+}
+
+fn list_path_items(word: &str, cwd: &Path, context_kind: Option<&str>) -> Vec<Value> {
+    let expanded = normalize_completion_path(word, cwd);
+    let (search_dir, match_prefix) =
+        if expanded.as_os_str().is_empty() || expanded == PathBuf::from(".") {
+            (cwd.to_path_buf(), String::new())
+        } else if word.ends_with('/') {
+            (expanded, String::new())
+        } else {
+            let search_dir = if expanded.is_dir() && word.ends_with(std::path::MAIN_SEPARATOR) {
+                expanded.clone()
+            } else {
+                expanded
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| cwd.to_path_buf())
+            };
+            let match_prefix = expanded
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            (search_dir, match_prefix)
+        };
+
+    let Ok(entries) = fs::read_dir(&search_dir) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    let match_lower = match_prefix.to_ascii_lowercase();
+    let mut rows = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let name = file_name.to_str()?.to_string();
+            if !match_prefix.is_empty() && !name.to_ascii_lowercase().starts_with(&match_lower) {
+                return None;
+            }
+            if context_kind.is_none() && word.starts_with('@') && name.starts_with('.') {
+                return None;
+            }
+            let full = entry.path();
+            let is_dir = full.is_dir();
+            match context_kind {
+                Some("file") if is_dir => return None,
+                Some("folder") if !is_dir => return None,
+                _ => {}
+            }
+            Some((name, full, is_dir))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (name, full, is_dir) in rows.into_iter().take(30) {
+        let rel = make_relative_display_path(&full, cwd);
+        let suffix = if is_dir { "/" } else { "" };
+        let text = if let Some(kind) = context_kind {
+            format!("@{kind}:{rel}{suffix}")
+        } else if word.starts_with("~/") {
+            let home = dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+            let home_rel = full.strip_prefix(&home).unwrap_or(full.as_path());
+            format!("~/{}{}", home_rel.display(), suffix)
+        } else if word.starts_with('@') {
+            let kind = if is_dir { "folder" } else { "file" };
+            format!("@{kind}:{rel}{suffix}")
+        } else if word.starts_with("./") {
+            format!("./{rel}{suffix}")
+        } else if full.is_absolute() && word.starts_with('/') {
+            format!("{}{}", full.display(), suffix)
+        } else {
+            format!("{rel}{suffix}")
+        };
+        items.push(json!({
+            "text": text,
+            "display": format!("{name}{suffix}"),
+            "meta": if is_dir { "dir" } else { "" },
+        }));
+    }
+
+    items
+}
+
+fn normalize_completion_path(word: &str, cwd: &Path) -> PathBuf {
+    let raw = word.strip_prefix('@').unwrap_or(word);
+    let raw = raw
+        .strip_prefix("file:")
+        .or_else(|| raw.strip_prefix("folder:"))
+        .unwrap_or(raw);
+    if raw.is_empty() {
+        return cwd.to_path_buf();
+    }
+    if raw == "." {
+        return cwd.to_path_buf();
+    }
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return dirs::home_dir()
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(rest);
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn make_relative_display_path(path: &Path, cwd: &Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+}
+
+fn complete_slash_items(text: &str, raw_config: &YamlValue) -> Result<(Vec<Value>, usize), String> {
+    if !text.starts_with('/') {
+        return Ok((Vec::new(), 1));
+    }
+
+    if let Some((items, replace_from)) = details_completions(text) {
+        return Ok((items, replace_from));
+    }
+
+    let mut items = parse_gateway_commands(raw_config)?
+        .into_iter()
+        .filter_map(|command| {
+            let completion = format!("/{}", command.name);
+            let aliases = command
+                .aliases
+                .iter()
+                .map(|alias| format!("/{}", alias))
+                .collect::<Vec<_>>();
+            let mut values = vec![completion];
+            values.extend(aliases);
+            let matched = values
+                .into_iter()
+                .filter(|value| value.starts_with(text))
+                .map(|value| {
+                    json!({
+                        "text": value,
+                        "display": value,
+                        "meta": command.description,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!matched.is_empty()).then_some(matched)
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    for extra in [
+        ("compact", "Toggle compact display mode"),
+        ("details", "Control agent detail visibility"),
+        ("logs", "Show recent gateway log lines"),
+        ("mouse", "Toggle mouse/wheel tracking [on|off|toggle]"),
+    ] {
+        let value = format!("/{}", extra.0);
+        if value.starts_with(text) && !items.iter().any(|item| item["text"] == json!(value)) {
+            items.push(json!({
+                "text": value,
+                "display": value,
+                "meta": extra.1,
+            }));
+        }
+    }
+
+    items.truncate(30);
+    Ok((items, 1))
+}
+
+fn details_completions(text: &str) -> Option<(Vec<Value>, usize)> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.starts_with("/details") {
+        return None;
+    }
+
+    let body = text.strip_prefix("/details").unwrap_or_default();
+    let body = body.strip_prefix(' ').unwrap_or(body);
+    let has_trailing_space = text.ends_with(' ');
+    let parts = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split_whitespace().collect::<Vec<_>>()
+    };
+    let sections = ["thinking", "tools", "subagents", "activity"];
+    let modes = ["hidden", "collapsed", "expanded"];
+
+    if body.is_empty() || (parts.is_empty() && has_trailing_space) {
+        let mut items = modes
+            .iter()
+            .map(|mode| {
+                let value = if has_trailing_space {
+                    (*mode).to_string()
+                } else {
+                    format!(" {mode}")
+                };
+                json!({"text": value, "display": *mode, "meta": "global mode"})
+            })
+            .collect::<Vec<_>>();
+        items.push(json!({
+            "text": if has_trailing_space { "cycle".to_string() } else { " cycle".to_string() },
+            "display":"cycle",
+            "meta":"cycle global mode"
+        }));
+        items.extend(sections.iter().map(|section| {
+            let value = if has_trailing_space {
+                (*section).to_string()
+            } else {
+                format!(" {section}")
+            };
+            json!({"text": value, "display": *section, "meta": "section override"})
+        }));
+        return Some((
+            items,
+            text.rfind(' ').map(|index| index + 1).unwrap_or(text.len()),
+        ));
+    }
+
+    if parts.len() == 1 && !has_trailing_space {
+        let prefix = parts[0].to_ascii_lowercase();
+        let mut items = Vec::new();
+        for mode in modes {
+            if mode.starts_with(&prefix) && mode != prefix {
+                items.push(json!({"text":mode,"display":mode,"meta":"global mode"}));
+            }
+        }
+        if "cycle".starts_with(&prefix) && prefix != "cycle" {
+            items.push(json!({"text":"cycle","display":"cycle","meta":"cycle global mode"}));
+        }
+        for section in sections {
+            if section.starts_with(&prefix) && section != prefix {
+                items.push(json!({"text":section,"display":section,"meta":"section override"}));
+            }
+        }
+        return Some((
+            items,
+            text.rfind(' ').map(|index| index + 1).unwrap_or(text.len()),
+        ));
+    }
+
+    if parts.len() == 1
+        && has_trailing_space
+        && sections.contains(&parts[0].to_ascii_lowercase().as_str())
+    {
+        let section = parts[0].to_ascii_lowercase();
+        let mut items = modes
+            .iter()
+            .map(|mode| json!({"text": *mode, "display": *mode, "meta": format!("set {section}")}))
+            .collect::<Vec<_>>();
+        items.push(
+            json!({"text":"reset","display":"reset","meta": format!("clear {section} override")}),
+        );
+        return Some((
+            items,
+            text.rfind(' ').map(|index| index + 1).unwrap_or(text.len()),
+        ));
+    }
+
+    if parts.len() == 2
+        && !has_trailing_space
+        && sections.contains(&parts[0].to_ascii_lowercase().as_str())
+    {
+        let section = parts[0].to_ascii_lowercase();
+        let prefix = parts[1].to_ascii_lowercase();
+        let mut items = Vec::new();
+        for mode in modes {
+            if mode.starts_with(&prefix) && mode != prefix {
+                items.push(json!({"text":mode,"display":mode,"meta": format!("set {section}")}));
+            }
+        }
+        if "reset".starts_with(&prefix) && prefix != "reset" {
+            items.push(json!({"text":"reset","display":"reset","meta": format!("clear {section} override")}));
+        }
+        return Some((
+            items,
+            text.rfind(' ').map(|index| index + 1).unwrap_or(text.len()),
+        ));
+    }
+
+    Some((
+        Vec::new(),
+        text.rfind(' ').map(|index| index + 1).unwrap_or(text.len()),
+    ))
+}
+
+#[derive(Debug)]
+struct RegistryCommand {
+    name: String,
+    description: String,
+    aliases: Vec<String>,
+}
+
+fn parse_gateway_commands(raw_config: &YamlValue) -> Result<Vec<RegistryCommand>, String> {
+    let source = fs::read_to_string(command_registry_path())
+        .map_err(|error| format!("reading command registry failed: {error}"))?;
+    let start = source
+        .find("COMMAND_REGISTRY")
+        .ok_or_else(|| String::from("could not locate COMMAND_REGISTRY"))?;
+    let regex = Regex::new(r#"CommandDef\((?s:.*?)\)"#)
+        .map_err(|error| format!("building registry regex failed: {error}"))?;
+    let alias_regex = Regex::new(r#"aliases=\((?P<body>[^)]*)\)"#)
+        .map_err(|error| format!("building alias regex failed: {error}"))?;
+    let gate_regex = Regex::new(r#"gateway_config_gate="(?P<value>[^"]+)""#)
+        .map_err(|error| format!("building config gate regex failed: {error}"))?;
+
+    let mut commands = Vec::new();
+    for capture in regex.find_iter(&source[start..]) {
+        let block = capture.as_str();
+        let strings = string_literals(block);
+        if strings.len() < 3 {
+            continue;
+        }
+        if block.contains("gateway_only=True") || !block.contains("cli_only=True") {
+            commands.push(RegistryCommand {
+                name: strings[0].clone(),
+                description: strings[1].clone(),
+                aliases: alias_regex
+                    .captures(block)
+                    .and_then(|captures| captures.name("body"))
+                    .map(|body| string_literals(body.as_str()))
+                    .unwrap_or_default(),
+            });
+            continue;
+        }
+        let gate = gate_regex
+            .captures(block)
+            .and_then(|captures| captures.name("value"))
+            .map(|value| value.as_str().to_string());
+        if gate
+            .as_deref()
+            .is_some_and(|value| config_gate_truthy(raw_config, value))
+        {
+            commands.push(RegistryCommand {
+                name: strings[0].clone(),
+                description: strings[1].clone(),
+                aliases: alias_regex
+                    .captures(block)
+                    .and_then(|captures| captures.name("body"))
+                    .map(|body| string_literals(body.as_str()))
+                    .unwrap_or_default(),
+            });
+        }
+    }
+
+    Ok(commands)
+}
+
+fn command_registry_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("hermes_cli")
+        .join("commands.py")
+}
+
+fn string_literals(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if in_string {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                values.push(current.clone());
+                current.clear();
+                in_string = false;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' {
+            in_string = true;
+        }
+    }
+    values
+}
+
+fn config_gate_truthy(raw_config: &YamlValue, gate: &str) -> bool {
+    let mut node = raw_config;
+    for part in gate.split('.') {
+        match node {
+            YamlValue::Mapping(mapping) => {
+                let key = YamlValue::String(part.to_string());
+                let Some(value) = mapping.get(&key) else {
+                    return false;
+                };
+                node = value;
+            }
+            _ => return false,
+        }
+    }
+    yaml_truthy(node)
+}
+
+fn yaml_truthy(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Bool(boolean) => *boolean,
+        YamlValue::Number(number) => number
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| number.as_u64().map(|value| value != 0))
+            .or_else(|| number.as_f64().map(|value| value != 0.0))
+            .unwrap_or(false),
+        YamlValue::String(text) => matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => false,
+    }
 }
 
 fn unix_ts_nanos() -> u128 {
@@ -864,5 +1359,77 @@ mod tests {
             frame["params"]["type"] == json!("message.complete")
                 && frame["params"]["payload"]["text"] == json!("hello from direct prompt")
         }));
+    }
+
+    #[test]
+    fn native_gateway_complete_path_lists_context_refs_and_files() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("alpha.txt"), "alpha").unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+
+        let refs = complete_path_items("@", temp.path());
+        assert!(refs.iter().any(|item| item["text"] == json!("@diff")));
+        assert!(refs.iter().any(|item| item["text"] == json!("@file:")));
+
+        let ref_prefix = complete_path_items("@fi", temp.path());
+        assert!(
+            ref_prefix
+                .iter()
+                .any(|item| item["text"] == json!("@file:"))
+        );
+
+        let files = complete_path_items("@file:a", temp.path());
+        assert!(
+            files
+                .iter()
+                .any(|item| item["text"] == json!("@file:alpha.txt"))
+        );
+
+        let folders = complete_path_items("@folder:d", temp.path());
+        assert!(
+            folders
+                .iter()
+                .any(|item| item["text"] == json!("@folder:docs/"))
+        );
+    }
+
+    #[test]
+    fn native_gateway_complete_slash_lists_gateway_commands_and_details_modes() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+
+        let (slash_items, slash_replace_from) = complete_slash_items("/he", &config.raw).unwrap();
+        assert_eq!(slash_replace_from, 1);
+        assert!(
+            slash_items
+                .iter()
+                .any(|item| item["text"] == json!("/help"))
+        );
+
+        let (detail_items, detail_replace_from) =
+            complete_slash_items("/details thinking ", &config.raw).unwrap();
+        assert_eq!(detail_replace_from, "/details thinking ".len());
+        assert!(
+            detail_items
+                .iter()
+                .any(|item| item["text"] == json!("hidden"))
+        );
+        assert!(
+            detail_items
+                .iter()
+                .any(|item| item["text"] == json!("reset"))
+        );
+
+        let (detail_root_items, detail_root_replace_from) =
+            complete_slash_items("/details", &config.raw).unwrap();
+        assert_eq!(detail_root_replace_from, "/details".len());
+        assert!(
+            detail_root_items
+                .iter()
+                .any(|item| item["text"] == json!(" hidden"))
+        );
     }
 }
