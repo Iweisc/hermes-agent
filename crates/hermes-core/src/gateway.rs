@@ -1506,6 +1506,90 @@ pub enum GatewayToolApprovalChoice {
     Deny,
 }
 
+impl GatewayToolApprovalChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Always => "always",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Result<Self, String> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "once" => Ok(Self::Once),
+            "session" => Ok(Self::Session),
+            "always" => Ok(Self::Always),
+            "deny" => Ok(Self::Deny),
+            _ => Err("tool approval choice must be once, session, always, or deny".to_string()),
+        }
+    }
+
+    pub fn acknowledgement_label(self) -> &'static str {
+        match self {
+            Self::Once => "✅ Approved once",
+            Self::Session => "✅ Approved for session",
+            Self::Always => "✅ Approved permanently",
+            Self::Deny => "❌ Denied",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayToolApprovalPromptPlan {
+    pub session_key: String,
+    pub command: String,
+    pub description: String,
+    pub fallback_message: String,
+}
+
+impl GatewayToolApprovalPromptPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.session_key.trim().is_empty() {
+            return Err("tool approval prompt session_key must not be empty".to_string());
+        }
+        if self.command.trim().is_empty() {
+            return Err("tool approval prompt command must not be empty".to_string());
+        }
+        if self.description.trim().is_empty() {
+            return Err("tool approval prompt description must not be empty".to_string());
+        }
+        if self.fallback_message.trim().is_empty() {
+            return Err("tool approval prompt fallback_message must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayToolApprovalCallbackPresentation {
+    pub acknowledgement_label: String,
+    pub decision_text: String,
+}
+
+impl GatewayToolApprovalCallbackPresentation {
+    pub fn from_choice(
+        choice: GatewayToolApprovalChoice,
+        actor_display: &str,
+    ) -> Result<Self, String> {
+        let actor_display = actor_display.trim();
+        if actor_display.is_empty() {
+            return Err("tool approval actor_display must not be empty".to_string());
+        }
+        Ok(Self {
+            acknowledgement_label: choice.acknowledgement_label().to_string(),
+            decision_text: format!("{} by {}", choice.acknowledgement_label(), actor_display),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayToolApprovalCallbackExecution {
+    pub presentation: GatewayToolApprovalCallbackPresentation,
+    pub result: GatewayToolApprovalCommandExecution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayToolApprovalRequest {
     pub session_key: String,
@@ -2929,6 +3013,37 @@ impl GatewayRuntime {
         self.pending_tool_approval_sessions.contains(session_key)
     }
 
+    pub fn begin_tool_approval_prompt(
+        &mut self,
+        session_key: &str,
+        command: &str,
+        description: &str,
+    ) -> Result<GatewayToolApprovalPromptPlan, String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("tool approval session_key must not be empty".to_string());
+        }
+        let command = command.trim();
+        if command.is_empty() {
+            return Err("tool approval command must not be empty".to_string());
+        }
+        let description = description.trim();
+        if description.is_empty() {
+            return Err("tool approval description must not be empty".to_string());
+        }
+
+        self.pending_tool_approval_sessions
+            .insert(session_key.to_string());
+        let plan = GatewayToolApprovalPromptPlan {
+            session_key: session_key.to_string(),
+            command: command.to_string(),
+            description: description.to_string(),
+            fallback_message: format_tool_approval_fallback_message(command, description)?,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn begin_tool_approval_host_command(
         &mut self,
         event: &MessageEvent,
@@ -3054,6 +3169,29 @@ impl GatewayRuntime {
             resolved_count,
             message,
             resume_typing: true,
+        })
+    }
+
+    pub fn complete_tool_approval_callback(
+        &mut self,
+        session_key: &str,
+        choice: GatewayToolApprovalChoice,
+        actor_display: &str,
+        resolved_count: usize,
+    ) -> Result<GatewayToolApprovalCallbackExecution, String> {
+        let presentation =
+            GatewayToolApprovalCallbackPresentation::from_choice(choice, actor_display)?;
+        let result = self.complete_tool_approval_host_command(
+            &GatewayToolApprovalRequest {
+                session_key: session_key.trim().to_string(),
+                choice,
+                resolve_all: false,
+            },
+            resolved_count,
+        )?;
+        Ok(GatewayToolApprovalCallbackExecution {
+            presentation,
+            result,
         })
     }
 
@@ -6048,6 +6186,30 @@ pub fn plan_exec_quick_command_response(
         ));
     }
     Ok(response)
+}
+
+pub fn format_tool_approval_fallback_message(
+    command: &str,
+    description: &str,
+) -> Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("tool approval command must not be empty".to_string());
+    }
+    let description = description.trim();
+    if description.is_empty() {
+        return Err("tool approval description must not be empty".to_string());
+    }
+
+    let preview = if command.chars().count() > 200 {
+        let truncated = command.chars().take(200).collect::<String>();
+        format!("{truncated}...")
+    } else {
+        command.to_string()
+    };
+    Ok(format!(
+        "⚠️ **Dangerous command requires approval:**\n```\n{preview}\n```\nReason: {description}\n\nReply `/approve` to execute, `/approve session` to approve this pattern for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+    ))
 }
 
 fn execute_quick_command_subprocess_with_timeout(
@@ -9391,6 +9553,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_begin_tool_approval_prompt_marks_pending_and_formats_message() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        let plan = runtime
+            .begin_tool_approval_prompt(
+                "session-1",
+                "python -c \"print('hello')\"",
+                "script execution via -c flag",
+            )
+            .unwrap();
+
+        assert_eq!(plan.session_key, "session-1");
+        assert!(runtime.has_pending_tool_approval("session-1"));
+        assert!(
+            plan.fallback_message
+                .contains("Dangerous command requires approval")
+        );
+        assert!(plan.fallback_message.contains("python -c"));
+        assert!(plan.fallback_message.contains("Reply `/approve`"));
+    }
+
+    #[test]
     fn runtime_begin_tool_approval_host_command_parses_approve_scope_and_all() {
         let temp = tempdir().unwrap();
         let mut runtime = GatewayRuntime::new(
@@ -9467,6 +9657,33 @@ mod tests {
     }
 
     #[test]
+    fn tool_approval_choice_parses_tokens_and_formats_callback_presentation() {
+        assert_eq!(
+            GatewayToolApprovalChoice::from_token("session").unwrap(),
+            GatewayToolApprovalChoice::Session
+        );
+        assert_eq!(
+            GatewayToolApprovalChoice::from_token("deny").unwrap(),
+            GatewayToolApprovalChoice::Deny
+        );
+        assert_eq!(
+            GatewayToolApprovalChoice::from_token("bogus").unwrap_err(),
+            "tool approval choice must be once, session, always, or deny"
+        );
+        assert_eq!(
+            GatewayToolApprovalCallbackPresentation::from_choice(
+                GatewayToolApprovalChoice::Always,
+                "Kai",
+            )
+            .unwrap(),
+            GatewayToolApprovalCallbackPresentation {
+                acknowledgement_label: "✅ Approved permanently".to_string(),
+                decision_text: "✅ Approved permanently by Kai".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn runtime_complete_tool_approval_host_command_formats_resolved_messages() {
         let temp = tempdir().unwrap();
         let mut runtime = GatewayRuntime::new(
@@ -9528,6 +9745,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_complete_tool_approval_callback_wraps_presentation_and_result() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime.mark_pending_tool_approval("session-1").unwrap();
+
+        assert_eq!(
+            runtime
+                .complete_tool_approval_callback(
+                    "session-1",
+                    GatewayToolApprovalChoice::Session,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackExecution {
+                presentation: GatewayToolApprovalCallbackPresentation {
+                    acknowledgement_label: "✅ Approved for session".to_string(),
+                    decision_text: "✅ Approved for session by Kai".to_string(),
+                },
+                result: GatewayToolApprovalCommandExecution::Resolved {
+                    request: GatewayToolApprovalRequest {
+                        session_key: "session-1".to_string(),
+                        choice: GatewayToolApprovalChoice::Session,
+                        resolve_all: false,
+                    },
+                    resolved_count: 1,
+                    message:
+                        "✅ Command approved (pattern approved for this session). The agent is resuming..."
+                            .to_string(),
+                    resume_typing: true,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn runtime_complete_tool_approval_host_command_returns_no_pending_for_zero_count() {
         let temp = tempdir().unwrap();
         let mut runtime = GatewayRuntime::new(
@@ -9551,6 +9809,20 @@ mod tests {
             GatewayToolApprovalCommandExecution::NoPending {
                 message: "No pending command to approve.".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn format_tool_approval_fallback_message_truncates_long_preview() {
+        let command = "x".repeat(240);
+        let message = format_tool_approval_fallback_message(&command, "dangerous command").unwrap();
+        assert!(message.contains("Dangerous command requires approval"));
+        assert!(message.contains("Reason: dangerous command"));
+        assert!(message.contains("`/approve always`"));
+        assert!(message.contains("..."));
+        assert_eq!(
+            format_tool_approval_fallback_message("  ", "desc").unwrap_err(),
+            "tool approval command must not be empty"
         );
     }
 
