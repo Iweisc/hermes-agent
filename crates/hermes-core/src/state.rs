@@ -339,6 +339,16 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn reopen_session(&self, session_id: &str) -> Result<(), HermesError> {
+        self.connection
+            .execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                [session_id],
+            )
+            .map_err(state_err("reopening session"))?;
+        Ok(())
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>, HermesError> {
         self.connection
             .query_row(

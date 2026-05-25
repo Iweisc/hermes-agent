@@ -11,6 +11,8 @@ use hermes_core::{
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
 
+mod tui_gateway;
+
 #[derive(Parser, Debug)]
 #[command(name = "hermes-agent", version, about = "Hermes agent Rust bootstrap")]
 struct Cli {
@@ -43,6 +45,7 @@ enum Command {
     },
     Env,
     Status,
+    TuiGateway,
 }
 
 #[derive(Clone)]
@@ -287,6 +290,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("terminal_backend={}", config.config.terminal.backend);
             println!("toolsets={}", config.config.toolsets.join(","));
             println!("note=Rust chat_completions loop available via `hermes-agent chat`");
+        }
+        Command::TuiGateway => {
+            tui_gateway::run(context)?;
         }
     }
 
