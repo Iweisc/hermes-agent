@@ -45,12 +45,12 @@ pub struct InstallArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PluginEntry {
-    name: String,
-    version: String,
-    description: String,
-    source: String,
-    path: PathBuf,
+pub(crate) struct PluginEntry {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
+    pub(crate) source: String,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -68,9 +68,30 @@ struct ProviderInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderOption {
-    name: String,
-    description: String,
+pub(crate) struct ProviderOption {
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardInstallResult {
+    pub(crate) plugin_name: String,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) missing_env: Vec<String>,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardToggleResult {
+    pub(crate) name: String,
+    pub(crate) unchanged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardUpdateResult {
+    pub(crate) name: String,
+    pub(crate) output: String,
+    pub(crate) unchanged: bool,
 }
 
 const SUPPORTED_MANIFEST_VERSION: i64 = 1;
@@ -88,6 +109,177 @@ pub fn print_plugins(
         Some(PluginsCommand::Disable { name }) => disable_plugin(context, &name),
         Some(PluginsCommand::Remove { name }) => remove_plugin(context, &name),
     }
+}
+
+pub(crate) fn dashboard_list_plugins(
+    context: &HermesContext,
+) -> Result<Vec<PluginEntry>, Box<dyn Error>> {
+    discover_all_plugins(context)
+}
+
+pub(crate) fn dashboard_plugin_sets(
+    context: &HermesContext,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), Box<dyn Error>> {
+    Ok((
+        load_plugin_set(context, "enabled")?,
+        load_plugin_set(context, "disabled")?,
+    ))
+}
+
+pub(crate) fn dashboard_memory_provider_options(context: &HermesContext) -> Vec<ProviderOption> {
+    discover_memory_providers(context)
+        .into_iter()
+        .map(|provider| ProviderOption {
+            name: provider.name,
+            description: provider.description,
+        })
+        .collect()
+}
+
+pub(crate) fn dashboard_context_engine_options(
+    context: &HermesContext,
+) -> Result<Vec<ProviderOption>, Box<dyn Error>> {
+    discover_context_engines(context)
+}
+
+pub(crate) fn dashboard_current_memory_provider(
+    context: &HermesContext,
+) -> Result<String, Box<dyn Error>> {
+    current_memory_provider(context)
+}
+
+pub(crate) fn dashboard_current_context_engine(
+    context: &HermesContext,
+) -> Result<String, Box<dyn Error>> {
+    current_context_engine(context)
+}
+
+pub(crate) fn dashboard_save_memory_provider(
+    context: &HermesContext,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    save_memory_provider(context, name)
+}
+
+pub(crate) fn dashboard_save_context_engine(
+    context: &HermesContext,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    save_context_engine(context, name)
+}
+
+pub(crate) fn dashboard_install_plugin(
+    context: &HermesContext,
+    identifier: &str,
+    force: bool,
+    enable: bool,
+) -> Result<DashboardInstallResult, Box<dyn Error>> {
+    let mut warnings = Vec::new();
+    let git_url = resolve_git_url(identifier)?;
+    if git_url.starts_with("http://") || git_url.starts_with("file://") {
+        warnings.push(String::from(
+            "Insecure URL scheme; prefer https:// or git@ for production installs.",
+        ));
+    }
+    let (target, manifest, installed_name) = install_plugin_core(context, identifier, force)?;
+    copy_example_files_silent(&target)?;
+    let missing_env = missing_manifest_env_names(context, &manifest);
+    if enable {
+        let mut enabled_set = load_plugin_set(context, "enabled")?;
+        let mut disabled_set = load_plugin_set(context, "disabled")?;
+        enabled_set.insert(installed_name.clone());
+        disabled_set.remove(&installed_name);
+        save_plugin_set(context, "enabled", &enabled_set)?;
+        save_plugin_set(context, "disabled", &disabled_set)?;
+    }
+    Ok(DashboardInstallResult {
+        plugin_name: installed_name,
+        warnings,
+        missing_env,
+        enabled: enable,
+    })
+}
+
+pub(crate) fn dashboard_set_agent_plugin_enabled(
+    context: &HermesContext,
+    raw_name: &str,
+    enabled: bool,
+) -> Result<DashboardToggleResult, Box<dyn Error>> {
+    let name = resolve_existing_plugin_name(context, raw_name)?
+        .ok_or_else(|| format!("plugin '{}' is not installed or bundled", raw_name.trim()))?;
+    let mut enabled_set = load_plugin_set(context, "enabled")?;
+    let mut disabled_set = load_plugin_set(context, "disabled")?;
+
+    if enabled {
+        if enabled_set.contains(&name) && !disabled_set.contains(&name) {
+            return Ok(DashboardToggleResult {
+                name,
+                unchanged: true,
+            });
+        }
+        enabled_set.insert(name.clone());
+        disabled_set.remove(&name);
+    } else {
+        if !enabled_set.contains(&name) && disabled_set.contains(&name) {
+            return Ok(DashboardToggleResult {
+                name,
+                unchanged: true,
+            });
+        }
+        enabled_set.remove(&name);
+        disabled_set.insert(name.clone());
+    }
+
+    save_plugin_set(context, "enabled", &enabled_set)?;
+    save_plugin_set(context, "disabled", &disabled_set)?;
+    Ok(DashboardToggleResult {
+        name,
+        unchanged: false,
+    })
+}
+
+pub(crate) fn dashboard_update_user_plugin(
+    context: &HermesContext,
+    raw_name: &str,
+) -> Result<DashboardUpdateResult, Box<dyn Error>> {
+    let plugins_dir = user_plugins_dir(context)?;
+    let (name, target) = resolve_installed_plugin(context, raw_name)?.ok_or_else(|| {
+        format!(
+            "plugin '{}' not found in {}",
+            raw_name.trim(),
+            plugins_dir.display()
+        )
+    })?;
+    if !target.join(".git").exists() {
+        return Err(format!(
+            "plugin '{name}' was not installed from git (no .git directory). Cannot update."
+        )
+        .into());
+    }
+    let output = git_pull_plugin_dir(&target)?;
+    copy_example_files_silent(&target)?;
+    Ok(DashboardUpdateResult {
+        unchanged: output.contains("Already up to date"),
+        name,
+        output,
+    })
+}
+
+pub(crate) fn dashboard_remove_user_plugin(
+    context: &HermesContext,
+    raw_name: &str,
+) -> Result<String, Box<dyn Error>> {
+    let plugins_dir = user_plugins_dir(context)?;
+    let (canonical_name, target) =
+        resolve_installed_plugin(context, raw_name)?.ok_or_else(|| {
+            format!(
+                "plugin '{}' not found in {}",
+                raw_name.trim(),
+                plugins_dir.display()
+            )
+        })?;
+    fs::remove_dir_all(&target)?;
+    Ok(canonical_name)
 }
 
 fn toggle_plugins(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -379,6 +571,20 @@ fn validate_manifest_version(manifest: &Mapping, plugin_name: &str) -> Result<()
 }
 
 fn copy_example_files(plugin_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let created = copy_example_files_with_report(plugin_dir)?;
+    for real_name in created {
+        println!("  Created {real_name} from {real_name}.example");
+    }
+    Ok(())
+}
+
+fn copy_example_files_silent(plugin_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let _ = copy_example_files_with_report(plugin_dir)?;
+    Ok(())
+}
+
+fn copy_example_files_with_report(plugin_dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut created = Vec::new();
     for entry in fs::read_dir(plugin_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -396,9 +602,9 @@ fn copy_example_files(plugin_dir: &Path) -> Result<(), Box<dyn Error>> {
             continue;
         }
         fs::copy(&path, &target)?;
-        println!("  Created {real_name} from {file_name}");
+        created.push(real_name.to_string());
     }
-    Ok(())
+    Ok(created)
 }
 
 fn prompt_plugin_env_vars(
@@ -519,6 +725,38 @@ fn parse_manifest_env_specs(manifest: &Mapping) -> Vec<EnvSpec> {
                 })
             }
             _ => None,
+        })
+        .collect()
+}
+
+fn missing_manifest_env_names(context: &HermesContext, manifest: &Mapping) -> Vec<String> {
+    let file_env = load_env_file_values(&context.env_path());
+    parse_manifest_env_specs(manifest)
+        .into_iter()
+        .filter(|spec| {
+            std::env::var(&spec.name)
+                .ok()
+                .is_none_or(|value| value.trim().is_empty())
+                && file_env
+                    .get(&spec.name)
+                    .is_none_or(|value| value.trim().is_empty())
+        })
+        .map(|spec| spec.name)
+        .collect()
+}
+
+fn load_env_file_values(path: &Path) -> BTreeMap<String, String> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let (key, value) = trimmed.split_once('=')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
         })
         .collect()
 }
