@@ -27,6 +27,7 @@ const HERMES_SUBCOMMANDS: &[&str] = &[
     "chat",
     "model",
     "gateway",
+    "platforms",
     "setup",
     "whatsapp",
     "login",
@@ -127,13 +128,8 @@ pub fn print_profile(
     command: Option<ProfileCommand>,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        None => print_profile_summary(context),
-        Some(ProfileCommand::Current) => {
-            println!("active_profile={}", context.active_profile());
-            println!("current_profile={}", context.current_profile_name());
-            println!("display_home={}", context.display_hermes_home());
-            Ok(())
-        }
+        None => print_profile_current(context),
+        Some(ProfileCommand::Current) => print_profile_current(context),
         Some(ProfileCommand::List) => print_profile_list(context),
         Some(ProfileCommand::Path { name }) => {
             let selected = name.unwrap_or_else(|| context.current_profile_name());
@@ -158,33 +154,17 @@ pub fn print_profile(
     }
 }
 
-fn print_profile_summary(context: &HermesContext) -> Result<(), Box<dyn Error>> {
-    let current = context.current_profile_name();
-    println!("active_profile={current}");
-    println!("display_home={}", context.display_hermes_home());
+fn profile_current_lines(context: &HermesContext) -> Vec<String> {
+    vec![
+        format!("active_profile={}", context.active_profile()),
+        format!("current_profile={}", context.current_profile_name()),
+        format!("display_home={}", context.display_hermes_home()),
+    ]
+}
 
-    let rows = list_profiles(context)?;
-    if let Some(row) = rows.iter().find(|row| row.name == current) {
-        if let Some(model) = row.model.as_deref() {
-            match row.provider.as_deref() {
-                Some(provider) if !provider.is_empty() => {
-                    println!("model={model} ({provider})");
-                }
-                _ => println!("model={model}"),
-            }
-        }
-        println!(
-            "gateway={}",
-            if row.gateway_running {
-                "running"
-            } else {
-                "stopped"
-            }
-        );
-        println!("skills={}", row.skill_count);
-        if row.alias_path.is_some() && !row.is_default {
-            println!("alias={} -> hermes -p {}", row.name, row.name);
-        }
+fn print_profile_current(context: &HermesContext) -> Result<(), Box<dyn Error>> {
+    for line in profile_current_lines(context) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1516,11 +1496,31 @@ mod tests {
     }
 
     #[test]
+    fn profile_current_lines_match_active_profile_and_home() {
+        let (_temp, ctx) = test_context();
+        let profile_home = ctx.create_profile("coder").unwrap();
+        ctx.set_active_profile("coder").unwrap();
+        let profile_ctx = ctx.with_hermes_home_env(Some(profile_home));
+
+        let lines = profile_current_lines(&profile_ctx);
+        assert_eq!(lines[0], "active_profile=coder");
+        assert_eq!(lines[1], "current_profile=coder");
+        assert_eq!(
+            lines[2],
+            format!("display_home={}", profile_ctx.display_hermes_home())
+        );
+    }
+
+    #[test]
     fn check_alias_collision_rejects_reserved_names() {
         let (_temp, ctx) = test_context();
         let message = check_alias_collision(ctx.home_dir(), "hermes")
             .unwrap()
             .unwrap();
         assert!(message.contains("reserved"));
+        let message = check_alias_collision(ctx.home_dir(), "platforms")
+            .unwrap()
+            .unwrap();
+        assert!(message.contains("conflicts with a hermes subcommand"));
     }
 }

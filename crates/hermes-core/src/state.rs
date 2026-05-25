@@ -131,6 +131,25 @@ pub struct SessionRecord {
     pub api_call_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionUsageRecord {
+    #[serde(flatten)]
+    pub session: SessionRecord,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub billing_provider: Option<String>,
+    pub billing_base_url: Option<String>,
+    pub billing_mode: Option<String>,
+    pub estimated_cost_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_status: Option<String>,
+    pub cost_source: Option<String>,
+    pub pricing_version: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -348,6 +367,24 @@ impl SessionStore {
             )
             .optional()
             .map_err(state_err("loading session"))
+    }
+
+    pub fn get_session_usage(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionUsageRecord>, HermesError> {
+        self.connection
+            .query_row(
+                "SELECT id, source, user_id, model, model_config, system_prompt, parent_session_id, started_at, ended_at, end_reason, message_count, tool_call_count, title, api_call_count,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                        billing_provider, billing_base_url, billing_mode,
+                        estimated_cost_usd, actual_cost_usd, cost_status, cost_source, pricing_version
+                 FROM sessions WHERE id = ?",
+                [session_id],
+                |row| map_session_usage_record(row),
+            )
+            .optional()
+            .map_err(state_err("loading session usage"))
     }
 
     pub fn update_session_runtime(
@@ -1160,6 +1197,25 @@ fn map_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord
     })
 }
 
+fn map_session_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionUsageRecord> {
+    Ok(SessionUsageRecord {
+        session: map_session_record(row)?,
+        input_tokens: row.get(14)?,
+        output_tokens: row.get(15)?,
+        cache_read_tokens: row.get(16)?,
+        cache_write_tokens: row.get(17)?,
+        reasoning_tokens: row.get(18)?,
+        billing_provider: row.get(19)?,
+        billing_base_url: row.get(20)?,
+        billing_mode: row.get(21)?,
+        estimated_cost_usd: row.get(22)?,
+        actual_cost_usd: row.get(23)?,
+        cost_status: row.get(24)?,
+        cost_source: row.get(25)?,
+        pricing_version: row.get(26)?,
+    })
+}
+
 fn map_message_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
     Ok(MessageRecord {
         id: row.get(0)?,
@@ -1833,6 +1889,69 @@ mod tests {
                 .expect("truncate"),
             None
         );
+    }
+
+    #[test]
+    fn get_session_usage_reads_persisted_usage_fields() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-usage"),
+                source: String::from("cli"),
+                user_id: None,
+                model: Some(String::from("test/model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+
+        store
+            .connection
+            .execute(
+                "UPDATE sessions
+                 SET input_tokens = 1200,
+                     output_tokens = 450,
+                     cache_read_tokens = 50,
+                     cache_write_tokens = 25,
+                     reasoning_tokens = 10,
+                     billing_provider = 'anthropic',
+                     billing_base_url = 'https://api.anthropic.com',
+                     billing_mode = 'subscription_included',
+                     estimated_cost_usd = 0.1234,
+                     actual_cost_usd = 0.1111,
+                     cost_status = 'exact',
+                     cost_source = 'pricing-table',
+                     pricing_version = 'test-pricing-v1',
+                     api_call_count = 3
+                 WHERE id = 'sess-usage'",
+                [],
+            )
+            .expect("seed session usage");
+
+        let usage = store
+            .get_session_usage("sess-usage")
+            .expect("get usage")
+            .expect("usage");
+        assert_eq!(usage.session.id, "sess-usage");
+        assert_eq!(usage.session.model.as_deref(), Some("test/model"));
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 450);
+        assert_eq!(usage.cache_read_tokens, 50);
+        assert_eq!(usage.cache_write_tokens, 25);
+        assert_eq!(usage.reasoning_tokens, 10);
+        assert_eq!(usage.billing_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            usage.billing_base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(usage.billing_mode.as_deref(), Some("subscription_included"));
+        assert_eq!(usage.estimated_cost_usd, Some(0.1234));
+        assert_eq!(usage.actual_cost_usd, Some(0.1111));
+        assert_eq!(usage.cost_status.as_deref(), Some("exact"));
+        assert_eq!(usage.cost_source.as_deref(), Some("pricing-table"));
+        assert_eq!(usage.pricing_version.as_deref(), Some("test-pricing-v1"));
+        assert_eq!(usage.session.api_call_count, 3);
     }
 
     #[test]

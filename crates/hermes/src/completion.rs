@@ -678,8 +678,10 @@ mod tests {
 
         assert!(bash.contains("${COMP_WORDS[3]}"));
         assert!(bash.contains("export import"));
+        assert!(bash.contains("platforms"));
 
         assert!(fish.contains("-a provider -d 'Alias for model'"));
+        assert!(fish.contains("-a platforms -d ''"));
         assert!(fish.contains("-a snap -d 'Alias for snapshot'"));
         assert!(fish.contains(
             "__fish_seen_subcommand_from skills; and __fish_seen_subcommand_from snapshot"
@@ -687,6 +689,7 @@ mod tests {
         assert!(fish.contains(" -a export "));
         assert!(fish.contains(" -a import "));
 
+        assert!(zsh.contains("'platforms:"));
         assert!(zsh.contains("'provider:Alias for model'"));
         assert!(zsh.contains("'snap:Alias for snapshot'"));
         assert!(zsh.contains("_describe 'snapshot command'"));
@@ -704,15 +707,44 @@ mod tests {
         assert!(bash.contains("assign"));
         assert!(bash.contains("switch"));
 
-        assert!(fish.contains("-a platforms -d 'Alias for gateway'"));
         assert!(fish.contains("__fish_seen_subcommand_from kanban"));
         assert!(fish.contains(" -a boards "));
         assert!(fish.contains(" -a switch "));
 
-        assert!(zsh.contains("'platforms:Alias for gateway'"));
         assert!(zsh.contains("_describe 'kanban command'"));
         assert!(zsh.contains("'boards:"));
         assert!(zsh.contains("'switch:"));
+    }
+
+    #[test]
+    fn slash_registry_canonical_commands_have_top_level_rust_entries() {
+        let tree = walk_root_command(&mut Cli::command());
+        let root_names = tree
+            .subcommands
+            .iter()
+            .flat_map(|command| command.names.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let commands_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hermes_cli/commands.py");
+        let registry = std::fs::read_to_string(commands_path).unwrap();
+        let registry_names = registry
+            .lines()
+            .filter_map(|line| {
+                let start = line.find("CommandDef(\"")?;
+                let rest = &line[start + "CommandDef(\"".len()..];
+                let end = rest.find('"')?;
+                Some(rest[..end].to_string())
+            })
+            .filter(|name| name != "quit" && name != "help")
+            .collect::<Vec<_>>();
+        let missing = registry_names
+            .into_iter()
+            .filter(|name| !root_names.contains(name))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "missing Rust top-level commands: {missing:?}"
+        );
     }
 
     #[test]
