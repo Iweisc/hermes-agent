@@ -726,6 +726,23 @@ impl SessionStore {
         Ok(message_id)
     }
 
+    pub fn increment_api_call_count(
+        &self,
+        session_id: &str,
+        delta: i64,
+    ) -> Result<(), HermesError> {
+        if delta <= 0 {
+            return Ok(());
+        }
+        self.connection
+            .execute(
+                "UPDATE sessions SET api_call_count = api_call_count + ? WHERE id = ?",
+                params![delta, session_id],
+            )
+            .map_err(state_err("updating api call count"))?;
+        Ok(())
+    }
+
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<MessageRecord>, HermesError> {
         let mut statement = self
             .connection
