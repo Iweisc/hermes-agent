@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
@@ -2979,7 +2979,7 @@ pub struct GatewayRuntime {
     pending_events: HashMap<String, MessageEvent>,
     queued_events: HashMap<String, VecDeque<MessageEvent>>,
     busy_ack_timestamps: HashMap<String, f64>,
-    pending_tool_approval_sessions: HashSet<String>,
+    pending_tool_approval_queues: HashMap<String, VecDeque<String>>,
     tool_approval_callbacks: HashMap<String, String>,
     next_tool_approval_id: u64,
     slash_confirms: GatewaySlashConfirmState,
@@ -3008,7 +3008,7 @@ impl GatewayRuntime {
             pending_events: HashMap::new(),
             queued_events: HashMap::new(),
             busy_ack_timestamps: HashMap::new(),
-            pending_tool_approval_sessions: HashSet::new(),
+            pending_tool_approval_queues: HashMap::new(),
             tool_approval_callbacks: HashMap::new(),
             next_tool_approval_id: 1,
             slash_confirms: GatewaySlashConfirmState::default(),
@@ -3046,8 +3046,12 @@ impl GatewayRuntime {
         if session_key.is_empty() {
             return Err("tool approval session_key must not be empty".to_string());
         }
-        self.pending_tool_approval_sessions
-            .insert(session_key.to_string());
+        let pending_id = format!("__pending__:{}", self.next_tool_approval_id);
+        self.next_tool_approval_id = self.next_tool_approval_id.saturating_add(1);
+        self.pending_tool_approval_queues
+            .entry(session_key.to_string())
+            .or_default()
+            .push_back(pending_id);
         Ok(())
     }
 
@@ -3056,9 +3060,13 @@ impl GatewayRuntime {
         if session_key.is_empty() {
             return false;
         }
+        let had_pending = self
+            .pending_tool_approval_queues
+            .remove(session_key)
+            .is_some_and(|queue| !queue.is_empty());
         self.tool_approval_callbacks
             .retain(|_, stored_session_key| stored_session_key != session_key);
-        self.pending_tool_approval_sessions.remove(session_key)
+        had_pending
     }
 
     pub fn has_pending_tool_approval(&self, session_key: &str) -> bool {
@@ -3066,7 +3074,157 @@ impl GatewayRuntime {
         if session_key.is_empty() {
             return false;
         }
-        self.pending_tool_approval_sessions.contains(session_key)
+        self.pending_tool_approval_count(session_key) > 0
+    }
+
+    pub fn pending_tool_approval_count(&self, session_key: &str) -> usize {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return 0;
+        }
+        self.pending_tool_approval_queues
+            .get(session_key)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
+    fn push_pending_tool_approval_id(
+        &mut self,
+        session_key: &str,
+        approval_id: String,
+    ) -> Result<(), String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("tool approval session_key must not be empty".to_string());
+        }
+        if approval_id.trim().is_empty() {
+            return Err("tool approval approval_id must not be empty".to_string());
+        }
+        self.pending_tool_approval_queues
+            .entry(session_key.to_string())
+            .or_default()
+            .push_back(approval_id);
+        Ok(())
+    }
+
+    fn remove_pending_tool_approval_id(&mut self, session_key: &str, approval_id: &str) -> bool {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return false;
+        }
+        let approval_id = approval_id.trim();
+        if approval_id.is_empty() {
+            return false;
+        }
+        let Some(queue) = self.pending_tool_approval_queues.get_mut(session_key) else {
+            return false;
+        };
+        let original_len = queue.len();
+        queue.retain(|queued_id| queued_id != approval_id);
+        let removed = queue.len() != original_len;
+        if queue.is_empty() {
+            self.pending_tool_approval_queues.remove(session_key);
+        }
+        removed
+    }
+
+    fn consume_pending_tool_approvals(
+        &mut self,
+        session_key: &str,
+        resolved_count: usize,
+        resolve_all: bool,
+    ) {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return;
+        }
+        if resolve_all {
+            self.clear_pending_tool_approval(session_key);
+            return;
+        }
+        if resolved_count == 0 {
+            return;
+        }
+        let mut drained_ids = Vec::new();
+        let mut queue_empty = false;
+        if let Some(queue) = self.pending_tool_approval_queues.get_mut(session_key) {
+            for _ in 0..resolved_count {
+                let Some(approval_id) = queue.pop_front() else {
+                    break;
+                };
+                drained_ids.push(approval_id);
+            }
+            queue_empty = queue.is_empty();
+        }
+        for approval_id in drained_ids {
+            self.tool_approval_callbacks.remove(&approval_id);
+        }
+        if queue_empty {
+            self.pending_tool_approval_queues.remove(session_key);
+        }
+    }
+
+    fn consume_pending_tool_approval_callback(
+        &mut self,
+        session_key: &str,
+        approval_id: &str,
+        resolved_count: usize,
+    ) {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return;
+        }
+        self.remove_pending_tool_approval_id(session_key, approval_id);
+        self.tool_approval_callbacks.remove(approval_id);
+        if resolved_count > 1 {
+            self.consume_pending_tool_approvals(session_key, resolved_count - 1, false);
+        }
+    }
+
+    fn format_tool_approval_command_execution(
+        request: &GatewayToolApprovalRequest,
+        resolved_count: usize,
+    ) -> GatewayToolApprovalCommandExecution {
+        if resolved_count == 0 {
+            let message = if request.choice == GatewayToolApprovalChoice::Deny {
+                "No pending command to deny.".to_string()
+            } else {
+                "No pending command to approve.".to_string()
+            };
+            return GatewayToolApprovalCommandExecution::NoPending { message };
+        }
+        let count_msg = if resolved_count > 1 {
+            format!(" ({resolved_count} commands)")
+        } else {
+            String::new()
+        };
+        let message = match request.choice {
+            GatewayToolApprovalChoice::Once => format!(
+                "✅ Command{} approved{}. The agent is resuming...",
+                if resolved_count > 1 { "s" } else { "" },
+                count_msg
+            ),
+            GatewayToolApprovalChoice::Session => format!(
+                "✅ Command{} approved (pattern approved for this session){}. The agent is resuming...",
+                if resolved_count > 1 { "s" } else { "" },
+                count_msg
+            ),
+            GatewayToolApprovalChoice::Always => format!(
+                "✅ Command{} approved (pattern approved permanently){}. The agent is resuming...",
+                if resolved_count > 1 { "s" } else { "" },
+                count_msg
+            ),
+            GatewayToolApprovalChoice::Deny => format!(
+                "❌ Command{} denied{count_msg}.",
+                if resolved_count > 1 { "s" } else { "" },
+            ),
+        };
+        GatewayToolApprovalCommandExecution::Resolved {
+            request: request.clone(),
+            resolved_count,
+            message,
+            resume_typing: true,
+        }
     }
 
     pub fn begin_tool_approval_prompt(
@@ -3088,10 +3246,9 @@ impl GatewayRuntime {
             return Err("tool approval description must not be empty".to_string());
         }
 
-        self.pending_tool_approval_sessions
-            .insert(session_key.to_string());
         let approval_id = self.next_tool_approval_id.to_string();
         self.next_tool_approval_id = self.next_tool_approval_id.saturating_add(1);
+        self.push_pending_tool_approval_id(session_key, approval_id.clone())?;
         self.tool_approval_callbacks
             .insert(approval_id.clone(), session_key.to_string());
         let plan = GatewayToolApprovalPromptPlan {
@@ -3190,47 +3347,15 @@ impl GatewayRuntime {
         resolved_count: usize,
     ) -> Result<GatewayToolApprovalCommandExecution, String> {
         request.validate()?;
-        if resolved_count == 0 {
-            let message = if request.choice == GatewayToolApprovalChoice::Deny {
-                "No pending command to deny.".to_string()
-            } else {
-                "No pending command to approve.".to_string()
-            };
-            return Ok(GatewayToolApprovalCommandExecution::NoPending { message });
-        }
-        self.clear_pending_tool_approval(&request.session_key);
-        let count_msg = if resolved_count > 1 {
-            format!(" ({resolved_count} commands)")
-        } else {
-            String::new()
-        };
-        let message = match request.choice {
-            GatewayToolApprovalChoice::Once => format!(
-                "✅ Command{} approved{}. The agent is resuming...",
-                if resolved_count > 1 { "s" } else { "" },
-                count_msg
-            ),
-            GatewayToolApprovalChoice::Session => format!(
-                "✅ Command{} approved (pattern approved for this session){}. The agent is resuming...",
-                if resolved_count > 1 { "s" } else { "" },
-                count_msg
-            ),
-            GatewayToolApprovalChoice::Always => format!(
-                "✅ Command{} approved (pattern approved permanently){}. The agent is resuming...",
-                if resolved_count > 1 { "s" } else { "" },
-                count_msg
-            ),
-            GatewayToolApprovalChoice::Deny => format!(
-                "❌ Command{} denied{count_msg}.",
-                if resolved_count > 1 { "s" } else { "" },
-            ),
-        };
-        Ok(GatewayToolApprovalCommandExecution::Resolved {
-            request: request.clone(),
+        self.consume_pending_tool_approvals(
+            &request.session_key,
             resolved_count,
-            message,
-            resume_typing: true,
-        })
+            request.resolve_all,
+        );
+        Ok(Self::format_tool_approval_command_execution(
+            request,
+            resolved_count,
+        ))
     }
 
     pub fn complete_tool_approval_callback(
@@ -3267,18 +3392,24 @@ impl GatewayRuntime {
         if approval_id.is_empty() {
             return Err("tool approval callback approval_id must not be empty".to_string());
         }
-        let Some(session_key) = self.tool_approval_callbacks.remove(approval_id) else {
+        let Some(session_key) = self.tool_approval_callbacks.get(approval_id).cloned() else {
             return Ok(GatewayToolApprovalCallbackOutcome::NoPending {
                 message: "This approval has already been resolved.".to_string(),
             });
         };
+        self.consume_pending_tool_approval_callback(&session_key, approval_id, resolved_count);
+        let presentation =
+            GatewayToolApprovalCallbackPresentation::from_choice(choice, actor_display)?;
+        let request = GatewayToolApprovalRequest {
+            session_key,
+            choice,
+            resolve_all: false,
+        };
         Ok(GatewayToolApprovalCallbackOutcome::Resolved {
-            execution: self.complete_tool_approval_callback(
-                &session_key,
-                choice,
-                actor_display,
-                resolved_count,
-            )?,
+            execution: GatewayToolApprovalCallbackExecution {
+                presentation,
+                result: Self::format_tool_approval_command_execution(&request, resolved_count),
+            },
         })
     }
 
@@ -10077,6 +10208,116 @@ mod tests {
                 message: "This approval has already been resolved.".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn runtime_complete_tool_approval_host_command_preserves_later_pending_approvals() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let first = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/a", "delete a")
+            .unwrap();
+        let second = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/b", "delete b")
+            .unwrap();
+
+        assert_eq!(runtime.pending_tool_approval_count("session-1"), 2);
+        assert_eq!(
+            runtime
+                .complete_tool_approval_host_command(
+                    &GatewayToolApprovalRequest {
+                        session_key: "session-1".to_string(),
+                        choice: GatewayToolApprovalChoice::Once,
+                        resolve_all: false,
+                    },
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCommandExecution::Resolved {
+                request: GatewayToolApprovalRequest {
+                    session_key: "session-1".to_string(),
+                    choice: GatewayToolApprovalChoice::Once,
+                    resolve_all: false,
+                },
+                resolved_count: 1,
+                message: "✅ Command approved. The agent is resuming...".to_string(),
+                resume_typing: true,
+            }
+        );
+        assert_eq!(runtime.pending_tool_approval_count("session-1"), 1);
+        assert_eq!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &first.approval_id,
+                    GatewayToolApprovalChoice::Once,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::NoPending {
+                message: "This approval has already been resolved.".to_string(),
+            }
+        );
+        assert!(runtime.has_pending_tool_approval("session-1"));
+        assert!(matches!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &second.approval_id,
+                    GatewayToolApprovalChoice::Once,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::Resolved { .. }
+        ));
+        assert!(!runtime.has_pending_tool_approval("session-1"));
+    }
+
+    #[test]
+    fn runtime_complete_tool_approval_callback_by_id_preserves_other_pending_callbacks() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let first = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/a", "delete a")
+            .unwrap();
+        let second = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/b", "delete b")
+            .unwrap();
+
+        assert!(matches!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &second.approval_id,
+                    GatewayToolApprovalChoice::Deny,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::Resolved { .. }
+        ));
+        assert_eq!(runtime.pending_tool_approval_count("session-1"), 1);
+        assert!(matches!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &first.approval_id,
+                    GatewayToolApprovalChoice::Once,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::Resolved { .. }
+        ));
+        assert!(!runtime.has_pending_tool_approval("session-1"));
     }
 
     #[test]
