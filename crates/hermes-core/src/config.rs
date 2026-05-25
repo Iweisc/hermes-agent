@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::{
-    HermesContext, HermesError, auto_provider_candidates, codex_cloudflare_headers,
+    HermesContext, HermesError, anthropic_base_url_supports_oauth, anthropic_oauth_default_headers,
+    anthropic_token_is_oauth, auto_provider_candidates, codex_cloudflare_headers,
     get_provider_profile, infer_api_mode_from_base_url, infer_provider_from_base_url,
-    normalize_model_for_provider, normalize_provider_alias, resolve_codex_access_token,
-    resolve_copilot_acp_runtime_credentials, resolve_copilot_runtime_credentials,
-    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_nous_runtime_credentials, resolve_provider_api_mode, resolve_qwen_runtime_credentials,
+    normalize_model_for_provider, normalize_provider_alias, resolve_anthropic_token,
+    resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
+    resolve_copilot_runtime_credentials, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
+    resolve_provider_api_mode, resolve_qwen_runtime_credentials,
 };
 
 const DEFAULT_SOUL_MD: &str = "You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.";
@@ -99,16 +101,27 @@ impl LoadedConfig {
             .and_then(|mapping| mapping_string(mapping, "api_mode"))
             .map(|value| value.to_ascii_lowercase())
     }
+
+    pub fn configured_model_context_length(&self) -> Option<u64> {
+        self.raw
+            .get("model")
+            .and_then(Value::as_mapping)
+            .and_then(|mapping| mapping_u64(mapping, "context_length"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HermesConfig {
     #[serde(default = "default_model_value")]
     pub model: Value,
+    #[serde(default)]
+    pub fallback_providers: Vec<FallbackProviderConfig>,
     #[serde(default = "default_toolsets")]
     pub toolsets: Vec<String>,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub compression: CompressionConfig,
     #[serde(default)]
     pub delegation: DelegationConfig,
     #[serde(default)]
@@ -129,8 +142,10 @@ impl Default for HermesConfig {
     fn default() -> Self {
         Self {
             model: default_model_value(),
+            fallback_providers: Vec::new(),
             toolsets: default_toolsets(),
             agent: AgentConfig::default(),
+            compression: CompressionConfig::default(),
             delegation: DelegationConfig::default(),
             terminal: TerminalConfig::default(),
             display: DisplayConfig::default(),
@@ -146,6 +161,8 @@ impl Default for HermesConfig {
 pub struct AgentConfig {
     #[serde(default = "default_agent_max_turns")]
     pub max_turns: u64,
+    #[serde(default = "default_agent_api_max_retries")]
+    pub api_max_retries: u64,
     #[serde(default = "default_gateway_timeout")]
     pub gateway_timeout: u64,
 }
@@ -154,7 +171,47 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_turns: default_agent_max_turns(),
+            api_max_retries: default_agent_api_max_retries(),
             gateway_timeout: default_gateway_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FallbackProviderConfig {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_mode: String,
+    #[serde(default)]
+    pub key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_compression_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_compression_target_ratio")]
+    pub target_ratio: f64,
+    #[serde(default = "default_compression_protect_last_n")]
+    pub protect_last_n: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            threshold: default_compression_threshold(),
+            target_ratio: default_compression_target_ratio(),
+            protect_last_n: default_compression_protect_last_n(),
         }
     }
 }
@@ -490,6 +547,8 @@ impl HermesContext {
         } else {
             None
         };
+        let anthropic_runtime_token =
+            (provider == "anthropic" && explicit_api_key.is_none()).then(resolve_anthropic_token);
 
         let base_url = explicit_base_url
             .or(config_base_url)
@@ -531,6 +590,7 @@ impl HermesContext {
                     .as_ref()
                     .map(|creds| creds.access_token.clone())
             })
+            .or_else(|| anthropic_runtime_token.clone().flatten())
             .or_else(|| qwen_oauth.as_ref().map(|creds| creds.access_token.clone()))
             .or_else(|| {
                 profile
@@ -588,6 +648,14 @@ impl HermesContext {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<Vec<_>>();
+        let mut auth_type = profile.auth_type.to_string();
+        if provider == "anthropic"
+            && anthropic_base_url_supports_oauth(&base_url)
+            && anthropic_token_is_oauth(&api_key)
+        {
+            auth_type = "oauth_external".to_string();
+            default_headers.extend(anthropic_oauth_default_headers());
+        }
         if provider == "openai-codex" {
             default_headers.extend(codex_cloudflare_headers(&api_key));
         }
@@ -598,7 +666,7 @@ impl HermesContext {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             api_mode,
-            auth_type: profile.auth_type.to_string(),
+            auth_type,
             default_headers,
         })
     }
@@ -651,8 +719,24 @@ fn default_agent_max_turns() -> u64 {
     90
 }
 
+fn default_agent_api_max_retries() -> u64 {
+    3
+}
+
 fn default_gateway_timeout() -> u64 {
     1800
+}
+
+fn default_compression_threshold() -> f64 {
+    0.5
+}
+
+fn default_compression_target_ratio() -> f64 {
+    0.2
+}
+
+fn default_compression_protect_last_n() -> usize {
+    20
 }
 
 fn default_terminal_backend() -> String {
@@ -727,6 +811,15 @@ fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .and_then(non_empty_string)
+}
+
+fn mapping_u64(mapping: &Mapping, key: &str) -> Option<u64> {
+    let value = mapping.get(Value::String(key.to_string()))?;
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 fn create_dir_all(path: &Path) -> Result<(), HermesError> {
@@ -1208,6 +1301,80 @@ mod tests {
         assert_eq!(runtime.api_mode, "chat_completions");
         assert_eq!(runtime.api_key, "google-runtime-token");
         assert_eq!(runtime.base_url, "cloudcode-pa://google");
+    }
+
+    #[test]
+    fn resolve_model_runtime_reads_anthropic_runtime_credentials() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let previous_path = env::var_os("HERMES_ANTHROPIC_CREDENTIALS_PATH");
+        let previous_token = env::var_os("ANTHROPIC_TOKEN");
+        let previous_cc = env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
+        let previous_api_key = env::var_os("ANTHROPIC_API_KEY");
+
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        let credentials_path = ctx.hermes_home().join("anthropic_credentials.json");
+        fs::write(
+            &credentials_path,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "cc-anthropic-runtime-token",
+                    "refreshToken": "anthropic-runtime-refresh",
+                    "expiresAt": i64::MAX / 2,
+                    "scopes": ["user:inference"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            ctx.config_path(),
+            "model:\n  default: claude-sonnet-4.6\n  provider: anthropic\n",
+        )
+        .unwrap();
+
+        unsafe {
+            env::set_var("HERMES_ANTHROPIC_CREDENTIALS_PATH", &credentials_path);
+            env::remove_var("ANTHROPIC_TOKEN");
+            env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+            env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        let loaded = ctx.load_config_document().expect("load config");
+        let runtime = ctx
+            .resolve_model_runtime(&loaded, &ModelOverrides::default())
+            .expect("resolve runtime");
+
+        match previous_path {
+            Some(value) => unsafe { env::set_var("HERMES_ANTHROPIC_CREDENTIALS_PATH", value) },
+            None => unsafe { env::remove_var("HERMES_ANTHROPIC_CREDENTIALS_PATH") },
+        }
+        match previous_token {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_TOKEN", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_TOKEN") },
+        }
+        match previous_cc {
+            Some(value) => unsafe { env::set_var("CLAUDE_CODE_OAUTH_TOKEN", value) },
+            None => unsafe { env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") },
+        }
+        match previous_api_key {
+            Some(value) => unsafe { env::set_var("ANTHROPIC_API_KEY", value) },
+            None => unsafe { env::remove_var("ANTHROPIC_API_KEY") },
+        }
+
+        assert_eq!(runtime.provider, "anthropic");
+        assert_eq!(runtime.api_mode, "anthropic_messages");
+        assert_eq!(runtime.api_key, "cc-anthropic-runtime-token");
+        assert_eq!(runtime.auth_type, "oauth_external");
+        assert!(runtime.default_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("anthropic-beta") && value.contains("oauth-2025-04-20")
+        }));
+        assert!(
+            runtime
+                .default_headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-app") && value == "cli")
+        );
     }
 
     #[test]

@@ -42,16 +42,23 @@ pub use agent::AgentTurnResult;
 pub use auth::{
     AuthStatusSummary, CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials,
     GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials,
-    QwenRuntimeCredentials, clear_provider_auth_state, codex_cloudflare_headers,
-    get_active_auth_provider, get_auth_status_summary, resolve_codex_access_token,
-    resolve_copilot_acp_runtime_credentials, resolve_copilot_runtime_credentials,
-    resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
+    QwenRuntimeCredentials, anthropic_base_url_supports_oauth, anthropic_oauth_default_headers,
+    anthropic_token_is_oauth, clear_provider_auth_state, clear_provider_runtime_cache,
+    codex_cloudflare_headers, force_refresh_anthropic_token,
+    force_refresh_codex_access_token, force_refresh_codex_credential_pool_entry,
+    force_refresh_google_gemini_runtime_credentials,
+    force_refresh_minimax_oauth_runtime_credentials, force_refresh_nous_credential_pool_entry,
+    force_refresh_nous_runtime_credentials, force_refresh_qwen_runtime_credentials,
+    get_active_auth_provider, get_auth_status_summary, resolve_anthropic_token,
+    resolve_codex_access_token, resolve_copilot_acp_runtime_credentials,
+    resolve_copilot_runtime_credentials, resolve_google_gemini_runtime_credentials,
+    resolve_minimax_oauth_runtime_credentials, resolve_nous_runtime_credentials,
+    resolve_qwen_runtime_credentials,
 };
 pub use config::{
-    AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,
-    MemoryConfig, ModelOverrides, ModelRuntimeConfig, NetworkConfig, SecurityConfig,
-    TerminalConfig,
+    AgentConfig, CompressionConfig, DelegationConfig, DisplayConfig, FallbackProviderConfig,
+    HermesConfig, LoadedConfig, LoggingConfig, MemoryConfig, ModelOverrides, ModelRuntimeConfig,
+    NetworkConfig, SecurityConfig, TerminalConfig,
 };
 pub use cronjob::{
     CronRunResult, CronTickResult, SILENT_MARKER, handle_cronjob, run_cron_job_now,
