@@ -412,6 +412,23 @@ sys.__stdout__.write(json.dumps(response))
 sys.__stdout__.flush()
 "#;
 
+const CONFIG_GET_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "cfg",
+    "method": "config.get",
+    "params": payload,
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
 const SKIN_PAYLOAD_HELPER: &str = r#"
 import json
 import sys
@@ -662,6 +679,7 @@ fn handle_native_request(
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "config.get" => handle_config_get(id, &params, state, helper, child_stdin)?,
         "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
         "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
@@ -1348,6 +1366,44 @@ fn handle_session_status(
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
 }
 
+fn handle_config_get(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let key = params
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let local_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if local_id.is_some()
+        && requires_child_config_get(key)
+        && let Some(child_id) = lookup_child_session_id(state, local_id.unwrap_or_default())?
+    {
+        let mut forwarded_params = params.clone();
+        forwarded_params.insert("session_id".to_string(), json!(child_id));
+        let response = send_blocking_child_request(
+            child_stdin,
+            state,
+            "config.get",
+            Value::Object(forwarded_params),
+        )?;
+        return Ok(Some(rebind_response_id(response, id)));
+    }
+
+    let response = run_python_helper_json(helper, CONFIG_GET_HELPER, Some(&json!(params)))
+        .map_err(|error| format!("config.get helper failed: {error}"))?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_config_set(
     id: Value,
     params: &Map<String, Value>,
@@ -1414,6 +1470,10 @@ fn handle_config_set(
         )?;
     }
     Ok(Some(response))
+}
+
+fn requires_child_config_get(key: &str) -> bool {
+    matches!(key, "fast")
 }
 
 fn requires_child_config_set(key: &str) -> bool {
@@ -4888,6 +4948,95 @@ mod tests {
         assert_eq!(response["result"]["value"], json!("queue"));
         let config_text = fs::read_to_string(hermes_home.join("config.yaml")).unwrap();
         assert!(config_text.contains("busy_input_mode: queue"));
+    }
+
+    #[test]
+    fn config_get_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-config-get-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-config-get", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "config.get");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"fast\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_config_get(
+            json!("r-config-get-child"),
+            json!({"key": "fast", "session_id": local_id})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-config-get-child"));
+        assert_eq!(response["result"]["value"], json!("fast"));
+    }
+
+    #[test]
+    fn config_get_helper_path_reads_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-config-get-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let (_child, child_stdin) = dummy_child_stdin();
+        let helper = helper_context_at(hermes_home.clone());
+
+        let _ = handle_config_set(
+            json!("r-config-helper-set"),
+            json!({"key": "busy", "value": "queue"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper,
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+        let response = handle_config_get(
+            json!("r-config-helper-get"),
+            json!({"key": "busy"}).as_object().unwrap(),
+            &state,
+            &helper,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get response");
+        let mtime = handle_config_get(
+            json!("r-config-helper-mtime"),
+            json!({"key": "mtime"}).as_object().unwrap(),
+            &state,
+            &helper,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get mtime response");
+
+        assert_eq!(response["id"], json!("r-config-helper-get"));
+        assert_eq!(response["result"]["value"], json!("queue"));
+        assert!(mtime["result"]["mtime"].as_f64().unwrap_or_default() > 0.0);
     }
 
     #[test]
