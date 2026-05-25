@@ -621,6 +621,7 @@ fn handle_native_request(
         }
         "session.resume" => handle_session_resume(id, &params, store, state, helper)?,
         "session.close" => handle_session_close(id, &params, store, state, child_stdin)?,
+        "session.branch" => handle_session_branch(id, &params, store, state, helper)?,
         "session.title" => handle_session_title(id, &params, store, state)?,
         "session.save" => handle_session_save(id, &params, store, state)?,
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
@@ -897,6 +898,98 @@ fn handle_session_close(
     }
     release_local_session(state, local_id)?;
     Ok(Some(ok_response(id, json!({"closed": true}))))
+}
+
+fn handle_session_branch(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(parent_session_id) = binding.store_session_id.as_deref() else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let history = store.get_messages(parent_session_id)?;
+    if history.is_empty() {
+        return Ok(Some(error_response(
+            id,
+            4008,
+            "nothing to branch — send a message first",
+        )));
+    }
+
+    let branch_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let title = if branch_name.is_empty() {
+        let current = store
+            .get_session_title(parent_session_id)?
+            .unwrap_or_else(|| "branch".to_string());
+        store.get_next_title_in_lineage(&current)?
+    } else {
+        branch_name.to_string()
+    };
+
+    let store_session_id = new_store_session_id();
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            store
+                .get_session(parent_session_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.model)
+        });
+    store.create_session(&SessionCreate {
+        id: store_session_id.clone(),
+        source: "tui".to_string(),
+        user_id: None,
+        model: model.clone(),
+        model_config: None,
+        system_prompt: None,
+        parent_session_id: Some(parent_session_id.to_string()),
+    })?;
+    for message in history {
+        store.append_message(&store_session_id, &message_record_to_append(&message))?;
+    }
+    store.set_session_title(&store_session_id, &title)?;
+
+    let info = initial_session_info(helper, model.as_deref());
+    let session_id = create_local_session(state, Some(store_session_id.clone()), binding.cols)?;
+    if let Some(info_object) = info.as_object().cloned() {
+        update_session_info_cache(state, &session_id, info_object.clone())?;
+        if let Some(usage) = info_object.get("usage").and_then(Value::as_object) {
+            update_session_usage_cache(state, &session_id, usage.clone())?;
+        }
+    }
+
+    Ok(Some(ok_response(
+        id,
+        json!({
+            "session_id": session_id,
+            "title": title,
+            "parent": parent_session_id,
+        }),
+    )))
 }
 
 fn resolve_resume_session(
@@ -3802,6 +3895,127 @@ mod tests {
         assert_eq!(response["result"]["message_count"], json!(2));
         assert_eq!(response["result"]["messages"][0]["text"], json!("hello"));
         assert_eq!(response["result"]["messages"][1]["text"], json!("hi"));
+    }
+
+    #[test]
+    fn session_branch_native_creates_lazy_child_session_with_copied_history() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-branch-parent".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-branch".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .set_session_title("stored-branch-parent", "Parent title")
+            .unwrap();
+        for (role, content) in [("user", "hello"), ("assistant", "hi")] {
+            store
+                .append_message(
+                    "stored-branch-parent",
+                    &MessageAppend {
+                        role: role.to_string(),
+                        content: Some(json!(content)),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: None,
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        codex_reasoning_items: None,
+                        codex_message_items: None,
+                    },
+                )
+                .unwrap();
+        }
+        let local_id =
+            create_local_session(&state, Some("stored-branch-parent".to_string()), 92).unwrap();
+
+        let response = handle_session_branch(
+            json!("r-branch"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &helper_context(),
+        )
+        .unwrap()
+        .expect("native session.branch response");
+
+        let new_local_id = response["result"]["session_id"].as_str().unwrap();
+        assert_ne!(new_local_id, "rs_tui_00000001");
+        assert_eq!(response["result"]["title"], json!("Parent title #2"));
+        assert_eq!(response["result"]["parent"], json!("stored-branch-parent"));
+
+        let branched_store_id = lookup_store_session_id(&state, new_local_id)
+            .unwrap()
+            .expect("branched store session id");
+        let branched_record = store
+            .get_session(&branched_store_id)
+            .unwrap()
+            .expect("branched session row");
+        assert_eq!(
+            branched_record.parent_session_id.as_deref(),
+            Some("stored-branch-parent")
+        );
+        assert_eq!(branched_record.model.as_deref(), Some("gpt-branch"));
+        assert_eq!(
+            store
+                .get_session_title(&branched_store_id)
+                .unwrap()
+                .as_deref(),
+            Some("Parent title #2")
+        );
+
+        let copied = store.get_messages(&branched_store_id).unwrap();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].role, "user");
+        assert_eq!(copied[0].content, Some(json!("hello")));
+        assert_eq!(copied[1].role, "assistant");
+        assert_eq!(copied[1].content, Some(json!("hi")));
+        assert!(
+            lookup_child_session_id(&state, new_local_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_branch_native_rejects_empty_session() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-empty-branch".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-empty".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        let local_id =
+            create_local_session(&state, Some("stored-empty-branch".to_string()), 80).unwrap();
+
+        let response = handle_session_branch(
+            json!("r-empty-branch"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &helper_context(),
+        )
+        .unwrap()
+        .expect("native session.branch response");
+
+        assert_eq!(response["error"]["code"], json!(4008));
     }
 
     #[test]
