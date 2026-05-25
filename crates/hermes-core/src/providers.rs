@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
+use url::Url;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
     pub name: &'static str,
@@ -87,7 +89,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "ai-gateway",
         aliases: &["vercel", "vercel-ai-gateway", "ai_gateway", "aigateway"],
         api_mode: "chat_completions",
-        env_vars: &["AI_GATEWAY_API_KEY"],
+        env_vars: &["AI_GATEWAY_API_KEY", "AI_GATEWAY_BASE_URL"],
         base_url: "https://ai-gateway.vercel.sh/v1",
         auth_type: "api_key",
         default_headers: AI_GATEWAY_HEADERS,
@@ -109,7 +111,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "alibaba",
         aliases: &["dashscope", "alibaba-cloud", "qwen-dashscope"],
         api_mode: "chat_completions",
-        env_vars: &["DASHSCOPE_API_KEY"],
+        env_vars: &["DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL"],
         base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -122,6 +124,7 @@ const PROVIDERS: &[ProviderProfile] = &[
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
         ],
         base_url: "https://api.anthropic.com",
         auth_type: "api_key",
@@ -131,7 +134,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "arcee",
         aliases: &["arcee-ai", "arceeai"],
         api_mode: "chat_completions",
-        env_vars: &["ARCEEAI_API_KEY"],
+        env_vars: &["ARCEEAI_API_KEY", "ARCEE_BASE_URL"],
         base_url: "https://api.arcee.ai/api/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -149,7 +152,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "bedrock",
         aliases: &["aws", "aws-bedrock", "amazon-bedrock", "amazon"],
         api_mode: "bedrock_converse",
-        env_vars: &[],
+        env_vars: &["BEDROCK_BASE_URL"],
         base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
         auth_type: "aws_sdk",
         default_headers: EMPTY_HEADERS,
@@ -158,7 +161,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "copilot-acp",
         aliases: &["github-copilot-acp", "copilot-acp-agent"],
         api_mode: "chat_completions",
-        env_vars: &[],
+        env_vars: &["COPILOT_ACP_BASE_URL"],
         base_url: "acp://copilot",
         auth_type: "external_process",
         default_headers: EMPTY_HEADERS,
@@ -167,7 +170,12 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "copilot",
         aliases: &["github-copilot", "github-models", "github-model", "github"],
         api_mode: "chat_completions",
-        env_vars: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        env_vars: &[
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_API_BASE_URL",
+        ],
         base_url: "https://api.githubcopilot.com",
         auth_type: "copilot",
         default_headers: COPILOT_HEADERS,
@@ -176,7 +184,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "deepseek",
         aliases: &["deepseek-chat"],
         api_mode: "chat_completions",
-        env_vars: &["DEEPSEEK_API_KEY"],
+        env_vars: &["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"],
         base_url: "https://api.deepseek.com/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -185,7 +193,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "gemini",
         aliases: &["google", "google-gemini", "google-ai-studio"],
         api_mode: "chat_completions",
-        env_vars: &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        env_vars: &["GOOGLE_API_KEY", "GEMINI_API_KEY", "GEMINI_BASE_URL"],
         base_url: "https://generativelanguage.googleapis.com/v1beta",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -212,7 +220,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "huggingface",
         aliases: &["hf", "hugging-face", "huggingface-hub"],
         api_mode: "chat_completions",
-        env_vars: &["HF_TOKEN"],
+        env_vars: &["HF_TOKEN", "HF_BASE_URL"],
         base_url: "https://router.huggingface.co/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -221,7 +229,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "kilocode",
         aliases: &["kilo-code", "kilo", "kilo-gateway"],
         api_mode: "chat_completions",
-        env_vars: &["KILOCODE_API_KEY"],
+        env_vars: &["KILOCODE_API_KEY", "KILOCODE_BASE_URL"],
         base_url: "https://api.kilo.ai/api/gateway",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -230,7 +238,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "kimi-coding",
         aliases: &["kimi", "moonshot", "kimi-for-coding"],
         api_mode: "chat_completions",
-        env_vars: &["KIMI_API_KEY", "KIMI_CODING_API_KEY"],
+        env_vars: &["KIMI_API_KEY", "KIMI_CODING_API_KEY", "KIMI_BASE_URL"],
         base_url: "https://api.moonshot.ai/v1",
         auth_type: "api_key",
         default_headers: KIMI_HEADERS,
@@ -248,7 +256,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "minimax",
         aliases: &["mini-max"],
         api_mode: "anthropic_messages",
-        env_vars: &["MINIMAX_API_KEY"],
+        env_vars: &["MINIMAX_API_KEY", "MINIMAX_BASE_URL"],
         base_url: "https://api.minimax.io/anthropic",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -257,7 +265,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "minimax-cn",
         aliases: &["minimax-china", "minimax_cn"],
         api_mode: "anthropic_messages",
-        env_vars: &["MINIMAX_CN_API_KEY"],
+        env_vars: &["MINIMAX_CN_API_KEY", "MINIMAX_CN_BASE_URL"],
         base_url: "https://api.minimaxi.com/anthropic",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -284,7 +292,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "nvidia",
         aliases: &["nvidia-nim"],
         api_mode: "chat_completions",
-        env_vars: &["NVIDIA_API_KEY"],
+        env_vars: &["NVIDIA_API_KEY", "NVIDIA_BASE_URL"],
         base_url: "https://integrate.api.nvidia.com/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -293,7 +301,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "ollama-cloud",
         aliases: &["ollama_cloud"],
         api_mode: "chat_completions",
-        env_vars: &["OLLAMA_API_KEY"],
+        env_vars: &["OLLAMA_API_KEY", "OLLAMA_BASE_URL"],
         base_url: "https://ollama.com/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -311,7 +319,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "opencode-zen",
         aliases: &["opencode", "opencode_zen", "zen"],
         api_mode: "chat_completions",
-        env_vars: &["OPENCODE_ZEN_API_KEY"],
+        env_vars: &["OPENCODE_ZEN_API_KEY", "OPENCODE_ZEN_BASE_URL"],
         base_url: "https://opencode.ai/zen/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -320,7 +328,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "opencode-go",
         aliases: &["opencode_go", "go", "opencode-go-sub"],
         api_mode: "chat_completions",
-        env_vars: &["OPENCODE_GO_API_KEY"],
+        env_vars: &["OPENCODE_GO_API_KEY", "OPENCODE_GO_BASE_URL"],
         base_url: "https://opencode.ai/zen/go/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -338,7 +346,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "stepfun",
         aliases: &["step", "stepfun-coding-plan"],
         api_mode: "chat_completions",
-        env_vars: &["STEPFUN_API_KEY"],
+        env_vars: &["STEPFUN_API_KEY", "STEPFUN_BASE_URL"],
         base_url: "https://api.stepfun.ai/step_plan/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -347,7 +355,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "xai",
         aliases: &["grok", "x-ai", "x.ai"],
         api_mode: "codex_responses",
-        env_vars: &["XAI_API_KEY"],
+        env_vars: &["XAI_API_KEY", "XAI_BASE_URL"],
         base_url: "https://api.x.ai/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -356,7 +364,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "xiaomi",
         aliases: &["mimo", "xiaomi-mimo"],
         api_mode: "chat_completions",
-        env_vars: &["XIAOMI_API_KEY"],
+        env_vars: &["XIAOMI_API_KEY", "XIAOMI_BASE_URL"],
         base_url: "https://api.xiaomimimo.com/v1",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -365,7 +373,7 @@ const PROVIDERS: &[ProviderProfile] = &[
         name: "zai",
         aliases: &["glm", "z-ai", "z.ai", "zhipu"],
         api_mode: "chat_completions",
-        env_vars: &["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"],
+        env_vars: &["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "GLM_BASE_URL"],
         base_url: "https://api.z.ai/api/paas/v4",
         auth_type: "api_key",
         default_headers: EMPTY_HEADERS,
@@ -484,6 +492,19 @@ pub fn infer_provider_from_base_url(base_url: &str) -> Option<&'static ProviderP
     if normalized.is_empty() {
         return None;
     }
+    if let Ok(parsed) = Url::parse(&normalized) {
+        let host = parsed.host_str()?.to_ascii_lowercase();
+        let path = parsed.path().trim_end_matches('/').to_ascii_lowercase();
+        if host == "api.kimi.com"
+            && path
+                .split('/')
+                .any(|segment| segment.eq_ignore_ascii_case("coding"))
+        {
+            return PROVIDERS
+                .iter()
+                .find(|profile| profile.name == "kimi-coding");
+        }
+    }
     PROVIDERS
         .iter()
         .filter(|profile| !profile.base_url.is_empty())
@@ -494,18 +515,35 @@ pub fn infer_provider_from_base_url(base_url: &str) -> Option<&'static ProviderP
 }
 
 pub fn infer_api_mode_from_base_url(base_url: &str) -> Option<&'static str> {
-    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let normalized = base_url.trim().trim_end_matches('/');
     if normalized.is_empty() {
         return None;
     }
-    if normalized.contains("/anthropic") || normalized.contains("api.anthropic.com") {
+    let parsed = Url::parse(normalized).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let path = parsed.path().trim_end_matches('/').to_ascii_lowercase();
+
+    if host == "api.openai.com" || host == "api.x.ai" {
+        return Some("codex_responses");
+    }
+    if host == "api.anthropic.com"
+        || path
+            .split('/')
+            .any(|segment| segment.eq_ignore_ascii_case("anthropic"))
+    {
         return Some("anthropic_messages");
     }
-    if normalized.contains("/chat/completions")
-        || normalized.ends_with("/v1")
-        || normalized.ends_with("/v4")
-        || normalized.ends_with("/v1beta")
+    if host == "api.kimi.com"
+        && path
+            .split('/')
+            .any(|segment| segment.eq_ignore_ascii_case("coding"))
     {
+        return Some("anthropic_messages");
+    }
+    if host.starts_with("bedrock-runtime.") && host.ends_with(".amazonaws.com") {
+        return Some("bedrock_converse");
+    }
+    if path.ends_with("/chat/completions") || matches!(path.as_str(), "/v1" | "/v4" | "/v1beta") {
         return Some("chat_completions");
     }
     None
@@ -514,6 +552,9 @@ pub fn infer_api_mode_from_base_url(base_url: &str) -> Option<&'static str> {
 pub fn resolve_provider_api_mode(provider: &str, model_input: &str) -> Option<&'static str> {
     let normalized_provider = normalize_provider_alias(provider);
     match normalized_provider.as_str() {
+        "anthropic" | "minimax" | "minimax-cn" => Some("anthropic_messages"),
+        "xai" | "openai-codex" => Some("codex_responses"),
+        "bedrock" => Some("bedrock_converse"),
         "copilot" => Some(copilot_model_api_mode(model_input)),
         "azure-foundry" => azure_foundry_model_api_mode(model_input),
         "opencode-zen" | "opencode-go" => {
@@ -843,6 +884,65 @@ mod tests {
     }
 
     #[test]
+    fn provider_profiles_capture_runtime_capabilities_for_key_backends() {
+        let cases = [
+            (
+                "openai-codex",
+                "codex_responses",
+                "oauth_external",
+                "https://chatgpt.com/backend-api/codex",
+            ),
+            ("xai", "codex_responses", "api_key", "https://api.x.ai/v1"),
+            (
+                "anthropic",
+                "anthropic_messages",
+                "api_key",
+                "https://api.anthropic.com",
+            ),
+            (
+                "bedrock",
+                "bedrock_converse",
+                "aws_sdk",
+                "https://bedrock-runtime.us-east-1.amazonaws.com",
+            ),
+        ];
+
+        for (provider, expected_api_mode, expected_auth_type, expected_base_url) in cases {
+            let profile = get_provider_profile(provider).expect("profile");
+            assert_eq!(profile.api_mode, expected_api_mode);
+            assert_eq!(profile.auth_type, expected_auth_type);
+            assert_eq!(profile.base_url, expected_base_url);
+        }
+    }
+
+    #[test]
+    fn provider_profiles_expose_python_base_url_env_overrides() {
+        let cases = [
+            ("ai-gateway", Some("AI_GATEWAY_BASE_URL")),
+            ("anthropic", Some("ANTHROPIC_BASE_URL")),
+            ("bedrock", Some("BEDROCK_BASE_URL")),
+            ("copilot", Some("COPILOT_API_BASE_URL")),
+            ("deepseek", Some("DEEPSEEK_BASE_URL")),
+            ("gemini", Some("GEMINI_BASE_URL")),
+            ("minimax", Some("MINIMAX_BASE_URL")),
+            ("opencode-go", Some("OPENCODE_GO_BASE_URL")),
+            ("xai", Some("XAI_BASE_URL")),
+            ("zai", Some("GLM_BASE_URL")),
+        ];
+
+        for (provider, expected_base_url_env) in cases {
+            let profile = get_provider_profile(provider).expect("profile");
+            assert_eq!(profile.base_url_env_var(), expected_base_url_env);
+            let api_key_env_vars = profile.api_key_env_vars().collect::<Vec<_>>();
+            assert!(
+                api_key_env_vars
+                    .iter()
+                    .all(|name| !name.ends_with("_BASE_URL"))
+            );
+        }
+    }
+
+    #[test]
     fn model_normalization_matches_python_rules_for_key_cases() {
         assert_eq!(
             normalize_model_for_provider("claude-sonnet-4.6", "openrouter"),
@@ -882,17 +982,70 @@ mod tests {
             Some("minimax")
         );
         assert_eq!(
+            infer_provider_from_base_url("https://api.kimi.com/coding/v1/messages")
+                .map(|profile| profile.name),
+            Some("kimi-coding")
+        );
+        assert_eq!(
             infer_api_mode_from_base_url("https://api.anthropic.com"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://api.kimi.com/coding"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://api.openai.com/v1"),
+            Some("codex_responses")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://api.x.ai/v1"),
+            Some("codex_responses")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://bedrock-runtime.us-east-1.amazonaws.com"),
+            Some("bedrock_converse")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://example.azure.com/anthropic/v1"),
             Some("anthropic_messages")
         );
         assert_eq!(
             infer_api_mode_from_base_url("https://api.deepseek.com/v1"),
             Some("chat_completions")
         );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://api.openai.com.example/v1"),
+            Some("chat_completions")
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://proxy.example.test/api.openai.com/v1"),
+            None
+        );
+        assert_eq!(
+            infer_api_mode_from_base_url("https://proxy.example.test/api.anthropic.com/v1"),
+            None
+        );
     }
 
     #[test]
     fn provider_specific_api_mode_routing_matches_python_rules() {
+        assert_eq!(
+            resolve_provider_api_mode("anthropic", "claude-sonnet-4.6"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("minimax", "MiniMax-M2.7-highspeed"),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("xai", "grok-4"),
+            Some("codex_responses")
+        );
+        assert_eq!(
+            resolve_provider_api_mode("bedrock", "anthropic.claude-sonnet-4-6-20250514-v1:0"),
+            Some("bedrock_converse")
+        );
         assert_eq!(
             resolve_provider_api_mode("copilot", "openai/gpt-5.4"),
             Some("codex_responses")

@@ -28,6 +28,8 @@ const DEFAULT_NOUS_INFERENCE_URL: &str = "https://inference-api.nousresearch.com
 const DEFAULT_NOUS_CLIENT_ID: &str = "hermes-cli";
 const DEFAULT_AGENT_KEY_MIN_TTL_SECONDS: i64 = 30 * 60;
 const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 120;
+const DEFAULT_ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+const DEFAULT_ZAI_TIMEOUT_SECONDS: f64 = 8.0;
 const GOOGLE_OAUTH_CLIENT_ID_ENV: &str = "HERMES_GEMINI_CLIENT_ID";
 const GOOGLE_OAUTH_CLIENT_SECRET_ENV: &str = "HERMES_GEMINI_CLIENT_SECRET";
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -45,6 +47,49 @@ const COPILOT_CLASSIC_PAT_PREFIX: &str = "ghp_";
 const COPILOT_TOKEN_REFRESH_MARGIN_SECONDS: f64 = 120.0;
 
 static COPILOT_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, (String, f64)>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZaiEndpoint {
+    id: &'static str,
+    base_url: &'static str,
+    probe_models: &'static [&'static str],
+    label: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZaiDetectedEndpoint {
+    id: &'static str,
+    base_url: &'static str,
+    model: &'static str,
+    label: &'static str,
+}
+
+const ZAI_ENDPOINTS: &[ZaiEndpoint] = &[
+    ZaiEndpoint {
+        id: "global",
+        base_url: "https://api.z.ai/api/paas/v4",
+        probe_models: &["glm-5"],
+        label: "Global",
+    },
+    ZaiEndpoint {
+        id: "cn",
+        base_url: "https://open.bigmodel.cn/api/paas/v4",
+        probe_models: &["glm-5"],
+        label: "China",
+    },
+    ZaiEndpoint {
+        id: "coding-global",
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        probe_models: &["glm-5.1", "glm-5v-turbo", "glm-4.7"],
+        label: "Global (Coding Plan)",
+    },
+    ZaiEndpoint {
+        id: "coding-cn",
+        base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
+        probe_models: &["glm-5.1", "glm-5v-turbo", "glm-4.7"],
+        label: "China (Coding Plan)",
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexTokens {
@@ -266,6 +311,24 @@ pub fn resolve_nous_runtime_credentials(
         min_key_ttl_seconds,
         timeout_seconds,
         &Client::new(),
+    )
+}
+
+pub fn resolve_nous_access_token(
+    hermes_home: &Path,
+    timeout_seconds: f64,
+) -> Result<String, HermesError> {
+    resolve_nous_access_token_with_client(hermes_home, timeout_seconds, &Client::new())
+}
+
+pub fn resolve_zai_base_url(hermes_home: &Path, api_key: &str, timeout_seconds: f64) -> String {
+    resolve_zai_base_url_with_client_and_endpoints(
+        hermes_home,
+        api_key,
+        timeout_seconds,
+        DEFAULT_ZAI_BASE_URL,
+        &Client::new(),
+        ZAI_ENDPOINTS,
     )
 }
 
@@ -565,11 +628,16 @@ fn exchange_copilot_token(
 }
 
 fn copilot_token_fingerprint(raw_token: &str) -> String {
+    short_sha256(raw_token, 8)
+}
+
+fn short_sha256(raw: &str, bytes: usize) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(raw_token.as_bytes());
+    hasher.update(raw.as_bytes());
     let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
+    let take_bytes = bytes.max(1).min(digest.len());
+    let mut encoded = String::with_capacity(take_bytes * 2);
+    for byte in digest.iter().take(take_bytes) {
         use std::fmt::Write as _;
         let _ = write!(&mut encoded, "{byte:02x}");
     }
@@ -1637,6 +1705,200 @@ fn resolve_nous_runtime_credentials_with_client(
     })
 }
 
+fn resolve_nous_access_token_with_client(
+    hermes_home: &Path,
+    timeout_seconds: f64,
+    client: &Client,
+) -> Result<String, HermesError> {
+    let auth_path = hermes_home.join("auth.json");
+    let mut auth_store = load_auth_store(&auth_path)?;
+    let mut provider_state = auth_store
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("nous"))
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Nous access token",
+            detail: "No Nous credentials stored. Run `hermes auth add nous` first.".to_string(),
+        })?;
+
+    let portal_base_url = provider_state
+        .get("portal_base_url")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .or_else(|| {
+            env::var("HERMES_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .or_else(|| {
+            env::var("NOUS_PORTAL_BASE_URL")
+                .ok()
+                .and_then(|value| non_empty_trimmed(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_NOUS_PORTAL_URL.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let client_id = provider_state
+        .get("client_id")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| DEFAULT_NOUS_CLIENT_ID.to_string());
+    let mut access_token = provider_state
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        .ok_or_else(|| HermesError::State {
+            action: "resolving Nous access token",
+            detail: "Nous auth state is missing access_token. Run `hermes auth add nous` again."
+                .to_string(),
+        })?;
+
+    if oauth_token_needs_refresh(
+        provider_state
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_epoch_seconds),
+        ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    ) && let Some(refresh_token) = provider_state
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .and_then(non_empty_trimmed)
+        && let Ok(refreshed) = refresh_nous_access_token(
+            client,
+            &portal_base_url,
+            &client_id,
+            &refresh_token,
+            timeout_seconds,
+        )
+    {
+        apply_nous_refresh(&mut provider_state, &refreshed, &mut String::new());
+        access_token = refreshed.access_token;
+        replace_provider_state(&mut auth_store, "nous", &provider_state)?;
+        persist_nous_state_with_metadata(&auth_path, &mut auth_store)?;
+    }
+
+    Ok(access_token)
+}
+
+fn resolve_zai_base_url_with_client_and_endpoints(
+    hermes_home: &Path,
+    api_key: &str,
+    timeout_seconds: f64,
+    default_url: &str,
+    client: &Client,
+    endpoints: &[ZaiEndpoint],
+) -> String {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return default_url.to_string();
+    }
+
+    let auth_path = hermes_home.join("auth.json");
+    let mut auth_store = load_auth_store(&auth_path).unwrap_or_else(|_| {
+        json!({
+            "version": AUTH_STORE_VERSION,
+            "providers": {},
+        })
+    });
+    let key_hash = short_sha256(api_key, 8);
+    if let Some(cached_url) = provider_state(&auth_store, "zai")
+        .and_then(|state| state.get("detected_endpoint"))
+        .and_then(Value::as_object)
+        .and_then(|cached| {
+            let base_url = cached
+                .get("base_url")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)?;
+            let cached_hash = cached
+                .get("key_hash")
+                .and_then(Value::as_str)
+                .and_then(non_empty_trimmed)?;
+            (cached_hash == key_hash).then_some(base_url)
+        })
+    {
+        return cached_url;
+    }
+
+    let timeout_seconds = if timeout_seconds.is_finite() {
+        timeout_seconds.max(1.0)
+    } else {
+        DEFAULT_ZAI_TIMEOUT_SECONDS
+    };
+    if let Some(detected) =
+        detect_zai_endpoint_with_client(api_key, timeout_seconds, client, endpoints)
+    {
+        let _ = persist_zai_detected_endpoint(&auth_path, &mut auth_store, &key_hash, detected);
+        return detected.base_url.to_string();
+    }
+
+    default_url.to_string()
+}
+
+fn detect_zai_endpoint_with_client<'a>(
+    api_key: &str,
+    timeout_seconds: f64,
+    client: &Client,
+    endpoints: &'a [ZaiEndpoint],
+) -> Option<ZaiDetectedEndpoint> {
+    for endpoint in endpoints {
+        for model in endpoint.probe_models {
+            let response = match client
+                .post(format!("{}/chat/completions", endpoint.base_url))
+                .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&json!({
+                    "model": model,
+                    "stream": false,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                }))
+                .send()
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            if response.status().is_success() {
+                return Some(ZaiDetectedEndpoint {
+                    id: endpoint.id,
+                    base_url: endpoint.base_url,
+                    model,
+                    label: endpoint.label,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn persist_zai_detected_endpoint(
+    auth_path: &Path,
+    auth_store: &mut Value,
+    key_hash: &str,
+    detected: ZaiDetectedEndpoint,
+) -> Result<(), HermesError> {
+    let mut state = provider_state(auth_store, "zai")
+        .cloned()
+        .unwrap_or_default();
+    state.insert(
+        "detected_endpoint".to_string(),
+        json!({
+            "base_url": detected.base_url,
+            "endpoint_id": detected.id,
+            "model": detected.model,
+            "label": detected.label,
+            "key_hash": key_hash,
+        }),
+    );
+    replace_provider_state(auth_store, "zai", &state)?;
+    if let Some(root) = auth_store.as_object_mut() {
+        root.insert("version".to_string(), Value::from(AUTH_STORE_VERSION));
+    }
+    save_auth_store_json(auth_path, auth_store)
+}
+
 fn refresh_nous_access_token(
     client: &Client,
     portal_base_url: &str,
@@ -2531,7 +2793,50 @@ mod tests {
 
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::thread::JoinHandle;
     use tempfile::TempDir;
+
+    fn spawn_zai_probe_server(statuses: Vec<u16>) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                assert!(request_text.starts_with("POST /chat/completions "));
+                let body = if status == 200 {
+                    json!({"id": "probe-ok"}).to_string()
+                } else {
+                    json!({"error": "probe-failed"}).to_string()
+                };
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), server)
+    }
 
     fn jwt_with_claims(exp: i64, account_id: &str) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2734,6 +3039,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_nous_access_token_reads_fresh_token_from_auth_store() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access",
+                        "refresh_token": "nous-refresh",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let resolved = resolve_nous_access_token(temp.path(), 15.0).unwrap();
+        assert_eq!(resolved, "nous-access");
+    }
+
+    #[test]
     fn resolve_nous_runtime_credentials_missing_state_points_to_native_auth_add() {
         let temp = TempDir::new().unwrap();
         let error = resolve_nous_runtime_credentials(temp.path(), 1800, 15.0).unwrap_err();
@@ -2874,6 +3204,102 @@ mod tests {
         );
         assert_eq!(state["agent_key_id"], "key-123");
         assert_eq!(state["agent_key_reused"], false);
+    }
+
+    #[test]
+    fn resolve_nous_access_token_refreshes_expired_token_without_minting_agent_key() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "stale-access",
+                        "refresh_token": "refresh-old",
+                        "portal_base_url": format!("http://{addr}"),
+                        "client_id": "hermes-cli",
+                        "expires_at": "2000-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let read = stream.read(&mut buffer).unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /oauth/token "));
+            assert!(request_text.contains("grant_type=refresh_token"));
+            assert!(request_text.contains("refresh_token=refresh-old"));
+
+            let body = json!({
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "token_type": "Bearer",
+                "scope": "inference:mint_agent_key",
+                "expires_in": 3600
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_nous_access_token_with_client(temp.path(), 15.0, &client).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resolved, "access-new");
+
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        let state = &persisted["providers"]["nous"];
+        assert_eq!(state["access_token"], "access-new");
+        assert_eq!(state["refresh_token"], "refresh-new");
+        assert!(state.get("agent_key").is_none());
     }
 
     #[test]
@@ -3448,5 +3874,129 @@ mod tests {
         assert!(persisted["credential_pool"]["google-gemini-cli"].is_null());
         assert!(persisted["active_provider"].is_null());
         assert!(!temp.path().join("auth").join("google_oauth.json").exists());
+    }
+
+    #[test]
+    fn resolve_zai_base_url_uses_cached_endpoint_for_matching_key() {
+        let temp = TempDir::new().unwrap();
+        let api_key = "zai-cached-key";
+        let cached_url = "https://cached.z.ai/api/paas/v4";
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "zai": {
+                        "detected_endpoint": {
+                            "base_url": cached_url,
+                            "endpoint_id": "cached",
+                            "model": "glm-5",
+                            "label": "Cached",
+                            "key_hash": short_sha256(api_key, 8),
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let client = Client::builder().build().unwrap();
+        let resolved = resolve_zai_base_url_with_client_and_endpoints(
+            temp.path(),
+            api_key,
+            1.0,
+            DEFAULT_ZAI_BASE_URL,
+            &client,
+            &[ZaiEndpoint {
+                id: "unreachable",
+                base_url: "http://127.0.0.1:1",
+                probe_models: &["glm-5"],
+                label: "Unreachable",
+            }],
+        );
+
+        assert_eq!(resolved, cached_url);
+    }
+
+    #[test]
+    fn resolve_zai_base_url_continues_after_probe_error_and_persists_success() {
+        let temp = TempDir::new().unwrap();
+        let api_key = "zai-probe-key";
+        let (working_base_url, server) = spawn_zai_probe_server(vec![200]);
+        let working_base_url_static = Box::leak(working_base_url.clone().into_boxed_str());
+        let client = Client::builder().build().unwrap();
+
+        let resolved = resolve_zai_base_url_with_client_and_endpoints(
+            temp.path(),
+            api_key,
+            1.0,
+            DEFAULT_ZAI_BASE_URL,
+            &client,
+            &[
+                ZaiEndpoint {
+                    id: "unreachable",
+                    base_url: "http://127.0.0.1:1",
+                    probe_models: &["glm-5"],
+                    label: "Unreachable",
+                },
+                ZaiEndpoint {
+                    id: "working",
+                    base_url: working_base_url_static,
+                    probe_models: &["glm-5"],
+                    label: "Working",
+                },
+            ],
+        );
+        server.join().unwrap();
+
+        assert_eq!(resolved, working_base_url);
+        let persisted = serde_json::from_str::<Value>(
+            &fs::read_to_string(temp.path().join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["providers"]["zai"]["detected_endpoint"]["base_url"],
+            working_base_url
+        );
+        assert_eq!(
+            persisted["providers"]["zai"]["detected_endpoint"]["endpoint_id"],
+            "working"
+        );
+        assert_eq!(
+            persisted["providers"]["zai"]["detected_endpoint"]["model"],
+            "glm-5"
+        );
+        assert_eq!(
+            persisted["providers"]["zai"]["detected_endpoint"]["key_hash"],
+            short_sha256(api_key, 8)
+        );
+    }
+
+    #[test]
+    fn resolve_zai_base_url_falls_back_when_all_probes_fail() {
+        let temp = TempDir::new().unwrap();
+        let fallback_url = "https://fallback.z.ai/api/paas/v4";
+        let (failing_base_url, server) = spawn_zai_probe_server(vec![401]);
+        let failing_base_url_static = Box::leak(failing_base_url.into_boxed_str());
+        let client = Client::builder().build().unwrap();
+
+        let resolved = resolve_zai_base_url_with_client_and_endpoints(
+            temp.path(),
+            "zai-failing-key",
+            1.0,
+            fallback_url,
+            &client,
+            &[ZaiEndpoint {
+                id: "failing",
+                base_url: failing_base_url_static,
+                probe_models: &["glm-5"],
+                label: "Failing",
+            }],
+        );
+        server.join().unwrap();
+
+        assert_eq!(resolved, fallback_url);
+        assert!(!temp.path().join("auth.json").exists());
     }
 }

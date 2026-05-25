@@ -288,7 +288,7 @@ impl<'a> AcpServer<'a> {
                     "sse": false,
                 },
                 "promptCapabilities": {
-                    "audio": false,
+                    "audio": true,
                     "embeddedContext": false,
                     "image": true,
                 },
@@ -1070,9 +1070,11 @@ fn extract_prompt_input(prompt: &Value) -> Result<PromptInput, String> {
                 }
             }
             "audio" => {
-                return Err(
-                    "Audio prompts are not supported by the Rust ACP runtime yet.".to_string(),
-                );
+                let audio_part = extract_audio_prompt_part(item)?;
+                if let Some(audio_part) = audio_part {
+                    display_parts.push("[Audio attachment]".to_string());
+                    content_parts.push(audio_part);
+                }
             }
             other => display_parts.push(format!("[Unsupported content block: {other}]")),
         }
@@ -1135,6 +1137,81 @@ fn extract_image_prompt_part(item: &Value) -> Result<Option<Value>, String> {
     })))
 }
 
+fn extract_audio_prompt_part(item: &Value) -> Result<Option<Value>, String> {
+    let data = item
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let uri = item
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mime_type = item
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("mime_type").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let (audio_data, inferred_mime_type) = match data {
+        Some(value) if !value.starts_with("data:") => (value.to_string(), mime_type),
+        Some(value) => parse_audio_data_url(value)?,
+        None => match uri {
+            Some(value) if value.starts_with("data:") => parse_audio_data_url(value)?,
+            Some(_) => {
+                return Err(
+                    "Audio prompts must include inline base64 data (either `data` or a data: URI)."
+                        .to_string(),
+                );
+            }
+            None => return Ok(None),
+        },
+    };
+    let format = audio_prompt_format(mime_type.or(inferred_mime_type))?;
+    Ok(Some(json!({
+        "type": "input_audio",
+        "input_audio": {
+            "data": audio_data,
+            "format": format,
+        }
+    })))
+}
+
+fn parse_audio_data_url(value: &str) -> Result<(String, Option<&str>), String> {
+    let Some((header, encoded)) = value
+        .strip_prefix("data:")
+        .and_then(|raw| raw.split_once(','))
+    else {
+        return Err("Audio data URI is malformed.".to_string());
+    };
+    if !header
+        .split(';')
+        .any(|segment| segment.eq_ignore_ascii_case("base64"))
+    {
+        return Err("Audio data URI must be base64-encoded.".to_string());
+    }
+    let mime_type = header
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    if encoded.trim().is_empty() {
+        return Err("Audio data URI contained no payload.".to_string());
+    }
+    Ok((encoded.trim().to_string(), mime_type))
+}
+
+fn audio_prompt_format(mime_type: Option<&str>) -> Result<&'static str, String> {
+    let normalized = mime_type.unwrap_or("audio/wav").trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave" => Ok("wav"),
+        "audio/mpeg" | "audio/mp3" | "audio/mpeg3" | "audio/x-mpeg-3" => Ok("mp3"),
+        other => Err(format!("Audio prompts must be WAV or MP3; got '{other}'.")),
+    }
+}
+
 fn has_meaningful_prompt_content(content: &Value) -> bool {
     match content {
         Value::String(text) => !text.trim().is_empty(),
@@ -1153,6 +1230,12 @@ fn has_meaningful_prompt_content(content: &Value) -> bool {
                     .and_then(|image| image.get("url"))
                     .and_then(Value::as_str)
                     .is_some_and(|url| !url.trim().is_empty()),
+                "input_audio" => part
+                    .get("input_audio")
+                    .and_then(Value::as_object)
+                    .and_then(|audio| audio.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.trim().is_empty()),
                 _ => false,
             }
         }),
@@ -1171,6 +1254,9 @@ fn message_display_text(message: &MessageRecord) -> String {
             .filter_map(|item| match item.as_object() {
                 Some(map) if map.get("type").and_then(Value::as_str) == Some("image_url") => {
                     Some("[Image attachment]".to_string())
+                }
+                Some(map) if map.get("type").and_then(Value::as_str) == Some("input_audio") => {
+                    Some("[Audio attachment]".to_string())
                 }
                 Some(map) => map
                     .get("text")
@@ -1356,7 +1442,25 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_image_prompt_capability() {
+    fn extract_prompt_input_supports_inline_audio() {
+        let prompt = json!([
+            {"type": "text", "text": "Transcribe this"},
+            {"type": "audio", "data": "aGVsbG8=", "mimeType": "audio/wav"}
+        ]);
+        let parsed = extract_prompt_input(&prompt).unwrap();
+        assert_eq!(
+            parsed.user_content,
+            json!([
+                {"type": "text", "text": "Transcribe this"},
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}}
+            ])
+        );
+        assert_eq!(parsed.display_text, "Transcribe this\n[Audio attachment]");
+        assert!(parsed.plain_text.is_none());
+    }
+
+    #[test]
+    fn initialize_advertises_image_and_audio_prompt_capabilities() {
         let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
         fs::create_dir_all(&home).unwrap();
         let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
@@ -1370,19 +1474,24 @@ mod tests {
             initialize["agentCapabilities"]["promptCapabilities"]["image"],
             json!(true)
         );
+        assert_eq!(
+            initialize["agentCapabilities"]["promptCapabilities"]["audio"],
+            json!(true)
+        );
 
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn message_display_text_uses_image_placeholder_for_multimodal_messages() {
+    fn message_display_text_uses_multimodal_placeholders() {
         let message = MessageRecord {
             id: 1,
             session_id: "acp_test".to_string(),
             role: "user".to_string(),
             content: Some(json!([
                 {"type": "text", "text": "look"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "mp3"}}
             ])),
             tool_call_id: None,
             tool_calls: None,
@@ -1396,7 +1505,10 @@ mod tests {
             codex_reasoning_items: None,
             codex_message_items: None,
         };
-        assert_eq!(message_display_text(&message), "look\n[Image attachment]");
+        assert_eq!(
+            message_display_text(&message),
+            "look\n[Image attachment]\n[Audio attachment]"
+        );
     }
 
     #[test]

@@ -13,13 +13,22 @@ use serde_json::{Map, Value, json};
 use serde_yaml::Value as YamlValue;
 
 use crate::tools::{tool_error, tool_result};
-use crate::{codex_cloudflare_headers, resolve_codex_access_token};
+use crate::{codex_cloudflare_headers, resolve_codex_access_token, resolve_nous_access_token};
 
 const DEFAULT_MODEL: &str = "fal-ai/flux-2/klein/9b";
 const DEFAULT_ASPECT_RATIO: &str = "landscape";
 const VALID_ASPECT_RATIOS: &[&str] = &["landscape", "square", "portrait"];
 const DEFAULT_TIMEOUT_SECS: u64 = 180;
 const POLL_INTERVAL_MS: u64 = 250;
+const UPSCALER_MODEL: &str = "fal-ai/clarity-upscaler";
+const UPSCALER_FACTOR: i64 = 2;
+const UPSCALER_SAFETY_CHECKER: bool = false;
+const UPSCALER_DEFAULT_PROMPT: &str = "masterpiece, best quality, highres";
+const UPSCALER_NEGATIVE_PROMPT: &str = "(worst quality, low quality, normal quality:2)";
+const UPSCALER_CREATIVITY: f64 = 0.35;
+const UPSCALER_RESEMBLANCE: f64 = 0.6;
+const UPSCALER_GUIDANCE_SCALE: i64 = 4;
+const UPSCALER_NUM_INFERENCE_STEPS: i64 = 18;
 const OPENAI_IMAGE_API_MODEL: &str = "gpt-image-2";
 const OPENAI_IMAGE_DEFAULT_MODEL: &str = "gpt-image-2-medium";
 const OPENAI_IMAGE_BASE_URL: &str = "https://api.openai.com/v1";
@@ -55,6 +64,7 @@ struct FalModelMeta {
     portrait: &'static str,
     defaults: &'static [(&'static str, DefaultValue)],
     supports: &'static [&'static str],
+    upscale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +96,19 @@ struct XaiImageGenConfig {
     base_url: Option<String>,
     api_key: Option<String>,
     resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FalBackendConfig {
+    base_url: String,
+    api_key: String,
+    managed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpJsonError {
+    status: Option<u16>,
+    detail: String,
 }
 
 const KLEIN_DEFAULTS: &[(&str, DefaultValue)] = &[
@@ -233,6 +256,7 @@ const KLEIN_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: KLEIN_DEFAULTS,
     supports: KLEIN_SUPPORTS,
+    upscale: false,
 };
 const FLUX2_PRO_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -241,6 +265,7 @@ const FLUX2_PRO_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: FLUX2_PRO_DEFAULTS,
     supports: FLUX2_PRO_SUPPORTS,
+    upscale: true,
 };
 const Z_IMAGE_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -249,6 +274,7 @@ const Z_IMAGE_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: Z_IMAGE_DEFAULTS,
     supports: Z_IMAGE_SUPPORTS,
+    upscale: false,
 };
 const NANO_BANANA_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::AspectRatio,
@@ -257,6 +283,7 @@ const NANO_BANANA_META: FalModelMeta = FalModelMeta {
     portrait: "9:16",
     defaults: NANO_BANANA_DEFAULTS,
     supports: NANO_BANANA_SUPPORTS,
+    upscale: false,
 };
 const GPT_IMAGE_15_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::GptLiteral,
@@ -265,6 +292,7 @@ const GPT_IMAGE_15_META: FalModelMeta = FalModelMeta {
     portrait: "1024x1536",
     defaults: GPT_IMAGE_15_DEFAULTS,
     supports: GPT_IMAGE_15_SUPPORTS,
+    upscale: false,
 };
 const GPT_IMAGE_2_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -273,6 +301,7 @@ const GPT_IMAGE_2_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_4_3",
     defaults: GPT_IMAGE_2_DEFAULTS,
     supports: GPT_IMAGE_2_SUPPORTS,
+    upscale: false,
 };
 const IDEOGRAM_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -281,6 +310,7 @@ const IDEOGRAM_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: IDEOGRAM_DEFAULTS,
     supports: IDEOGRAM_SUPPORTS,
+    upscale: false,
 };
 const RECRAFT_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -289,6 +319,7 @@ const RECRAFT_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: RECRAFT_DEFAULTS,
     supports: RECRAFT_SUPPORTS,
+    upscale: false,
 };
 const QWEN_META: FalModelMeta = FalModelMeta {
     size_style: SizeStyle::ImageSizePreset,
@@ -297,17 +328,13 @@ const QWEN_META: FalModelMeta = FalModelMeta {
     portrait: "portrait_16_9",
     defaults: QWEN_DEFAULTS,
     supports: QWEN_SUPPORTS,
+    upscale: false,
 };
 
 pub fn image_generate_available() -> bool {
-    let config = read_image_gen_config(&hermes_home());
-    match config.provider.as_deref() {
-        Some("openai") => openai_api_key(&config).is_some(),
-        Some("openai-codex") => resolve_codex_access_token(&hermes_home()).is_ok(),
-        Some("xai") => xai_api_key(&config).is_some(),
-        Some(provider) if provider != "fal" => false,
-        _ => has_direct_fal_key() || managed_gateway_ready(),
-    }
+    let home = hermes_home();
+    let config = read_image_gen_config(&home);
+    any_image_backend_available(&config, &home)
 }
 
 pub fn image_generate_schema() -> Value {
@@ -343,56 +370,99 @@ pub fn handle_image_generate(args: &Value, runtime: &crate::tools::ToolRuntime) 
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_ASPECT_RATIO);
     let config = read_image_gen_config(runtime.hermes_home());
-    if let Some(provider) = config.provider.as_deref() {
-        return match provider {
-            "fal" => match generate_fal_image(&prompt, aspect_ratio, &config) {
-                Ok(result) => tool_result(result),
-                Err(error) => tool_result(json!({
-                    "success": false,
-                    "image": Value::Null,
-                    "error": error,
-                    "error_type": "api_error",
-                })),
-            },
-            "openai" => tool_result(generate_openai_image(
-                &prompt,
-                aspect_ratio,
-                &config,
-                runtime.hermes_home(),
-            )),
-            "openai-codex" => tool_result(generate_openai_codex_image(
-                &prompt,
-                aspect_ratio,
-                &config,
-                runtime.hermes_home(),
-            )),
-            "xai" => tool_result(generate_xai_image(
-                &prompt,
-                aspect_ratio,
-                &config,
-                runtime.hermes_home(),
-            )),
-            other => tool_result(json!({
-                "success": false,
-                "image": Value::Null,
-                "error": format!(
-                    "image_gen.provider='{}' is set but that backend is not ported in the Rust runtime yet.",
-                    other
-                ),
-                "error_type": "provider_not_registered",
-            })),
-        };
-    }
-
-    match generate_fal_image(&prompt, aspect_ratio, &config) {
-        Ok(result) => tool_result(result),
-        Err(error) => tool_result(json!({
+    let Some(provider) = resolve_image_backend(&config, runtime.hermes_home()) else {
+        return tool_result(json!({
             "success": false,
             "image": Value::Null,
-            "error": error,
-            "error_type": "api_error",
+            "error": "No image generation backend is configured. Set image_gen.provider, FAL_KEY, OpenAI image credentials, xAI image credentials, or Codex auth.",
+            "error_type": "provider_not_configured",
+        }));
+    };
+
+    dispatch_image_backend(
+        &provider,
+        &prompt,
+        aspect_ratio,
+        &config,
+        runtime.hermes_home(),
+    )
+}
+
+fn dispatch_image_backend(
+    provider: &str,
+    prompt: &str,
+    aspect_ratio: &str,
+    config: &ImageGenConfig,
+    hermes_home: &Path,
+) -> String {
+    match provider {
+        "fal" => match generate_fal_image(prompt, aspect_ratio, config, hermes_home) {
+            Ok(result) => tool_result(result),
+            Err(error) => tool_result(json!({
+                "success": false,
+                "image": Value::Null,
+                "error": error,
+                "error_type": "api_error",
+            })),
+        },
+        "openai" => tool_result(generate_openai_image(
+            prompt,
+            aspect_ratio,
+            config,
+            hermes_home,
+        )),
+        "openai-codex" => tool_result(generate_openai_codex_image(
+            prompt,
+            aspect_ratio,
+            config,
+            hermes_home,
+        )),
+        "xai" => tool_result(generate_xai_image(
+            prompt,
+            aspect_ratio,
+            config,
+            hermes_home,
+        )),
+        other => tool_result(json!({
+            "success": false,
+            "image": Value::Null,
+            "error": format!(
+                "image_gen.provider='{}' is set but that backend is not ported in the Rust runtime yet.",
+                other
+            ),
+            "error_type": "provider_not_registered",
         })),
     }
+}
+
+fn resolve_image_backend(config: &ImageGenConfig, hermes_home: &Path) -> Option<String> {
+    if let Some(provider) = config.provider.as_deref() {
+        return Some(provider.to_string());
+    }
+    if any_fal_backend_available(hermes_home) {
+        return Some("fal".to_string());
+    }
+    if openai_api_key(config).is_some() {
+        return Some("openai".to_string());
+    }
+    if xai_api_key(config).is_some() {
+        return Some("xai".to_string());
+    }
+    if resolve_codex_access_token(hermes_home).is_ok() {
+        return Some("openai-codex".to_string());
+    }
+    None
+}
+
+fn any_image_backend_available(config: &ImageGenConfig, hermes_home: &Path) -> bool {
+    any_fal_backend_available(hermes_home)
+        || openai_api_key(config).is_some()
+        || xai_api_key(config).is_some()
+        || resolve_codex_access_token(hermes_home).is_ok()
+}
+
+fn any_fal_backend_available(hermes_home: &Path) -> bool {
+    has_direct_fal_key() || managed_gateway_ready(hermes_home)
 }
 
 fn generate_openai_image(
@@ -961,16 +1031,23 @@ fn generate_fal_image(
     prompt: &str,
     aspect_ratio: &str,
     config: &ImageGenConfig,
+    hermes_home: &Path,
 ) -> Result<Value, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("Prompt is required and must be a non-empty string".to_string());
     }
     let aspect_ratio = normalize_aspect_ratio(aspect_ratio);
-    let (model_id, _) = resolve_fal_model(config);
+    let (model_id, meta) = resolve_fal_model(config);
     let payload = build_fal_payload(&model_id, prompt, &aspect_ratio, None, None)?;
-    let (base_url, api_key) = resolve_fal_backend(config)?;
-    let result = submit_fal_request(&base_url, &api_key, &model_id, &payload)?;
+    let backend = resolve_fal_backend(config, hermes_home)?;
+    let result = submit_fal_request(
+        &backend.base_url,
+        &backend.api_key,
+        &model_id,
+        &payload,
+        backend.managed,
+    )?;
 
     let first_image = result
         .get("images")
@@ -984,6 +1061,17 @@ fn generate_fal_image(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Invalid response from FAL API: image URL missing".to_string())?;
+    let (image_ref, upscaled) = if meta.upscale {
+        if let Some(upscaled_url) =
+            upscale_fal_image(&backend.base_url, &backend.api_key, image_ref, prompt)
+        {
+            (upscaled_url, true)
+        } else {
+            (image_ref.to_string(), false)
+        }
+    } else {
+        (image_ref.to_string(), false)
+    };
 
     Ok(json!({
         "success": true,
@@ -992,10 +1080,14 @@ fn generate_fal_image(
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         "provider": "fal",
+        "upscaled": upscaled,
     }))
 }
 
-fn resolve_fal_backend(config: &ImageGenConfig) -> Result<(String, String), String> {
+fn resolve_fal_backend(
+    config: &ImageGenConfig,
+    hermes_home: &Path,
+) -> Result<FalBackendConfig, String> {
     let direct_key = env::var("FAL_KEY")
         .ok()
         .map(|value| value.trim().to_string())
@@ -1004,11 +1096,19 @@ fn resolve_fal_backend(config: &ImageGenConfig) -> Result<(String, String), Stri
     if let Some(key) = direct_key
         && !config.use_gateway
     {
-        return Ok(("https://queue.fal.run".to_string(), key));
+        return Ok(FalBackendConfig {
+            base_url: "https://queue.fal.run".to_string(),
+            api_key: key,
+            managed: false,
+        });
     }
 
-    if let Some((gateway_url, gateway_token)) = managed_gateway_config() {
-        return Ok((gateway_url, gateway_token));
+    if let Some((gateway_url, gateway_token)) = managed_gateway_config(hermes_home) {
+        return Ok(FalBackendConfig {
+            base_url: gateway_url,
+            api_key: gateway_token,
+            managed: true,
+        });
     }
 
     if let Some(key) = env::var("FAL_KEY")
@@ -1016,7 +1116,11 @@ fn resolve_fal_backend(config: &ImageGenConfig) -> Result<(String, String), Stri
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        return Ok(("https://queue.fal.run".to_string(), key));
+        return Ok(FalBackendConfig {
+            base_url: "https://queue.fal.run".to_string(),
+            api_key: key,
+            managed: false,
+        });
     }
 
     Err("FAL_KEY environment variable not set and managed FAL gateway is unavailable".to_string())
@@ -1027,13 +1131,14 @@ fn submit_fal_request(
     api_key: &str,
     model_id: &str,
     payload: &Value,
+    managed_gateway: bool,
 ) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
         .build()
         .map_err(|error| format!("building FAL client failed: {error}"))?;
     let submit_url = format!("{}/{}", base_url.trim_end_matches('/'), model_id);
-    let initial = send_json(
+    let initial = send_fal_json(
         authorized_request(
             client
                 .post(&submit_url)
@@ -1042,7 +1147,8 @@ fn submit_fal_request(
             api_key,
         ),
         "submitting FAL request",
-    )?;
+    )
+    .map_err(|error| format_fal_submit_error(error, model_id, managed_gateway))?;
 
     let request_id = initial
         .get("request_id")
@@ -1107,27 +1213,74 @@ fn submit_fal_request(
     }
 }
 
+fn upscale_fal_image(
+    base_url: &str,
+    api_key: &str,
+    image_url: &str,
+    prompt: &str,
+) -> Option<String> {
+    let payload = json!({
+        "image_url": image_url,
+        "prompt": format!("{UPSCALER_DEFAULT_PROMPT}, {}", prompt.trim()),
+        "upscale_factor": UPSCALER_FACTOR,
+        "negative_prompt": UPSCALER_NEGATIVE_PROMPT,
+        "creativity": UPSCALER_CREATIVITY,
+        "resemblance": UPSCALER_RESEMBLANCE,
+        "guidance_scale": UPSCALER_GUIDANCE_SCALE,
+        "num_inference_steps": UPSCALER_NUM_INFERENCE_STEPS,
+        "enable_safety_checker": UPSCALER_SAFETY_CHECKER,
+    });
+    let result = submit_fal_request(base_url, api_key, UPSCALER_MODEL, &payload, false).ok()?;
+    result
+        .get("image")
+        .and_then(Value::as_object)
+        .and_then(|image| image.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn authorized_request(request: RequestBuilder, api_key: &str) -> RequestBuilder {
     request.header("Authorization", format!("Key {api_key}"))
 }
 
 fn send_json(request: RequestBuilder, action: &str) -> Result<Value, String> {
-    let response = request
-        .send()
-        .map_err(|error| format!("{action} failed: {error}"))?;
+    send_fal_json(request, action).map_err(|error| error.detail)
+}
+
+fn send_fal_json(request: RequestBuilder, action: &str) -> Result<Value, HttpJsonError> {
+    let response = request.send().map_err(|error| HttpJsonError {
+        status: None,
+        detail: format!("{action} failed: {error}"),
+    })?;
     let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("reading FAL response failed: {error}"))?;
+    let body = response.text().map_err(|error| HttpJsonError {
+        status: None,
+        detail: format!("reading FAL response failed: {error}"),
+    })?;
     if !status.is_success() {
-        return Err(format!(
-            "{action} failed with HTTP {}: {}",
-            status.as_u16(),
-            body
-        ));
+        return Err(HttpJsonError {
+            status: Some(status.as_u16()),
+            detail: format!("{action} failed with HTTP {}: {}", status.as_u16(), body),
+        });
     }
-    serde_json::from_str::<Value>(&body)
-        .map_err(|error| format!("decoding FAL JSON failed: {error}"))
+    serde_json::from_str::<Value>(&body).map_err(|error| HttpJsonError {
+        status: None,
+        detail: format!("decoding FAL JSON failed: {error}"),
+    })
+}
+
+fn format_fal_submit_error(error: HttpJsonError, model_id: &str, managed_gateway: bool) -> String {
+    if managed_gateway
+        && let Some(status) = error.status
+        && (400..500).contains(&status)
+    {
+        return format!(
+            "Nous Subscription gateway rejected model '{model_id}' (HTTP {status}). This model may not yet be enabled on the Nous Portal's FAL proxy. Either:\n- Set FAL_KEY in your environment to use FAL.ai directly, or\n- Pick a different model via `hermes tools` -> Image Generation."
+        );
+    }
+    error.detail
 }
 
 fn resolve_fal_model(config: &ImageGenConfig) -> (String, FalModelMeta) {
@@ -1558,15 +1711,16 @@ fn has_direct_fal_key() -> bool {
         .unwrap_or(false)
 }
 
-fn managed_gateway_ready() -> bool {
-    managed_gateway_config().is_some()
+fn managed_gateway_ready(hermes_home: &Path) -> bool {
+    managed_gateway_config(hermes_home).is_some()
 }
 
-fn managed_gateway_config() -> Option<(String, String)> {
+fn managed_gateway_config(hermes_home: &Path) -> Option<(String, String)> {
     let token = env::var("TOOL_GATEWAY_USER_TOKEN")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
+        .filter(|value| !value.is_empty())
+        .or_else(|| resolve_nous_access_token(hermes_home, 15.0).ok())?;
     let url = env::var("FAL_QUEUE_GATEWAY_URL")
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -1695,6 +1849,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_generate_available_matches_python_backend_probe_order() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_xai = env::var_os("XAI_API_KEY");
+        let previous_fal = env::var_os("FAL_KEY");
+
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("XAI_API_KEY");
+        remove_env_var("FAL_KEY");
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            "image_gen:\n  provider: fal\n",
+        )
+        .unwrap();
+        assert!(!image_generate_available());
+
+        set_env_var("OPENAI_API_KEY", "openai-test-key");
+        assert!(image_generate_available());
+        remove_env_var("OPENAI_API_KEY");
+
+        set_env_var("XAI_API_KEY", "xai-test-key");
+        assert!(image_generate_available());
+        remove_env_var("XAI_API_KEY");
+
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "header.payload.sig",
+                            "refresh_token": "refresh-test"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(image_generate_available());
+
+        set_env_var("FAL_KEY", "fal-test-key");
+        fs::write(
+            temp.path().join("config.yaml"),
+            "image_gen:\n  provider: replicate\n",
+        )
+        .unwrap();
+        assert!(image_generate_available());
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_xai {
+            Some(value) => set_env_var("XAI_API_KEY", value),
+            None => remove_env_var("XAI_API_KEY"),
+        }
+        match previous_fal {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+    }
+
     fn serve_fal_queue() -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1741,8 +1970,9 @@ mod tests {
                     body_bytes.extend_from_slice(&buffer[..read]);
                 }
                 captured_clone.lock().unwrap().push(format!(
-                    "{}\n{}",
-                    headers.lines().next().unwrap_or_default(),
+                    "{}{}{}",
+                    headers,
+                    if headers.ends_with("\n") { "" } else { "\n" },
                     String::from_utf8_lossy(&body_bytes)
                 ));
                 let first_line = headers.lines().next().unwrap_or_default().to_string();
@@ -1774,6 +2004,177 @@ mod tests {
                 );
                 stream.write_all(response.as_bytes()).unwrap();
             }
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    fn serve_fal_queue_with_upscaler()
+    -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let mut body_bytes = request[header_end..].to_vec();
+                while body_bytes.len() < content_length {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    body_bytes.extend_from_slice(&buffer[..read]);
+                }
+                captured_clone.lock().unwrap().push(format!(
+                    "{}{}{}",
+                    headers,
+                    if headers.ends_with("\n") { "" } else { "\n" },
+                    String::from_utf8_lossy(&body_bytes)
+                ));
+                let first_line = headers.lines().next().unwrap_or_default().to_string();
+                let response_body = if first_line.starts_with("POST /fal-ai/flux-2-pro ") {
+                    json!({
+                        "request_id": "req-main",
+                        "response_url": format!("http://{}/requests/req-main/response", addr),
+                        "status_url": format!("http://{}/requests/req-main/status", addr),
+                        "cancel_url": format!("http://{}/requests/req-main/cancel", addr),
+                        "queue_position": 1,
+                    })
+                    .to_string()
+                } else if first_line.starts_with("GET /requests/req-main/status ") {
+                    json!({"status": "COMPLETED"}).to_string()
+                } else if first_line.starts_with("GET /requests/req-main/response ") {
+                    json!({
+                        "images": [{
+                            "url": "https://v3.fal.media/files/demo/original.png",
+                            "width": 1024,
+                            "height": 1024
+                        }]
+                    })
+                    .to_string()
+                } else if first_line.starts_with("POST /fal-ai/clarity-upscaler ") {
+                    json!({
+                        "request_id": "req-upscale",
+                        "response_url": format!("http://{}/requests/req-upscale/response", addr),
+                        "status_url": format!("http://{}/requests/req-upscale/status", addr),
+                        "cancel_url": format!("http://{}/requests/req-upscale/cancel", addr),
+                        "queue_position": 1,
+                    })
+                    .to_string()
+                } else if first_line.starts_with("GET /requests/req-upscale/status ") {
+                    json!({"status": "COMPLETED"}).to_string()
+                } else {
+                    json!({
+                        "image": {
+                            "url": "https://v3.fal.media/files/demo/upscaled.png",
+                            "width": 2048,
+                            "height": 2048
+                        }
+                    })
+                    .to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    fn serve_fal_queue_rejecting_model(
+        status_code: u16,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request[header_end..].to_vec();
+            while body_bytes.len() < content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                body_bytes.extend_from_slice(&buffer[..read]);
+            }
+            captured_clone.lock().unwrap().push(format!(
+                "{}{}{}",
+                headers,
+                if headers.ends_with("\n") { "" } else { "\n" },
+                String::from_utf8_lossy(&body_bytes)
+            ));
+
+            let response_body =
+                json!({"detail": "model not enabled for managed gateway"}).to_string();
+            let response = format!(
+                "HTTP/1.1 {} Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_code,
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{addr}"), captured, handle)
     }
@@ -1810,6 +2211,192 @@ mod tests {
         assert!(requests[0].starts_with("POST /fal-ai/flux-2/klein/9b "));
         assert!(requests[0].contains("\"image_size\":\"square_hd\""));
         assert!(requests[0].contains("\"num_inference_steps\":4"));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_key {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_token {
+            Some(value) => set_env_var("TOOL_GATEWAY_USER_TOKEN", value),
+            None => remove_env_var("TOOL_GATEWAY_USER_TOKEN"),
+        }
+    }
+
+    #[test]
+    fn image_generate_uses_managed_gateway_token_from_nous_auth_store() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_key = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_token = env::var_os("TOOL_GATEWAY_USER_TOKEN");
+        let (gateway_url, captured, server) = serve_fal_queue();
+
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+        set_env_var("FAL_QUEUE_GATEWAY_URL", &gateway_url);
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-auth-token",
+                        "refresh_token": "nous-refresh-token",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw cat", "aspect_ratio": "square"}),
+            &crate::tools::ToolRuntime::new(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], true);
+        let requests = captured.lock().unwrap();
+        let request = &requests[0].to_ascii_lowercase();
+        assert!(request.contains("authorization: key nous-auth-token"));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_key {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_token {
+            Some(value) => set_env_var("TOOL_GATEWAY_USER_TOKEN", value),
+            None => remove_env_var("TOOL_GATEWAY_USER_TOKEN"),
+        }
+    }
+
+    #[test]
+    fn image_generate_managed_gateway_rejections_surface_actionable_fal_message() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_key = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_token = env::var_os("TOOL_GATEWAY_USER_TOKEN");
+        let (gateway_url, captured, server) = serve_fal_queue_rejecting_model(403);
+
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        set_env_var("FAL_QUEUE_GATEWAY_URL", &gateway_url);
+        set_env_var("TOOL_GATEWAY_USER_TOKEN", "nous-token");
+
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw cat", "aspect_ratio": "square"}),
+            &crate::tools::ToolRuntime::new(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["error_type"], "api_error");
+        let error = result["error"].as_str().unwrap_or_default();
+        assert!(error.contains(
+            "Nous Subscription gateway rejected model 'fal-ai/flux-2/klein/9b' (HTTP 403)."
+        ));
+        assert!(error.contains("Set FAL_KEY in your environment to use FAL.ai directly"));
+        assert!(error.contains("Pick a different model via `hermes tools` -> Image Generation."));
+
+        let requests = captured.lock().unwrap();
+        assert!(requests[0].starts_with("POST /fal-ai/flux-2/klein/9b "));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_key {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_token {
+            Some(value) => set_env_var("TOOL_GATEWAY_USER_TOKEN", value),
+            None => remove_env_var("TOOL_GATEWAY_USER_TOKEN"),
+        }
+    }
+
+    #[test]
+    fn image_generate_flux2_pro_uses_clarity_upscaler() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_key = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_token = env::var_os("TOOL_GATEWAY_USER_TOKEN");
+        let (gateway_url, captured, server) = serve_fal_queue_with_upscaler();
+
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        set_env_var("FAL_QUEUE_GATEWAY_URL", &gateway_url);
+        set_env_var("TOOL_GATEWAY_USER_TOKEN", "nous-token");
+        fs::write(
+            temp.path().join("config.yaml"),
+            "image_gen:\n  provider: fal\n  model: fal-ai/flux-2-pro\n",
+        )
+        .unwrap();
+
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw cat", "aspect_ratio": "square"}),
+            &crate::tools::ToolRuntime::new(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["provider"], "fal");
+        assert_eq!(
+            result["image"],
+            "https://v3.fal.media/files/demo/upscaled.png"
+        );
+        assert_eq!(result["upscaled"], true);
+
+        let requests = captured.lock().unwrap();
+        assert!(requests[0].starts_with("POST /fal-ai/flux-2-pro "));
+        assert!(requests[0].contains("\"image_size\":\"square_hd\""));
+        assert!(requests[3].starts_with("POST /fal-ai/clarity-upscaler "));
+        assert!(
+            requests[3].contains("\"image_url\":\"https://v3.fal.media/files/demo/original.png\"")
+        );
+        assert!(requests[3].contains("\"upscale_factor\":2"));
+        assert!(requests[3].contains("\"enable_safety_checker\":false"));
+        assert!(
+            requests[3].contains("\"prompt\":\"masterpiece, best quality, highres, draw cat\"")
+        );
 
         match previous_home {
             Some(value) => set_env_var("HERMES_HOME", value),
@@ -1936,6 +2523,124 @@ mod tests {
         match previous_home {
             Some(value) => set_env_var("HERMES_HOME", value),
             None => remove_env_var("HERMES_HOME"),
+        }
+    }
+
+    #[test]
+    fn image_generate_auto_selects_openai_when_fal_is_unavailable() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_fal = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        remove_env_var("FAL_QUEUE_GATEWAY_URL");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request[header_end..].to_vec();
+            while body_bytes.len() < content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                body_bytes.extend_from_slice(&buffer[..read]);
+            }
+            captured_clone.lock().unwrap().push(format!(
+                "{}\n{}",
+                headers.lines().next().unwrap_or_default(),
+                String::from_utf8_lossy(&body_bytes)
+            ));
+
+            let response_body = json!({
+                "data": [{
+                    "b64_json": base64::engine::general_purpose::STANDARD.encode(b"openai-auto-image")
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "image_gen:\n  openai:\n    base_url: http://{}\n    api_key: openai-test-key\n    model: gpt-image-2-high\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw cat", "aspect_ratio": "portrait"}),
+            &crate::tools::ToolRuntime::new(temp.path()).with_hermes_home(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["provider"], "openai");
+        assert_eq!(result["model"], "gpt-image-2-high");
+        assert_eq!(result["quality"], "high");
+        assert_eq!(result["size"], "1024x1536");
+        assert_eq!(
+            fs::read(result["image"].as_str().unwrap()).unwrap(),
+            b"openai-auto-image"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(requests[0].starts_with("POST /images/generations "));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_fal {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
         }
     }
 
@@ -2093,6 +2798,171 @@ mod tests {
     }
 
     #[test]
+    fn image_generate_auto_selects_codex_when_it_is_the_only_backend() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_fal = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_xai = env::var_os("XAI_API_KEY");
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        remove_env_var("FAL_QUEUE_GATEWAY_URL");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("XAI_API_KEY");
+
+        let token = {
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(r#"{"alg":"none","typ":"JWT"}"#);
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                json!({
+                    "exp": i64::MAX / 2,
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct-image-auto",
+                    }
+                })
+                .to_string(),
+            );
+            format!("{header}.{payload}.sig")
+        };
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": token,
+                            "refresh_token": "refresh-image",
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request[header_end..].to_vec();
+            while body_bytes.len() < content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                body_bytes.extend_from_slice(&buffer[..read]);
+            }
+            captured_clone.lock().unwrap().push(format!(
+                "{}\n{}{}",
+                headers,
+                if headers.ends_with("\n") { "" } else { "\n" },
+                String::from_utf8_lossy(&body_bytes)
+            ));
+
+            let response_body = json!({
+                "output": [{
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "id": "ig_test",
+                    "result": base64::engine::general_purpose::STANDARD.encode(b"codex-auto-image")
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "image_gen:\n  openai-codex:\n    base_url: http://{}\n    model: gpt-image-2-low\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw owl", "aspect_ratio": "square"}),
+            &crate::tools::ToolRuntime::new(temp.path()).with_hermes_home(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["provider"], "openai-codex");
+        assert_eq!(result["model"], "gpt-image-2-low");
+        assert_eq!(result["quality"], "low");
+        assert_eq!(result["size"], "1024x1024");
+        assert_eq!(
+            fs::read(result["image"].as_str().unwrap()).unwrap(),
+            b"codex-auto-image"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(requests[0].contains("POST /responses HTTP/1.1"));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_fal {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_xai {
+            Some(value) => set_env_var("XAI_API_KEY", value),
+            None => remove_env_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
     fn image_generate_runs_with_xai_provider() {
         let _guard = crate::test_env_lock()
             .lock()
@@ -2197,6 +3067,193 @@ mod tests {
         match previous_home {
             Some(value) => set_env_var("HERMES_HOME", value),
             None => remove_env_var("HERMES_HOME"),
+        }
+    }
+
+    #[test]
+    fn image_generate_auto_selects_xai_when_it_is_the_only_backend() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_fal = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_xai = env::var_os("XAI_API_KEY");
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        remove_env_var("FAL_QUEUE_GATEWAY_URL");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("XAI_API_KEY");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let mut body_bytes = request[header_end..].to_vec();
+            while body_bytes.len() < content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                body_bytes.extend_from_slice(&buffer[..read]);
+            }
+            captured_clone.lock().unwrap().push(format!(
+                "{}\n{}",
+                headers.lines().next().unwrap_or_default(),
+                String::from_utf8_lossy(&body_bytes)
+            ));
+
+            let response_body = json!({
+                "data": [{
+                    "b64_json": base64::engine::general_purpose::STANDARD.encode(b"xai-auto-image")
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "image_gen:\n  xai:\n    base_url: http://{}\n    api_key: xai-test-key\n    resolution: 2k\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw fox", "aspect_ratio": "landscape"}),
+            &crate::tools::ToolRuntime::new(temp.path()).with_hermes_home(temp.path()),
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["provider"], "xai");
+        assert_eq!(result["model"], "grok-imagine-image");
+        assert_eq!(result["resolution"], "2048");
+        assert_eq!(result["resolution_key"], "2k");
+        assert_eq!(
+            fs::read(result["image"].as_str().unwrap()).unwrap(),
+            b"xai-auto-image"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert!(requests[0].starts_with("POST /images/generations "));
+        assert!(requests[0].contains("\"aspect_ratio\":\"16:9\""));
+        assert!(requests[0].contains("\"resolution\":\"2048\""));
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_fal {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_xai {
+            Some(value) => set_env_var("XAI_API_KEY", value),
+            None => remove_env_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn image_generate_reports_provider_not_configured_when_no_backend_exists() {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_fal = env::var_os("FAL_KEY");
+        let previous_gateway = env::var_os("FAL_QUEUE_GATEWAY_URL");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_xai = env::var_os("XAI_API_KEY");
+        set_env_var("HERMES_HOME", temp.path());
+        remove_env_var("FAL_KEY");
+        remove_env_var("FAL_QUEUE_GATEWAY_URL");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("XAI_API_KEY");
+        fs::write(temp.path().join("config.yaml"), "image_gen:\n").unwrap();
+
+        let result = serde_json::from_str::<Value>(&handle_image_generate(
+            &json!({"prompt": "draw cat"}),
+            &crate::tools::ToolRuntime::new(temp.path()).with_hermes_home(temp.path()),
+        ))
+        .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["error_type"], "provider_not_configured");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("No image generation backend is configured.")
+        );
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_fal {
+            Some(value) => set_env_var("FAL_KEY", value),
+            None => remove_env_var("FAL_KEY"),
+        }
+        match previous_gateway {
+            Some(value) => set_env_var("FAL_QUEUE_GATEWAY_URL", value),
+            None => remove_env_var("FAL_QUEUE_GATEWAY_URL"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_xai {
+            Some(value) => set_env_var("XAI_API_KEY", value),
+            None => remove_env_var("XAI_API_KEY"),
         }
     }
 

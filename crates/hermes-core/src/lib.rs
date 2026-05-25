@@ -46,7 +46,8 @@ pub use auth::{
     get_active_auth_provider, get_auth_status_summary, resolve_codex_access_token,
     resolve_copilot_acp_runtime_credentials, resolve_copilot_runtime_credentials,
     resolve_google_gemini_runtime_credentials, resolve_minimax_oauth_runtime_credentials,
-    resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
+    resolve_nous_access_token, resolve_nous_runtime_credentials, resolve_qwen_runtime_credentials,
+    resolve_zai_base_url,
 };
 pub use config::{
     AgentConfig, DelegationConfig, DisplayConfig, HermesConfig, LoadedConfig, LoggingConfig,
