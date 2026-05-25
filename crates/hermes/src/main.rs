@@ -107,6 +107,8 @@ enum Command {
         command: Option<hooks::HooksCommand>,
     },
     Login(login_cmd::LoginArgs),
+    Approve(SlashCompatArgs),
+    Deny(SlashCompatArgs),
     Fallback {
         #[command(subcommand)]
         command: Option<fallback_cmd::FallbackCommand>,
@@ -153,6 +155,8 @@ enum Command {
     Resume(ResumeArgs),
     Retry(SlashCompatArgs),
     Save(SlashCompatArgs),
+    #[command(alias = "set-home")]
+    Sethome(SlashCompatArgs),
     Skin(SlashCompatArgs),
     #[command(alias = "sb")]
     Statusbar(SlashCompatArgs),
@@ -233,6 +237,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<profile_cmd::ProfileCommand>,
     },
+    Topic(SlashCompatArgs),
     Chat {
         prompt: String,
         #[arg(long)]
@@ -489,6 +494,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
         Command::Login(args) => login_cmd::print_login(args)?,
+        Command::Approve(args) => print_live_gateway_only_command(
+            "approve",
+            &args.args,
+            "approve is only available for live pending approvals in a running gateway or TUI session.",
+        )?,
+        Command::Deny(args) => print_live_gateway_only_command(
+            "deny",
+            &args.args,
+            "deny is only available for live pending approvals in a running gateway or TUI session.",
+        )?,
         Command::Fallback { command } => {
             fallback_cmd::print_fallback(&context.config_path(), &config, command)?
         }
@@ -529,6 +544,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Resume(args) => print_resume(&session_store, args)?,
         Command::Retry(args) => print_retry_compat(&session_store, args)?,
         Command::Save(args) => print_slash_compat(&session_store, "save", args)?,
+        Command::Sethome(args) => print_live_gateway_only_command(
+            "sethome",
+            &args.args,
+            "sethome is only available from a running gateway chat context.",
+        )?,
         Command::Skin(args) => print_slash_compat(&session_store, "skin", args)?,
         Command::Statusbar(args) => print_slash_compat(&session_store, "statusbar", args)?,
         Command::Steer(args) => print_send_turn_compat(&session_store, "steer", args)?,
@@ -566,6 +586,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => profile_cmd::print_profile(&context, command)?,
+        Command::Topic(args) => print_live_gateway_only_command(
+            "topic",
+            &args.args,
+            "topic is only available in Telegram private chats through the gateway.",
+        )?,
         Command::Chat {
             prompt,
             session,
@@ -1607,6 +1632,14 @@ fn print_no_arg_slash_compat(
     launch_python_slash_command(&session_id, slash_name, &[])
 }
 
+fn print_live_gateway_only_command(
+    _command_name: &str,
+    _args: &[String],
+    message: &str,
+) -> Result<(), Box<dyn Error>> {
+    Err(message.into())
+}
+
 fn print_goal_compat(
     session_store: &hermes_core::SessionStore,
     args: SlashCompatArgs,
@@ -2559,6 +2592,14 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
+        let cli = Cli::try_parse_from(["hermes", "approve", "all", "session"]).unwrap();
+        match cli.command {
+            Some(Command::Approve(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("all"), String::from("session")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
         let cli =
             Cli::try_parse_from(["hermes", "browser", "connect", "ws://127.0.0.1:9222"]).unwrap();
         match cli.command {
@@ -2655,6 +2696,14 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
+        let cli = Cli::try_parse_from(["hermes", "deny", "all"]).unwrap();
+        match cli.command {
+            Some(Command::Deny(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("all")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
         let cli = Cli::try_parse_from(["hermes", "redraw"]).unwrap();
         match cli.command {
             Some(Command::Redraw(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
@@ -2688,6 +2737,12 @@ mod tests {
         let cli = Cli::try_parse_from(["hermes", "retry"]).unwrap();
         match cli.command {
             Some(Command::Retry(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "set-home"]).unwrap();
+        match cli.command {
+            Some(Command::Sethome(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
             other => panic!("unexpected parse result: {other:?}"),
         }
 
@@ -2749,6 +2804,14 @@ mod tests {
             Some(Command::Title(SlashCompatArgs { session, args })) => {
                 assert_eq!(session.as_deref(), Some("sess-1"));
                 assert_eq!(args, vec![String::from("My"), String::from("Session")]);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "topic", "help"]).unwrap();
+        match cli.command {
+            Some(Command::Topic(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("help")]);
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -3177,6 +3240,33 @@ mod tests {
 
         let payload = fs::read_to_string(&stdin_log).unwrap();
         assert!(payload.contains("\"command\":\"/status\""));
+    }
+
+    #[test]
+    fn live_gateway_only_commands_report_explicit_unavailable_errors() {
+        let approve = print_live_gateway_only_command(
+            "approve",
+            &[String::from("all")],
+            "approve is only available for live pending approvals in a running gateway or TUI session.",
+        )
+        .unwrap_err();
+        assert!(
+            approve
+                .to_string()
+                .contains("approve is only available for live pending approvals")
+        );
+
+        let topic = print_live_gateway_only_command(
+            "topic",
+            &[String::from("help")],
+            "topic is only available in Telegram private chats through the gateway.",
+        )
+        .unwrap_err();
+        assert!(
+            topic
+                .to_string()
+                .contains("topic is only available in Telegram private chats")
+        );
     }
 
     #[test]
