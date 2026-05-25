@@ -1,5 +1,10 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use regex::Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
@@ -48,7 +53,7 @@ const COPILOT_HEADERS: &[(&str, &str)] = &[
 const KIMI_HEADERS: &[(&str, &str)] = &[("User-Agent", "hermes-agent/1.0")];
 const AZURE_FOUNDRY_RESPONSES_PREFIXES: &[&str] = &["codex", "gpt-5", "o1", "o3", "o4"];
 
-const PROVIDERS: &[ProviderProfile] = &[
+const BUILTIN_PROVIDERS: &[ProviderProfile] = &[
     ProviderProfile {
         name: "openai",
         aliases: &["oa"],
@@ -449,8 +454,28 @@ const DEEPSEEK_CANONICAL_MODELS: &[&str] = &[
 ];
 const DEEPSEEK_REASONER_KEYWORDS: &[&str] = &["reasoner", "r1", "think", "reasoning", "cot"];
 
+#[derive(Debug)]
+struct ProviderRegistryCache {
+    profiles: &'static [ProviderProfile],
+    aliases: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedProviderProfile {
+    name: String,
+    aliases: Option<Vec<String>>,
+    api_mode: Option<String>,
+    env_vars: Option<Vec<String>>,
+    base_url: Option<String>,
+    auth_type: Option<String>,
+    default_headers: Option<Vec<(String, String)>>,
+}
+
+static PROVIDER_REGISTRY_CACHE: OnceLock<Mutex<Option<&'static ProviderRegistryCache>>> =
+    OnceLock::new();
+
 pub fn list_provider_profiles() -> &'static [ProviderProfile] {
-    PROVIDERS
+    provider_registry_cache().profiles
 }
 
 pub fn get_provider_profile(name: &str) -> Option<&'static ProviderProfile> {
@@ -458,9 +483,632 @@ pub fn get_provider_profile(name: &str) -> Option<&'static ProviderProfile> {
     if normalized.is_empty() {
         return None;
     }
-    PROVIDERS
+    let cache = provider_registry_cache();
+    cache
+        .aliases
+        .get(&normalized)
+        .and_then(|index| cache.profiles.get(*index))
+}
+
+fn provider_registry_cache() -> &'static ProviderRegistryCache {
+    let cache = PROVIDER_REGISTRY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().expect("provider registry cache poisoned");
+    if let Some(existing) = *guard {
+        return existing;
+    }
+    let built = Box::leak(Box::new(build_provider_registry_cache()));
+    *guard = Some(built);
+    built
+}
+
+fn build_provider_registry_cache() -> ProviderRegistryCache {
+    let mut profiles = BUILTIN_PROVIDERS.to_vec();
+
+    for path in discover_provider_plugin_files(bundled_model_providers_root()) {
+        for profile in parse_provider_profiles_from_file(&path) {
+            register_parsed_provider_override(&mut profiles, profile);
+        }
+    }
+
+    for path in discover_provider_plugin_files(user_model_providers_root()) {
+        for profile in parse_provider_profiles_from_file(&path) {
+            register_parsed_provider_override(&mut profiles, profile);
+        }
+    }
+
+    for path in discover_legacy_provider_files(legacy_providers_root()) {
+        for profile in parse_provider_profiles_from_file(&path) {
+            register_parsed_provider_override(&mut profiles, profile);
+        }
+    }
+
+    let profiles = Box::leak(profiles.into_boxed_slice());
+    let mut aliases = BTreeMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        aliases.insert(profile.name.to_string(), index);
+        for alias in profile.aliases {
+            aliases.insert((*alias).to_string(), index);
+        }
+    }
+
+    ProviderRegistryCache { profiles, aliases }
+}
+
+fn register_provider_override(profiles: &mut Vec<ProviderProfile>, profile: ProviderProfile) {
+    if let Some(existing) = profiles.iter_mut().find(|entry| entry.name == profile.name) {
+        *existing = profile;
+    } else {
+        profiles.push(profile);
+    }
+}
+
+fn register_parsed_provider_override(
+    profiles: &mut Vec<ProviderProfile>,
+    parsed: ParsedProviderProfile,
+) {
+    let existing = profiles
         .iter()
-        .find(|profile| profile.matches(&normalized))
+        .find(|entry| entry.name == parsed.name)
+        .cloned();
+    let merged = ProviderProfile {
+        name: leak_string(parsed.name),
+        aliases: leak_string_slice(
+            parsed
+                .aliases
+                .or_else(|| {
+                    existing.as_ref().map(|profile| {
+                        profile
+                            .aliases
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default(),
+        ),
+        api_mode: leak_string(
+            parsed
+                .api_mode
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|profile| profile.api_mode.to_string())
+                })
+                .unwrap_or_else(|| "chat_completions".to_string()),
+        ),
+        env_vars: leak_string_slice(
+            parsed
+                .env_vars
+                .or_else(|| {
+                    existing.as_ref().map(|profile| {
+                        profile
+                            .env_vars
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default(),
+        ),
+        base_url: leak_string(
+            parsed
+                .base_url
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|profile| profile.base_url.to_string())
+                })
+                .unwrap_or_default(),
+        ),
+        auth_type: leak_string(
+            parsed
+                .auth_type
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|profile| profile.auth_type.to_string())
+                })
+                .unwrap_or_else(|| "api_key".to_string()),
+        ),
+        default_headers: leak_header_slice(
+            parsed
+                .default_headers
+                .or_else(|| {
+                    existing.as_ref().map(|profile| {
+                        profile
+                            .default_headers
+                            .iter()
+                            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default(),
+        ),
+    };
+    register_provider_override(profiles, merged);
+}
+
+fn discover_provider_plugin_files(root: PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !path.is_dir() || name.starts_with(['.', '_']) {
+            continue;
+        }
+        let init = path.join("__init__.py");
+        if init.is_file() {
+            files.push(init);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn discover_legacy_provider_files(root: PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !path.is_file()
+            || !name.ends_with(".py")
+            || matches!(name.as_str(), "__init__.py" | "base.py")
+            || name.starts_with('_')
+        {
+            continue;
+        }
+        files.push(path);
+    }
+    files.sort();
+    files
+}
+
+fn bundled_model_providers_root() -> PathBuf {
+    let root = std::env::var_os("HERMES_BUNDLED_PLUGINS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("plugins"));
+    if root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == "model-providers")
+    {
+        root
+    } else {
+        root.join("model-providers")
+    }
+}
+
+fn user_model_providers_root() -> PathBuf {
+    std::env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".hermes")))
+        .unwrap_or_else(|| PathBuf::from(".hermes"))
+        .join("plugins")
+        .join("model-providers")
+}
+
+fn legacy_providers_root() -> PathBuf {
+    repo_root().join("providers")
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+        })
+}
+
+fn parse_provider_profiles_from_file(path: &Path) -> Vec<ParsedProviderProfile> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|source| parse_provider_profiles_from_source(&source))
+        .unwrap_or_default()
+}
+
+fn parse_provider_profiles_from_source(source: &str) -> Vec<ParsedProviderProfile> {
+    let mut assignments = BTreeMap::new();
+    for captures in provider_assignment_regex().captures_iter(source) {
+        let Some(name) = captures.get(1).map(|value| value.as_str().to_string()) else {
+            continue;
+        };
+        let Some(matched) = captures.get(0) else {
+            continue;
+        };
+        let open_index = matched.end().saturating_sub(1);
+        let Some(close_index) = find_matching_delimiter(source, open_index, '(', ')') else {
+            continue;
+        };
+        let body = &source[open_index + 1..close_index];
+        let Some(profile) = parse_provider_constructor(body) else {
+            continue;
+        };
+        assignments.insert(name, profile);
+    }
+
+    let mut profiles = Vec::new();
+    for captures in register_provider_regex().captures_iter(source) {
+        let Some(name) = captures.get(1).map(|value| value.as_str()) else {
+            continue;
+        };
+        if let Some(profile) = assignments.get(name) {
+            profiles.push(profile.clone());
+        }
+    }
+    profiles
+}
+
+fn parse_provider_constructor(body: &str) -> Option<ParsedProviderProfile> {
+    let args = parse_keyword_args(body);
+    Some(ParsedProviderProfile {
+        name: parse_python_string(args.get("name")?)?,
+        aliases: args
+            .get("aliases")
+            .and_then(|value| parse_python_string_list(value)),
+        api_mode: args
+            .get("api_mode")
+            .and_then(|value| parse_python_string(value)),
+        env_vars: args
+            .get("env_vars")
+            .and_then(|value| parse_python_string_list(value)),
+        base_url: args
+            .get("base_url")
+            .and_then(|value| parse_python_string(value)),
+        auth_type: args
+            .get("auth_type")
+            .and_then(|value| parse_python_string(value)),
+        default_headers: args
+            .get("default_headers")
+            .and_then(|value| parse_python_string_dict(value)),
+    })
+}
+
+fn parse_keyword_args(body: &str) -> BTreeMap<String, String> {
+    let mut args = BTreeMap::new();
+    for item in split_top_level_items(body, ',') {
+        let item = strip_python_comment(&item);
+        if item.trim().is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_top_level_pair(&item, '=') else {
+            continue;
+        };
+        args.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    args
+}
+
+fn find_matching_delimiter(
+    source: &str,
+    open_index: usize,
+    open_char: char,
+    close_char: char,
+) -> Option<usize> {
+    let mut stack = vec![open_char];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for (offset, ch) in source[open_index + 1..].char_indices() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => comment = true,
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => stack.push(ch),
+            ')' => {
+                if stack.pop() != Some('(') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == ')' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == ']' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == '}' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_top_level_items(body: &str, separator: char) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for ch in body.chars() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => {
+                comment = true;
+            }
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                stack.push(ch);
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                stack.pop();
+                current.push(ch);
+            }
+            _ if ch == separator && stack.is_empty() => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    items.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        items.push(trimmed.to_string());
+    }
+    items
+}
+
+fn split_top_level_pair(text: &str, separator: char) -> Option<(String, String)> {
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for (index, ch) in text.char_indices() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => comment = true,
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                stack.pop();
+            }
+            _ if ch == separator && stack.is_empty() => {
+                return Some((
+                    text[..index].trim().to_string(),
+                    text[index + ch.len_utf8()..].trim().to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn strip_python_comment(text: &str) -> String {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if let Some(active) = quote {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                result.push(ch);
+            }
+            '#' => break,
+            _ => result.push(ch),
+        }
+    }
+
+    result.trim().to_string()
+}
+
+fn parse_python_string(text: &str) -> Option<String> {
+    let trimmed = strip_python_comment(text);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = *bytes.first()?;
+    if !matches!(quote, b'\'' | b'"') || bytes.last().copied()? != quote {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    Some(
+        inner
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\\\", "\\"),
+    )
+}
+
+fn parse_python_string_list(text: &str) -> Option<Vec<String>> {
+    let trimmed = strip_python_comment(text);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let (open, close) = (bytes[0] as char, *bytes.last()? as char);
+    if !matches!((open, close), ('(', ')') | ('[', ']')) {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut values = Vec::new();
+    for item in split_top_level_items(inner, ',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        values.push(parse_python_string(item)?);
+    }
+    Some(values)
+}
+
+fn parse_python_string_dict(text: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = strip_python_comment(text);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'{' || *bytes.last()? != b'}' {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut values = Vec::new();
+    for item in split_top_level_items(inner, ',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (key, value) = split_top_level_pair(item, ':')?;
+        values.push((parse_python_string(&key)?, parse_python_string(&value)?));
+    }
+    Some(values)
+}
+
+fn leak_string(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn leak_string_slice(values: Vec<String>) -> &'static [&'static str] {
+    if values.is_empty() {
+        return &[];
+    }
+    let leaked = values.into_iter().map(leak_string).collect::<Vec<_>>();
+    Box::leak(leaked.into_boxed_slice())
+}
+
+fn leak_header_slice(values: Vec<(String, String)>) -> &'static [(&'static str, &'static str)] {
+    if values.is_empty() {
+        return &[];
+    }
+    let leaked = values
+        .into_iter()
+        .map(|(key, value)| (leak_string(key), leak_string(value)))
+        .collect::<Vec<_>>();
+    Box::leak(leaked.into_boxed_slice())
+}
+
+fn provider_assignment_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?m)^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\(")
+            .expect("provider assignment regex")
+    })
+}
+
+fn register_provider_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?m)^register_provider\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
+            .expect("provider registration regex")
+    })
+}
+
+#[cfg(test)]
+fn reset_provider_registry_for_tests() {
+    if let Some(cache) = PROVIDER_REGISTRY_CACHE.get() {
+        let mut guard = cache.lock().expect("provider registry cache poisoned");
+        *guard = None;
+    }
 }
 
 pub fn normalize_provider_alias(name: &str) -> String {
@@ -484,7 +1132,7 @@ pub fn infer_provider_from_base_url(base_url: &str) -> Option<&'static ProviderP
     if normalized.is_empty() {
         return None;
     }
-    PROVIDERS
+    list_provider_profiles()
         .iter()
         .filter(|profile| !profile.base_url.is_empty())
         .find(|profile| {
@@ -831,6 +1479,25 @@ fn detect_vendor(model_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    fn set_optional_env(name: &str, value: Option<&Path>) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os(name);
+        match value {
+            Some(path) => unsafe { std::env::set_var(name, path) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        previous
+    }
+
+    fn restore_optional_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
 
     #[test]
     fn provider_aliases_and_auto_order_include_expected_profiles() {
@@ -930,5 +1597,101 @@ mod tests {
             resolve_provider_api_mode("opencode-go", "glm-5.1"),
             Some("chat_completions")
         );
+    }
+
+    #[test]
+    fn lazy_discovery_loads_multiple_profiles_from_plugin_source() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let bundled = temp
+            .path()
+            .join("bundled")
+            .join("model-providers")
+            .join("demo");
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(
+            bundled.join("__init__.py"),
+            r#"
+alpha = ProviderProfile(
+    name="alpha-provider",
+    aliases=("alpha",),
+    env_vars=("ALPHA_API_KEY",),
+    base_url="https://alpha.example/v1",
+)
+
+beta = CustomProfile(
+    name="beta-provider",
+    aliases=("beta",),
+    api_mode="anthropic_messages",
+    env_vars=(),
+    base_url="https://beta.example/v1",
+    auth_type="oauth_external",
+)
+
+register_provider(alpha)
+register_provider(beta)
+"#,
+        )
+        .unwrap();
+
+        let old_bundled =
+            set_optional_env("HERMES_BUNDLED_PLUGINS", Some(&temp.path().join("bundled")));
+        let old_home = set_optional_env("HERMES_HOME", Some(&temp.path().join(".hermes")));
+        reset_provider_registry_for_tests();
+
+        let names = list_provider_profiles()
+            .iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"alpha-provider"));
+        assert!(names.contains(&"beta-provider"));
+        assert_eq!(
+            get_provider_profile("beta").map(|profile| profile.auth_type),
+            Some("oauth_external")
+        );
+
+        restore_optional_env("HERMES_BUNDLED_PLUGINS", old_bundled);
+        restore_optional_env("HERMES_HOME", old_home);
+        reset_provider_registry_for_tests();
+    }
+
+    #[test]
+    fn user_provider_override_wins_over_bundled_and_builtin_profiles() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let hermes_home = temp.path().join(".hermes");
+        let user_plugin = hermes_home
+            .join("plugins")
+            .join("model-providers")
+            .join("gmi");
+        fs::create_dir_all(&user_plugin).unwrap();
+        fs::write(
+            user_plugin.join("__init__.py"),
+            r#"
+override = ProviderProfile(
+    name="gmi",
+    aliases=("gmi-user-override",),
+    env_vars=("GMI_API_KEY",),
+    base_url="https://override.example.com/v1",
+    auth_type="api_key",
+)
+
+register_provider(override)
+"#,
+        )
+        .unwrap();
+
+        let old_bundled =
+            set_optional_env("HERMES_BUNDLED_PLUGINS", Some(&repo_root().join("plugins")));
+        let old_home = set_optional_env("HERMES_HOME", Some(&hermes_home));
+        reset_provider_registry_for_tests();
+
+        let profile = get_provider_profile("gmi-user-override").unwrap();
+        assert_eq!(profile.name, "gmi");
+        assert_eq!(profile.base_url, "https://override.example.com/v1");
+
+        restore_optional_env("HERMES_BUNDLED_PLUGINS", old_bundled);
+        restore_optional_env("HERMES_HOME", old_home);
+        reset_provider_registry_for_tests();
     }
 }
