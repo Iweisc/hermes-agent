@@ -631,8 +631,10 @@ mod tests {
         save_subscriptions(&context, &subscriptions).unwrap();
         test_subscription(&context, &loaded, "demo", DEFAULT_TEST_PAYLOAD).unwrap();
         let signature = handle.join().unwrap();
-        assert!(signature
-            .to_ascii_lowercase()
-            .contains("x-hub-signature-256: sha256="));
+        assert!(
+            signature
+                .to_ascii_lowercase()
+                .contains("x-hub-signature-256: sha256=")
+        );
     }
 }

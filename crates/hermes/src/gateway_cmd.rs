@@ -8353,6 +8353,26 @@ exit 9\n",
     }
 
     #[test]
+    fn configure_discord_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "discord")
+            .unwrap();
+
+        let mut input = Cursor::new("discord-token\n111, 222\n123456789\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("DISCORD_BOT_TOKEN=discord-token"));
+        assert!(env_text.contains("DISCORD_ALLOWED_USERS=111,222"));
+        assert!(env_text.contains("DISCORD_HOME_CHANNEL=123456789"));
+    }
+
+    #[test]
     fn configure_slack_gateway_platform_writes_manifest_and_env_values() {
         let (_temp, context) = test_context();
         fs::create_dir_all(context.hermes_home()).unwrap();
