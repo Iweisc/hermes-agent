@@ -178,6 +178,26 @@ struct GatewaySetupVar {
     is_allowlist: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GatewaySetupPlatformSpec {
+    key: &'static str,
+    label: &'static str,
+    emoji: &'static str,
+    token_var: &'static str,
+    has_builtin_setup: bool,
+    setup_instructions: &'static [&'static str],
+    vars: &'static [GatewaySetupVarSpec],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GatewaySetupVarSpec {
+    name: &'static str,
+    prompt: &'static str,
+    password: bool,
+    help: &'static str,
+    is_allowlist: bool,
+}
+
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
@@ -844,7 +864,7 @@ pub(crate) fn run_gateway_setup_with_io(
     loop {
         writeln!(output)?;
         writeln!(output, "Messaging Platforms")?;
-        let platforms = load_gateway_setup_metadata(accept_hooks)?;
+        let platforms = load_gateway_setup_metadata(context, accept_hooks)?;
         let mut labels = platforms
             .iter()
             .map(|platform| {
@@ -872,7 +892,7 @@ pub(crate) fn run_gateway_setup_with_io(
         }
     }
 
-    let platforms = load_gateway_setup_metadata(accept_hooks)?;
+    let platforms = load_gateway_setup_metadata(context, accept_hooks)?;
     let any_configured = platforms
         .iter()
         .any(|platform| gateway_platform_status_is_progress(&platform.status));
@@ -998,12 +1018,486 @@ pub(crate) fn run_gateway_setup_with_io(
     Ok(())
 }
 
+const NO_GATEWAY_SETUP_INSTRUCTIONS: &[&str] = &[];
+const NO_GATEWAY_SETUP_VARS: &[GatewaySetupVarSpec] = &[];
+
+const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Use a dedicated email account for your Hermes agent",
+    "2. For Gmail: enable 2FA, then create an App Password at",
+    "   https://myaccount.google.com/apppasswords",
+    "3. For other providers: use your email password or app-specific password",
+    "4. IMAP must be enabled on your email account",
+];
+
+const EMAIL_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "EMAIL_ADDRESS",
+        prompt: "Email address",
+        password: false,
+        help: "The email address Hermes will use (e.g., hermes@gmail.com).",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "EMAIL_PASSWORD",
+        prompt: "Email password (or app password)",
+        password: true,
+        help: "For Gmail, use an App Password (not your regular password).",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "EMAIL_IMAP_HOST",
+        prompt: "IMAP host",
+        password: false,
+        help: "e.g., imap.gmail.com for Gmail, outlook.office365.com for Outlook.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "EMAIL_SMTP_HOST",
+        prompt: "SMTP host",
+        password: false,
+        help: "e.g., smtp.gmail.com for Gmail, smtp.office365.com for Outlook.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "EMAIL_ALLOWED_USERS",
+        prompt: "Allowed sender emails (comma-separated)",
+        password: false,
+        help: "Only emails from these addresses will be processed.",
+        is_allowlist: true,
+    },
+];
+
+const SMS_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Create a Twilio account at https://www.twilio.com/",
+    "2. Get your Account SID and Auth Token from the Twilio Console dashboard",
+    "3. Buy or configure a phone number capable of sending SMS",
+    "4. Set up your webhook URL for inbound SMS:",
+    "   Twilio Console → Phone Numbers → Active Numbers → your number",
+    "   → Messaging → A MESSAGE COMES IN → Webhook → https://your-server:8080/webhooks/twilio",
+];
+
+const SMS_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "TWILIO_ACCOUNT_SID",
+        prompt: "Twilio Account SID",
+        password: false,
+        help: "Found on the Twilio Console dashboard.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "TWILIO_AUTH_TOKEN",
+        prompt: "Twilio Auth Token",
+        password: true,
+        help: "Found on the Twilio Console dashboard (click to reveal).",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "TWILIO_PHONE_NUMBER",
+        prompt: "Twilio phone number (E.164 format, e.g. +15551234567)",
+        password: false,
+        help: "The Twilio phone number to send SMS from.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "SMS_ALLOWED_USERS",
+        prompt: "Allowed phone numbers (comma-separated, E.164 format)",
+        password: false,
+        help: "Only messages from these phone numbers will be processed.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "SMS_HOME_CHANNEL",
+        prompt: "Home channel phone number (for cron/notification delivery, or empty)",
+        password: false,
+        help: "Phone number to deliver cron job results and notifications to.",
+        is_allowlist: false,
+    },
+];
+
+const WECOM_CALLBACK_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Go to WeCom Admin Console → Applications → Create Self-Built App",
+    "2. Note the Corp ID (top of admin console) and create a Corp Secret",
+    "3. Under Receive Messages, configure the callback URL to point to your server",
+    "4. Copy the Token and EncodingAESKey from the callback configuration",
+    "5. The adapter runs an HTTP server — ensure the port is reachable from WeCom",
+    "6. Restrict access with WECOM_CALLBACK_ALLOWED_USERS for production use",
+];
+
+const WECOM_CALLBACK_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_CORP_ID",
+        prompt: "Corp ID",
+        password: false,
+        help: "Your WeCom enterprise Corp ID.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_CORP_SECRET",
+        prompt: "Corp Secret",
+        password: true,
+        help: "The secret for your self-built application.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_AGENT_ID",
+        prompt: "Agent ID",
+        password: false,
+        help: "The Agent ID of your self-built application.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_TOKEN",
+        prompt: "Callback Token",
+        password: true,
+        help: "The Token from your WeCom callback configuration.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_ENCODING_AES_KEY",
+        prompt: "Encoding AES Key",
+        password: true,
+        help: "The EncodingAESKey from your WeCom callback configuration.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_PORT",
+        prompt: "Callback server port (default: 8645)",
+        password: false,
+        help: "Port for the HTTP callback server.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WECOM_CALLBACK_ALLOWED_USERS",
+        prompt: "Allowed user IDs (comma-separated, or empty)",
+        password: false,
+        help: "Restrict which WeCom users can interact with the app.",
+        is_allowlist: true,
+    },
+];
+
+const YUANBAO_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Download the Yuanbao app from https://yuanbao.tencent.com/",
+    "2. In the app, go to PAI → My Bot and create a new bot",
+    "3. After the bot is created, copy the App ID and App Secret",
+    "4. Enter them below and Hermes will connect automatically over WebSocket",
+];
+
+const YUANBAO_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "YUANBAO_APP_ID",
+        prompt: "App ID",
+        password: false,
+        help: "The App ID from your Yuanbao IM Bot credentials.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "YUANBAO_APP_SECRET",
+        prompt: "App Secret",
+        password: true,
+        help: "The App Secret (used for HMAC signing) from your Yuanbao IM Bot.",
+        is_allowlist: false,
+    },
+];
+
+const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
+    GatewaySetupPlatformSpec {
+        key: "telegram",
+        label: "Telegram",
+        emoji: "📱",
+        token_var: "TELEGRAM_BOT_TOKEN",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "discord",
+        label: "Discord",
+        emoji: "💬",
+        token_var: "DISCORD_BOT_TOKEN",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "slack",
+        label: "Slack",
+        emoji: "💼",
+        token_var: "SLACK_BOT_TOKEN",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "matrix",
+        label: "Matrix",
+        emoji: "🔐",
+        token_var: "MATRIX_ACCESS_TOKEN",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "mattermost",
+        label: "Mattermost",
+        emoji: "💬",
+        token_var: "MATTERMOST_TOKEN",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "whatsapp",
+        label: "WhatsApp",
+        emoji: "📲",
+        token_var: "WHATSAPP_ENABLED",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "signal",
+        label: "Signal",
+        emoji: "📡",
+        token_var: "SIGNAL_HTTP_URL",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "email",
+        label: "Email",
+        emoji: "📧",
+        token_var: "EMAIL_ADDRESS",
+        has_builtin_setup: false,
+        setup_instructions: EMAIL_SETUP_INSTRUCTIONS,
+        vars: EMAIL_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "sms",
+        label: "SMS (Twilio)",
+        emoji: "📱",
+        token_var: "TWILIO_ACCOUNT_SID",
+        has_builtin_setup: false,
+        setup_instructions: SMS_SETUP_INSTRUCTIONS,
+        vars: SMS_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "dingtalk",
+        label: "DingTalk",
+        emoji: "💬",
+        token_var: "DINGTALK_CLIENT_ID",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "feishu",
+        label: "Feishu / Lark",
+        emoji: "🪽",
+        token_var: "FEISHU_APP_ID",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "wecom",
+        label: "WeCom (Enterprise WeChat)",
+        emoji: "💬",
+        token_var: "WECOM_BOT_ID",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "wecom_callback",
+        label: "WeCom Callback (Self-Built App)",
+        emoji: "💬",
+        token_var: "WECOM_CALLBACK_CORP_ID",
+        has_builtin_setup: false,
+        setup_instructions: WECOM_CALLBACK_SETUP_INSTRUCTIONS,
+        vars: WECOM_CALLBACK_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "weixin",
+        label: "Weixin / WeChat",
+        emoji: "💬",
+        token_var: "WEIXIN_ACCOUNT_ID",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "bluebubbles",
+        label: "BlueBubbles (iMessage)",
+        emoji: "💬",
+        token_var: "BLUEBUBBLES_SERVER_URL",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "qqbot",
+        label: "QQ Bot",
+        emoji: "🐧",
+        token_var: "QQ_APP_ID",
+        has_builtin_setup: true,
+        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        vars: NO_GATEWAY_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "yuanbao",
+        label: "Yuanbao",
+        emoji: "💎",
+        token_var: "YUANBAO_APP_ID",
+        has_builtin_setup: false,
+        setup_instructions: YUANBAO_SETUP_INSTRUCTIONS,
+        vars: YUANBAO_SETUP_VARS,
+    },
+];
+
+fn gateway_builtin_platform_specs() -> &'static [GatewaySetupPlatformSpec] {
+    GATEWAY_BUILTIN_PLATFORM_SPECS
+}
+
 fn load_gateway_setup_metadata(
+    context: &HermesContext,
+    accept_hooks: bool,
+) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
+    let mut platforms = native_gateway_setup_metadata(context);
+    for platform in load_gateway_plugin_setup_metadata(accept_hooks)? {
+        if platforms
+            .iter()
+            .all(|existing| existing.key != platform.key)
+        {
+            platforms.push(platform);
+        }
+    }
+    Ok(platforms)
+}
+
+fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
+    gateway_builtin_platform_specs()
+        .iter()
+        .map(|spec| GatewaySetupPlatform {
+            key: spec.key.to_string(),
+            label: spec.label.to_string(),
+            emoji: spec.emoji.to_string(),
+            status: native_gateway_platform_status(context, spec),
+            token_var: spec.token_var.to_string(),
+            install_hint: None,
+            setup_instructions: spec
+                .setup_instructions
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect(),
+            required_env: Vec::new(),
+            has_builtin_setup: spec.has_builtin_setup,
+            has_plugin_setup: false,
+            vars: spec
+                .vars
+                .iter()
+                .map(|var| GatewaySetupVar {
+                    name: var.name.to_string(),
+                    prompt: var.prompt.to_string(),
+                    password: var.password,
+                    help: var.help.to_string(),
+                    is_allowlist: var.is_allowlist,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn native_gateway_platform_status(
+    context: &HermesContext,
+    spec: &GatewaySetupPlatformSpec,
+) -> String {
+    let val = read_effective_env_value(context, spec.token_var);
+    match spec.key {
+        "whatsapp" => {
+            if val
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            {
+                let session_file = context
+                    .hermes_home()
+                    .join("whatsapp")
+                    .join("session")
+                    .join("creds.json");
+                if session_file.exists() {
+                    return "configured + paired".to_string();
+                }
+                return "enabled, not paired".to_string();
+            }
+            "not configured".to_string()
+        }
+        "signal" => {
+            let account = read_effective_env_value(context, "SIGNAL_ACCOUNT");
+            if val.is_some() && account.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || account.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "email" => {
+            let password = read_effective_env_value(context, "EMAIL_PASSWORD");
+            let imap = read_effective_env_value(context, "EMAIL_IMAP_HOST");
+            let smtp = read_effective_env_value(context, "EMAIL_SMTP_HOST");
+            if val.is_some() && password.is_some() && imap.is_some() && smtp.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || password.is_some() || imap.is_some() || smtp.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "matrix" => {
+            let homeserver = read_effective_env_value(context, "MATRIX_HOMESERVER");
+            let password = read_effective_env_value(context, "MATRIX_PASSWORD");
+            if (val.is_some() || password.is_some()) && homeserver.is_some() {
+                let e2ee = read_effective_env_value(context, "MATRIX_ENCRYPTION")
+                    .map(|value| value.to_ascii_lowercase())
+                    .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"));
+                if e2ee {
+                    "configured + E2EE".to_string()
+                } else {
+                    "configured".to_string()
+                }
+            } else if val.is_some() || password.is_some() || homeserver.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "weixin" => {
+            let token = read_effective_env_value(context, "WEIXIN_TOKEN");
+            if val.is_some() && token.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || token.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        _ => {
+            if val.is_some() {
+                "configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+    }
+}
+
+fn load_gateway_plugin_setup_metadata(
     accept_hooks: bool,
 ) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
     let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
-        .ok_or("could not find a Python interpreter for gateway setup")?;
+    let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
+        return Ok(Vec::new());
+    };
 
     let mut command = Command::new(&python);
     command
@@ -1012,15 +1506,21 @@ fn load_gateway_setup_metadata(
     if accept_hooks {
         command.env("HERMES_ACCEPT_HOOKS", "1");
     }
-    command.arg("-c").arg(GATEWAY_SETUP_METADATA_BOOTSTRAP);
+    command
+        .arg("-c")
+        .arg(GATEWAY_PLUGIN_SETUP_METADATA_BOOTSTRAP);
 
     let output = command.output()?;
     if !output.status.success() {
-        return Err(exit_status_message("gateway metadata", output.status).into());
+        return Err(exit_status_message("gateway plugin metadata", output.status).into());
     }
     let stdout = String::from_utf8(output.stdout)?;
-    serde_json::from_str::<Vec<GatewaySetupPlatform>>(stdout.trim())
-        .map_err(|error| format!("invalid gateway setup metadata: {error}").into())
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<GatewaySetupPlatform>>(trimmed)
+        .map_err(|error| format!("invalid gateway plugin setup metadata: {error}").into())
 }
 
 fn run_gateway_platform_setup_bridge(
@@ -1342,33 +1842,34 @@ fn normalize_gateway_allowlist(var_name: &str, value: &str) -> String {
         .join(",")
 }
 
-const GATEWAY_SETUP_METADATA_BOOTSTRAP: &str = concat!(
+const GATEWAY_PLUGIN_SETUP_METADATA_BOOTSTRAP: &str = concat!(
     "import json\n",
-    "from hermes_cli.gateway import _all_platforms, _platform_status, _builtin_setup_fn\n",
+    "from hermes_cli.gateway import _platform_status\n",
+    "from hermes_cli.plugins import discover_plugins\n",
+    "discover_plugins()\n",
+    "from gateway.platform_registry import platform_registry\n",
     "items = []\n",
-    "for platform in _all_platforms():\n",
-    "    entry = platform.get('_registry_entry')\n",
-    "    vars_ = []\n",
-    "    for spec in platform.get('vars') or []:\n",
-    "        vars_.append({\n",
-    "            'name': spec.get('name', ''),\n",
-    "            'prompt': spec.get('prompt', ''),\n",
-    "            'password': bool(spec.get('password', False)),\n",
-    "            'help': spec.get('help', '') or '',\n",
-    "            'is_allowlist': bool(spec.get('is_allowlist', False)),\n",
-    "        })\n",
+    "for entry in platform_registry.plugin_entries():\n",
+    "    platform = {\n",
+    "        'key': entry.name,\n",
+    "        'label': entry.label,\n",
+    "        'emoji': entry.emoji,\n",
+    "        'token_var': entry.required_env[0] if entry.required_env else '',\n",
+    "        'install_hint': entry.install_hint,\n",
+    "        '_registry_entry': entry,\n",
+    "    }\n",
     "    items.append({\n",
-    "        'key': platform.get('key', ''),\n",
-    "        'label': platform.get('label', ''),\n",
-    "        'emoji': platform.get('emoji', ''),\n",
+    "        'key': entry.name,\n",
+    "        'label': entry.label,\n",
+    "        'emoji': entry.emoji,\n",
     "        'status': _platform_status(platform),\n",
-    "        'token_var': platform.get('token_var', '') or '',\n",
-    "        'install_hint': platform.get('install_hint'),\n",
-    "        'setup_instructions': list(platform.get('setup_instructions') or []),\n",
+    "        'token_var': platform['token_var'],\n",
+    "        'install_hint': entry.install_hint,\n",
+    "        'setup_instructions': [],\n",
     "        'required_env': list(getattr(entry, 'required_env', []) or []),\n",
-    "        'has_builtin_setup': _builtin_setup_fn(platform.get('key', '')) is not None,\n",
-    "        'has_plugin_setup': bool(entry is not None and getattr(entry, 'setup_fn', None) is not None),\n",
-    "        'vars': vars_,\n",
+    "        'has_builtin_setup': False,\n",
+    "        'has_plugin_setup': bool(getattr(entry, 'setup_fn', None) is not None),\n",
+    "        'vars': [],\n",
     "    })\n",
     "print(json.dumps(items))\n",
 );
@@ -3052,10 +3553,11 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn gateway_setup_metadata_uses_python_override_and_accept_hooks() {
+    fn gateway_setup_metadata_uses_native_builtins_and_plugin_bridge() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
+        let (_home, context) = test_context();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
@@ -3066,7 +3568,7 @@ exit 9\n",
 if [ \"$1\" = \"-c\" ]; then\n\
   printf 'metadata accept=%s platform=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
   cat <<'JSON'\n\
-[{{\"key\":\"email\",\"label\":\"Email\",\"emoji\":\"@\",\"status\":\"not configured\",\"token_var\":\"EMAIL_ADDRESS\",\"vars\":[{{\"name\":\"EMAIL_ADDRESS\",\"prompt\":\"Email address\",\"help\":\"Mailbox address.\"}}]}}]\n\
+[{{\"key\":\"irc\",\"label\":\"IRC\",\"emoji\":\"#\",\"status\":\"not configured\",\"token_var\":\"IRC_SERVER\",\"required_env\":[\"IRC_SERVER\",\"IRC_CHANNEL\"],\"has_plugin_setup\":true}}]\n\
 JSON\n\
   exit 0\n\
 fi\n\
@@ -3080,15 +3582,70 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        let metadata = load_gateway_setup_metadata(true).unwrap();
+        let metadata = load_gateway_setup_metadata(&context, true).unwrap();
 
-        assert_eq!(metadata.len(), 1);
-        assert_eq!(metadata[0].key, "email");
-        assert_eq!(metadata[0].label, "Email");
+        let telegram = metadata
+            .iter()
+            .find(|platform| platform.key == "telegram")
+            .unwrap();
+        assert_eq!(telegram.label, "Telegram");
+        assert!(telegram.has_builtin_setup);
+
+        let email = metadata
+            .iter()
+            .find(|platform| platform.key == "email")
+            .unwrap();
+        assert_eq!(email.status, "not configured");
+        assert!(gateway_platform_uses_native_standard_setup(email));
+
+        let irc = metadata
+            .iter()
+            .find(|platform| platform.key == "irc")
+            .unwrap();
+        assert_eq!(irc.required_env, vec!["IRC_SERVER", "IRC_CHANNEL"]);
+        assert!(irc.has_plugin_setup);
         let log_text = fs::read_to_string(&log).unwrap();
         assert!(log_text.contains("metadata accept=1 platform="));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    fn gateway_setup_metadata_reports_native_status() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        for key in [
+            "EMAIL_ADDRESS",
+            "EMAIL_PASSWORD",
+            "EMAIL_IMAP_HOST",
+            "EMAIL_SMTP_HOST",
+            "WHATSAPP_ENABLED",
+        ] {
+            remove_env_var(key);
+        }
+        fs::create_dir_all(context.hermes_home().join("whatsapp").join("session")).unwrap();
+        fs::write(
+            context.hermes_home().join("whatsapp/session/creds.json"),
+            "{}",
+        )
+        .unwrap();
+        save_env_value(context.env_path(), "EMAIL_ADDRESS", "bot@example.com").unwrap();
+        save_env_value(context.env_path(), "EMAIL_PASSWORD", "app-password").unwrap();
+        save_env_value(context.env_path(), "EMAIL_IMAP_HOST", "imap.example.com").unwrap();
+        save_env_value(context.env_path(), "EMAIL_SMTP_HOST", "smtp.example.com").unwrap();
+        save_env_value(context.env_path(), "WHATSAPP_ENABLED", "true").unwrap();
+
+        let metadata = native_gateway_setup_metadata(&context);
+        let email = metadata
+            .iter()
+            .find(|platform| platform.key == "email")
+            .unwrap();
+        assert_eq!(email.status, "configured");
+        let whatsapp = metadata
+            .iter()
+            .find(|platform| platform.key == "whatsapp")
+            .unwrap();
+        assert_eq!(whatsapp.status, "configured + paired");
     }
 
     #[test]

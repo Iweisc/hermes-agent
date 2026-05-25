@@ -5195,7 +5195,7 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        let mut input = io::Cursor::new(b"1\n".to_vec());
+        let mut input = io::Cursor::new(b"18\n".to_vec());
         let mut output = Vec::new();
         run_native_gateway_setup_with_io(&context, &mut input, &mut output).unwrap();
 
