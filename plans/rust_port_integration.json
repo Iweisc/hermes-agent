@@ -12,16 +12,18 @@
     "lead_worktree": "agent-01",
     "lead_branch": "codex/hermes-port-20260525-160251-agent-01",
     "worker_branch_count": 21,
-    "baseline_head": "554243ac5",
-    "baseline_subject": "Port memory manifest save config to Rust",
+    "baseline_head": "56f4d65fe",
+    "baseline_subject": "chore: add rust port integration control plane",
     "main_head": "654755dba",
     "main_subject": "Port legacy MCP OAuth token expiry to Rust",
     "main_drift_files": [
       "crates/hermes/src/gateway_cmd.rs",
       "crates/hermes/src/mcp_cmd.rs",
-      "crates/hermes/src/memory_cmd.rs"
+      "crates/hermes/src/memory_cmd.rs",
+      "plans/rust_port_integration.json",
+      "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "52ef7a12cb66"
+    "state_fingerprint": "32283ed911f5"
   },
   "merge_order": [
     {
@@ -186,31 +188,10 @@
         "crates/hermes/src/completion.rs",
         "crates/hermes/src/curator_cmd.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes/src/auth_cmd.rs",
-        "crates/hermes/src/claw_cmd.rs",
-        "crates/hermes/src/config_cmd.rs",
-        "crates/hermes/src/curator_cmd.rs",
-        "crates/hermes/src/dashboard_cmd.rs",
-        "crates/hermes/src/debug.rs",
-        "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/hooks.rs",
-        "crates/hermes/src/mcp_cmd.rs",
-        "crates/hermes/src/plugins_cmd.rs",
-        "crates/hermes/src/profile_cmd.rs",
-        "crates/hermes/src/setup_cmd.rs",
-        "crates/hermes/src/skills_cmd.rs",
-        "crates/hermes/src/tools_cmd.rs",
-        "crates/hermes/src/uninstall_cmd.rs",
-        "crates/hermes/src/update_cmd.rs",
-        "crates/hermes/src/whatsapp_cmd.rs",
-        "gateway/platforms/qqbot/adapter.py",
-        "tests/gateway/test_slack.py",
-        "tests/gateway/test_whatsapp_connect.py"
-      ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "c01d3df83",
+      "subject": "test: stabilize skills cmd github mock server"
     },
     {
       "worktree": "agent-03",
@@ -279,27 +260,10 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "Cargo.lock",
-        "crates/hermes-acp/src/main.rs",
-        "crates/hermes-agent/Cargo.toml",
-        "crates/hermes-agent/src/main.rs",
-        "crates/hermes-core/Cargo.toml",
-        "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/approvals.rs",
-        "crates/hermes-core/src/checkpoints.rs",
-        "crates/hermes-core/src/clarify.rs",
-        "crates/hermes-core/src/context_engine.rs",
-        "crates/hermes-core/src/gateway_events.rs",
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/shell_hooks.rs",
-        "crates/hermes-core/src/terminal.rs",
-        "crates/hermes-core/src/tools.rs",
-        "crates/hermes/src/backup.rs",
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/webhook.rs"
+        "crates/hermes/src/gateway_native.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "74ff1e51e",
+      "subject": "Add native gateway completion RPCs"
     },
     {
       "worktree": "agent-07",
@@ -330,18 +294,13 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/state.rs",
-        "crates/hermes/src/backup.rs",
         "crates/hermes/src/completion.rs",
-        "crates/hermes/src/fallback_cmd.rs",
+        "crates/hermes/src/gateway_cmd.rs",
         "crates/hermes/src/main.rs",
-        "crates/hermes/src/model_cmd.rs",
-        "crates/hermes/src/webhook.rs",
-        "tui_gateway/session_bridge.py"
+        "crates/hermes/src/profile_cmd.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "826155e02",
+      "subject": "Add explicit live-only slash command parity"
     },
     {
       "worktree": "agent-09",
@@ -358,16 +317,10 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "Cargo.lock",
-        "crates/hermes-agent/Cargo.toml",
-        "crates/hermes-agent/src/main.rs",
-        "crates/hermes-agent/src/tui_gateway.rs",
-        "crates/hermes-core/src/state.rs",
-        "tui_gateway/worker.py",
-        "ui-tui/src/gatewayClient.ts"
+        "crates/hermes-agent/src/tui_gateway.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "f677b2fc4",
+      "subject": "WIP: move TUI session save and undo into Rust"
     },
     {
       "worktree": "agent-10",
@@ -380,7 +333,10 @@
         "crates/hermes/src/tui_cmd.rs",
         "tui_gateway/session_bridge.py",
         "crates/hermes-core/src/gateway_events.rs",
-        "tui_gateway/worker.py"
+        "tui_gateway/worker.py",
+        "crates/hermes/src/gateway_native.rs",
+        "tui_gateway/server.py",
+        "crates/hermes/src/native_gateway_runtime.rs"
       ],
       "status": "dirty",
       "observed_dirty_files": [
@@ -406,17 +362,10 @@
         "crates/hermes/src/dashboard_cmd.rs",
         "crates/hermes/src/dashboard_server.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "Cargo.lock",
-        "crates/hermes/Cargo.toml",
-        "crates/hermes/src/dashboard_cmd.rs",
-        "crates/hermes/src/dashboard_server.rs",
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/plugins_cmd.rs"
-      ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "2b3a164e5",
+      "subject": "feat: port dashboard backend to rust"
     },
     {
       "worktree": "agent-12",
@@ -428,11 +377,12 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/gateway.rs",
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
-      "head": "8c0f40011",
-      "subject": "WIP: port gateway runtime core to hermes-core"
+      "head": "2550b5394",
+      "subject": "WIP: port gateway watcher and confirm runtime"
     },
     {
       "worktree": "agent-13",
@@ -442,10 +392,12 @@
       "allowed_paths": [
         "crates/hermes/src/acp_cmd.rs"
       ],
-      "status": "diverged",
-      "observed_dirty_files": [],
-      "head": "1b5011a9c",
-      "subject": "WIP: improve Rust gateway send parity"
+      "status": "dirty",
+      "observed_dirty_files": [
+        "crates/hermes-core/src/send_message.rs"
+      ],
+      "head": "6006ab48c",
+      "subject": "WIP: extend Rust gateway send_message parity"
     },
     {
       "worktree": "agent-14",
@@ -462,20 +414,17 @@
       "observed_dirty_files": [
         "Cargo.lock",
         "Cargo.toml",
-        "crates/hermes-core/Cargo.toml",
         "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/send_message.rs",
+        "crates/hermes-core/src/lib.rs",
         "crates/hermes/Cargo.toml",
-        "crates/hermes/src/backup.rs",
         "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/main.rs",
         "crates/hermes/src/native_api_server.rs",
         "crates/hermes/src/native_gateway_runtime.rs",
-        "crates/hermes/src/native_webhook_server.rs",
-        "crates/hermes/src/webhook.rs"
+        "gateway/config.py",
+        "gateway/run.py"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "f92ecb4d1",
+      "subject": "WIP: extend native Rust api_server parity"
     },
     {
       "worktree": "agent-15",
@@ -525,28 +474,12 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "Cargo.lock",
-        "crates/hermes-acp/src/main.rs",
-        "crates/hermes-agent/src/main.rs",
-        "crates/hermes-core/Cargo.toml",
-        "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/cronjob.rs",
-        "crates/hermes-core/src/delegate.rs",
+        "crates/hermes-core/src/image_gen.rs",
         "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/plugin_runtime.rs",
-        "crates/hermes-core/src/tools.rs",
-        "crates/hermes/src/backup.rs",
-        "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/mcp_server.rs",
-        "crates/hermes/src/memory_cmd.rs",
-        "crates/hermes/src/plugin_runtime.rs",
-        "crates/hermes/src/plugins_cmd.rs",
-        "crates/hermes/src/tools_cmd.rs",
-        "crates/hermes/src/webhook.rs"
+        "crates/hermes-core/src/plugin_runtime.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "2ee21c3a1",
+      "subject": "WIP: tighten Rust plugin runtime parity"
     },
     {
       "worktree": "agent-18",
@@ -617,20 +550,11 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "crates/hermes-acp/src/main.rs",
-        "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/auth.rs",
-        "crates/hermes-core/src/config.rs",
-        "crates/hermes-core/src/image_gen.rs",
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/providers.rs",
-        "crates/hermes-core/src/tools.rs",
-        "crates/hermes-core/src/tts.rs",
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "39feb968f",
+      "subject": "WIP: tighten Rust runtime and media parity"
     },
     {
       "worktree": "agent-22",
@@ -673,7 +597,7 @@
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 14 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 13 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -683,7 +607,7 @@
     {
       "item": "Prevent shared-file conflicts",
       "status": "in_progress",
-      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=28; critical_overlap_count=4; ownership_decision_count=4; lane_proposal_count=1; tracker_edit_action_count=3; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=4; allowed_path_additions=0."
+      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=31; critical_overlap_count=4; ownership_decision_count=5; lane_proposal_count=1; tracker_edit_action_count=2; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=5; allowed_path_additions=1."
     },
     {
       "item": "Keep an integration checklist",
@@ -693,17 +617,17 @@
     {
       "item": "Continuously identify blockers",
       "status": "in_progress",
-      "evidence": "tracker_validation.summary reports violation_count=68 and execution_queue.summary reports operation_count=41."
+      "evidence": "tracker_validation.summary reports violation_count=71 and execution_queue.summary reports operation_count=41."
     },
     {
       "item": "Rebase the integration stack onto main",
       "status": "blocked",
-      "evidence": "lead_head=554243ac5 vs main_head=654755dba; drift files=['crates/hermes/src/gateway_cmd.rs', 'crates/hermes/src/mcp_cmd.rs', 'crates/hermes/src/memory_cmd.rs']."
+      "evidence": "lead_head=56f4d65fe vs main_head=654755dba; drift files=['crates/hermes/src/gateway_cmd.rs', 'crates/hermes/src/mcp_cmd.rs', 'crates/hermes/src/memory_cmd.rs', 'plans/rust_port_integration.json', 'scripts/rust_port_status.py']."
     },
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=14, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=13, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -1047,6 +971,15 @@
       "reason": "Only agent-05 claims this path in allowed_paths."
     },
     {
+      "path": "crates/hermes-core/src/image_gen.rs",
+      "workers": [
+        "agent-17",
+        "agent-21"
+      ],
+      "owner": "agent-21",
+      "reason": "Only agent-21 claims this path in allowed_paths."
+    },
+    {
       "path": "crates/hermes-core/src/lib.rs",
       "workers": [
         "agent-04",
@@ -1055,6 +988,7 @@
         "agent-07",
         "agent-08",
         "agent-12",
+        "agent-14",
         "agent-15",
         "agent-17",
         "agent-20",
@@ -1090,6 +1024,15 @@
       ],
       "owner": "agent-06",
       "reason": "Only agent-06 claims this path in allowed_paths."
+    },
+    {
+      "path": "crates/hermes-core/src/terminal.rs",
+      "workers": [
+        "agent-06",
+        "agent-17"
+      ],
+      "owner": "agent-16",
+      "reason": "Only agent-16 claims this path in allowed_paths."
     },
     {
       "path": "crates/hermes-core/src/tools.rs",
@@ -1166,6 +1109,8 @@
       "path": "crates/hermes/src/gateway_cmd.rs",
       "workers": [
         "agent-02",
+        "agent-06",
+        "agent-08",
         "agent-13",
         "agent-14",
         "agent-17"
@@ -1217,6 +1162,15 @@
       ],
       "owner": "agent-07",
       "reason": "Only agent-07 claims this path in allowed_paths."
+    },
+    {
+      "path": "crates/hermes/src/profile_cmd.rs",
+      "workers": [
+        "agent-02",
+        "agent-08"
+      ],
+      "owner": "agent-05",
+      "reason": "Only agent-05 claims this path in allowed_paths."
     },
     {
       "path": "crates/hermes/src/tools_cmd.rs",
@@ -1271,8 +1225,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "14 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=14.",
+      "summary": "13 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=13.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1284,25 +1238,25 @@
     {
       "severity": "high",
       "summary": "The lead baseline is 4 commits behind main.",
-      "evidence": "main_head is 654755dba while the lead remains 554243ac5.",
+      "evidence": "main_head is 654755dba while the lead remains 56f4d65fe.",
       "next_action": "Rebase agent-01 first, then restack or rebase workers onto that refreshed baseline."
     },
     {
       "severity": "high",
       "summary": "The worst conflict clusters are active right now.",
-      "evidence": "backup.rs has 15 workers, webhook.rs has 15 workers, lib.rs has 10 workers, main.rs has 10 workers, Cargo.lock has 9 workers, agent.rs has 8 workers",
+      "evidence": "backup.rs has 15 workers, webhook.rs has 15 workers, lib.rs has 11 workers, main.rs has 10 workers, Cargo.lock has 9 workers, agent.rs has 8 workers",
       "next_action": "Use live_conflict_clusters owners as the first serialization pass."
     },
     {
       "severity": "medium",
       "summary": "Some worker branches still lack upstreams.",
-      "evidence": "workers_with_upstream=3 in the status script summary.",
+      "evidence": "workers_with_upstream=5 in the status script summary.",
       "next_action": "Push the surviving branches after scopes are corrected so integration state is externally visible."
     },
     {
       "severity": "medium",
       "summary": "The validator still reports many scope violations because the live edits do not match the planned lanes.",
-      "evidence": "tracker_validation.summary reports violation_count=68 with high_severity_count=50.",
+      "evidence": "tracker_validation.summary reports violation_count=71 with high_severity_count=50.",
       "next_action": "Either retask the branches to their current files or move the files to the designated owners."
     },
     {
@@ -1416,10 +1370,58 @@
         "shares directory with an overlapping lane path",
         "matches proposed scope tokens ['gateway', 'tui']"
       ]
+    },
+    {
+      "owner": "agent-10",
+      "path": "crates/hermes/src/gateway_native.rs",
+      "confidence": "high",
+      "reason": [
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway.rs",
+        "shares tokens ['gateway'] with crates/hermes/src/gateway_cmd.rs",
+        "shares tokens ['gateway'] with tui_gateway/session_bridge.py",
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway_events.rs",
+        "shares tokens ['gateway'] with tui_gateway/worker.py",
+        "shares top-level module area",
+        "shares directory with an overlapping lane path",
+        "matches proposed scope tokens ['gateway']"
+      ]
+    },
+    {
+      "owner": "agent-10",
+      "path": "tui_gateway/server.py",
+      "confidence": "high",
+      "reason": [
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway.rs",
+        "shares tokens ['gateway'] with crates/hermes/src/gateway_cmd.rs",
+        "shares tokens ['tui'] with crates/hermes/src/tui_cmd.rs",
+        "shares tokens ['gateway', 'tui'] with tui_gateway/session_bridge.py",
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway_events.rs",
+        "shares tokens ['gateway', 'tui'] with tui_gateway/worker.py",
+        "shares top-level module area",
+        "shares directory with an overlapping lane path",
+        "matches proposed scope tokens ['gateway', 'tui']"
+      ]
+    },
+    {
+      "owner": "agent-10",
+      "path": "crates/hermes/src/native_gateway_runtime.rs",
+      "confidence": "high",
+      "reason": [
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway.rs",
+        "shares tokens ['gateway'] with crates/hermes/src/gateway_cmd.rs",
+        "shares tokens ['gateway'] with tui_gateway/session_bridge.py",
+        "shares tokens ['gateway'] with crates/hermes-core/src/gateway_events.rs",
+        "shares tokens ['gateway'] with tui_gateway/worker.py",
+        "shares tokens ['gateway', 'native'] with crates/hermes/src/gateway_native.rs",
+        "shares tokens ['gateway'] with tui_gateway/server.py",
+        "shares top-level module area",
+        "shares directory with an overlapping lane path",
+        "matches proposed scope tokens ['gateway']"
+      ]
     }
   ],
-  "last_synced_at": "2026-05-25T12:24:45+00:00",
-  "state_fingerprint": "52ef7a12cb66",
+  "last_synced_at": "2026-05-25T15:31:23+00:00",
+  "state_fingerprint": "32283ed911f5",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
