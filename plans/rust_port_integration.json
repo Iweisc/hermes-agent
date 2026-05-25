@@ -23,7 +23,7 @@
       "plans/rust_port_integration.json",
       "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "32283ed911f5"
+    "state_fingerprint": "777277357d83"
   },
   "merge_order": [
     {
@@ -262,8 +262,8 @@
       "observed_dirty_files": [
         "crates/hermes/src/gateway_native.rs"
       ],
-      "head": "74ff1e51e",
-      "subject": "Add native gateway completion RPCs"
+      "head": "20bd6299f",
+      "subject": "Add native gateway startup RPCs"
     },
     {
       "worktree": "agent-07",
@@ -319,8 +319,8 @@
       "observed_dirty_files": [
         "crates/hermes-agent/src/tui_gateway.rs"
       ],
-      "head": "f677b2fc4",
-      "subject": "WIP: move TUI session save and undo into Rust"
+      "head": "f2f235f0d",
+      "subject": "WIP: move TUI session branching into Rust"
     },
     {
       "worktree": "agent-10",
@@ -377,12 +377,11 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "crates/hermes-core/src/gateway.rs",
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
-      "head": "2550b5394",
-      "subject": "WIP: port gateway watcher and confirm runtime"
+      "head": "42c04df5e",
+      "subject": "WIP: finish Rust gateway update and confirm runtime"
     },
     {
       "worktree": "agent-13",
@@ -392,12 +391,10 @@
       "allowed_paths": [
         "crates/hermes/src/acp_cmd.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-core/src/send_message.rs"
-      ],
-      "head": "6006ab48c",
-      "subject": "WIP: extend Rust gateway send_message parity"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "8f2ad0a9d",
+      "subject": "WIP: extend gateway send_message parity"
     },
     {
       "worktree": "agent-14",
@@ -412,19 +409,10 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "Cargo.lock",
-        "Cargo.toml",
-        "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes/Cargo.toml",
-        "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/native_api_server.rs",
-        "crates/hermes/src/native_gateway_runtime.rs",
-        "gateway/config.py",
-        "gateway/run.py"
+        "crates/hermes/src/native_api_server.rs"
       ],
-      "head": "f92ecb4d1",
-      "subject": "WIP: extend native Rust api_server parity"
+      "head": "3e5283934",
+      "subject": "WIP: extend native gateway API runtime"
     },
     {
       "worktree": "agent-15",
@@ -597,7 +585,7 @@
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 13 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 12 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -607,7 +595,7 @@
     {
       "item": "Prevent shared-file conflicts",
       "status": "in_progress",
-      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=31; critical_overlap_count=4; ownership_decision_count=5; lane_proposal_count=1; tracker_edit_action_count=2; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=5; allowed_path_additions=1."
+      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=31; critical_overlap_count=4; ownership_decision_count=4; lane_proposal_count=1; tracker_edit_action_count=2; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=4; allowed_path_additions=0."
     },
     {
       "item": "Keep an integration checklist",
@@ -627,7 +615,7 @@
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=13, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=12, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -1225,8 +1213,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "13 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=13.",
+      "summary": "12 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=12.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1248,10 +1236,10 @@
       "next_action": "Use live_conflict_clusters owners as the first serialization pass."
     },
     {
-      "severity": "medium",
-      "summary": "Some worker branches still lack upstreams.",
-      "evidence": "workers_with_upstream=5 in the status script summary.",
-      "next_action": "Push the surviving branches after scopes are corrected so integration state is externally visible."
+      "severity": "high",
+      "summary": "Some worker branches still exist only as dirty local worktrees with no committed branch delta.",
+      "evidence": "Unmergeable local-only branches: agent-05@554243ac5 (9 dirty files), agent-10@554243ac5 (8 dirty files), agent-19@554243ac5 (8 dirty files), agent-22@554243ac5 (16 dirty files).",
+      "next_action": "Commit and push those local-only branches, or explicitly discard them, before treating their lanes as merge candidates."
     },
     {
       "severity": "medium",
@@ -1420,8 +1408,8 @@
       ]
     }
   ],
-  "last_synced_at": "2026-05-25T15:31:23+00:00",
-  "state_fingerprint": "32283ed911f5",
+  "last_synced_at": "2026-05-25T15:37:22+00:00",
+  "state_fingerprint": "777277357d83",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",

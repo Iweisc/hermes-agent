@@ -4055,6 +4055,17 @@ def build_tracker_blockers(payload: dict) -> list[dict]:
     remediation_summary = payload["tracker_validation"]["remediation"]["summary"]
     merge_summary = payload["tracker_validation"]["merge_gates"]["summary"]
     validation_summary = payload["tracker_validation"]["summary"]
+    local_only_workers = [
+        entry
+        for entry in payload["workers"]
+        if not entry.get("upstream")
+        and entry.get("status") == "dirty"
+        and entry.get("committed_file_count_vs_main", 0) == 0
+    ]
+    local_only_summary = ", ".join(
+        f"{entry['worktree']}@{entry['head']} ({entry['dirty_file_count']} dirty files)"
+        for entry in local_only_workers[:6]
+    )
     top_conflicts = ", ".join(
         f"{item['path'].split('/')[-1]} has {len(item['worktrees'])} workers"
         for item in overlaps[:6]
@@ -4101,12 +4112,26 @@ def build_tracker_blockers(payload: dict) -> list[dict]:
             "next_action": "Use live_conflict_clusters owners as the first serialization pass.",
         },
         {
-            "severity": "medium",
-            "summary": "No worker branch has an upstream configured."
-            if payload["summary"]["workers_with_upstream"] == 0
-            else "Some worker branches still lack upstreams.",
-            "evidence": f"workers_with_upstream={payload['summary']['workers_with_upstream']} in the status script summary.",
-            "next_action": "Push the surviving branches after scopes are corrected so integration state is externally visible.",
+            "severity": "high" if local_only_workers else "medium",
+            "summary": (
+                "Some worker branches still exist only as dirty local worktrees with no committed branch delta."
+                if local_only_workers
+                else (
+                    "No worker branch has an upstream configured."
+                    if payload["summary"]["workers_with_upstream"] == 0
+                    else "Some worker branches still lack upstreams."
+                )
+            ),
+            "evidence": (
+                f"Unmergeable local-only branches: {local_only_summary}."
+                if local_only_workers
+                else f"workers_with_upstream={payload['summary']['workers_with_upstream']} in the status script summary."
+            ),
+            "next_action": (
+                "Commit and push those local-only branches, or explicitly discard them, before treating their lanes as merge candidates."
+                if local_only_workers
+                else "Push the surviving branches after scopes are corrected so integration state is externally visible."
+            ),
         },
         {
             "severity": "medium",
