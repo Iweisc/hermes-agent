@@ -1093,6 +1093,46 @@ const DISCORD_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
+const SLACK_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Go to https://api.slack.com/apps → Create New App",
+    "2. Pick 'From an app manifest' — Hermes will write one below",
+    "3. Enable Socket Mode and create an App-Level Token with connections:write",
+    "4. Install the app to your workspace and copy the xoxb-... bot token",
+    "5. Invite the bot to channels with /invite @YourBot",
+    "6. Find your user ID: click your profile → three dots → Copy member ID",
+];
+
+const SLACK_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "SLACK_BOT_TOKEN",
+        prompt: "Bot Token (xoxb-...)",
+        password: true,
+        help: "Paste the bot token from Slack after installing the app.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "SLACK_APP_TOKEN",
+        prompt: "App Token (xapp-...)",
+        password: true,
+        help: "Paste the app-level token from Socket Mode.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "SLACK_ALLOWED_USERS",
+        prompt: "Allowed user IDs (comma-separated)",
+        password: false,
+        help: "Paste your member ID from step 6 above.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "SLACK_HOME_CHANNEL",
+        prompt: "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+        password: false,
+        help: "Open the channel in Slack, copy its link, and use the C... channel ID.",
+        is_allowlist: false,
+    },
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1347,9 +1387,9 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Slack",
         emoji: "💼",
         token_var: "SLACK_BOT_TOKEN",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
-        vars: NO_GATEWAY_SETUP_VARS,
+        has_builtin_setup: false,
+        setup_instructions: SLACK_SETUP_INSTRUCTIONS,
+        vars: SLACK_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
         key: "matrix",
@@ -1815,8 +1855,22 @@ fn configure_standard_gateway_platform_with_io(
             format!("Reconfigure {}?", platform.label).as_str(),
             false,
         )? {
+            if platform.key == "slack"
+                && prompt_gateway_yes_no(
+                    input,
+                    output,
+                    "Regenerate the Slack app manifest with the latest command list?",
+                    true,
+                )?
+            {
+                write_slack_manifest_for_gateway_setup(context, output)?;
+            }
             return Ok(());
         }
+    }
+
+    if platform.key == "slack" {
+        write_slack_manifest_for_gateway_setup(context, output)?;
     }
 
     let mut allowlist_value: Option<String> = None;
@@ -1930,6 +1984,35 @@ fn configure_standard_gateway_platform_with_io(
 
     writeln!(output)?;
     writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    Ok(())
+}
+
+fn write_slack_manifest_for_gateway_setup(
+    context: &HermesContext,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    match crate::slack_cmd::write_default_slack_manifest(context) {
+        Ok(target) => {
+            writeln!(output)?;
+            writeln!(
+                output,
+                "  Slack app manifest written to: {}",
+                target.display()
+            )?;
+            writeln!(
+                output,
+                "  Paste it into https://api.slack.com/apps → your app → App Manifest, then save and reinstall."
+            )?;
+        }
+        Err(error) => {
+            writeln!(output)?;
+            writeln!(output, "  Couldn't write Slack manifest: {error}")?;
+            writeln!(
+                output,
+                "  You can generate it manually later with: hermes slack manifest --write"
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -4150,7 +4233,13 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "slack")
             .unwrap();
-        assert!(slack.has_builtin_setup);
+        assert!(gateway_platform_uses_native_standard_setup(slack));
+
+        let matrix = metadata
+            .iter()
+            .find(|platform| platform.key == "matrix")
+            .unwrap();
+        assert!(matrix.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -4300,10 +4389,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "slack").unwrap();
+        run_gateway_platform_setup_bridge(true, "matrix").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=slack"));
+        assert!(log_text.contains("platform accept=1 key=matrix"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -4399,6 +4488,56 @@ exit 9\n",
         assert!(env_text.contains("TELEGRAM_BOT_TOKEN=123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"));
         assert!(env_text.contains("TELEGRAM_ALLOWED_USERS=111,222"));
         assert!(env_text.contains("TELEGRAM_HOME_CHANNEL=111"));
+    }
+
+    #[test]
+    fn configure_slack_gateway_platform_writes_manifest_and_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "slack")
+            .unwrap();
+
+        let mut input = Cursor::new("xoxb-token\nxapp-token\nU123, U456\nC123CHANNEL\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Slack app manifest written to:"));
+
+        let manifest_text =
+            fs::read_to_string(context.hermes_home().join("slack-manifest.json")).unwrap();
+        assert!(manifest_text.contains("\"socket_mode_enabled\": true"));
+        assert!(manifest_text.contains("\"command\": \"/hermes\""));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("SLACK_BOT_TOKEN=xoxb-token"));
+        assert!(env_text.contains("SLACK_APP_TOKEN=xapp-token"));
+        assert!(env_text.contains("SLACK_ALLOWED_USERS=U123,U456"));
+        assert!(env_text.contains("SLACK_HOME_CHANNEL=C123CHANNEL"));
+    }
+
+    #[test]
+    fn configure_slack_existing_token_can_refresh_manifest_without_reconfigure() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        save_env_value(context.env_path(), "SLACK_BOT_TOKEN", "xoxb-existing").unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "slack")
+            .unwrap();
+
+        let mut input = Cursor::new("n\n\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        assert!(context.hermes_home().join("slack-manifest.json").exists());
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("SLACK_BOT_TOKEN=xoxb-existing"));
+        assert!(!env_text.contains("SLACK_APP_TOKEN="));
     }
 
     #[test]

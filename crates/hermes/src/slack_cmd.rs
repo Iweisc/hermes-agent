@@ -127,6 +127,18 @@ fn print_slack_manifest(
     Ok(())
 }
 
+pub(crate) fn write_default_slack_manifest(
+    context: &HermesContext,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let loaded = context.load_config_document()?;
+    let slashes = slack_native_slashes(&loaded)?;
+    let payload = full_manifest(SLACK_DEFAULT_NAME, SLACK_DEFAULT_DESCRIPTION, &slashes);
+    let rendered = serde_json::to_string_pretty(&payload)? + "\n";
+    let target = context.hermes_home().join("slack-manifest.json");
+    write_manifest(&target, &rendered)?;
+    Ok(target)
+}
+
 fn slashes_only_manifest(slashes: &[SlackSlash]) -> JsonValue {
     JsonValue::Array(
         slashes
