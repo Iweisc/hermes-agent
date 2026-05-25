@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     AgentTurnResult, ApprovalRequest, ClarifyRequest, StepToolRecord, StepUpdate,
-    ToolProgressUpdate,
+    ToolProgressUpdate, ToolRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,6 +191,47 @@ impl GatewayEventBridge {
             started_at: Instant::now(),
         }
     }
+}
+
+pub fn attach_gateway_event_callbacks<F>(
+    runtime: ToolRuntime,
+    bridge: Arc<Mutex<GatewayEventBridge>>,
+    emit: F,
+) -> ToolRuntime
+where
+    F: Fn(&GatewayEventEnvelope) + Send + Sync + 'static,
+{
+    let emit = Arc::new(emit);
+    runtime
+        .with_tool_progress_callback({
+            let bridge = Arc::clone(&bridge);
+            let emit = Arc::clone(&emit);
+            move |update| {
+                let events = bridge.lock().unwrap().on_tool_progress(update);
+                for event in events {
+                    emit(&event);
+                }
+            }
+        })
+        .with_step_callback({
+            let bridge = Arc::clone(&bridge);
+            let emit = Arc::clone(&emit);
+            move |update| {
+                let events = bridge.lock().unwrap().on_step(update);
+                for event in events {
+                    emit(&event);
+                }
+            }
+        })
+        .with_clarify_request_callback({
+            let bridge = Arc::clone(&bridge);
+            let emit = Arc::clone(&emit);
+            move |request| emit(&bridge.lock().unwrap().on_clarify_request(request))
+        })
+        .with_approval_request_callback({
+            let bridge = Arc::clone(&bridge);
+            move |request| emit(&bridge.lock().unwrap().on_approval_request(request))
+        })
 }
 
 fn gateway_event(event_type: &str, payload: Value) -> GatewayEventEnvelope {

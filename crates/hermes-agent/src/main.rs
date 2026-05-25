@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use hermes_core::{
     ApprovalRequest, DelegateExecutor, EnvLoadReport, GatewayEventBridge, HermesContext,
     LoadedConfig, LoggingMode, ModelOverrides, StepUpdate, ToolProgressUpdate, ToolRuntime,
+    attach_gateway_event_callbacks,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -193,37 +194,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(bridge) = gateway_bridge.clone() {
                     emitter.emit(&bridge.lock().unwrap().gateway_ready());
                     emitter.emit(&bridge.lock().unwrap().message_start());
-                    runtime = runtime
-                        .with_tool_progress_callback({
-                            let bridge = Arc::clone(&bridge);
-                            let emitter = emitter.clone();
-                            move |update| {
-                                let events = bridge.lock().unwrap().on_tool_progress(update);
-                                emit_gateway_events(&emitter, &events);
-                            }
-                        })
-                        .with_step_callback({
-                            let bridge = Arc::clone(&bridge);
-                            let emitter = emitter.clone();
-                            move |update| {
-                                let events = bridge.lock().unwrap().on_step(update);
-                                emit_gateway_events(&emitter, &events);
-                            }
-                        })
-                        .with_clarify_request_callback({
-                            let bridge = Arc::clone(&bridge);
-                            let emitter = emitter.clone();
-                            move |request| {
-                                emitter.emit(&bridge.lock().unwrap().on_clarify_request(request))
-                            }
-                        })
-                        .with_approval_request_callback({
-                            let bridge = Arc::clone(&bridge);
-                            let emitter = emitter.clone();
-                            move |request| {
-                                emitter.emit(&bridge.lock().unwrap().on_approval_request(request))
-                            }
-                        });
+                    runtime = attach_gateway_event_callbacks(runtime, Arc::clone(&bridge), {
+                        let emitter = emitter.clone();
+                        move |event| emitter.emit(event)
+                    });
                 } else {
                     runtime = runtime
                         .with_tool_progress_callback({

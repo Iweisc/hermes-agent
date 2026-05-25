@@ -54,9 +54,9 @@ use clap::{Args, Parser, Subcommand};
 use hermes_core::{
     ApprovalRequest, DelegateExecutor, EnvLoadReport, GatewayEventBridge, HermesContext,
     KanbanDispatchOptions, LoadedConfig, LoggingMode, LoggingSetup, ModelOverrides, StepUpdate,
-    ToolProgressUpdate, ToolRuntime, dispatch_kanban_once, get_tool_definitions, handle_cronjob,
-    is_container, is_wsl, kanban_has_spawnable_ready, run_cron_job_now, run_due_cron_jobs,
-    run_kanban_task,
+    ToolProgressUpdate, ToolRuntime, attach_gateway_event_callbacks, dispatch_kanban_once,
+    get_tool_definitions, handle_cronjob, is_container, is_wsl, kanban_has_spawnable_ready,
+    run_cron_job_now, run_due_cron_jobs, run_kanban_task,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -793,35 +793,10 @@ fn run_chat(
         if let Some(bridge) = gateway_bridge.clone() {
             emitter.emit(&bridge.lock().unwrap().gateway_ready());
             emitter.emit(&bridge.lock().unwrap().message_start());
-            runtime = runtime
-                .with_tool_progress_callback({
-                    let bridge = Arc::clone(&bridge);
-                    let emitter = emitter.clone();
-                    move |update| {
-                        let events = bridge.lock().unwrap().on_tool_progress(update);
-                        emit_gateway_events(&emitter, &events);
-                    }
-                })
-                .with_step_callback({
-                    let bridge = Arc::clone(&bridge);
-                    let emitter = emitter.clone();
-                    move |update| {
-                        let events = bridge.lock().unwrap().on_step(update);
-                        emit_gateway_events(&emitter, &events);
-                    }
-                })
-                .with_clarify_request_callback({
-                    let bridge = Arc::clone(&bridge);
-                    let emitter = emitter.clone();
-                    move |request| emitter.emit(&bridge.lock().unwrap().on_clarify_request(request))
-                })
-                .with_approval_request_callback({
-                    let bridge = Arc::clone(&bridge);
-                    let emitter = emitter.clone();
-                    move |request| {
-                        emitter.emit(&bridge.lock().unwrap().on_approval_request(request))
-                    }
-                });
+            runtime = attach_gateway_event_callbacks(runtime, Arc::clone(&bridge), {
+                let emitter = emitter.clone();
+                move |event| emitter.emit(event)
+            });
         } else {
             runtime = runtime
                 .with_tool_progress_callback({

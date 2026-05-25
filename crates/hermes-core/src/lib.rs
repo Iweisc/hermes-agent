@@ -66,7 +66,9 @@ pub use cronjob::{
 };
 pub use delegate::DelegateExecutor;
 pub use env_loader::EnvLoadReport;
-pub use gateway_events::{GatewayEventBridge, GatewayEventEnvelope};
+pub use gateway_events::{
+    GatewayEventBridge, GatewayEventEnvelope, attach_gateway_event_callbacks,
+};
 pub use kanban::{
     KanbanDispatchOptions, KanbanDispatchResult, KanbanRunResult, dispatch_kanban_once,
     kanban_has_spawnable_ready, run_kanban_task,
