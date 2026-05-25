@@ -1875,7 +1875,7 @@ fn load_gateway_plugin_setup_metadata(
     context: &HermesContext,
     accept_hooks: bool,
 ) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
-    if !gateway_has_enabled_user_plugins(context)? {
+    if !gateway_enabled_plugins_require_bridge(context)? {
         return Ok(Vec::new());
     }
     let root = project_root();
@@ -1907,25 +1907,46 @@ fn load_gateway_plugin_setup_metadata(
         .map_err(|error| format!("invalid gateway plugin setup metadata: {error}").into())
 }
 
-fn gateway_has_enabled_user_plugins(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+fn gateway_enabled_plugins_require_bridge(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+    Ok(gateway_enabled_plugin_keys(context)?
+        .into_iter()
+        .any(|key| !native_gateway_plugin_key_is_covered(context, &key)))
+}
+
+fn gateway_enabled_plugin_keys(context: &HermesContext) -> Result<Vec<String>, Box<dyn Error>> {
     let root = read_raw_yaml_mapping(&context.config_path())?;
     let Some(plugins) = root
         .get(YamlValue::String(String::from("plugins")))
         .and_then(YamlValue::as_mapping)
     else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let Some(enabled) = plugins
         .get(YamlValue::String(String::from("enabled")))
         .and_then(YamlValue::as_sequence)
     else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     Ok(enabled
         .iter()
         .filter_map(YamlValue::as_str)
         .map(str::trim)
-        .any(|value| !value.is_empty()))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn native_gateway_plugin_key_is_covered(context: &HermesContext, key: &str) -> bool {
+    const NATIVE_GATEWAY_PLUGIN_KEYS: &[&str] = &[
+        "platforms/irc",
+        "platforms/teams",
+        "irc-platform",
+        "teams-platform",
+    ];
+    if !NATIVE_GATEWAY_PLUGIN_KEYS.contains(&key) {
+        return false;
+    }
+    !context.hermes_home().join("plugins").join(key).exists()
 }
 
 fn run_gateway_platform_setup_bridge(
@@ -7005,6 +7026,46 @@ exit 9\n",
         let _guard = test_env_lock().lock().unwrap();
         let (_home, context) = test_context();
         fs::create_dir_all(context.hermes_home()).unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        let metadata = load_gateway_setup_metadata(&context, true).unwrap();
+
+        assert!(metadata.iter().any(|platform| platform.key == "irc"));
+        assert!(metadata.iter().any(|platform| platform.key == "teams"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_setup_metadata_skips_plugin_bridge_for_native_platform_plugins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_home, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(
+            context.config_path(),
+            "plugins:\n  enabled:\n    - platforms/irc\n    - platforms/teams\n",
+        )
+        .unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
