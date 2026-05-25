@@ -1473,6 +1473,10 @@ fn emit_warnings(env_report: &EnvLoadReport, config: &LoadedConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::python_bridge::{project_root, resolve_repo_python};
+    use clap::CommandFactory;
+    use serde::Deserialize;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn cron_cli_parses_python_compatible_crud_commands() {
@@ -1555,6 +1559,479 @@ mod tests {
         assert_eq!(
             listed["jobs"][0]["skills"][0],
             JsonValue::String(String::from("ops"))
+        );
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+    struct PythonCommandMatrix {
+        flags: Vec<String>,
+        subcommands: BTreeMap<String, PythonCommandMatrix>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CommandMatrix {
+        flags: BTreeSet<String>,
+        subcommands: BTreeMap<String, CommandMatrix>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CommandGap {
+        path: String,
+        python_only: Vec<String>,
+        rust_only: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FlagGap {
+        path: String,
+        python_only: Vec<String>,
+        rust_only: Vec<String>,
+    }
+
+    const PYTHON_COMMAND_MATRIX_SCRIPT: &str = r#"
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
+
+import hermes_cli.main as hermes_main
+
+
+class _StopCapture(Exception):
+    pass
+
+
+captured = {}
+original = argparse.ArgumentParser.parse_args
+
+
+def _capture(parser, *args, **kwargs):
+    captured["parser"] = parser
+    raise _StopCapture()
+
+
+def _walk(parser):
+    flags = set()
+    subcommands = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, subparser in action.choices.items():
+                if name == "help":
+                    continue
+                subcommands[name] = _walk(subparser)
+        else:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    flags.add(option)
+    return {
+        "flags": sorted(flags),
+        "subcommands": subcommands,
+    }
+
+
+argparse.ArgumentParser.parse_args = _capture
+argv0 = sys.argv[:]
+sys.argv = ["hermes"]
+try:
+    hermes_main.main()
+except _StopCapture:
+    pass
+finally:
+    argparse.ArgumentParser.parse_args = original
+    sys.argv = argv0
+
+print(json.dumps(_walk(captured["parser"]), sort_keys=True))
+"#;
+
+    fn rust_command_matrix(command: &mut clap::Command) -> CommandMatrix {
+        command.build();
+
+        let mut flags = BTreeSet::new();
+        for arg in command.get_arguments() {
+            if arg.is_hide_set() {
+                continue;
+            }
+            if let Some(long) = arg.get_long() {
+                flags.insert(format!("--{long}"));
+            }
+        }
+
+        let mut subcommands = BTreeMap::new();
+        for subcommand in command.get_subcommands_mut() {
+            if subcommand.is_hide_set() || subcommand.get_name() == "help" {
+                continue;
+            }
+            let child = rust_command_matrix(subcommand);
+            subcommands.insert(subcommand.get_name().to_string(), child.clone());
+            for alias in subcommand.get_all_aliases() {
+                subcommands.insert(alias.to_string(), child.clone());
+            }
+        }
+
+        CommandMatrix { flags, subcommands }
+    }
+
+    fn python_command_matrix() -> PythonCommandMatrix {
+        let project_root = project_root();
+        let python = resolve_repo_python(&project_root, None).expect("python interpreter");
+        let hermes_home = tempfile::TempDir::new().expect("temp hermes home");
+        let output = std::process::Command::new(python)
+            .arg("-c")
+            .arg(PYTHON_COMMAND_MATRIX_SCRIPT)
+            .current_dir(&project_root)
+            .env("HERMES_HOME", hermes_home.path())
+            .output()
+            .expect("run python command matrix helper");
+
+        assert!(
+            output.status.success(),
+            "python command matrix helper failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        serde_json::from_slice(&output.stdout).expect("parse python command matrix json")
+    }
+
+    fn normalize_python_matrix(node: PythonCommandMatrix) -> CommandMatrix {
+        CommandMatrix {
+            flags: node.flags.into_iter().collect(),
+            subcommands: node
+                .subcommands
+                .into_iter()
+                .map(|(name, child)| (name, normalize_python_matrix(child)))
+                .collect(),
+        }
+    }
+
+    fn diff_command_sets(
+        path: &str,
+        python: &CommandMatrix,
+        rust: &CommandMatrix,
+        gaps: &mut Vec<CommandGap>,
+    ) {
+        let python_names = python
+            .subcommands
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<String>>();
+        let rust_names = rust
+            .subcommands
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<String>>();
+
+        let python_only = python_names
+            .difference(&rust_names)
+            .cloned()
+            .collect::<Vec<String>>();
+        let rust_only = rust_names
+            .difference(&python_names)
+            .cloned()
+            .collect::<Vec<String>>();
+        if !python_only.is_empty() || !rust_only.is_empty() {
+            gaps.push(CommandGap {
+                path: path.to_string(),
+                python_only,
+                rust_only,
+            });
+        }
+
+        for name in python_names.intersection(&rust_names) {
+            let next_path = format!("{path} {name}");
+            diff_command_sets(
+                &next_path,
+                python.subcommands.get(name).expect("python child"),
+                rust.subcommands.get(name).expect("rust child"),
+                gaps,
+            );
+        }
+    }
+
+    fn matrix_at_path<'a>(root: &'a CommandMatrix, path: &[&str]) -> &'a CommandMatrix {
+        let mut current = root;
+        for segment in path {
+            current = current
+                .subcommands
+                .get(*segment)
+                .unwrap_or_else(|| panic!("missing command path segment: {segment}"));
+        }
+        current
+    }
+
+    fn flag_gap_at_path(
+        root_path: &[&str],
+        python_root: &CommandMatrix,
+        rust_root: &CommandMatrix,
+        ignored: &[&str],
+    ) -> FlagGap {
+        let path = if root_path.is_empty() {
+            String::from("hermes")
+        } else {
+            format!("hermes {}", root_path.join(" "))
+        };
+        let python = matrix_at_path(python_root, root_path);
+        let rust = matrix_at_path(rust_root, root_path);
+        let ignored = ignored
+            .iter()
+            .map(|flag| flag.to_string())
+            .collect::<BTreeSet<String>>();
+
+        let python_only = python
+            .flags
+            .difference(&rust.flags)
+            .filter(|flag| !ignored.contains(*flag))
+            .cloned()
+            .collect::<Vec<String>>();
+        let rust_only = rust
+            .flags
+            .difference(&python.flags)
+            .filter(|flag| !ignored.contains(*flag))
+            .cloned()
+            .collect::<Vec<String>>();
+
+        FlagGap {
+            path,
+            python_only,
+            rust_only,
+        }
+    }
+
+    #[test]
+    fn python_rust_cli_command_matrix_is_current() {
+        let python = normalize_python_matrix(python_command_matrix());
+        let rust = rust_command_matrix(&mut Cli::command());
+        let mut gaps = Vec::new();
+        diff_command_sets("hermes", &python, &rust, &mut gaps);
+        let expected = vec![
+            CommandGap {
+                path: String::from("hermes"),
+                python_only: vec![],
+                rust_only: vec![String::from("paths"), String::from("snapshot")],
+            },
+            CommandGap {
+                path: String::from("hermes kanban"),
+                python_only: vec![
+                    "archive",
+                    "assign",
+                    "assignees",
+                    "block",
+                    "boards",
+                    "claim",
+                    "comment",
+                    "complete",
+                    "context",
+                    "create",
+                    "diag",
+                    "diagnostics",
+                    "dispatch",
+                    "edit",
+                    "gc",
+                    "heartbeat",
+                    "init",
+                    "link",
+                    "list",
+                    "log",
+                    "ls",
+                    "notify-list",
+                    "notify-subscribe",
+                    "notify-unsubscribe",
+                    "reassign",
+                    "reclaim",
+                    "runs",
+                    "show",
+                    "stats",
+                    "tail",
+                    "unblock",
+                    "unlink",
+                    "watch",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                rust_only: vec![String::from("run"), String::from("tick")],
+            },
+            CommandGap {
+                path: String::from("hermes model"),
+                python_only: vec![],
+                rust_only: vec![
+                    String::from("providers"),
+                    String::from("set"),
+                    String::from("show"),
+                ],
+            },
+            CommandGap {
+                path: String::from("hermes profile"),
+                python_only: vec![],
+                rust_only: vec![String::from("current"), String::from("path")],
+            },
+            CommandGap {
+                path: String::from("hermes sessions"),
+                python_only: vec![String::from("browse")],
+                rust_only: vec![String::from("search")],
+            },
+            CommandGap {
+                path: String::from("hermes tools"),
+                python_only: vec![],
+                rust_only: vec![String::from("ls"), String::from("run")],
+            },
+        ];
+        assert_eq!(gaps, expected);
+    }
+
+    #[test]
+    fn python_rust_root_and_chat_flag_matrix_is_current() {
+        let python = normalize_python_matrix(python_command_matrix());
+        let rust = rust_command_matrix(&mut Cli::command());
+        let ignored = ["--profile"];
+
+        assert_eq!(
+            flag_gap_at_path(&[], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes"),
+                python_only: vec![
+                    "--accept-hooks",
+                    "--continue",
+                    "--dev",
+                    "--ignore-rules",
+                    "--ignore-user-config",
+                    "--model",
+                    "--oneshot",
+                    "--pass-session-id",
+                    "--provider",
+                    "--resume",
+                    "--skills",
+                    "--toolsets",
+                    "--tui",
+                    "--worktree",
+                    "--yolo",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                rust_only: vec![],
+            }
+        );
+
+        assert_eq!(
+            flag_gap_at_path(&["chat"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes chat"),
+                python_only: vec![
+                    "--accept-hooks",
+                    "--checkpoints",
+                    "--continue",
+                    "--dev",
+                    "--ignore-rules",
+                    "--ignore-user-config",
+                    "--image",
+                    "--max-turns",
+                    "--pass-session-id",
+                    "--query",
+                    "--quiet",
+                    "--resume",
+                    "--skills",
+                    "--source",
+                    "--toolsets",
+                    "--tui",
+                    "--verbose",
+                    "--worktree",
+                    "--yolo",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+                rust_only: vec![
+                    "--api-key",
+                    "--api-mode",
+                    "--base-url",
+                    "--session",
+                    "--toolset",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            }
+        );
+    }
+
+    #[test]
+    fn python_rust_gateway_and_tools_flag_matrix_is_current() {
+        let python = normalize_python_matrix(python_command_matrix());
+        let rust = rust_command_matrix(&mut Cli::command());
+        let ignored = ["--profile"];
+
+        assert_eq!(
+            flag_gap_at_path(&["gateway"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes gateway"),
+                python_only: vec![],
+                rust_only: vec![],
+            }
+        );
+        assert_eq!(
+            flag_gap_at_path(&["gateway", "run"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes gateway run"),
+                python_only: vec![],
+                rust_only: vec![],
+            }
+        );
+
+        for path in [
+            ["gateway", "start"].as_slice(),
+            ["gateway", "stop"].as_slice(),
+            ["gateway", "restart"].as_slice(),
+            ["gateway", "status"].as_slice(),
+            ["gateway", "install"].as_slice(),
+            ["gateway", "uninstall"].as_slice(),
+            ["gateway", "setup"].as_slice(),
+            ["gateway", "migrate-legacy"].as_slice(),
+        ] {
+            let gap = flag_gap_at_path(path, &python, &rust, &ignored);
+            assert_eq!(
+                gap,
+                FlagGap {
+                    path: format!("hermes {}", path.join(" ")),
+                    python_only: vec![],
+                    rust_only: vec![String::from("--accept-hooks")],
+                }
+            );
+        }
+
+        assert_eq!(
+            flag_gap_at_path(&["tools"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes tools"),
+                python_only: vec![],
+                rust_only: vec![],
+            }
+        );
+        assert_eq!(
+            flag_gap_at_path(&["tools", "enable"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes tools enable"),
+                python_only: vec![],
+                rust_only: vec![],
+            }
+        );
+        assert_eq!(
+            flag_gap_at_path(&["tools", "disable"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes tools disable"),
+                python_only: vec![],
+                rust_only: vec![],
+            }
+        );
+        assert_eq!(
+            flag_gap_at_path(&["tools", "list"], &python, &rust, &ignored),
+            FlagGap {
+                path: String::from("hermes tools list"),
+                python_only: vec![],
+                rust_only: vec![String::from("--toolset")],
+            }
         );
     }
 }
