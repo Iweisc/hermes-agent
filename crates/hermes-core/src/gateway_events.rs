@@ -844,6 +844,9 @@ mod tests {
             provider: String::from("custom"),
             base_url: String::from("http://localhost"),
             session_id: Some(String::from("session_123")),
+            completed: true,
+            interrupted: false,
+            turn_exit_reason: String::from("completed"),
         })));
         let GatewayTurnOutcome::Final { result, events } = final_outcome else {
             panic!("expected final outcome");
@@ -903,6 +906,9 @@ mod tests {
                 provider: String::from("custom"),
                 base_url: String::from("http://localhost"),
                 session_id: None,
+                completed: true,
+                interrupted: false,
+                turn_exit_reason: String::from("completed"),
             })))
             .unwrap();
 
