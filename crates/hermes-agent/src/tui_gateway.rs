@@ -695,6 +695,7 @@ fn handle_native_request(
         "session.title" => handle_session_title(id, &params, store, state)?,
         "session.save" => handle_session_save(id, &params, store, state)?,
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
+        "session.compress" => handle_session_compress(id, &params, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
         "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
@@ -1413,6 +1414,46 @@ fn handle_session_status(
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
 }
 
+fn handle_session_compress(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    if !session_exists(state, local_id)? {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    }
+
+    mark_store_session_dirty(state, local_id)?;
+    ensure_child_session(child_stdin, state, local_id)?;
+    let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4001,
+            "child session not materialized",
+        )));
+    };
+
+    let mut forwarded_params = params.clone();
+    forwarded_params.insert("session_id".to_string(), json!(child_id));
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        "session.compress",
+        Value::Object(forwarded_params),
+        Some(local_id.to_string()),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_helper_dispatch(
     id: Value,
     method: &str,
@@ -1453,8 +1494,22 @@ fn forward_child_request(
             }
         }
     }
-    let response =
-        send_blocking_child_request(child_stdin, state, method, Value::Object(forwarded_params))?;
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        method,
+        Value::Object(forwarded_params),
+        if map_session_id {
+            params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        },
+    )?;
     Ok(Some(rebind_response_id(response, id)))
 }
 
@@ -1487,6 +1542,7 @@ fn handle_config_get(
             state,
             "config.get",
             Value::Object(forwarded_params),
+            Some(local_id.unwrap_or_default().to_string()),
         )?;
         return Ok(Some(rebind_response_id(response, id)));
     }
@@ -1539,6 +1595,7 @@ fn handle_config_set(
             state,
             "config.set",
             Value::Object(forwarded_params),
+            Some(local_id.to_string()),
         )?;
         return Ok(Some(rebind_response_id(response, id)));
     }
@@ -1754,6 +1811,7 @@ fn handle_prompt_submit(
         state,
         "prompt.submit",
         Value::Object(forwarded_params),
+        Some(local_id.to_string()),
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -1790,6 +1848,7 @@ fn handle_session_steer(
             state,
             "session.steer",
             json!({"session_id": binding.child_id, "text": text}),
+            Some(local_id.to_string()),
         )?;
         return Ok(Some(rebind_response_id(response, id)));
     }
@@ -1882,6 +1941,7 @@ fn handle_text_respond(
         state,
         method,
         json!({request_key: binding.child_request_id, value_key: value}),
+        None,
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -2457,10 +2517,17 @@ fn rewrite_child_response(
         return Ok(pending.suppress_output);
     };
 
-    if let Some(local_sid) = pending.local_session_id.as_deref()
-        && let Some(session_key) = result.get("session_key").and_then(Value::as_str)
-    {
-        update_store_session_id(state, local_sid, session_key)?;
+    if let Some(local_sid) = pending.local_session_id.as_deref() {
+        if let Some(session_key) = result.get("session_key").and_then(Value::as_str) {
+            update_store_session_id(state, local_sid, session_key)?;
+        } else if let Some(session_key) = result
+            .get("info")
+            .and_then(Value::as_object)
+            .and_then(|info| info.get("session_key"))
+            .and_then(Value::as_str)
+        {
+            update_store_session_id(state, local_sid, session_key)?;
+        }
     }
 
     match pending.method.as_str() {
@@ -3067,6 +3134,7 @@ fn send_blocking_child_request(
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     params: Value,
+    local_session_id: Option<String>,
 ) -> Result<Value, Box<dyn Error>> {
     let (response_tx, response_rx) = mpsc::channel();
     let request_id = {
@@ -3078,7 +3146,7 @@ fn send_blocking_child_request(
         guard.pending.insert(
             request_id.clone(),
             PendingRequest {
-                local_session_id: None,
+                local_session_id,
                 method: method.to_string(),
                 resume_target: None,
                 response_tx: Some(response_tx),
@@ -5008,6 +5076,50 @@ mod tests {
         assert_eq!(response["result"]["status"], json!("streaming"));
         let guard = state.lock().unwrap();
         assert!(guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
+    fn session_compress_with_child_reanchors_store_session_from_nested_info() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-compress-before".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-compress", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "session.compress");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"compressed\",\"removed\":2,\"info\":{{\"session_key\":\"stored-compress-after\",\"model\":\"demo/model\"}},\"messages\":[]}}}}"
+                ),
+            );
+        });
+
+        mark_store_session_dirty(&state, &local_id).unwrap();
+        let response = handle_session_compress(
+            json!("r-compress-child"),
+            json!({"session_id": local_id, "focus_topic": "summary"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("session.compress response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-compress-child"));
+        assert_eq!(response["result"]["status"], json!("compressed"));
+        assert_eq!(response["result"]["removed"], json!(2));
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.sessions[&local_id].store_session_id.as_deref(),
+            Some("stored-compress-after")
+        );
+        assert!(!guard.sessions[&local_id].store_session_dirty);
     }
 
     #[test]
