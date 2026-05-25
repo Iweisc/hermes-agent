@@ -950,7 +950,7 @@ hooks:
         let script = dir.path().join("hook.sh");
         fs::write(
             &script,
-            "#!/usr/bin/env bash\ncat >/dev/null\necho '{\"context\":\"extra\"}'\n",
+            "#!/bin/sh\nread _ || true\necho '{\"context\":\"extra\"}'\n",
         )
         .unwrap();
         #[cfg(unix)]

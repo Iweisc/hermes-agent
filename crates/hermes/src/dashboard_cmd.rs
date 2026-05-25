@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -535,8 +535,7 @@ mod tests {
 
     #[cfg(test)]
     fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::cli_test_env_lock()
     }
 
     fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {

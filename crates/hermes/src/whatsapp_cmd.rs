@@ -595,12 +595,11 @@ mod tests {
     use std::collections::VecDeque;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::cli_test_env_lock()
     }
 
     fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {

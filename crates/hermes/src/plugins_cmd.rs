@@ -1469,7 +1469,12 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        crate::cli_test_env_lock()
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -1494,6 +1499,7 @@ mod tests {
 
     #[test]
     fn discover_plugins_prefers_user_over_bundled() {
+        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let bundled = temp.path().join("bundled");
         let user = temp.path().join("user");

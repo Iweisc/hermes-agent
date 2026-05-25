@@ -6756,15 +6756,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     #[cfg(test)]
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     #[cfg(test)]
     fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::cli_test_env_lock()
     }
 
     #[cfg(test)]
@@ -9598,46 +9597,59 @@ nVWE01LnUfioY4UUbblFOLyUeVgm3cyVVa+UM3YfNy4VEHrJUkHbmJRJ+LrLkAwt\n\
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let handle = thread::spawn(move || {
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_http_request(&mut stream);
-                requests.lock().unwrap().push(request.clone());
-                let first_line = request.lines().next().unwrap_or_default();
-                let (status, body, content_type) = if first_line
-                    .starts_with("GET /repos/openai/skills/contents/shipit ")
-                {
-                    (
-                        "HTTP/1.1 200 OK",
-                        r#"[{"type":"file","path":"shipit/SKILL.md"},{"type":"file","path":"shipit/notes.txt"}]"#
-                            .to_string(),
-                        "application/json",
-                    )
-                } else if first_line
-                    .starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md ")
-                {
-                    (
-                        "HTTP/1.1 200 OK",
-                        "---\nname: shipit\ndescription: Remote demo\n---\nbody\n".to_string(),
-                        "text/plain",
-                    )
-                } else if first_line
-                    .starts_with("GET /repos/openai/skills/contents/shipit/notes.txt ")
-                {
-                    ("HTTP/1.1 200 OK", "hello\n".to_string(), "text/plain")
-                } else {
-                    (
-                        "HTTP/1.1 404 Not Found",
-                        "{}".to_string(),
-                        "application/json",
-                    )
-                };
-                let response = format!(
-                    "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        requests.lock().unwrap().push(request.clone());
+                        let first_line = request.lines().next().unwrap_or_default();
+                        let (status, body, content_type) = if first_line
+                            .starts_with("GET /repos/openai/skills/contents/shipit ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                r#"[{"type":"file","path":"shipit/SKILL.md"},{"type":"file","path":"shipit/notes.txt"}]"#
+                                    .to_string(),
+                                "application/json",
+                            )
+                        } else if first_line
+                            .starts_with("GET /repos/openai/skills/contents/shipit/SKILL.md ")
+                        {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "---\nname: shipit\ndescription: Remote demo\n---\nbody\n"
+                                    .to_string(),
+                                "text/plain",
+                            )
+                        } else if first_line
+                            .starts_with("GET /repos/openai/skills/contents/shipit/notes.txt ")
+                        {
+                            ("HTTP/1.1 200 OK", "hello\n".to_string(), "text/plain")
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                "{}".to_string(),
+                                "application/json",
+                            )
+                        };
+                        let response = format!(
+                            "{status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if started.elapsed() > std::time::Duration::from_millis(500) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("github install test server accept failed: {error}"),
+                }
             }
         });
         (format!("http://{addr}"), handle)

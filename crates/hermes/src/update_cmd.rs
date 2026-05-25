@@ -1671,7 +1671,7 @@ exit 0\n",
         }
 
         let mut gateway = Command::new("bash")
-            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .args(["-c", "exec -a 'hermes gateway run' sleep 30"])
             .spawn()
             .unwrap();
         fs::write(
@@ -1681,19 +1681,19 @@ exit 0\n",
         .unwrap();
 
         let mut unrelated_gateway = Command::new("bash")
-            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .args(["-c", "exec -a 'hermes gateway run' sleep 30"])
             .spawn()
             .unwrap();
 
         let mut dashboard = Command::new("bash")
             .current_dir(project_root())
-            .args(["-lc", "exec -a 'hermes dashboard' sleep 30"])
+            .args(["-c", "exec -a 'hermes dashboard' sleep 30"])
             .spawn()
             .unwrap();
 
         let mut unrelated_dashboard = Command::new("bash")
             .current_dir(temp.path())
-            .args(["-lc", "exec -a 'hermes dashboard' sleep 30"])
+            .args(["-c", "exec -a 'hermes dashboard' sleep 30"])
             .spawn()
             .unwrap();
 
@@ -1747,6 +1747,7 @@ exit 0\n",
 
     #[test]
     fn formats_homebrew_message() {
+        let _guard = test_env_lock().lock().unwrap();
         let old = std::env::var("HERMES_MANAGED").ok();
         unsafe { std::env::set_var("HERMES_MANAGED", "homebrew") };
         let message = format_managed_message("Homebrew", "update Hermes Agent");

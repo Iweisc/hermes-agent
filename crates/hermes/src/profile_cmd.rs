@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use clap::{Args, Subcommand};
 use flate2::Compression;
@@ -1226,8 +1226,7 @@ fn truncate(value: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 fn test_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::cli_test_env_lock()
 }
 
 #[cfg(test)]
