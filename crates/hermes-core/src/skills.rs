@@ -363,7 +363,7 @@ pub fn handle_skill_manage(args: &Value, runtime: &ToolRuntime) -> String {
     }
 }
 
-pub(crate) fn load_skill_prompt_content(hermes_home: &Path, name: &str) -> Result<String, String> {
+pub fn load_skill_prompt_content(hermes_home: &Path, name: &str) -> Result<String, String> {
     let runtime = ToolRuntime::new(".").with_hermes_home(hermes_home);
     let skill = resolved_skill(&runtime, name)?;
     fs::read_to_string(&skill.skill_md)

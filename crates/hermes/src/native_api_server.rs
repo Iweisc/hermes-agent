@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{
@@ -17,11 +18,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermes_core::{
     AgentProgressCallback, AgentProgressEvent, DelegateExecutor, HermesContext, LoadedConfig,
-    ModelOverrides, ToolRuntime, get_tool_definitions,
+    ModelOverrides, SessionCreate, ToolRuntime, get_tool_definitions,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml::{Mapping, Value as YamlValue};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -31,6 +33,7 @@ use crate::gateway_cmd::GatewayRunArgs;
 const DEFAULT_API_SERVER_HOST: &str = "127.0.0.1";
 const DEFAULT_API_SERVER_PORT: u16 = 8642;
 const MAX_STORED_RESPONSES: usize = 100;
+const MAX_SESSION_HEADER_LEN: usize = 256;
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeApiServerSettings {
@@ -54,12 +57,15 @@ pub(crate) struct NativeApiServerState {
 struct ResponseStore {
     order: VecDeque<String>,
     responses: BTreeMap<String, StoredResponse>,
+    conversations: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
 struct StoredResponse {
     response: Value,
     conversation_history: Vec<Value>,
+    instructions: Option<String>,
+    session_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -74,9 +80,31 @@ struct StoredRun {
     interrupt_requested: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct PendingResponseToolCall {
+    item_id: String,
+    output_index: usize,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+enum LiveResponseEvent {
+    Progress(AgentProgressEvent),
+    Completed(hermes_core::AgentTurnResult),
+    Failed(String),
+}
+
 enum ResponsesMessagesError {
     BadRequest(String),
     NotFound(String),
+}
+
+struct ResolvedResponsesMessages {
+    messages: Vec<Value>,
+    conversation: Option<String>,
+    instructions: Option<String>,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,7 +124,17 @@ struct ResponsesRequest {
     #[serde(default)]
     previous_response_id: Option<String>,
     #[serde(default)]
+    conversation: Option<String>,
+    #[serde(default)]
+    conversation_history: Option<Vec<Value>>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    store: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +144,14 @@ struct RunsRequest {
     input: Value,
     #[serde(default)]
     previous_response_id: Option<String>,
+    #[serde(default)]
+    conversation: Option<String>,
+    #[serde(default)]
+    conversation_history: Option<Vec<Value>>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 pub(crate) fn maybe_run_native_api_server(
@@ -290,12 +336,17 @@ async fn handle_capabilities(
                 "responses_api": true,
                 "responses_streaming": true,
                 "stored_responses": true,
+                "responses_conversation_aliases": true,
+                "responses_conversation_history": true,
+                "responses_instructions": true,
                 "runs_api": true,
                 "run_submission": true,
                 "run_status": true,
                 "run_events": true,
                 "run_events_sse": true,
                 "run_stop": true,
+                "runs_conversation_history": true,
+                "runs_instructions": true,
                 "tool_progress_events": true,
                 "cors": !state.settings.cors_origins.is_empty(),
             },
@@ -327,27 +378,59 @@ async fn handle_chat_completions(
     if let Err(response) = ensure_authorized(&state.settings, &headers) {
         return response;
     }
+    let continued_session_id =
+        match resolve_chat_session_id(&state.settings, &headers, &request.messages) {
+            Ok(session_id) => session_id,
+            Err(response) => return response,
+        };
     if request.stream.unwrap_or(false) {
-        return match run_agent_for_messages_async(
-            Arc::clone(&state),
-            request.model,
-            request.messages,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(result) => chat_completions_sse_response(
-                &state.settings,
-                headers.get(ORIGIN),
-                &result.final_response,
-            ),
-            Err(error) => json_response(
-                StatusCode::BAD_GATEWAY,
-                json!({ "error": { "message": error.to_string() } }),
-                &state.settings,
-                headers.get(ORIGIN),
-            ),
+        return if let Some(session_id) = continued_session_id.clone() {
+            match run_chat_session_messages_async(
+                Arc::clone(&state),
+                request.model,
+                request.messages.clone(),
+                session_id.clone(),
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => chat_completions_sse_response(
+                    &state.settings,
+                    headers.get(ORIGIN),
+                    &result.final_response,
+                    Some(session_id.as_str()),
+                ),
+                Err(error) => json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "error": { "message": error.to_string() } }),
+                    &state.settings,
+                    headers.get(ORIGIN),
+                ),
+            }
+        } else {
+            match run_agent_for_messages_async(
+                Arc::clone(&state),
+                request.model,
+                request.messages,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => chat_completions_sse_response(
+                    &state.settings,
+                    headers.get(ORIGIN),
+                    &result.final_response,
+                    None,
+                ),
+                Err(error) => json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "error": { "message": error.to_string() } }),
+                    &state.settings,
+                    headers.get(ORIGIN),
+                ),
+            }
         };
     }
     if request.messages.is_empty() {
@@ -358,18 +441,30 @@ async fn handle_chat_completions(
             headers.get(ORIGIN),
         );
     }
-    match run_agent_for_messages_async(
-        Arc::clone(&state),
-        request.model,
-        request.messages,
-        None,
-        None,
-    )
-    .await
-    {
+    let result = if let Some(session_id) = continued_session_id.clone() {
+        run_chat_session_messages_async(
+            Arc::clone(&state),
+            request.model,
+            request.messages,
+            session_id,
+            None,
+            None,
+        )
+        .await
+    } else {
+        run_agent_for_messages_async(
+            Arc::clone(&state),
+            request.model,
+            request.messages,
+            None,
+            None,
+        )
+        .await
+    };
+    match result {
         Ok(result) => {
             let response_id = format!("chatcmpl-rs-{:x}", unix_ts_nanos());
-            json_response(
+            let mut response = json_response(
                 StatusCode::OK,
                 json!({
                     "id": response_id,
@@ -392,7 +487,13 @@ async fn handle_chat_completions(
                 }),
                 &state.settings,
                 headers.get(ORIGIN),
-            )
+            );
+            if let Some(session_id) = result.session_id.as_deref() {
+                if let Ok(value) = HeaderValue::from_str(session_id) {
+                    response.headers_mut().insert("X-Hermes-Session-Id", value);
+                }
+            }
+            response
         }
         Err(error) => json_response(
             StatusCode::BAD_GATEWAY,
@@ -412,10 +513,14 @@ async fn handle_responses(
         return response;
     }
     if request.stream.unwrap_or(false) {
-        let messages = match build_responses_messages(
+        let resolved = match build_responses_messages(
             &state,
             &request.input,
             request.previous_response_id.as_deref(),
+            request.conversation.as_deref(),
+            request.conversation_history.as_deref(),
+            request.instructions.as_deref(),
+            request.session_id.as_deref(),
         ) {
             Ok(messages) => messages,
             Err(ResponsesMessagesError::BadRequest(error)) => {
@@ -434,33 +539,22 @@ async fn handle_responses(
                 );
             }
         };
-        return match run_agent_for_messages_async(
+        return responses_streaming_response(
             Arc::clone(&state),
+            headers.get(ORIGIN),
             request.model,
-            messages.clone(),
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(result) => responses_sse_response(
-                &state,
-                headers.get(ORIGIN),
-                &result.final_response,
-                &messages,
-            ),
-            Err(error) => json_response(
-                StatusCode::BAD_GATEWAY,
-                json!({ "error": { "message": error.to_string() } }),
-                &state.settings,
-                headers.get(ORIGIN),
-            ),
-        };
+            resolved,
+            request.store.unwrap_or(true),
+        );
     }
-    let messages = match build_responses_messages(
+    let resolved = match build_responses_messages(
         &state,
         &request.input,
         request.previous_response_id.as_deref(),
+        request.conversation.as_deref(),
+        request.conversation_history.as_deref(),
+        request.instructions.as_deref(),
+        request.session_id.as_deref(),
     ) {
         Ok(messages) => messages,
         Err(ResponsesMessagesError::BadRequest(error)) => {
@@ -475,29 +569,66 @@ async fn handle_responses(
             return response_not_found_response(&state.settings, headers.get(ORIGIN), &response_id);
         }
     };
-    match run_agent_for_messages_async(
-        Arc::clone(&state),
-        request.model,
-        messages.clone(),
-        None,
-        None,
-    )
-    .await
-    {
+    let should_store = request.store.unwrap_or(true);
+    let result = if let Some(session_id) = resolved.session_id.clone() {
+        run_chat_session_messages_async(
+            Arc::clone(&state),
+            request.model,
+            resolved.messages.clone(),
+            session_id,
+            None,
+            None,
+        )
+        .await
+    } else {
+        run_agent_for_messages_async(
+            Arc::clone(&state),
+            request.model,
+            resolved.messages.clone(),
+            None,
+            None,
+        )
+        .await
+    };
+    match result {
         Ok(result) => {
             let response_body = build_completed_responses_payload(
                 &state.settings.model_name,
                 &result.final_response,
             );
-            let conversation_history =
-                build_stored_conversation_history(&messages, &result.final_response);
-            store_response_snapshot(&state, &response_body, &conversation_history);
-            json_response(
+            if should_store {
+                let conversation_history = build_stored_conversation_history(
+                    &resolved.messages,
+                    &result.final_response,
+                    resolved.instructions.as_deref(),
+                );
+                store_response_snapshot(
+                    &state,
+                    &response_body,
+                    &conversation_history,
+                    resolved.instructions.as_deref(),
+                    resolved.conversation.as_deref(),
+                    result
+                        .session_id
+                        .as_deref()
+                        .or(resolved.session_id.as_deref()),
+                );
+            }
+            let mut response = json_response(
                 StatusCode::OK,
                 response_body,
                 &state.settings,
                 headers.get(ORIGIN),
-            )
+            );
+            if let Some(session_id) = result
+                .session_id
+                .as_deref()
+                .or(resolved.session_id.as_deref())
+                && let Ok(value) = HeaderValue::from_str(session_id)
+            {
+                response.headers_mut().insert("X-Hermes-Session-Id", value);
+            }
+            response
         }
         Err(error) => json_response(
             StatusCode::BAD_GATEWAY,
@@ -544,10 +675,7 @@ async fn handle_delete_response(
         .response_store
         .lock()
         .ok()
-        .map(|mut store| {
-            store.order.retain(|id| id != &response_id);
-            store.responses.remove(&response_id).is_some()
-        })
+        .map(|mut store| remove_stored_response(&mut store, &response_id))
         .unwrap_or(false);
     if !deleted {
         return response_not_found_response(&state.settings, headers.get(ORIGIN), &response_id);
@@ -572,10 +700,14 @@ async fn handle_runs(
     if let Err(response) = ensure_authorized(&state.settings, &headers) {
         return response;
     }
-    let messages = match build_responses_messages(
+    let resolved = match build_responses_messages(
         &state,
         &request.input,
         request.previous_response_id.as_deref(),
+        request.conversation.as_deref(),
+        request.conversation_history.as_deref(),
+        request.instructions.as_deref(),
+        request.session_id.as_deref(),
     ) {
         Ok(messages) => messages,
         Err(ResponsesMessagesError::BadRequest(error)) => {
@@ -606,6 +738,7 @@ async fn handle_runs(
             "run_id": run_id,
             "status": "queued",
             "created_at": created_at,
+            "session_id": resolved.session_id.clone().unwrap_or_else(|| run_id.clone()),
             "model": queued_model_name,
         }),
         Arc::clone(&interrupt_requested),
@@ -613,7 +746,8 @@ async fn handle_runs(
 
     let state_for_task = Arc::clone(&state);
     let run_id_for_task = run_id.clone();
-    let messages_for_task = messages.clone();
+    let messages_for_task = resolved.messages.clone();
+    let session_id_for_task = resolved.session_id.clone();
     let model_for_task = request.model.clone();
     let running_model_name = model_name.clone();
     let interrupt_requested_for_task = Arc::clone(&interrupt_requested);
@@ -632,6 +766,7 @@ async fn handle_runs(
                     "run_id": run_id_for_task,
                     "status": "cancelled",
                     "created_at": created_at,
+                    "session_id": session_id_for_task.clone().unwrap_or_else(|| run_id_for_task.clone()),
                     "model": running_model_name,
                 }),
             );
@@ -645,18 +780,31 @@ async fn handle_runs(
                 "run_id": run_id_for_task,
                 "status": "running",
                 "created_at": created_at,
+                "session_id": session_id_for_task.clone().unwrap_or_else(|| run_id_for_task.clone()),
                 "model": running_model_name,
             }),
         );
-        match run_agent_for_messages_async(
-            state_for_task.clone(),
-            model_for_task,
-            messages_for_task.clone(),
-            Some(Arc::clone(&interrupt_requested_for_task)),
-            Some(progress_callback),
-        )
-        .await
-        {
+        let result = if let Some(session_id) = session_id_for_task.clone() {
+            run_chat_session_messages_async(
+                state_for_task.clone(),
+                model_for_task,
+                messages_for_task.clone(),
+                session_id,
+                None,
+                None,
+            )
+            .await
+        } else {
+            run_agent_for_messages_async(
+                state_for_task.clone(),
+                model_for_task,
+                messages_for_task.clone(),
+                Some(Arc::clone(&interrupt_requested_for_task)),
+                Some(progress_callback),
+            )
+            .await
+        };
+        match result {
             Ok(result) => {
                 let final_response = result.final_response;
                 record_run_status(
@@ -667,6 +815,7 @@ async fn handle_runs(
                         "run_id": run_id_for_task,
                         "status": "completed",
                         "created_at": created_at,
+                        "session_id": result.session_id.clone().or(session_id_for_task.clone()).unwrap_or_else(|| run_id_for_task.clone()),
                         "model": model_name,
                         "output": final_response,
                     }),
@@ -684,6 +833,7 @@ async fn handle_runs(
                             "run_id": run_id_for_task,
                             "status": "cancelled",
                             "created_at": created_at,
+                            "session_id": session_id_for_task.clone().unwrap_or_else(|| run_id_for_task.clone()),
                             "model": model_name,
                         }),
                     );
@@ -697,6 +847,7 @@ async fn handle_runs(
                         "run_id": run_id_for_task,
                         "status": "failed",
                         "created_at": created_at,
+                        "session_id": session_id_for_task.clone().unwrap_or_else(|| run_id_for_task.clone()),
                         "model": model_name,
                         "error": error,
                     }),
@@ -876,6 +1027,22 @@ async fn run_agent_for_messages_async(
     .map_err(|error| error.to_string())?
 }
 
+async fn run_chat_session_messages_async(
+    state: Arc<NativeApiServerState>,
+    model: Option<String>,
+    messages: Vec<Value>,
+    session_id: String,
+    _interrupt_requested: Option<Arc<AtomicBool>>,
+    _progress_callback: Option<AgentProgressCallback>,
+) -> Result<hermes_core::AgentTurnResult, String> {
+    tokio::task::spawn_blocking(move || {
+        run_chat_session_messages(&state, model, &messages, &session_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 async fn handle_options(
     State(state): State<Arc<NativeApiServerState>>,
     headers: HeaderMap,
@@ -936,6 +1103,71 @@ fn run_agent_for_messages(
     )?)
 }
 
+fn run_chat_session_messages(
+    state: &NativeApiServerState,
+    model: Option<String>,
+    messages: &[Value],
+    session_id: &str,
+) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
+    let user_content =
+        extract_last_user_content(messages).map_err(|error| io::Error::other(error))?;
+    let system_prompt = extract_system_prompt(messages);
+    let enabled_toolsets = state.loaded.config.toolsets.clone();
+    let delegate = DelegateExecutor::new(
+        state.context.clone(),
+        state.loaded.clone(),
+        "rust-api-server",
+        enabled_toolsets.clone(),
+        ModelOverrides::default(),
+        state.context.hermes_home(),
+    );
+    let tool_names = get_tool_definitions(
+        Some(&enabled_toolsets),
+        disabled_memory_toolsets(&state.loaded).as_deref(),
+    )
+    .into_iter()
+    .map(|tool| tool.name)
+    .collect::<Vec<_>>();
+    let mut runtime = ToolRuntime::default()
+        .with_hermes_home(state.context.hermes_home())
+        .with_available_tool_names(tool_names)
+        .with_delegate_callback(move |request| delegate.execute(request));
+    let _ = runtime.load_memory_store(&state.loaded.config.memory);
+    let overrides = ModelOverrides {
+        model,
+        ..ModelOverrides::default()
+    };
+    let session_store = state.context.open_session_store()?;
+    if session_store.get_session(session_id)?.is_none() {
+        session_store.create_session(&SessionCreate {
+            id: session_id.to_string(),
+            source: "rust-api-server".to_string(),
+            user_id: None,
+            model: Some(
+                overrides
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| state.settings.model_name.clone()),
+            ),
+            model_config: None,
+            system_prompt: system_prompt.clone(),
+            parent_session_id: None,
+        })?;
+    }
+    if session_store.get_messages(session_id)?.is_empty() {
+        seed_chat_completion_session_history(&session_store, session_id, messages)?;
+    }
+    Ok(state.context.run_chat_turn_with_user_content(
+        &state.loaded,
+        user_content,
+        &runtime,
+        Some(&enabled_toolsets),
+        &overrides,
+        Some(session_id),
+        Some(&session_store),
+    )?)
+}
+
 fn normalize_responses_input(input: &Value) -> Result<Vec<Value>, String> {
     match input {
         Value::String(text) => Ok(vec![json!({
@@ -948,36 +1180,317 @@ fn normalize_responses_input(input: &Value) -> Result<Vec<Value>, String> {
     }
 }
 
+fn parse_session_continuation_header(
+    settings: &NativeApiServerSettings,
+    headers: &HeaderMap,
+) -> Result<Option<String>, Response> {
+    let Some(raw) = headers
+        .get("X-Hermes-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if settings.api_key.trim().is_empty() {
+        return Err(json_response(
+            StatusCode::FORBIDDEN,
+            json!({ "error": { "message": "Session continuation requires API key authentication. Configure API_SERVER_KEY to enable this feature." } }),
+            settings,
+            headers.get(ORIGIN),
+        ));
+    }
+    if raw.len() > MAX_SESSION_HEADER_LEN {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": { "message": "Session ID too long" } }),
+            settings,
+            headers.get(ORIGIN),
+        ));
+    }
+    if raw.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": { "message": "Invalid session ID" } }),
+            settings,
+            headers.get(ORIGIN),
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+fn resolve_chat_session_id(
+    settings: &NativeApiServerSettings,
+    headers: &HeaderMap,
+    messages: &[Value],
+) -> Result<Option<String>, Response> {
+    if let Some(explicit) = parse_session_continuation_header(settings, headers)? {
+        return Ok(Some(explicit));
+    }
+    let system_prompt = extract_system_prompt(messages);
+    let first_user_message = messages.iter().find_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        normalize_chat_text(message.get("content")?)
+    });
+    Ok(first_user_message
+        .map(|first_user| derive_chat_session_id(system_prompt.as_deref(), &first_user)))
+}
+
+fn derive_chat_session_id(system_prompt: Option<&str>, first_user_message: &str) -> String {
+    let seed = format!(
+        "{}\n{}",
+        system_prompt.unwrap_or_default(),
+        first_user_message
+    );
+    let digest = Sha256::digest(seed.as_bytes());
+    let hex = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("api-{hex}")
+}
+
+fn extract_last_user_content(messages: &[Value]) -> Result<Value, String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+        })
+        .and_then(|message| message.get("content").cloned())
+        .filter(chat_content_is_meaningful)
+        .ok_or_else(|| "messages must include a non-empty user message".to_string())
+}
+
+fn seed_chat_completion_session_history(
+    session_store: &hermes_core::SessionStore,
+    session_id: &str,
+    messages: &[Value],
+) -> Result<(), Box<dyn Error>> {
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    let Some(last_user_index) = last_user_index else {
+        return Ok(());
+    };
+    for message in &messages[..last_user_index] {
+        let Some(role) = message
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if role == "system" {
+            continue;
+        }
+        let tool_calls = message.get("tool_calls").cloned();
+        let tool_name = tool_calls
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("function"))
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        session_store.append_message(
+            session_id,
+            &hermes_core::MessageAppend {
+                role: role.to_string(),
+                content: message.get("content").cloned(),
+                tool_call_id: message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                tool_calls,
+                tool_name,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn extract_system_prompt(messages: &[Value]) -> Option<String> {
+    messages.iter().find_map(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("system") {
+            return None;
+        }
+        normalize_chat_text(message.get("content")?)
+    })
+}
+
+fn normalize_chat_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| match part {
+                    Value::String(text) => Some(text.trim().to_string()),
+                    Value::Object(object) => object
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .map(ToOwned::to_owned),
+                    _ => None,
+                })
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn chat_content_is_meaningful(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(parts) => parts.iter().any(|part| match part {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(object) => object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+            _ => false,
+        }),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        _ => false,
+    }
+}
+
 fn build_responses_messages(
     state: &NativeApiServerState,
     input: &Value,
     previous_response_id: Option<&str>,
-) -> Result<Vec<Value>, ResponsesMessagesError> {
-    let mut messages =
-        normalize_responses_input(input).map_err(ResponsesMessagesError::BadRequest)?;
-    let Some(previous_response_id) = previous_response_id
+    conversation: Option<&str>,
+    conversation_history: Option<&[Value]>,
+    instructions: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<ResolvedResponsesMessages, ResponsesMessagesError> {
+    let normalized_previous_response_id = previous_response_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return Ok(messages);
-    };
-    let Some(previous_history) = state.response_store.lock().ok().and_then(|store| {
-        store
-            .responses
-            .get(previous_response_id)
-            .map(|entry| entry.conversation_history.clone())
-    }) else {
-        return Err(ResponsesMessagesError::NotFound(
-            previous_response_id.to_string(),
+        .map(ToOwned::to_owned);
+    let normalized_conversation = conversation
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if normalized_conversation.is_some() && normalized_previous_response_id.is_some() {
+        return Err(ResponsesMessagesError::BadRequest(
+            "cannot use both conversation and previous_response_id".to_string(),
         ));
+    }
+
+    let resolved_previous_response_id =
+        if let Some(conversation_name) = normalized_conversation.as_deref() {
+            state.response_store.lock().ok().and_then(|store| {
+                store
+                    .conversations
+                    .get(conversation_name)
+                    .cloned()
+                    .filter(|value| !value.trim().is_empty())
+            })
+        } else {
+            normalized_previous_response_id
+        };
+
+    let stored_response = resolved_previous_response_id
+        .as_deref()
+        .map(|response_id| load_stored_response(state, response_id))
+        .transpose()?
+        .flatten();
+
+    let mut messages = if let Some(history) = conversation_history {
+        normalize_message_history(history)?
+    } else if let Some(previous_response) = stored_response.as_ref() {
+        previous_response.conversation_history.clone()
+    } else {
+        Vec::new()
     };
-    let mut combined = previous_history;
-    combined.append(&mut messages);
-    Ok(combined)
+
+    let carried_instructions = if conversation_history.is_none() {
+        stored_response
+            .as_ref()
+            .and_then(|entry| entry.instructions.clone())
+    } else {
+        None
+    };
+    let effective_session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            stored_response
+                .as_ref()
+                .and_then(|entry| entry.session_id.clone())
+        });
+    let effective_instructions = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(carried_instructions);
+    if let Some(instructions) = effective_instructions.as_deref() {
+        messages.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": instructions,
+            }),
+        );
+    }
+
+    let mut input_messages =
+        normalize_responses_input(input).map_err(ResponsesMessagesError::BadRequest)?;
+    messages.append(&mut input_messages);
+    Ok(ResolvedResponsesMessages {
+        messages,
+        conversation: normalized_conversation,
+        instructions: effective_instructions,
+        session_id: effective_session_id,
+    })
 }
 
-fn build_stored_conversation_history(messages: &[Value], final_response: &str) -> Vec<Value> {
+fn build_stored_conversation_history(
+    messages: &[Value],
+    final_response: &str,
+    instructions: Option<&str>,
+) -> Vec<Value> {
     let mut conversation_history = messages.to_vec();
+    if let Some(expected) = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && conversation_history.first().is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("system")
+                && message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.trim() == expected)
+        })
+    {
+        conversation_history.remove(0);
+    }
     conversation_history.push(json!({
         "role": "assistant",
         "content": final_response,
@@ -1024,6 +1537,7 @@ fn chat_completions_sse_response(
     settings: &NativeApiServerSettings,
     origin: Option<&HeaderValue>,
     final_response: &str,
+    session_id: Option<&str>,
 ) -> Response {
     let completion_id = format!("chatcmpl-rs-{:x}", unix_ts_nanos());
     let created = unix_ts_secs();
@@ -1078,111 +1592,452 @@ fn chat_completions_sse_response(
         "data: [DONE]\n\n".to_string(),
     ]
     .concat();
-    sse_response(body, settings, origin)
+    let mut response = sse_response(body, settings, origin);
+    if let Some(session_id) = session_id
+        && let Ok(value) = HeaderValue::from_str(session_id)
+    {
+        response.headers_mut().insert("X-Hermes-Session-Id", value);
+    }
+    response
 }
 
-fn responses_sse_response(
-    state: &NativeApiServerState,
+async fn send_sse_chunk(
+    sender: &mpsc::Sender<String>,
+    interrupt_requested: &Arc<AtomicBool>,
+    chunk: String,
+) -> bool {
+    if sender.send(chunk).await.is_err() {
+        interrupt_requested.store(true, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+fn format_sse_event(event_name: &str, sequence_number: &mut u64, payload: Value) -> String {
+    let mut object = payload.as_object().cloned().unwrap_or_default();
+    object.insert("sequence_number".to_string(), json!(*sequence_number));
+    *sequence_number += 1;
+    format!("event: {event_name}\ndata: {}\n\n", Value::Object(object))
+}
+
+fn responses_streaming_response(
+    state: Arc<NativeApiServerState>,
     origin: Option<&HeaderValue>,
-    final_response: &str,
-    messages: &[Value],
+    model: Option<String>,
+    resolved: ResolvedResponsesMessages,
+    should_store: bool,
 ) -> Response {
-    let completed_response =
-        build_completed_responses_payload(&state.settings.model_name, final_response);
-    let conversation_history = build_stored_conversation_history(messages, final_response);
-    store_response_snapshot(state, &completed_response, &conversation_history);
-    let response_id = completed_response["id"].as_str().unwrap_or_default();
-    let message_id = completed_response["output"][0]["id"]
-        .as_str()
-        .unwrap_or_default();
-    let created_at = completed_response["created_at"]
-        .as_u64()
-        .unwrap_or_else(unix_ts_secs);
-    let body = [
-        format!(
-            "event: response.created\ndata: {}\n\n",
+    let response_id = format!("resp-rs-{:x}", unix_ts_nanos());
+    let created_at = unix_ts_secs();
+    let model_name = model.unwrap_or_else(|| state.settings.model_name.clone());
+    let origin = origin.cloned();
+    let interrupt_requested = Arc::new(AtomicBool::new(false));
+
+    let (body_tx, body_rx) = mpsc::channel::<String>(32);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LiveResponseEvent>();
+
+    let progress_callback: AgentProgressCallback = {
+        let event_tx = event_tx.clone();
+        Arc::new(move |event| {
+            let _ = event_tx.send(LiveResponseEvent::Progress(event));
+        })
+    };
+    let state_for_run = Arc::clone(&state);
+    let messages_for_run = resolved.messages.clone();
+    let session_id_for_run = resolved.session_id.clone();
+    let interrupt_for_run = Arc::clone(&interrupt_requested);
+    tokio::spawn(async move {
+        let result = if let Some(session_id) = session_id_for_run {
+            run_chat_session_messages_async(
+                state_for_run,
+                Some(model_name.clone()),
+                messages_for_run,
+                session_id,
+                Some(interrupt_for_run),
+                Some(progress_callback),
+            )
+            .await
+        } else {
+            run_agent_for_messages_async(
+                state_for_run,
+                Some(model_name.clone()),
+                messages_for_run,
+                Some(interrupt_for_run),
+                Some(progress_callback),
+            )
+            .await
+        };
+        let terminal = match result {
+            Ok(result) => LiveResponseEvent::Completed(result),
+            Err(error) => LiveResponseEvent::Failed(error),
+        };
+        let _ = event_tx.send(terminal);
+    });
+
+    let state_for_stream = Arc::clone(&state);
+    let settings = state.settings.clone();
+    let instructions = resolved.instructions.clone();
+    let conversation = resolved.conversation.clone();
+    let session_id = resolved.session_id.clone();
+    let messages = resolved.messages;
+    let response_id_for_stream = response_id.clone();
+    tokio::spawn(async move {
+        let mut sequence_number = 0_u64;
+        let mut output_index = 0_usize;
+        let mut pending_tool_calls = Vec::<PendingResponseToolCall>::new();
+        let mut emitted_items = Vec::<Value>::new();
+        let message_item_id = format!("msg-rs-{:x}", unix_ts_nanos());
+        let mut message_opened = false;
+        let mut message_output_index = None::<usize>;
+        let mut final_text = String::new();
+
+        let created_chunk = format_sse_event(
+            "response.created",
+            &mut sequence_number,
             json!({
                 "type": "response.created",
-                "sequence_number": 0,
                 "response": {
-                    "id": response_id,
+                    "id": response_id_for_stream,
                     "object": "response",
                     "created_at": created_at,
                     "status": "in_progress",
-                    "model": state.settings.model_name,
+                    "model": settings.model_name,
                     "output": [],
                 }
-            })
-        ),
-        format!(
-            "event: response.output_item.added\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.added",
-                "sequence_number": 1,
-                "output_index": 0,
-                "item": {
-                    "id": message_id,
-                    "type": "message",
-                    "status": "in_progress",
-                    "role": "assistant",
-                    "content": [],
+            }),
+        );
+        if !send_sse_chunk(&body_tx, &interrupt_requested, created_chunk).await {
+            return;
+        }
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                LiveResponseEvent::Progress(AgentProgressEvent::ToolStarted {
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                }) => {
+                    let item_id = format!("fc-rs-{:x}", unix_ts_nanos());
+                    let item = json!({
+                        "id": item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "name": tool_name,
+                        "call_id": tool_call_id,
+                        "arguments": arguments,
+                    });
+                    pending_tool_calls.push(PendingResponseToolCall {
+                        item_id,
+                        output_index,
+                        call_id: tool_call_id,
+                        name: item["name"].as_str().unwrap_or_default().to_string(),
+                        arguments: item["arguments"].as_str().unwrap_or_default().to_string(),
+                    });
+                    emitted_items.push(json!({
+                        "type": "function_call",
+                        "name": item["name"],
+                        "call_id": item["call_id"],
+                        "arguments": item["arguments"],
+                    }));
+                    let chunk = format_sse_event(
+                        "response.output_item.added",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": item,
+                        }),
+                    );
+                    output_index += 1;
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        return;
+                    }
                 }
-            })
-        ),
-        format!(
-            "event: response.output_text.delta\ndata: {}\n\n",
-            json!({
-                "type": "response.output_text.delta",
-                "sequence_number": 2,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": final_response,
-                "logprobs": [],
-            })
-        ),
-        format!(
-            "event: response.output_text.done\ndata: {}\n\n",
-            json!({
-                "type": "response.output_text.done",
-                "sequence_number": 3,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": final_response,
-                "logprobs": [],
-            })
-        ),
-        format!(
-            "event: response.output_item.done\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "sequence_number": 4,
-                "output_index": 0,
-                "item": {
-                    "id": message_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": final_response,
-                        "annotations": [],
-                    }],
+                LiveResponseEvent::Progress(AgentProgressEvent::ToolCompleted {
+                    tool_call_id,
+                    tool_name: _,
+                    arguments: _,
+                    result,
+                    duration_secs: _,
+                    is_error: _,
+                }) => {
+                    let Some(pending_index) = pending_tool_calls
+                        .iter()
+                        .position(|call| call.call_id == tool_call_id)
+                    else {
+                        continue;
+                    };
+                    let pending = pending_tool_calls.remove(pending_index);
+                    let done_chunk = format_sse_event(
+                        "response.output_item.done",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": pending.output_index,
+                            "item": {
+                                "id": pending.item_id,
+                                "type": "function_call",
+                                "status": "completed",
+                                "name": pending.name,
+                                "call_id": pending.call_id,
+                                "arguments": pending.arguments,
+                            }
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, done_chunk).await {
+                        return;
+                    }
+                    let output_item = json!({
+                        "id": format!("fco-rs-{:x}", unix_ts_nanos()),
+                        "type": "function_call_output",
+                        "call_id": pending.call_id,
+                        "output": [{
+                            "type": "input_text",
+                            "text": result,
+                        }],
+                        "status": "completed",
+                    });
+                    emitted_items.push(json!({
+                        "type": "function_call_output",
+                        "call_id": output_item["call_id"],
+                        "output": output_item["output"],
+                    }));
+                    let added_chunk = format_sse_event(
+                        "response.output_item.added",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": output_item,
+                        }),
+                    );
+                    output_index += 1;
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, added_chunk).await {
+                        return;
+                    }
+                    let done_chunk = format_sse_event(
+                        "response.output_item.done",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": output_index - 1,
+                            "item": output_item,
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, done_chunk).await {
+                        return;
+                    }
                 }
-            })
-        ),
-        format!(
-            "event: response.completed\ndata: {}\n\n",
-            json!({
-                "type": "response.completed",
-                "sequence_number": 5,
-                "response": completed_response,
-            })
-        ),
-    ]
-    .concat();
-    sse_response(body, &state.settings, origin)
+                LiveResponseEvent::Progress(AgentProgressEvent::MessageDelta { delta }) => {
+                    if !message_opened {
+                        let chunk = format_sse_event(
+                            "response.output_item.added",
+                            &mut sequence_number,
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": {
+                                    "id": message_item_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                }
+                            }),
+                        );
+                        message_output_index = Some(output_index);
+                        output_index += 1;
+                        message_opened = true;
+                        if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            return;
+                        }
+                    }
+                    final_text.push_str(&delta);
+                    let chunk = format_sse_event(
+                        "response.output_text.delta",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_text.delta",
+                            "item_id": message_item_id,
+                            "output_index": message_output_index.unwrap_or(0),
+                            "content_index": 0,
+                            "delta": delta,
+                            "logprobs": [],
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        return;
+                    }
+                }
+                LiveResponseEvent::Progress(AgentProgressEvent::ReasoningAvailable { text }) => {
+                    let chunk = format_sse_event(
+                        "response.reasoning_summary_part.added",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.reasoning_summary_part.added",
+                            "text": text,
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        return;
+                    }
+                }
+                LiveResponseEvent::Completed(result) => {
+                    if final_text.is_empty() && !result.final_response.trim().is_empty() {
+                        if !message_opened {
+                            let chunk = format_sse_event(
+                                "response.output_item.added",
+                                &mut sequence_number,
+                                json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": output_index,
+                                    "item": {
+                                        "id": message_item_id,
+                                        "type": "message",
+                                        "status": "in_progress",
+                                        "role": "assistant",
+                                        "content": [],
+                                    }
+                                }),
+                            );
+                            message_output_index = Some(output_index);
+                            if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                                return;
+                            }
+                        }
+                        final_text = result.final_response.clone();
+                        let chunk = format_sse_event(
+                            "response.output_text.delta",
+                            &mut sequence_number,
+                            json!({
+                                "type": "response.output_text.delta",
+                                "item_id": message_item_id,
+                                "output_index": message_output_index.unwrap_or(0),
+                                "content_index": 0,
+                                "delta": result.final_response,
+                                "logprobs": [],
+                            }),
+                        );
+                        if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            return;
+                        }
+                    }
+                    let text_done = format_sse_event(
+                        "response.output_text.done",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_text.done",
+                            "item_id": message_item_id,
+                            "output_index": message_output_index.unwrap_or(0),
+                            "content_index": 0,
+                            "text": final_text,
+                            "logprobs": [],
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, text_done).await {
+                        return;
+                    }
+                    let message_item = json!({
+                        "id": message_item_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": final_text,
+                            "annotations": [],
+                        }],
+                    });
+                    let item_done = format_sse_event(
+                        "response.output_item.done",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": message_output_index.unwrap_or(0),
+                            "item": message_item.clone(),
+                        }),
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, item_done).await {
+                        return;
+                    }
+                    emitted_items.push(message_item.clone());
+                    let completed_response = build_completed_responses_payload_with_output(
+                        &settings.model_name,
+                        &response_id_for_stream,
+                        created_at,
+                        emitted_items.clone(),
+                    );
+                    if should_store {
+                        let conversation_history = build_stored_conversation_history(
+                            &messages,
+                            &final_text,
+                            instructions.as_deref(),
+                        );
+                        store_response_snapshot(
+                            &state_for_stream,
+                            &completed_response,
+                            &conversation_history,
+                            instructions.as_deref(),
+                            conversation.as_deref(),
+                            session_id.as_deref(),
+                        );
+                    }
+                    let chunk = format_sse_event(
+                        "response.completed",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.completed",
+                            "response": completed_response,
+                        }),
+                    );
+                    let _ = send_sse_chunk(&body_tx, &interrupt_requested, chunk).await;
+                    return;
+                }
+                LiveResponseEvent::Failed(error) => {
+                    let chunk = format_sse_event(
+                        "response.failed",
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.failed",
+                            "response": {
+                                "id": response_id_for_stream,
+                                "object": "response",
+                                "created_at": created_at,
+                                "status": "failed",
+                                "model": settings.model_name,
+                                "output": emitted_items,
+                                "error": { "message": error, "type": "server_error" },
+                            }
+                        }),
+                    );
+                    let _ = send_sse_chunk(&body_tx, &interrupt_requested, chunk).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(
+        ReceiverStream::new(body_rx).map(Ok::<_, io::Error>),
+    ));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    if let Some(session_id) = resolved.session_id.as_deref()
+        && let Ok(value) = HeaderValue::from_str(session_id)
+    {
+        response.headers_mut().insert("X-Hermes-Session-Id", value);
+    }
+    apply_cors_headers(response.headers_mut(), &state.settings, origin.as_ref());
+    response
 }
 
 fn build_completed_responses_payload(model_name: &str, final_response: &str) -> Value {
@@ -1206,10 +2061,29 @@ fn build_completed_responses_payload(model_name: &str, final_response: &str) -> 
     })
 }
 
+fn build_completed_responses_payload_with_output(
+    model_name: &str,
+    response_id: &str,
+    created_at: u64,
+    output: Vec<Value>,
+) -> Value {
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model_name,
+        "output": output,
+    })
+}
+
 fn store_response_snapshot(
     state: &NativeApiServerState,
     response_body: &Value,
     conversation_history: &[Value],
+    instructions: Option<&str>,
+    conversation: Option<&str>,
+    session_id: Option<&str>,
 ) {
     let Some(response_id) = response_body.get("id").and_then(Value::as_str) else {
         return;
@@ -1224,13 +2098,92 @@ fn store_response_snapshot(
         StoredResponse {
             response: response_body.clone(),
             conversation_history: conversation_history.to_vec(),
+            instructions: instructions
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            session_id: session_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
         },
     );
+    if let Some(conversation) = conversation
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        store
+            .conversations
+            .insert(conversation.to_string(), response_id.to_string());
+    }
     while store.order.len() > MAX_STORED_RESPONSES {
         if let Some(oldest) = store.order.pop_front() {
-            store.responses.remove(&oldest);
+            remove_stored_response(&mut store, &oldest);
         }
     }
+}
+
+fn remove_stored_response(store: &mut ResponseStore, response_id: &str) -> bool {
+    store.order.retain(|id| id != response_id);
+    let removed = store.responses.remove(response_id).is_some();
+    if removed {
+        store
+            .conversations
+            .retain(|_, current| current != response_id);
+    }
+    removed
+}
+
+fn load_stored_response(
+    state: &NativeApiServerState,
+    response_id: &str,
+) -> Result<Option<StoredResponse>, ResponsesMessagesError> {
+    let normalized_response_id = response_id.trim();
+    if normalized_response_id.is_empty() {
+        return Ok(None);
+    }
+    let stored = state
+        .response_store
+        .lock()
+        .ok()
+        .and_then(|store| store.responses.get(normalized_response_id).cloned());
+    match stored {
+        Some(entry) => Ok(Some(entry)),
+        None => Err(ResponsesMessagesError::NotFound(
+            normalized_response_id.to_string(),
+        )),
+    }
+}
+
+fn normalize_message_history(history: &[Value]) -> Result<Vec<Value>, ResponsesMessagesError> {
+    let mut normalized = Vec::with_capacity(history.len());
+    for (index, entry) in history.iter().enumerate() {
+        let Some(object) = entry.as_object() else {
+            return Err(ResponsesMessagesError::BadRequest(format!(
+                "conversation_history[{index}] must be an object"
+            )));
+        };
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ResponsesMessagesError::BadRequest(format!(
+                    "conversation_history[{index}] must include a non-empty role"
+                ))
+            })?;
+        if !object.contains_key("content") {
+            return Err(ResponsesMessagesError::BadRequest(format!(
+                "conversation_history[{index}] must include content"
+            )));
+        }
+        normalized.push(json!({
+            "role": role,
+            "content": object.get("content").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(normalized)
 }
 
 fn initialize_run(
@@ -1324,18 +2277,26 @@ fn append_progress_run_event(
                 "delta": delta,
             }),
         ),
-        AgentProgressEvent::ToolStarted { tool_name, preview } => (
+        AgentProgressEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => (
             "tool.started",
             json!({
                 "event": "tool.started",
                 "run_id": run_id,
                 "timestamp": unix_ts_secs(),
+                "tool_call_id": tool_call_id,
                 "tool": tool_name,
-                "preview": preview,
+                "preview": arguments,
             }),
         ),
         AgentProgressEvent::ToolCompleted {
+            tool_call_id,
             tool_name,
+            arguments: _,
+            result: _,
             duration_secs,
             is_error,
         } => (
@@ -1344,6 +2305,7 @@ fn append_progress_run_event(
                 "event": "tool.completed",
                 "run_id": run_id,
                 "timestamp": unix_ts_secs(),
+                "tool_call_id": tool_call_id,
                 "tool": tool_name,
                 "duration": (duration_secs * 1000.0).round() / 1000.0,
                 "error": is_error,
@@ -1959,6 +2921,277 @@ mod tests {
     }
 
     #[test]
+    fn native_api_server_chat_completions_can_resume_explicit_session() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "First turn."
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Second turn."
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |requests| {
+                assert_eq!(requests.len(), 2);
+                let second_body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+                let payload: Value = serde_json::from_str(second_body).unwrap();
+                let messages = payload["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("hello")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("assistant")
+                        && message["content"] == json!("First turn.")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("continue")
+                }));
+            },
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n      key: native-key\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: "native-key".to_string(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let first = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer native-key")
+            .header("X-Hermes-Session-Id", "sess-native-1")
+            .json(&json!({
+                "messages": [
+                    { "role": "system", "content": "Be concise." },
+                    { "role": "user", "content": "hello" }
+                ]
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(
+            first.headers().get("X-Hermes-Session-Id").unwrap(),
+            "sess-native-1"
+        );
+        let first_body: Value = first.json().unwrap();
+        assert_eq!(
+            first_body["choices"][0]["message"]["content"],
+            json!("First turn.")
+        );
+
+        let second = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer native-key")
+            .header("X-Hermes-Session-Id", "sess-native-1")
+            .json(&json!({
+                "messages": [
+                    { "role": "user", "content": "continue" }
+                ]
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(
+            second.headers().get("X-Hermes-Session-Id").unwrap(),
+            "sess-native-1"
+        );
+        let second_body: Value = second.json().unwrap();
+        assert_eq!(
+            second_body["choices"][0]["message"]["content"],
+            json!("Second turn.")
+        );
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_chat_completions_derive_stable_session_id() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "First derived turn."
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Second derived turn."
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |requests| {
+                assert_eq!(requests.len(), 2);
+                let second_body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+                let payload: Value = serde_json::from_str(second_body).unwrap();
+                let messages = payload["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("hello")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("assistant")
+                        && message["content"] == json!("First derived turn.")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("continue")
+                }));
+            },
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let first = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "messages": [
+                    { "role": "system", "content": "Be concise." },
+                    { "role": "user", "content": "hello" }
+                ]
+            }))
+            .send()
+            .unwrap();
+        let first_session = first
+            .headers()
+            .get("X-Hermes-Session-Id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(first_session.starts_with("api-"));
+        let first_body: Value = first.json().unwrap();
+        assert_eq!(
+            first_body["choices"][0]["message"]["content"],
+            json!("First derived turn.")
+        );
+
+        let second = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "messages": [
+                    { "role": "system", "content": "Be concise." },
+                    { "role": "user", "content": "hello" },
+                    { "role": "assistant", "content": "First derived turn." },
+                    { "role": "user", "content": "continue" }
+                ]
+            }))
+            .send()
+            .unwrap();
+        let second_session = second
+            .headers()
+            .get("X-Hermes-Session-Id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(second_session, first_session);
+        let second_body: Value = second.json().unwrap();
+        assert_eq!(
+            second_body["choices"][0]["message"]["content"],
+            json!("Second derived turn.")
+        );
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn native_api_server_chat_completions_streams_sse_output() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let response_body = json!({
@@ -2128,6 +3361,101 @@ mod tests {
     }
 
     #[test]
+    fn native_api_server_responses_stream_tool_events() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_todo_stream",
+                                "type": "function",
+                                "function": {
+                                    "name": "todo",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "tool stream hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |_| {},
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let response = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "say hi",
+                "stream": true,
+            }))
+            .send()
+            .unwrap();
+        let body = response.text().unwrap();
+        assert!(body.contains("\"type\":\"function_call\""));
+        assert!(body.contains("\"call_id\":\"call_todo_stream\""));
+        assert!(body.contains("\"type\":\"function_call_output\""));
+        assert!(body.contains("event: response.output_item.done"));
+        assert!(body.contains("\"text\":\"tool stream hello\""));
+        assert!(body.contains("event: response.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn native_api_server_capabilities_and_response_lookup_work() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let response_body = json!({
@@ -2193,12 +3521,29 @@ mod tests {
         assert_eq!(capabilities["auth"]["type"], json!("bearer"));
         assert_eq!(capabilities["auth"]["required"], json!(false));
         assert_eq!(capabilities["features"]["stored_responses"], json!(true));
+        assert_eq!(
+            capabilities["features"]["responses_conversation_aliases"],
+            json!(true)
+        );
+        assert_eq!(
+            capabilities["features"]["responses_conversation_history"],
+            json!(true)
+        );
+        assert_eq!(
+            capabilities["features"]["responses_instructions"],
+            json!(true)
+        );
         assert_eq!(capabilities["features"]["runs_api"], json!(true));
         assert_eq!(capabilities["features"]["run_submission"], json!(true));
         assert_eq!(capabilities["features"]["run_status"], json!(true));
         assert_eq!(capabilities["features"]["run_events"], json!(true));
         assert_eq!(capabilities["features"]["run_events_sse"], json!(true));
         assert_eq!(capabilities["features"]["run_stop"], json!(true));
+        assert_eq!(
+            capabilities["features"]["runs_conversation_history"],
+            json!(true)
+        );
+        assert_eq!(capabilities["features"]["runs_instructions"], json!(true));
         assert_eq!(
             capabilities["features"]["tool_progress_events"],
             json!(true)
@@ -2346,6 +3691,123 @@ mod tests {
         }
         assert_eq!(status["status"], json!("completed"));
         assert_eq!(status["output"], json!("run hello"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_runs_accept_conversation_history_and_instructions() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "id": "chatcmpl-run-history",
+                    "choices": [{
+                        "message": {
+                            "content": "history hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |requests| {
+                assert_eq!(requests.len(), 1);
+                let body = requests[0].split("\r\n\r\n").nth(1).unwrap_or_default();
+                let payload: Value = serde_json::from_str(body).unwrap();
+                let messages = payload["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("system")
+                        && message["content"] == json!("Follow policy.")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("earlier user")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("assistant")
+                        && message["content"] == json!("earlier assistant")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("current")
+                }));
+            },
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "current",
+                "instructions": "Follow policy.",
+                "conversation_history": [
+                    { "role": "user", "content": "earlier user" },
+                    { "role": "assistant", "content": "earlier assistant" }
+                ],
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(started["status"], json!("started"));
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+
+        let mut status = Value::Null;
+        for _ in 0..40 {
+            status = client
+                .get(format!("http://{addr}/v1/runs/{run_id}"))
+                .send()
+                .unwrap()
+                .json()
+                .unwrap();
+            if status["status"] == json!("completed") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(status["status"], json!("completed"));
+        assert_eq!(status["output"], json!("history hello"));
 
         let _ = shutdown_tx.send(());
         server_thread.join().unwrap();
@@ -2768,6 +4230,129 @@ mod tests {
             .json(&json!({
                 "input": "second",
                 "previous_response_id": previous_response_id,
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(
+            second_response["output"][0]["content"][0]["text"],
+            json!("second reply")
+        );
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_responses_support_conversation_alias_and_instruction_carryover() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "id": "chatcmpl-conversation-first",
+                    "choices": [{
+                        "message": {
+                            "content": "first reply"
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "id": "chatcmpl-conversation-second",
+                    "choices": [{
+                        "message": {
+                            "content": "second reply"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |requests| {
+                assert_eq!(requests.len(), 2);
+                let second_body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+                let payload: Value = serde_json::from_str(second_body).unwrap();
+                let messages = payload["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("system") && message["content"] == json!("Be terse.")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("first")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("assistant")
+                        && message["content"] == json!("first reply")
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user") && message["content"] == json!("second")
+                }));
+            },
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let first_response: Value = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "first",
+                "conversation": "demo",
+                "instructions": "Be terse.",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(
+            first_response["output"][0]["content"][0]["text"],
+            json!("first reply")
+        );
+
+        let second_response: Value = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "second",
+                "conversation": "demo",
             }))
             .send()
             .unwrap()

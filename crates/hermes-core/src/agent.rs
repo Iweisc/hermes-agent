@@ -73,11 +73,15 @@ pub enum AgentProgressEvent {
         delta: String,
     },
     ToolStarted {
+        tool_call_id: String,
         tool_name: String,
-        preview: String,
+        arguments: String,
     },
     ToolCompleted {
+        tool_call_id: String,
         tool_name: String,
+        arguments: String,
+        result: String,
         duration_secs: f64,
         is_error: bool,
     },
@@ -553,8 +557,9 @@ impl HermesContext {
                 emit_progress_event(
                     progress_callback,
                     AgentProgressEvent::ToolStarted {
+                        tool_call_id: tool_call.id.clone(),
                         tool_name: tool_call.name.clone(),
-                        preview: tool_call.arguments_raw.clone(),
+                        arguments: tool_call.arguments_raw.clone(),
                     },
                 );
                 let started_at = Instant::now();
@@ -564,7 +569,10 @@ impl HermesContext {
                 emit_progress_event(
                     progress_callback,
                     AgentProgressEvent::ToolCompleted {
+                        tool_call_id: tool_call.id.clone(),
                         tool_name: tool_call.name.clone(),
+                        arguments: tool_call.arguments_raw.clone(),
+                        result: result.clone(),
                         duration_secs,
                         is_error,
                     },
