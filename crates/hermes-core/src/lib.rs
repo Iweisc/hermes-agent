@@ -28,6 +28,7 @@ mod kanban;
 pub mod logging;
 mod memory;
 mod moa;
+mod plugin_runtime;
 pub mod providers;
 mod rl;
 mod send_message;
@@ -80,6 +81,16 @@ pub use logging::{
     LoggingMode, LoggingSetup, clear_session_context, enable_verbose_logging, set_session_context,
 };
 pub use memory::build_memory_context_block;
+pub use plugin_runtime::{
+    DashboardSurface, DiscoveredPlugin, PlatformSurface, PluginCliCommand, PluginCliDispatchResult,
+    PluginKind, PluginSource, attach_python_plugin_callbacks, attach_python_plugin_runtime,
+    discover_dashboard_surfaces, discover_enabled_plugin_cli_commands,
+    discover_enabled_plugin_platforms, discover_hook_registrations_from_source,
+    discover_memory_provider_plugins, discover_platform_surfaces_from_source,
+    discover_plugin_cli_commands_from_source, discover_scanned_plugins,
+    discover_tool_definitions_from_source, dispatch_python_plugin_cli_command,
+    run_python_plugin_platform_setup,
+};
 pub use providers::{
     ProviderProfile, auto_provider_candidates, get_provider_profile, infer_api_mode_from_base_url,
     infer_provider_from_base_url, list_provider_profiles, normalize_model_for_provider,
@@ -94,8 +105,9 @@ pub use state::{
 pub use tools::{
     ClarifyRequest, StepToolRecord, StepUpdate, ToolDefinition, ToolProgressUpdate, ToolRuntime,
     ToolsetInfo, coerce_tool_args, dispatch_tool, get_all_tool_names, get_all_toolsets,
-    get_tool_definitions, get_tool_definitions_for_runtime, get_toolset_for_tool, get_toolset_info,
-    get_toolset_names, resolve_toolset, tool_error, tool_result, validate_toolset,
+    get_tool_definitions, get_tool_definitions_for_runtime, get_tool_definitions_with_runtime,
+    get_toolset_for_tool, get_toolset_info, get_toolset_names, resolve_toolset, tool_error,
+    tool_result, validate_toolset,
 };
 
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";

@@ -7178,7 +7178,9 @@ for raw in sys.stdin:
         );
         let runtime = ToolRuntime::new(temp.path())
             .with_hermes_home(temp.path())
-            .with_delegate_callback(move |request| delegate.execute(request));
+            .with_delegate_callback(move |request, parent_runtime| {
+                delegate.execute(request, parent_runtime)
+            });
         let result = context
             .run_chat_completions_turn(
                 &loaded,

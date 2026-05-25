@@ -189,7 +189,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 gateway_events.then(|| Arc::new(Mutex::new(GatewayEventBridge::default())));
             let mut runtime = ToolRuntime::default()
                 .with_hermes_home(context.hermes_home())
-                .with_delegate_callback(move |request| delegate.execute(request));
+                .with_delegate_callback(move |request, parent_runtime| {
+                    delegate.execute(request, parent_runtime)
+                });
             if let Some(emitter) = event_emitter.clone() {
                 if let Some(bridge) = gateway_bridge.clone() {
                     emitter.emit(&bridge.lock().unwrap().gateway_ready());

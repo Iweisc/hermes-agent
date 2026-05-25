@@ -21,6 +21,7 @@ mod mcp_server;
 mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
+mod plugin_runtime;
 mod plugins_cmd;
 mod profile_cmd;
 mod python_bridge;
@@ -1054,7 +1055,9 @@ fn build_chat_runtime(
         .with_hermes_home(context.hermes_home())
         .with_available_tool_names(tool_names)
         .with_clarify_callback(run_clarify_prompt)
-        .with_delegate_callback(move |request| delegate.execute(request));
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
 
     let mut missing_skills = Vec::new();
     for skill in unique_cli_strings(skills) {

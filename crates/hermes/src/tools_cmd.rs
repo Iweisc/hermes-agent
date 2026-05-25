@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use hermes_core::{
     DelegateExecutor, HermesContext, LoadedConfig, ModelOverrides, ToolRuntime, dispatch_tool,
-    get_tool_definitions, resolve_toolset, validate_toolset,
+    get_tool_definitions, get_tool_definitions_with_runtime, resolve_toolset, validate_toolset,
 };
 use serde_yaml::{Mapping, Value};
 
 use crate::auth_cmd;
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_cmd;
+use crate::plugin_runtime;
 use crate::setup_cmd;
 use crate::{disabled_memory_toolsets, run_clarify_prompt};
 
@@ -393,11 +394,22 @@ fn run_tool(
     if !parsed_args.is_object() {
         return Err("tools run --args must be a JSON object".into());
     }
+    let base_runtime = match cwd.clone() {
+        Some(path) => ToolRuntime::new(path),
+        None => ToolRuntime::default(),
+    }
+    .with_hermes_home(context.hermes_home())
+    .with_clarify_callback(run_clarify_prompt);
+    let runtime = plugin_runtime::attach_python_plugin_runtime(context, base_runtime)?;
     let disabled = disabled_memory_toolsets(&config.config.memory);
-    let tool_names = get_tool_definitions(Some(&config.config.toolsets), disabled.as_deref())
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect::<Vec<_>>();
+    let tool_names = get_tool_definitions_with_runtime(
+        Some(&config.config.toolsets),
+        disabled.as_deref(),
+        Some(&runtime),
+    )
+    .into_iter()
+    .map(|tool| tool.name)
+    .collect::<Vec<_>>();
     let delegate = DelegateExecutor::new(
         context.clone(),
         config.clone(),
@@ -406,15 +418,13 @@ fn run_tool(
         ModelOverrides::default(),
         cwd.clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-    );
-    let runtime = match cwd {
-        Some(path) => ToolRuntime::new(path),
-        None => ToolRuntime::default(),
-    }
-    .with_hermes_home(context.hermes_home())
-    .with_available_tool_names(tool_names)
-    .with_clarify_callback(run_clarify_prompt)
-    .with_delegate_callback(move |request| delegate.execute(request));
+    )
+    .with_runtime_template(runtime.clone());
+    let runtime = runtime
+        .with_available_tool_names(tool_names)
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
     let mut runtime = runtime;
     let _ = runtime.load_memory_store(&config.config.memory);
     println!("{}", dispatch_tool(trimmed_name, parsed_args, &runtime));

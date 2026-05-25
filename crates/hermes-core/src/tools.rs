@@ -97,11 +97,13 @@ type ToolHandler = fn(&Value, &ToolRuntime) -> String;
 type ToolCheck = fn() -> bool;
 type ClarifyFn = dyn Fn(&str, Option<&[String]>) -> Result<String, String> + Send + Sync;
 type ClarifyRequestFn = dyn Fn(&ClarifyRequest) + Send + Sync;
-type DelegateFn = dyn Fn(DelegateTaskRequest) -> Result<Value, String> + Send + Sync;
+type DelegateFn = dyn Fn(DelegateTaskRequest, &ToolRuntime) -> Result<Value, String> + Send + Sync;
 type ApprovalFn = dyn Fn(&crate::ApprovalRequest) -> Result<String, String> + Send + Sync;
 type ApprovalRequestFn = dyn Fn(&crate::ApprovalRequest) + Send + Sync;
 type ToolProgressFn = dyn Fn(&ToolProgressUpdate) + Send + Sync;
 type StepFn = dyn Fn(&StepUpdate) + Send + Sync;
+type DynamicToolDispatchFn = dyn Fn(&str, &Value, &ToolRuntime) -> Option<String> + Send + Sync;
+type HookInvokeFn = dyn Fn(&str, &Value, &ToolRuntime) -> Vec<Value> + Send + Sync;
 
 #[derive(Clone)]
 struct ClarifyCallback(Arc<ClarifyFn>);
@@ -136,6 +138,15 @@ struct ApprovalCallback(Arc<ApprovalFn>);
 impl std::fmt::Debug for ApprovalCallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ApprovalCallback(..)")
+    }
+}
+
+#[derive(Clone)]
+struct DynamicToolDispatchCallback(Arc<DynamicToolDispatchFn>);
+
+impl std::fmt::Debug for DynamicToolDispatchCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DynamicToolDispatchCallback(..)")
     }
 }
 
@@ -204,6 +215,14 @@ pub struct ClarifyRequest {
     pub choices: Option<Vec<String>>,
 }
 
+#[derive(Clone)]
+struct HookInvokeCallback(Arc<HookInvokeFn>);
+
+impl std::fmt::Debug for HookInvokeCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HookInvokeCallback(..)")
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -397,6 +416,8 @@ pub struct ToolRuntime {
     external_memory_provider: Option<Arc<Mutex<ExternalMemoryProviderRuntime>>>,
     available_tool_names: Option<BTreeSet<String>>,
     system_prompt_additions: Vec<String>,
+    dynamic_tool_definitions: Arc<BTreeMap<String, ToolDefinition>>,
+    dynamic_toolsets: Arc<BTreeMap<String, Vec<String>>>,
     clarify_callback: Option<ClarifyCallback>,
     clarify_request_callback: Option<ClarifyRequestCallback>,
     delegate_callback: Option<DelegateCallback>,
@@ -410,6 +431,8 @@ pub struct ToolRuntime {
     shell_hooks: Option<Arc<crate::shell_hooks::ShellHookRunner>>,
     tool_progress_callback: Option<ToolProgressCallback>,
     step_callback: Option<StepCallback>,
+    dynamic_tool_dispatch: Option<DynamicToolDispatchCallback>,
+    hook_invoke_callback: Option<HookInvokeCallback>,
 }
 
 impl ToolRuntime {
@@ -423,6 +446,8 @@ impl ToolRuntime {
             external_memory_provider: None,
             available_tool_names: None,
             system_prompt_additions: Vec::new(),
+            dynamic_tool_definitions: Arc::new(BTreeMap::new()),
+            dynamic_toolsets: Arc::new(BTreeMap::new()),
             clarify_callback: None,
             clarify_request_callback: None,
             delegate_callback: None,
@@ -436,6 +461,8 @@ impl ToolRuntime {
             shell_hooks: None,
             tool_progress_callback: None,
             step_callback: None,
+            dynamic_tool_dispatch: None,
+            hook_invoke_callback: None,
         }
     }
 
@@ -690,7 +717,7 @@ impl ToolRuntime {
 
     pub fn with_delegate_callback<F>(mut self, callback: F) -> Self
     where
-        F: Fn(DelegateTaskRequest) -> Result<Value, String> + Send + Sync + 'static,
+        F: Fn(DelegateTaskRequest, &ToolRuntime) -> Result<Value, String> + Send + Sync + 'static,
     {
         self.delegate_callback = Some(DelegateCallback(Arc::new(callback)));
         self
@@ -932,7 +959,7 @@ impl ToolRuntime {
         let Some(callback) = &self.delegate_callback else {
             return Err("delegate_task requires a parent agent context.".to_string());
         };
-        (callback.0)(request)
+        (callback.0)(request, self)
     }
 
     pub fn with_available_tool_names<I, S>(mut self, values: I) -> Self
@@ -1050,6 +1077,55 @@ impl ToolRuntime {
         }
     }
 
+    pub fn with_dynamic_tools(
+        mut self,
+        definitions: Vec<ToolDefinition>,
+        toolsets: BTreeMap<String, Vec<String>>,
+    ) -> Self {
+        self.dynamic_tool_definitions = Arc::new(
+            definitions
+                .into_iter()
+                .map(|definition| (definition.name.clone(), definition))
+                .collect(),
+        );
+        self.dynamic_toolsets = Arc::new(
+            toolsets
+                .into_iter()
+                .map(|(name, tools)| {
+                    let normalized = tools
+                        .into_iter()
+                        .map(|tool| tool.trim().to_string())
+                        .filter(|tool| !tool.is_empty())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    (name, normalized)
+                })
+                .collect(),
+        );
+        self
+    }
+
+    pub fn dynamic_tool_definition(&self, name: &str) -> Option<ToolDefinition> {
+        self.dynamic_tool_definitions.get(name).cloned()
+    }
+
+    pub fn dynamic_toolset_names(&self) -> Vec<String> {
+        self.dynamic_toolsets.keys().cloned().collect()
+    }
+
+    pub fn resolve_dynamic_toolset(&self, name: &str) -> Vec<String> {
+        self.dynamic_toolsets.get(name).cloned().unwrap_or_default()
+    }
+
+    pub fn with_dynamic_runtime_from(mut self, other: &Self) -> Self {
+        self.dynamic_tool_definitions = Arc::clone(&other.dynamic_tool_definitions);
+        self.dynamic_toolsets = Arc::clone(&other.dynamic_toolsets);
+        self.dynamic_tool_dispatch = other.dynamic_tool_dispatch.clone();
+        self.hook_invoke_callback = other.hook_invoke_callback.clone();
+        self
+    }
+
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1071,6 +1147,35 @@ impl ToolRuntime {
         } else {
             Ok(self.cwd.join(path))
         }
+    }
+
+    pub fn with_dynamic_tool_dispatch<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &Value, &ToolRuntime) -> Option<String> + Send + Sync + 'static,
+    {
+        self.dynamic_tool_dispatch = Some(DynamicToolDispatchCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn dispatch_dynamic_tool(&self, name: &str, args: &Value) -> Option<String> {
+        self.dynamic_tool_dispatch
+            .as_ref()
+            .and_then(|callback| (callback.0)(name, args, self))
+    }
+
+    pub fn with_hook_invoke_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, &Value, &ToolRuntime) -> Vec<Value> + Send + Sync + 'static,
+    {
+        self.hook_invoke_callback = Some(HookInvokeCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn invoke_hook(&self, hook_name: &str, payload: &Value) -> Vec<Value> {
+        self.hook_invoke_callback
+            .as_ref()
+            .map(|callback| (callback.0)(hook_name, payload, self))
+            .unwrap_or_default()
     }
 }
 
@@ -2620,6 +2725,14 @@ pub fn get_tool_definitions(
     enabled_toolsets: Option<&[String]>,
     disabled_toolsets: Option<&[String]>,
 ) -> Vec<ToolDefinition> {
+    get_tool_definitions_with_runtime(enabled_toolsets, disabled_toolsets, None)
+}
+
+pub fn get_tool_definitions_with_runtime(
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+    runtime: Option<&ToolRuntime>,
+) -> Vec<ToolDefinition> {
     let mut selected = BTreeSet::new();
 
     if let Some(enabled) = enabled_toolsets {
@@ -2627,11 +2740,23 @@ pub fn get_tool_definitions(
             for tool in resolve_toolset(name) {
                 selected.insert(tool);
             }
+            if let Some(runtime) = runtime {
+                for tool in runtime.resolve_dynamic_toolset(name) {
+                    selected.insert(tool);
+                }
+            }
         }
     } else {
         for name in get_toolset_names() {
             for tool in resolve_toolset(&name) {
                 selected.insert(tool);
+            }
+        }
+        if let Some(runtime) = runtime {
+            for toolset in runtime.dynamic_toolset_names() {
+                for tool in runtime.resolve_dynamic_toolset(&toolset) {
+                    selected.insert(tool);
+                }
             }
         }
     }
@@ -2641,14 +2766,22 @@ pub fn get_tool_definitions(
             for tool in resolve_toolset(name) {
                 selected.remove(&tool);
             }
+            if let Some(runtime) = runtime {
+                for tool in runtime.resolve_dynamic_toolset(name) {
+                    selected.remove(&tool);
+                }
+            }
         }
     }
 
     selected
         .into_iter()
-        .filter_map(|name| tool_entry(&name))
-        .filter(|entry| tool_is_available(entry))
-        .map(build_tool_definition)
+        .filter_map(|name| {
+            if let Some(entry) = tool_entry(&name) {
+                return tool_is_available(entry).then(|| build_tool_definition(entry));
+            }
+            runtime.and_then(|runtime| runtime.dynamic_tool_definition(&name))
+        })
         .collect()
 }
 
@@ -2856,9 +2989,11 @@ pub(crate) fn dispatch_tool_with_messages(
 ) -> String {
     let static_entry = tool_entry(name);
     let context_schema = runtime.context_tool_schema(name);
+    let dynamic_schema = runtime.dynamic_tool_definition(name).map(|definition| definition.schema);
     let Some(schema) = static_entry
         .map(|entry| (entry.schema_fn)())
         .or(context_schema)
+        .or(dynamic_schema)
     else {
         if runtime.external_memory_has_tool(name) {
             return runtime
@@ -2873,6 +3008,27 @@ pub(crate) fn dispatch_tool_with_messages(
         return tool_error(format!("tool unavailable: {name}"));
     }
     let coerced = coerce_tool_args_against_schema(args, &schema);
+    let pre_hook_payload = json!({
+        "tool_name": name,
+        "args": coerced.clone(),
+        "task_id": runtime.current_session_id().unwrap_or_default(),
+        "session_id": runtime.current_session_id().unwrap_or_default(),
+        "tool_call_id": "",
+    });
+    for hook_result in runtime.invoke_hook("pre_tool_call", &pre_hook_payload) {
+        let Some(object) = hook_result.as_object() else {
+            continue;
+        };
+        if object.get("action").and_then(Value::as_str) != Some("block") {
+            continue;
+        }
+        let Some(message) = object.get("message").and_then(Value::as_str) else {
+            continue;
+        };
+        if !message.trim().is_empty() {
+            return tool_error(message);
+        }
+    }
     if let Some(shell_hooks) = runtime.shell_hooks.as_ref()
         && let Some(message) =
             shell_hooks.pre_tool_call(name, &coerced, runtime.current_session_id(), runtime.cwd())
@@ -2890,15 +3046,16 @@ pub(crate) fn dispatch_tool_with_messages(
     });
 
     let started = std::time::Instant::now();
-    let result = if let Some(entry) = static_entry {
+    let mut result = if let Some(entry) = static_entry {
         (entry.handler)(&coerced, runtime)
     } else if let Some(result) = runtime.dispatch_context_tool(name, &coerced, messages) {
+        result
+    } else if let Some(result) = runtime.dispatch_dynamic_tool(name, &coerced) {
         result
     } else {
         tool_error(format!("unknown tool: {name}"))
     };
     let duration_ms = started.elapsed().as_millis() as u64;
-    let is_error = tool_result_is_error(&result);
     if let Some(shell_hooks) = runtime.shell_hooks.as_ref() {
         shell_hooks.post_tool_call(
             name,
@@ -2909,13 +3066,29 @@ pub(crate) fn dispatch_tool_with_messages(
             duration_ms,
         );
     }
+    let post_hook_payload = json!({
+        "tool_name": name,
+        "args": coerced,
+        "result": result.clone(),
+        "task_id": runtime.current_session_id().unwrap_or_default(),
+        "session_id": runtime.current_session_id().unwrap_or_default(),
+        "tool_call_id": "",
+        "duration_ms": duration_ms,
+    });
+    let _ = runtime.invoke_hook("post_tool_call", &post_hook_payload);
+    for hook_result in runtime.invoke_hook("transform_tool_result", &post_hook_payload) {
+        if let Some(text) = hook_result.as_str() {
+            result = text.to_string();
+            break;
+        }
+    }
     runtime.emit_tool_progress(ToolProgressUpdate {
         event_type: "tool.completed".to_string(),
         function_name: Some(name.to_string()),
         preview: None,
         function_args: None,
         duration_ms: Some(duration_ms),
-        is_error: Some(is_error),
+        is_error: Some(tool_result_is_error(&result)),
     });
     result
 }
@@ -5005,6 +5178,54 @@ mod tests {
         assert_eq!(coerced["offset"], json!(12));
         assert_eq!(coerced["limit"], json!(4));
         assert_eq!(coerced["context"], json!(2));
+    }
+
+    #[test]
+    fn dynamic_runtime_can_be_inherited() {
+        let parent = ToolRuntime::default()
+            .with_dynamic_tools(
+                vec![ToolDefinition {
+                    name: "demo_tool".to_string(),
+                    toolset: "demo".to_string(),
+                    description: "Demo".to_string(),
+                    emoji: "plug".to_string(),
+                    schema: json!({
+                        "name": "demo_tool",
+                        "description": "Demo",
+                        "parameters": {"type": "object", "properties": {}},
+                    }),
+                }],
+                BTreeMap::from([(String::from("demo"), vec![String::from("demo_tool")])]),
+            )
+            .with_dynamic_tool_dispatch(|name, args, _runtime| {
+                (name == "demo_tool").then(|| {
+                    json!({
+                        "success": true,
+                        "echo": args.get("message").cloned().unwrap_or(Value::Null),
+                    })
+                    .to_string()
+                })
+            })
+            .with_hook_invoke_callback(|hook_name, _payload, _runtime| {
+                if hook_name == "pre_llm_call" {
+                    vec![json!({"context": "from parent"})]
+                } else {
+                    Vec::new()
+                }
+            });
+        let child = ToolRuntime::new(".").with_dynamic_runtime_from(&parent);
+
+        assert_eq!(
+            child.resolve_dynamic_toolset("demo"),
+            vec![String::from("demo_tool")]
+        );
+        let result = child
+            .dispatch_dynamic_tool("demo_tool", &json!({"message": "hello"}))
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("echo"), Some(&json!("hello")));
+        let hook_results = child.invoke_hook("pre_llm_call", &json!({}));
+        assert_eq!(hook_results, vec![json!({"context": "from parent"})]);
     }
 
     #[test]
