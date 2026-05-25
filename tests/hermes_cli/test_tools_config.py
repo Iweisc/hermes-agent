@@ -4,10 +4,14 @@ from unittest.mock import patch
 
 import pytest
 
+from gateway.platform_registry import PlatformEntry, platform_registry
+from tools.registry import ToolRegistry
+
 from hermes_cli.tools_config import (
     _DEFAULT_OFF_TOOLSETS,
     _apply_toolset_change,
     _configure_provider,
+    _get_enabled_platforms,
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
@@ -532,7 +536,7 @@ def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
     # set by the first as "explicit" and skips them.
     monkeypatch.setattr(
         "hermes_cli.tools_config._get_enabled_platforms",
-        lambda: ["cli"],
+        lambda config=None: ["cli"],
     )
     monkeypatch.setattr(
         "hermes_cli.nous_subscription.get_nous_auth_status",
@@ -802,6 +806,62 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
     assert "_test_platform_tool" in enabled
     assert "web" in enabled
     assert "terminal" in enabled
+
+
+def test_get_platform_tools_recovers_dynamic_registry_toolset_from_plugin_platform(monkeypatch):
+    reg = ToolRegistry()
+    reg.register(
+        name="irc_whois",
+        toolset="irc",
+        schema={
+            "name": "irc_whois",
+            "description": "IRC whois",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda *_a, **_k: "{}",
+    )
+    monkeypatch.setattr("tools.registry.registry", reg)
+
+    entry = PlatformEntry(
+        name="irc",
+        label="IRC",
+        adapter_factory=lambda cfg: object(),
+        check_fn=lambda: True,
+        source="plugin",
+    )
+    platform_registry.register(entry)
+    try:
+        enabled = _get_platform_tools({}, "irc")
+    finally:
+        platform_registry.unregister("irc")
+
+    assert "irc" in enabled
+    assert "web" in enabled
+    assert "terminal" in enabled
+
+
+def test_get_enabled_platforms_includes_registered_plugin_platform(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("WHATSAPP_ENABLED", raising=False)
+    monkeypatch.delenv("QQ_APP_ID", raising=False)
+
+    entry = PlatformEntry(
+        name="irc",
+        label="IRC",
+        adapter_factory=lambda cfg: object(),
+        check_fn=lambda: True,
+        source="plugin",
+    )
+    platform_registry.register(entry)
+    try:
+        enabled = _get_enabled_platforms({})
+    finally:
+        platform_registry.unregister("irc")
+
+    assert enabled[0] == "cli"
+    assert "irc" in enabled
 
 
 def test_get_platform_tools_second_pass_skips_fully_claimed_toolsets():

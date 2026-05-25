@@ -30,7 +30,6 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -115,14 +114,23 @@ def _get_subagent_approval_callback():
 # delegation is role='orchestrator', which re-adds "delegation" in
 # _build_child_agent regardless of this exclusion.
 _EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
-_SUBAGENT_TOOLSETS = sorted(
-    name
-    for name, defn in TOOLSETS.items()
-    if name not in _EXCLUDED_TOOLSET_NAMES
-    and not name.startswith("hermes-")
-    and not all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
-)
-_TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
+
+
+def _get_subagent_toolset_names() -> List[str]:
+    """Return live toolset names suitable for subagent requests."""
+    from toolsets import get_all_toolsets
+
+    return sorted(
+        name
+        for name, defn in get_all_toolsets().items()
+        if name not in _EXCLUDED_TOOLSET_NAMES
+        and not name.startswith("hermes-")
+        and not all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
+    )
+
+
+def _get_toolset_list_str() -> str:
+    return ", ".join(f"'{name}'" for name in _get_subagent_toolset_names())
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
@@ -527,6 +535,7 @@ _LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
 
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
+    _refresh_delegate_task_schema()
     return True
 
 
@@ -2453,14 +2462,7 @@ DELEGATE_TASK_SCHEMA = {
             "toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": (
-                    "Toolsets to enable for this subagent. "
-                    "Default: inherits your enabled toolsets. "
-                    f"Available toolsets: {_TOOLSET_LIST_STR}. "
-                    "Common patterns: ['terminal', 'file'] for code work, "
-                    "['web'] for research, ['browser'] for web interaction, "
-                    "['terminal', 'file', 'web'] for full-stack tasks."
-                ),
+                "description": "",
             },
             "tasks": {
                 "type": "array",
@@ -2475,7 +2477,7 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                            "description": "",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2537,6 +2539,28 @@ DELEGATE_TASK_SCHEMA = {
         "required": [],
     },
 }
+
+
+def _refresh_delegate_task_schema() -> None:
+    """Refresh toolset descriptions so dynamic toolsets stay visible."""
+    toolset_list = _get_toolset_list_str()
+    props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    props["toolsets"]["description"] = (
+        "Toolsets to enable for this subagent. "
+        "Default: inherits your enabled toolsets. "
+        f"Available toolsets: {toolset_list}. "
+        "Common patterns: ['terminal', 'file'] for code work, "
+        "['web'] for research, ['browser'] for web interaction, "
+        "['terminal', 'file', 'web'] for full-stack tasks."
+    )
+    props["tasks"]["items"]["properties"]["toolsets"]["description"] = (
+        "Toolsets for this specific task. "
+        f"Available: {toolset_list}. "
+        "Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction."
+    )
+
+
+_refresh_delegate_task_schema()
 
 
 # --- Registry ---

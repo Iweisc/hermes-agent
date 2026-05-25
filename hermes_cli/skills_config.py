@@ -22,6 +22,21 @@ from hermes_cli.platforms import PLATFORMS as _PLATFORMS
 # working without changes to every call site.
 PLATFORMS = {k: info.label for k, info in _PLATFORMS.items() if k != "api_server"}
 
+
+def _get_platforms() -> dict[str, str]:
+    """Return built-in platform labels plus any live plugin platforms."""
+    platforms = dict(PLATFORMS)
+    try:
+        from hermes_cli.platforms import get_all_platforms
+
+        for key, info in get_all_platforms().items():
+            if key == "api_server" or key in platforms:
+                continue
+            platforms[key] = info.label
+    except Exception:
+        pass
+    return platforms
+
 # ─── Config Helpers ───────────────────────────────────────────────────────────
 
 def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str]:
@@ -67,7 +82,7 @@ def _get_categories(skills: List[dict]) -> List[str]:
 
 def _select_platform() -> Optional[str]:
     """Ask user which platform to configure, or global."""
-    options = [("global", "All platforms (global default)")] + list(PLATFORMS.items())
+    options = [("global", "All platforms (global default)")] + list(_get_platforms().items())
     print()
     print(color("  Configure skills for:", Colors.BOLD))
     for i, (key, label) in enumerate(options, 1):
@@ -135,7 +150,7 @@ def skills_command(args=None):
 
     # Step 1: Select platform
     platform = _select_platform()
-    platform_label = PLATFORMS.get(platform, "All platforms") if platform else "All platforms"
+    platform_label = _get_platforms().get(platform, "All platforms") if platform else "All platforms"
 
     # Step 2: Select mode — individual or by category
     print()
