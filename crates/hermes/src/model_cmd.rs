@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use clap::Subcommand;
 use hermes_core::{
@@ -38,16 +39,40 @@ pub fn print_model(
     loaded: &LoadedConfig,
     command: Option<ModelCommand>,
 ) -> Result<(), Box<dyn Error>> {
-    match command.unwrap_or(ModelCommand::Show) {
-        ModelCommand::Show => print_model_show(context, loaded)?,
-        ModelCommand::Set {
+    match command {
+        None if io::stdin().is_terminal() && io::stdout().is_terminal() => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let mut input = stdin.lock();
+            let mut output = stdout.lock();
+            if let Some(selection) =
+                prompt_model_selection_with_io(loaded, &mut input, &mut output)?
+            {
+                set_model(
+                    context,
+                    loaded,
+                    SetModelArgs {
+                        model: selection.model,
+                        provider: Some(selection.provider),
+                        base_url: selection.base_url,
+                        api_mode: selection.api_mode,
+                        clear_base_url: false,
+                        clear_api_mode: false,
+                    },
+                )?;
+            } else {
+                writeln!(output, "cancelled=true")?;
+            }
+        }
+        None | Some(ModelCommand::Show) => print_model_show(context, loaded)?,
+        Some(ModelCommand::Set {
             model,
             provider,
             base_url,
             api_mode,
             clear_base_url,
             clear_api_mode,
-        } => set_model(
+        }) => set_model(
             context,
             loaded,
             SetModelArgs {
@@ -59,7 +84,7 @@ pub fn print_model(
                 clear_api_mode,
             },
         )?,
-        ModelCommand::Providers { configured_only } => {
+        Some(ModelCommand::Providers { configured_only }) => {
             print_providers(context, loaded, configured_only)?
         }
     }
@@ -74,6 +99,14 @@ struct SetModelArgs {
     api_mode: Option<String>,
     clear_base_url: bool,
     clear_api_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractiveModelSelection {
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_mode: Option<String>,
 }
 
 #[derive(Debug)]
@@ -331,6 +364,126 @@ fn provider_marker(row: &ProviderRow) -> &'static str {
     }
 }
 
+pub(crate) fn prompt_model_selection_with_io(
+    loaded: &LoadedConfig,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<Option<InteractiveModelSelection>, Box<dyn Error>> {
+    let providers = list_provider_profiles()
+        .iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    let current_provider = loaded
+        .configured_model_provider()
+        .unwrap_or_else(|| "openai".to_string());
+    let current_model = loaded.configured_model_name().unwrap_or_default();
+    let current_base_url = loaded.configured_model_base_url();
+
+    writeln!(output)?;
+    writeln!(output, "Hermes Model Picker")?;
+    writeln!(
+        output,
+        "  Select a provider, then enter the model slug to save."
+    )?;
+    writeln!(output)?;
+    for (index, provider) in providers.iter().enumerate() {
+        let marker = if provider == &current_provider {
+            " ← current"
+        } else {
+            ""
+        };
+        writeln!(output, "  {}. {}{}", index + 1, provider, marker)?;
+    }
+    writeln!(output, "  q. Cancel")?;
+
+    let provider = loop {
+        let response = prompt_line(input, output, "Provider")?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") {
+            return Ok(None);
+        }
+        if let Ok(index) = trimmed.parse::<usize>() {
+            if (1..=providers.len()).contains(&index) {
+                break providers[index - 1].to_string();
+            }
+        }
+        match validate_provider_input(trimmed) {
+            Ok(provider) => break provider,
+            Err(error) => {
+                writeln!(output, "{error}")?;
+            }
+        }
+    };
+
+    let default_model = if provider == current_provider {
+        current_model
+    } else {
+        String::new()
+    };
+    let model = loop {
+        let prompt = if default_model.is_empty() {
+            "Model slug".to_string()
+        } else {
+            format!("Model slug [{default_model}]")
+        };
+        let response = prompt_line(input, output, &prompt)?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            if !default_model.is_empty() {
+                break default_model.clone();
+            }
+            writeln!(output, "model cannot be empty")?;
+            continue;
+        }
+        break sanitize_model_input(trimmed)?;
+    };
+
+    let base_url = if provider == "custom" {
+        loop {
+            let default = if provider == current_provider {
+                current_base_url.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let prompt = if default.is_empty() {
+                "Base URL".to_string()
+            } else {
+                format!("Base URL [{default}]")
+            };
+            let response = prompt_line(input, output, &prompt)?;
+            let trimmed = response.trim();
+            if trimmed.is_empty() && !default.is_empty() {
+                break Some(validate_base_url_input(&default)?);
+            }
+            match validate_base_url_input(trimmed) {
+                Ok(value) => break Some(value),
+                Err(error) => {
+                    writeln!(output, "{error}")?;
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let api_mode = if provider == "custom" {
+        base_url
+            .as_deref()
+            .and_then(infer_api_mode_from_base_url)
+            .map(str::to_string)
+            .or_else(|| Some("chat_completions".to_string()))
+    } else {
+        None
+    };
+
+    Ok(Some(InteractiveModelSelection {
+        provider,
+        model,
+        base_url,
+        api_mode,
+    }))
+}
+
 fn sanitize_model_input(value: &str) -> Result<String, Box<dyn Error>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -419,10 +572,27 @@ fn yaml_key(value: &str) -> Value {
     Value::String(value.to_string())
 }
 
+fn prompt_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    label: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{label}: ")?;
+    output.flush()?;
+
+    let mut response = String::new();
+    let read = input.read_line(&mut response)?;
+    if read == 0 {
+        return Ok(String::new());
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -513,6 +683,48 @@ mod tests {
         assert!(written.contains("base_url: https://api.anthropic.com"));
         assert!(!written.contains("https://localhost:11434/v1"));
         assert!(!written.contains("api_mode:"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn prompt_model_selection_accepts_provider_name_and_default_model() {
+        let home = temp_path("picker-default");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "model:\n  default: gpt-5\n  provider: openai\n",
+        )
+        .unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let loaded = context.load_config_document().unwrap();
+        let mut input = Cursor::new(b"openai\n\n".to_vec());
+        let mut output = Vec::new();
+        let selection = prompt_model_selection_with_io(&loaded, &mut input, &mut output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.provider, "openai");
+        assert_eq!(selection.model, "gpt-5");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn prompt_model_selection_prompts_for_custom_base_url() {
+        let home = temp_path("picker-custom");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let loaded = context.load_config_document().unwrap();
+        let mut input = Cursor::new(b"custom\nlocal-model\nhttp://localhost:11434/v1\n".to_vec());
+        let mut output = Vec::new();
+        let selection = prompt_model_selection_with_io(&loaded, &mut input, &mut output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.provider, "custom");
+        assert_eq!(selection.model, "local-model");
+        assert_eq!(
+            selection.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(selection.api_mode.as_deref(), Some("chat_completions"));
         let _ = fs::remove_dir_all(home);
     }
 }
