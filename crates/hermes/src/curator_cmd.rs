@@ -8,18 +8,16 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use clap::{Args, Subcommand};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use hermes_core::HermesContext;
+use hermes_core::{HermesContext, LoadedConfig, ModelOverrides, ToolRuntime};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::Value as YamlValue;
 use tar::{Archive, Builder};
-
-use crate::python_bridge::{project_root, resolve_repo_python};
 
 const DEFAULT_INTERVAL_HOURS: i64 = 24 * 7;
 const DEFAULT_STALE_AFTER_DAYS: i64 = 30;
@@ -28,6 +26,42 @@ const STATE_ACTIVE: &str = "active";
 const STATE_STALE: &str = "stale";
 const STATE_ARCHIVED: &str = "archived";
 const VALID_STATES: [&str; 3] = [STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED];
+const CURATOR_REVIEW_TOOLSETS: [&str; 2] = ["skills", "terminal"];
+const CURATOR_DRY_RUN_BANNER: &str = concat!(
+    "DRY-RUN — REPORT ONLY. DO NOT MUTATE THE SKILL LIBRARY.\n\n",
+    "Do not create, patch, delete, move, or rewrite skills. ",
+    "Read freely and produce the same human summary and YAML block you would ",
+    "produce on a live run, but describe what you would do.\n",
+);
+const CURATOR_REVIEW_PROMPT: &str = concat!(
+    "You are Hermes' background skill curator.\n\n",
+    "Goal: consolidate agent-created skills into broad umbrella skills with ",
+    "better discoverability. Prefer one class-level skill with labeled sections ",
+    "or support files over many narrow one-session skills.\n\n",
+    "Rules:\n",
+    "1. Only touch the candidate skills listed below.\n",
+    "2. Never delete a skill permanently. Archiving is the maximum destructive action.\n",
+    "3. Skip pinned skills entirely.\n",
+    "4. Judge overlap by content and maintainability, not raw usage counts.\n",
+    "5. If a skill is narrow but valuable, absorb it into an umbrella via patching, ",
+    "creating a new umbrella, or moving content into references/, templates/, or scripts/.\n\n",
+    "Available tools:\n",
+    "- skills_list and skill_view to inspect the library\n",
+    "- skill_manage for create, patch, write_file, and delete/archive\n",
+    "- terminal for mv/mkdir when moving support files into umbrella skills\n\n",
+    "When done, provide a short human summary followed by this exact section:\n",
+    "## Structured summary (required)\n",
+    "```yaml\n",
+    "consolidations:\n",
+    "  - from: <old-skill-name>\n",
+    "    into: <umbrella-skill-name>\n",
+    "    reason: <one short sentence>\n",
+    "prunings:\n",
+    "  - name: <skill-name>\n",
+    "    reason: <one short sentence>\n",
+    "```\n",
+    "Every archived skill must appear in exactly one list.\n",
+);
 
 #[derive(Subcommand, Debug)]
 pub enum CuratorCommand {
@@ -105,6 +139,31 @@ struct UsageRecord {
     archived_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AutoTransitionCounts {
+    checked: i64,
+    marked_stale: i64,
+    archived: i64,
+    reactivated: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CuratorLlmReview {
+    final_response: String,
+    summary: String,
+    model: String,
+    provider: String,
+    tool_calls: Vec<JsonValue>,
+    error: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CuratorRunOutcome {
+    auto: AutoTransitionCounts,
+    final_summary: String,
+}
+
 pub fn print_curator(
     context: &HermesContext,
     command: Option<CuratorCommand>,
@@ -174,35 +233,26 @@ fn print_curator_run(context: &HermesContext, args: RunArgs) -> Result<(), Box<d
         return Ok(());
     }
 
-    if agent_created_report(context)?.is_empty() {
-        if args.dry_run {
-            println!("auto (preview): 0 candidate skill(s) — no transitions applied in dry-run");
-            println!(
-                "dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply."
-            );
-            return Ok(());
-        }
-
-        record_no_candidate_curator_run(context)?;
-        println!("curator: auto: no changes; llm: skipped (no candidates)");
-        println!("auto: checked=0 stale=0 archived=0 reactivated=0");
-        return Ok(());
+    let outcome = run_curator_review_native(context, args.dry_run)?;
+    println!("curator: {}", outcome.final_summary);
+    if args.dry_run {
+        println!(
+            "auto (preview): {} candidate skill(s) — no transitions applied in dry-run",
+            outcome.auto.checked
+        );
+        println!(
+            "dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply."
+        );
+    } else {
+        println!(
+            "auto: checked={} stale={} archived={} reactivated={}",
+            outcome.auto.checked,
+            outcome.auto.marked_stale,
+            outcome.auto.archived,
+            outcome.auto.reactivated
+        );
     }
-
-    let mut envs = vec![(
-        "HERMES_CURATOR_RUN_DRY".to_string(),
-        if args.dry_run { "1" } else { "0" }.to_string(),
-    )];
-    run_curator_python(CURATOR_RUN_SYNC_BOOTSTRAP, &mut envs)
-}
-
-fn record_no_candidate_curator_run(context: &HermesContext) -> Result<(), Box<dyn Error>> {
-    let mut state = load_curator_state(context)?;
-    state.last_run_at = Some(Utc::now().to_rfc3339());
-    state.last_run_duration_seconds = Some(0.0);
-    state.last_run_summary = Some("auto: no changes; llm: skipped (no candidates)".to_string());
-    state.run_count += 1;
-    save_curator_state(context, &state)
+    Ok(())
 }
 
 fn launch_detached_curator_run(
@@ -340,51 +390,476 @@ fn print_curator_rollback(
     }
 }
 
-fn run_curator_python(
-    bootstrap: &str,
-    extra_env: &mut Vec<(String, String)>,
-) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_CURATOR_PYTHON"))
-        .ok_or("could not find a Python interpreter for curator")?;
+fn run_curator_review_native(
+    context: &HermesContext,
+    dry_run: bool,
+) -> Result<CuratorRunOutcome, Box<dyn Error>> {
+    let start = Utc::now();
+    let counts = if dry_run {
+        AutoTransitionCounts {
+            checked: agent_created_report(context)?.len() as i64,
+            ..AutoTransitionCounts::default()
+        }
+    } else {
+        if let Some(snapshot) = snapshot_skills(context, "pre-curator-run")? {
+            println!("curator: snapshot created ({})", snapshot.display());
+        }
+        apply_automatic_transitions(context, start)?
+    };
+    let auto_summary = summarize_auto_transitions(&counts);
+    let prefix = if dry_run { "dry-run auto: " } else { "auto: " };
 
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string());
-    for (key, value) in extra_env.drain(..) {
-        command.env(key, value);
+    let mut state = load_curator_state(context)?;
+    if !dry_run {
+        state.last_run_at = Some(start.to_rfc3339());
+        state.run_count += 1;
     }
-    command.arg("-c").arg(bootstrap);
+    state.last_run_summary = Some(format!("{prefix}{auto_summary}"));
+    save_curator_state(context, &state)?;
 
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
+    let before = agent_created_report(context)?;
+    let llm_review = if before.is_empty() {
+        CuratorLlmReview {
+            summary: "skipped (no candidates)".to_string(),
+            ..CuratorLlmReview::default()
+        }
+    } else {
+        run_curator_llm_review(context, dry_run)?
+    };
+
+    let final_summary = if let Some(error) = llm_review.error.as_deref() {
+        format!("{prefix}{auto_summary}; llm: error ({error})")
+    } else {
+        format!("{prefix}{auto_summary}; llm: {}", llm_review.summary)
+    };
+    let elapsed = (Utc::now() - start)
+        .to_std()
+        .map(|value| value.as_secs_f64())
+        .unwrap_or_default();
+    let after = agent_created_report(context)?;
+    let report_path = write_curator_run_report(
+        context,
+        start,
+        elapsed,
+        &counts,
+        &before,
+        &after,
+        &llm_review,
+    )
+    .ok()
+    .flatten();
+
+    let mut final_state = load_curator_state(context)?;
+    final_state.last_run_duration_seconds = Some(elapsed);
+    final_state.last_run_summary = Some(final_summary.clone());
+    if let Some(report_path) = report_path {
+        final_state.last_report_path = Some(report_path.display().to_string());
     }
-    Err(exit_status_message("curator", status).into())
+    save_curator_state(context, &final_state)?;
+
+    Ok(CuratorRunOutcome {
+        auto: counts,
+        final_summary,
+    })
 }
 
-const CURATOR_RUN_SYNC_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from agent import curator\n",
-    "dry = (os.environ.get('HERMES_CURATOR_RUN_DRY') == '1')\n",
-    "def _on_summary(msg):\n",
-    "    print(msg)\n",
-    "result = curator.run_curator_review(on_summary=_on_summary, synchronous=True, dry_run=dry)\n",
-    "auto = result.get('auto_transitions', {}) or {}\n",
-    "if dry:\n",
-    "    print(f\"auto (preview): {auto.get('checked', 0)} candidate skill(s) — no transitions applied in dry-run\")\n",
-    "else:\n",
-    "    print(f\"auto: checked={auto.get('checked', 0)} stale={auto.get('marked_stale', 0)} archived={auto.get('archived', 0)} reactivated={auto.get('reactivated', 0)}\")\n",
-    "if dry:\n",
-    "    print(\"dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply.\")\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
+fn apply_automatic_transitions(
+    context: &HermesContext,
+    now: DateTime<Utc>,
+) -> Result<AutoTransitionCounts, Box<dyn Error>> {
+    let stale_cutoff = now - Duration::days(curator_stale_after_days(context)?);
+    let archive_cutoff = now - Duration::days(curator_archive_after_days(context)?);
+    let mut counts = AutoTransitionCounts::default();
+    for row in agent_created_report(context)? {
+        counts.checked += 1;
+        if row.pinned {
+            continue;
+        }
+        let anchor = row
+            .last_activity_at()
+            .or_else(|| row.created_at_dt())
+            .unwrap_or(now);
+        if anchor <= archive_cutoff && row.state != STATE_ARCHIVED {
+            let (ok, _) = archive_skill(context, &row.name)?;
+            if ok {
+                counts.archived += 1;
+            }
+        } else if anchor <= stale_cutoff && row.state == STATE_ACTIVE {
+            set_skill_state(context, &row.name, STATE_STALE)?;
+            counts.marked_stale += 1;
+        } else if anchor > stale_cutoff && row.state == STATE_STALE {
+            set_skill_state(context, &row.name, STATE_ACTIVE)?;
+            counts.reactivated += 1;
+        }
     }
+    Ok(counts)
+}
+
+fn summarize_auto_transitions(counts: &AutoTransitionCounts) -> String {
+    let mut parts = Vec::new();
+    if counts.marked_stale > 0 {
+        parts.push(format!("{} marked stale", counts.marked_stale));
+    }
+    if counts.archived > 0 {
+        parts.push(format!("{} archived", counts.archived));
+    }
+    if counts.reactivated > 0 {
+        parts.push(format!("{} reactivated", counts.reactivated));
+    }
+    if parts.is_empty() {
+        "no changes".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn run_curator_llm_review(
+    context: &HermesContext,
+    dry_run: bool,
+) -> Result<CuratorLlmReview, Box<dyn Error>> {
+    let mut loaded = context.load_config_document()?;
+    loaded.config.memory.memory_enabled = false;
+    loaded.config.memory.user_profile_enabled = false;
+    loaded.config.agent.max_turns = loaded.config.agent.max_turns.max(9_999);
+
+    let enabled_toolsets = CURATOR_REVIEW_TOOLSETS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let cwd = context.hermes_home();
+    let runtime = ToolRuntime::new(&cwd).with_hermes_home(context.hermes_home());
+    let prompt = build_curator_prompt(context, dry_run)?;
+    let overrides = resolve_curator_model_overrides(&loaded);
+    let session_store = context.open_session_store()?;
+    let result = context.run_chat_completions_turn(
+        &loaded,
+        &prompt,
+        &runtime,
+        Some(&enabled_toolsets),
+        &overrides,
+        None,
+        Some(&session_store),
+    );
+    match result {
+        Ok(result) => Ok(CuratorLlmReview {
+            summary: truncate_summary(&result.final_response),
+            final_response: result.final_response.clone(),
+            model: result.model,
+            provider: result.provider,
+            tool_calls: collect_curator_tool_calls(&session_store, result.session_id.as_deref()),
+            session_id: result.session_id,
+            error: None,
+        }),
+        Err(error) => Ok(CuratorLlmReview {
+            summary: format!("error ({error})"),
+            error: Some(error.to_string()),
+            ..CuratorLlmReview::default()
+        }),
+    }
+}
+
+fn build_curator_prompt(context: &HermesContext, dry_run: bool) -> Result<String, Box<dyn Error>> {
+    let candidate_list = render_curator_candidate_list(context)?;
+    let mut prompt = String::new();
+    if dry_run {
+        prompt.push_str(CURATOR_DRY_RUN_BANNER);
+        prompt.push('\n');
+    }
+    prompt.push_str(CURATOR_REVIEW_PROMPT);
+    prompt.push('\n');
+    prompt.push('\n');
+    prompt.push_str(&candidate_list);
+    Ok(prompt)
+}
+
+fn render_curator_candidate_list(context: &HermesContext) -> Result<String, Box<dyn Error>> {
+    let rows = agent_created_report(context)?;
+    if rows.is_empty() {
+        return Ok("No agent-created skills to review.".to_string());
+    }
+    let mut lines = vec![
+        format!("Agent-created skills ({}):", rows.len()),
+        String::new(),
+    ];
+    for row in rows {
+        lines.push(format!(
+            "- {}  state={}  pinned={}  activity={}  use={}  view={}  patches={}  last_activity={}",
+            row.name,
+            row.state,
+            if row.pinned { "yes" } else { "no" },
+            row.activity_count(),
+            row.use_count,
+            row.view_count,
+            row.patch_count,
+            row.last_activity_at()
+                .map(|value| value.to_rfc3339())
+                .or(row.created_at)
+                .unwrap_or_else(|| "never".to_string())
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn resolve_curator_model_overrides(loaded: &LoadedConfig) -> ModelOverrides {
+    let aux_provider = nested_yaml_string(&loaded.raw, &["auxiliary", "curator", "provider"]);
+    let aux_model = nested_yaml_string(&loaded.raw, &["auxiliary", "curator", "model"]);
+    if aux_provider.as_deref().is_some_and(|value| value != "auto")
+        && aux_model.as_deref().is_some_and(|value| !value.is_empty())
+    {
+        return ModelOverrides {
+            provider: aux_provider,
+            model: aux_model,
+            base_url: nested_yaml_string(&loaded.raw, &["auxiliary", "curator", "base_url"]),
+            api_key: nested_yaml_string(&loaded.raw, &["auxiliary", "curator", "api_key"]),
+            api_mode: None,
+        };
+    }
+
+    let legacy_provider = nested_yaml_string(&loaded.raw, &["curator", "auxiliary", "provider"]);
+    let legacy_model = nested_yaml_string(&loaded.raw, &["curator", "auxiliary", "model"]);
+    if legacy_provider
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && legacy_model
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return ModelOverrides {
+            provider: legacy_provider,
+            model: legacy_model,
+            base_url: nested_yaml_string(&loaded.raw, &["curator", "auxiliary", "base_url"]),
+            api_key: nested_yaml_string(&loaded.raw, &["curator", "auxiliary", "api_key"]),
+            api_mode: None,
+        };
+    }
+
+    ModelOverrides::default()
+}
+
+fn nested_yaml_string(root: &YamlValue, keys: &[&str]) -> Option<String> {
+    let mut node = root;
+    for key in keys {
+        let mapping = node.as_mapping()?;
+        node = mapping.get(yaml_key(key))?;
+    }
+    node.as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn truncate_summary(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "no change".to_string();
+    }
+    let mut chars = trimmed.chars();
+    let short = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+fn collect_curator_tool_calls(
+    session_store: &hermes_core::SessionStore,
+    session_id: Option<&str>,
+) -> Vec<JsonValue> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let Ok(messages) = session_store.get_messages(session_id) else {
+        return Vec::new();
+    };
+    let mut calls = Vec::new();
+    for message in messages {
+        let Some(tool_calls) = message.tool_calls else {
+            continue;
+        };
+        let Some(array) = tool_calls.as_array() else {
+            continue;
+        };
+        for tool_call in array {
+            calls.push(tool_call.clone());
+        }
+    }
+    calls
+}
+
+fn write_curator_run_report(
+    context: &HermesContext,
+    started_at: DateTime<Utc>,
+    elapsed_seconds: f64,
+    counts: &AutoTransitionCounts,
+    before: &[UsageRecord],
+    after: &[UsageRecord],
+    llm_review: &CuratorLlmReview,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let root = context.hermes_home().join("logs").join("curator");
+    fs::create_dir_all(&root)?;
+    let stamp = started_at.format("%Y%m%d-%H%M%S").to_string();
+    let mut run_dir = root.join(&stamp);
+    let mut suffix = 2usize;
+    while run_dir.exists() {
+        run_dir = root.join(format!("{stamp}-{suffix}"));
+        suffix += 1;
+    }
+    fs::create_dir_all(&run_dir)?;
+
+    let payload = serde_json::json!({
+        "started_at": started_at.to_rfc3339(),
+        "duration_seconds": elapsed_seconds,
+        "model": llm_review.model,
+        "provider": llm_review.provider,
+        "session_id": llm_review.session_id,
+        "auto_transitions": {
+            "checked": counts.checked,
+            "marked_stale": counts.marked_stale,
+            "archived": counts.archived,
+            "reactivated": counts.reactivated,
+        },
+        "counts": {
+            "before": before.len(),
+            "after": after.len(),
+            "delta": after.len() as i64 - before.len() as i64,
+            "tool_calls_total": llm_review.tool_calls.len(),
+        },
+        "before": before.iter().map(usage_record_report_json).collect::<Vec<_>>(),
+        "after": after.iter().map(usage_record_report_json).collect::<Vec<_>>(),
+        "llm_final": llm_review.final_response,
+        "llm_summary": llm_review.summary,
+        "llm_error": llm_review.error,
+        "tool_calls": llm_review.tool_calls,
+    });
+    atomic_write_json(&run_dir.join("run.json"), &payload)?;
+    fs::write(
+        run_dir.join("REPORT.md"),
+        render_curator_report_markdown(&payload),
+    )?;
+    Ok(Some(run_dir))
+}
+
+fn usage_record_report_json(record: &UsageRecord) -> JsonValue {
+    serde_json::json!({
+        "name": record.name,
+        "state": record.state,
+        "pinned": record.pinned,
+        "created_at": record.created_at,
+        "last_used_at": record.last_used_at,
+        "last_viewed_at": record.last_viewed_at,
+        "last_patched_at": record.last_patched_at,
+        "use_count": record.use_count,
+        "view_count": record.view_count,
+        "patch_count": record.patch_count,
+        "created_by": record.created_by,
+        "agent_created": record.agent_created,
+        "archived_at": record.archived_at,
+    })
+}
+
+fn render_curator_report_markdown(payload: &JsonValue) -> String {
+    let started_at = payload
+        .get("started_at")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let duration = payload
+        .get("duration_seconds")
+        .and_then(JsonValue::as_f64)
+        .unwrap_or_default();
+    let model = payload
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let provider = payload
+        .get("provider")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let auto = payload
+        .get("auto_transitions")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let counts = payload
+        .get("counts")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let llm_final = payload
+        .get("llm_final")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let llm_error = payload
+        .get("llm_error")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+
+    let mut lines = vec![
+        format!("# Curator run — {started_at}"),
+        String::new(),
+        format!("Model: `{model}` via `{provider}`"),
+        format!("Duration: {:.2}s", duration),
+        String::new(),
+        "## Auto-transitions".to_string(),
+        String::new(),
+        format!(
+            "- checked: {}",
+            auto.get("checked").and_then(JsonValue::as_i64).unwrap_or(0)
+        ),
+        format!(
+            "- marked stale: {}",
+            auto.get("marked_stale")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "- archived: {}",
+            auto.get("archived")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "- reactivated: {}",
+            auto.get("reactivated")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0)
+        ),
+        String::new(),
+        "## Run counts".to_string(),
+        String::new(),
+        format!(
+            "- skills before: {}",
+            counts
+                .get("before")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "- skills after: {}",
+            counts.get("after").and_then(JsonValue::as_i64).unwrap_or(0)
+        ),
+        format!(
+            "- tool calls: {}",
+            counts
+                .get("tool_calls_total")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0)
+        ),
+        String::new(),
+    ];
+    if !llm_error.is_empty() {
+        lines.push("## LLM error".to_string());
+        lines.push(String::new());
+        lines.push(llm_error.to_string());
+        lines.push(String::new());
+    }
+    if !llm_final.trim().is_empty() {
+        lines.push("## LLM final summary".to_string());
+        lines.push(String::new());
+        lines.push(llm_final.to_string());
+        lines.push(String::new());
+    }
+    lines.join("\n") + "\n"
 }
 
 fn print_status(context: &HermesContext) -> Result<(), Box<dyn Error>> {
@@ -2126,10 +2601,14 @@ mod tests {
     use super::*;
     use std::env;
     use std::fs;
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(test)]
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
+    #[cfg(test)]
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(test)]
@@ -2157,6 +2636,44 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("hermes-rs-curator-{label}-{unique}"))
+    }
+
+    fn serve_single_chat_response(response_body: JsonValue) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response_body.to_string();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("Content-Length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            assert!(request_line.starts_with("POST /v1/chat/completions "));
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+        (format!("http://{addr}/v1"), join)
     }
 
     #[test]
@@ -2258,10 +2775,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn curator_run_sync_uses_python_override_and_env_flags() {
+    fn curator_run_sync_with_candidates_stays_native() {
         let _guard = test_env_lock().lock().unwrap();
-        let home = temp_path("curator-run");
+        let home = temp_path("curator-run-native");
         fs::create_dir_all(&home).unwrap();
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         fs::create_dir_all(home.join("skills").join("demo")).unwrap();
@@ -2274,24 +2790,38 @@ mod tests {
             record.created_by = Some("agent".to_string());
         })
         .unwrap();
+        let (base_url, server) = serve_single_chat_response(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "native curator pass complete"
+                }
+            }]
+        }));
         let fake_python = home.join("python3");
         let log = home.join("python.log");
         fs::write(
             &fake_python,
             format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'run dry=%s\\n' \"$HERMES_CURATOR_RUN_DRY\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
+                "#!/bin/sh\nprintf 'called\\n' >> '{}'\nexit 9\n",
                 log.display()
             ),
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_python, perms).unwrap();
+        }
+
+        fs::write(
+            home.join("config.yaml"),
+            format!(
+                "model:\n  provider: custom\n  default: test-model\n  base_url: {base_url}\n  api_key: test-key\n  api_mode: chat_completions\n"
+            ),
+        )
+        .unwrap();
 
         set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
         print_curator_run(
@@ -2302,9 +2832,27 @@ exit 9\n",
             },
         )
         .unwrap();
+        server.join().unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("run dry=0"));
+        assert!(!log.exists());
+        let state = load_curator_state(&context).unwrap();
+        assert_eq!(state.run_count, 1);
+        assert!(
+            state
+                .last_run_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("llm: native curator pass complete")
+        );
+        let report_dir = PathBuf::from(state.last_report_path.unwrap());
+        assert!(report_dir.join("run.json").exists());
+        let report: JsonValue =
+            serde_json::from_str(&fs::read_to_string(report_dir.join("run.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            report["llm_final"],
+            JsonValue::String("native curator pass complete".to_string())
+        );
 
         remove_env_var("HERMES_CURATOR_PYTHON");
         let _ = fs::remove_dir_all(home);
