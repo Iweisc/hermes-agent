@@ -26,6 +26,7 @@ use crate::python_bridge::{project_root, resolve_repo_python};
 #[derive(Debug, Clone)]
 struct NativeGatewaySessionState {
     cwd: PathBuf,
+    cols: u16,
     overrides: ModelOverrides,
 }
 
@@ -233,12 +234,14 @@ impl<'a> NativeGatewayServer<'a> {
             "session.list" => self.handle_session_list(),
             "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
+            "session.branch" => self.handle_session_branch(params),
             "session.undo" => self.handle_session_undo(params),
             "session.delete" => self.handle_session_delete(params),
             "session.title" => self.handle_session_title(params),
             "session.status" => self.handle_session_status(params),
             "session.save" => self.handle_session_save(params),
             "session.close" => self.handle_session_close(params),
+            "terminal.resize" => self.handle_terminal_resize(params),
             "input.detect_drop" => Ok(json!({
                 "matched": false,
                 "text": params.get("text").and_then(Value::as_str).unwrap_or_default(),
@@ -276,9 +279,9 @@ impl<'a> NativeGatewayServer<'a> {
 
     fn handle_session_create(
         &mut self,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, (i64, String, Option<Value>)> {
-        let session_id = format!("rust-gw-{:x}", unix_ts_nanos());
+        let session_id = next_gateway_session_id();
         self.session_store
             .create_session(&SessionCreate {
                 id: session_id.clone(),
@@ -294,6 +297,7 @@ impl<'a> NativeGatewayServer<'a> {
             session_id.clone(),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: parse_terminal_cols(params.get("cols"))?,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -366,6 +370,7 @@ impl<'a> NativeGatewayServer<'a> {
             resolved.clone(),
             NativeGatewaySessionState {
                 cwd: cwd_from_record(&record),
+                cols: 80,
                 overrides: overrides_from_record(&record),
             },
         );
@@ -425,6 +430,67 @@ impl<'a> NativeGatewayServer<'a> {
             .trim_last_exchange(&session_id)
             .map_err(|error| (5007, error.to_string(), None))?;
         Ok(json!({ "removed": removed }))
+    }
+
+    fn handle_session_branch(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let record = self
+            .session_store
+            .get_session(&session_id)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let messages = self
+            .session_store
+            .get_messages(&session_id)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        if messages.is_empty() {
+            return Err((
+                4008,
+                String::from("nothing to branch — send a message first"),
+                None,
+            ));
+        }
+
+        let new_session_id = next_gateway_session_id();
+        let title = resolved_branch_title(self.session_store, &record, &params)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        self.session_store
+            .create_session(&SessionCreate {
+                id: new_session_id.clone(),
+                source: record.source.clone(),
+                user_id: record.user_id.clone(),
+                model: state
+                    .overrides
+                    .model
+                    .clone()
+                    .or_else(|| record.model.clone()),
+                model_config: record.model_config.clone(),
+                system_prompt: record.system_prompt.clone(),
+                parent_session_id: Some(session_id.clone()),
+            })
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        for message in &messages {
+            self.session_store
+                .append_message(&new_session_id, &branch_message_append(message))
+                .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        }
+        self.session_store
+            .set_session_title(&new_session_id, &title)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        self.sessions.insert(new_session_id.clone(), state);
+        Ok(json!({
+            "session_id": new_session_id,
+            "title": title,
+            "parent": session_id,
+        }))
     }
 
     fn handle_session_title(
@@ -576,6 +642,20 @@ impl<'a> NativeGatewayServer<'a> {
             self.active_turn = None;
         }
         Ok(json!({ "ok": existed, "closed": existed }))
+    }
+
+    fn handle_terminal_resize(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let cols = parse_terminal_cols(params.get("cols"))?;
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        state.cols = cols;
+        Ok(json!({ "cols": cols }))
     }
 
     fn handle_prompt_submit<W: Write>(
@@ -1191,6 +1271,57 @@ fn format_local_timestamp(timestamp: f64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| String::from("(unknown)"))
+}
+
+fn next_gateway_session_id() -> String {
+    format!("rust-gw-{:x}", unix_ts_nanos())
+}
+
+fn parse_terminal_cols(value: Option<&Value>) -> Result<u16, (i64, String, Option<Value>)> {
+    let raw = value.and_then(Value::as_u64).unwrap_or(80);
+    let cols = u16::try_from(raw)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| (4004, String::from("cols must be a positive integer"), None))?;
+    Ok(cols)
+}
+
+fn resolved_branch_title(
+    session_store: &SessionStore,
+    record: &SessionRecord,
+    params: &Value,
+) -> Result<String, String> {
+    let requested = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(name) = requested {
+        return SessionStore::sanitize_title(Some(name))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| String::from("branch title required"));
+    }
+    let base = record.title.as_deref().unwrap_or("branch");
+    session_store
+        .get_next_title_in_lineage(base)
+        .map_err(|error| error.to_string())
+}
+
+fn branch_message_append(message: &MessageRecord) -> hermes_core::MessageAppend {
+    hermes_core::MessageAppend {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_name: message.tool_name.clone(),
+        token_count: message.token_count,
+        finish_reason: message.finish_reason.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning_details: message.reasoning_details.clone(),
+        codex_reasoning_items: message.codex_reasoning_items.clone(),
+        codex_message_items: message.codex_message_items.clone(),
+    }
 }
 
 fn resolve_gateway_command_name(name: &str, raw_config: &YamlValue) -> Result<String, String> {
@@ -2197,6 +2328,7 @@ mod tests {
             String::from("rust-gw-direct"),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2462,6 +2594,7 @@ mod tests {
             String::from("session-rpc-test"),
             NativeGatewaySessionState {
                 cwd: temp.path().to_path_buf(),
+                cols: 80,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2662,6 +2795,7 @@ mod tests {
             String::from("undo-session"),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -2683,6 +2817,165 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, Some(json!("keep")));
         assert_eq!(messages[1].content, Some(json!("keep answer")));
+    }
+
+    #[test]
+    fn native_gateway_session_branch_copies_history_and_lineage_title() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("branch-source"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store.set_session_title("branch-source", "Sprint").unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("branch-older"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: Some(String::from("branch-source")),
+            })
+            .unwrap();
+        store
+            .set_session_title("branch-older", "Sprint #2")
+            .unwrap();
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("question")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: Some(3),
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("answer")),
+                tool_call_id: None,
+                tool_calls: Some(json!([{"name":"search"}])),
+                tool_name: None,
+                token_count: Some(5),
+                finish_reason: Some(String::from("stop")),
+                reasoning: Some(String::from("brief")),
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message("branch-source", &message).unwrap();
+        }
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("branch-source"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("/tmp/demo"),
+                cols: 120,
+                overrides: ModelOverrides {
+                    model: Some(String::from("override-model")),
+                    provider: Some(String::from("demo-provider")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut branch = Vec::new();
+        server
+            .handle_request(
+                "session.branch",
+                json!(1),
+                json!({"session_id":"branch-source"}),
+                &mut branch,
+                false,
+            )
+            .unwrap();
+        let branch_frame = serde_json::from_slice::<Value>(&branch).unwrap();
+        let new_session_id = branch_frame["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(new_session_id.starts_with("rust-gw-"));
+        assert_eq!(branch_frame["result"]["title"], json!("Sprint #3"));
+        assert_eq!(branch_frame["result"]["parent"], json!("branch-source"));
+
+        let branched_session = store.get_session(&new_session_id).unwrap().unwrap();
+        assert_eq!(
+            branched_session.parent_session_id,
+            Some(String::from("branch-source"))
+        );
+        assert_eq!(branched_session.title, Some(String::from("Sprint #3")));
+        assert_eq!(branched_session.model, Some(String::from("override-model")));
+
+        let branched_messages = store.get_messages(&new_session_id).unwrap();
+        assert_eq!(branched_messages.len(), 2);
+        assert_eq!(branched_messages[0].content, Some(json!("question")));
+        assert_eq!(branched_messages[1].content, Some(json!("answer")));
+        assert_eq!(
+            branched_messages[1].tool_calls,
+            Some(json!([{"name":"search"}]))
+        );
+        assert_eq!(branched_messages[1].reasoning, Some(String::from("brief")));
+
+        let state = server.sessions.get(&new_session_id).unwrap();
+        assert_eq!(state.cwd, PathBuf::from("/tmp/demo"));
+        assert_eq!(state.cols, 120);
+        assert_eq!(state.overrides.provider.as_deref(), Some("demo-provider"));
+    }
+
+    #[test]
+    fn native_gateway_terminal_resize_updates_session_columns() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("resize-session"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("."),
+                cols: 80,
+                overrides: ModelOverrides::default(),
+            },
+        );
+
+        let mut resize = Vec::new();
+        server
+            .handle_request(
+                "terminal.resize",
+                json!(1),
+                json!({"session_id":"resize-session","cols":132}),
+                &mut resize,
+                false,
+            )
+            .unwrap();
+        let resize_frame = serde_json::from_slice::<Value>(&resize).unwrap();
+        assert_eq!(resize_frame["result"]["cols"], json!(132));
+        assert_eq!(server.sessions.get("resize-session").unwrap().cols, 132);
     }
 
     #[test]
@@ -2771,6 +3064,7 @@ mod tests {
             String::from("slash-session"),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     ..ModelOverrides::default()
