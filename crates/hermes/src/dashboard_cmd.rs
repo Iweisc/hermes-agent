@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, Output};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use clap::Args;
 
-use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::dashboard_server::{DashboardLaunchConfig, run_dashboard_server};
+use crate::python_bridge::project_root;
 
 const DASHBOARD_PATTERNS: &[&str] = &[
     "hermes dashboard",
@@ -331,52 +332,16 @@ fn launch_dashboard(args: DashboardArgs) -> Result<(), Box<dyn Error>> {
     validate_dashboard_args(&args)?;
 
     let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_DASHBOARD_PYTHON"))
-        .ok_or("could not find a Python interpreter for dashboard launch")?;
-
-    ensure_dashboard_python_dependencies(&python, &root)?;
     ensure_dashboard_web_ui(&root)?;
-
-    let embedded_chat = dashboard_embedded_chat_enabled(&args);
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_DASHBOARD_HOST", args.host.trim())
-        .env("HERMES_DASHBOARD_PORT", args.port.to_string())
-        .env(
-            "HERMES_DASHBOARD_OPEN_BROWSER",
-            if args.no_open { "0" } else { "1" },
-        )
-        .env(
-            "HERMES_DASHBOARD_ALLOW_PUBLIC",
-            if args.insecure { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_DASHBOARD_EMBEDDED_CHAT",
-            if embedded_chat { "1" } else { "0" },
-        )
-        .arg("-c")
-        .arg(DASHBOARD_BOOTSTRAP);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("dashboard", status).into())
+    run_dashboard_server(DashboardLaunchConfig {
+        host: args.host.trim().to_string(),
+        port: args.port,
+        open_browser: !args.no_open,
+        allow_public: args.insecure,
+        embedded_chat: dashboard_embedded_chat_enabled(&args),
+        project_root: root,
+    })
 }
-
-const DASHBOARD_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from hermes_cli.web_server import start_server\n",
-    "start_server(\n",
-    "    host=os.environ['HERMES_DASHBOARD_HOST'],\n",
-    "    port=int(os.environ['HERMES_DASHBOARD_PORT']),\n",
-    "    open_browser=os.environ.get('HERMES_DASHBOARD_OPEN_BROWSER') == '1',\n",
-    "    allow_public=os.environ.get('HERMES_DASHBOARD_ALLOW_PUBLIC') == '1',\n",
-    "    embedded_chat=os.environ.get('HERMES_DASHBOARD_EMBEDDED_CHAT') == '1',\n",
-    ")\n",
-);
 
 fn validate_dashboard_args(args: &DashboardArgs) -> Result<(), Box<dyn Error>> {
     if args.host.trim().is_empty() {
@@ -390,27 +355,6 @@ fn validate_dashboard_args(args: &DashboardArgs) -> Result<(), Box<dyn Error>> {
 
 fn dashboard_embedded_chat_enabled(args: &DashboardArgs) -> bool {
     args.tui || env::var("HERMES_DASHBOARD_TUI").is_ok_and(|value| value.trim() == "1")
-}
-
-fn ensure_dashboard_python_dependencies(
-    python: &Path,
-    project_root: &Path,
-) -> Result<(), Box<dyn Error>> {
-    let status = Command::new(python)
-        .current_dir(project_root)
-        .arg("-c")
-        .arg("import fastapi, uvicorn")
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-
-    eprintln!("Web UI dependencies not installed (need fastapi + uvicorn).");
-    eprintln!("Re-install the package into this interpreter so metadata updates apply:");
-    eprintln!("  cd {}", project_root.display());
-    eprintln!("  {} -m pip install -e .", python.display());
-    eprintln!("If `pip` is missing in this venv, use:  uv pip install -e .");
-    Err("dashboard dependencies are missing".into())
 }
 
 pub(crate) fn ensure_dashboard_web_ui(project_root: &Path) -> Result<(), Box<dyn Error>> {
@@ -568,13 +512,6 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,16 +545,6 @@ mod tests {
 
     fn remove_env_var(key: &str) {
         unsafe { env::remove_var(key) };
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::write(path, contents).unwrap();
-        let mut perms = fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).unwrap();
     }
 
     #[test]
@@ -734,43 +661,16 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn launch_dashboard_uses_python_override_and_env_flags() {
+    fn launch_dashboard_starts_rust_server_with_expected_flags() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = temp_path("launch");
-        let log = temp.join("python.log");
-        let fake_python = temp.join("python3");
         fs::create_dir_all(&temp).unwrap();
-        write_executable(
-            &fake_python,
-            &format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  case \"$2\" in\n\
-    'import fastapi, uvicorn')\n\
-      echo deps >> '{}'\n\
-      exit 0\n\
-      ;;\n\
-    *)\n\
-      printf 'launch host=%s port=%s open=%s insecure=%s chat=%s\\n' \\\n\
-        \"$HERMES_DASHBOARD_HOST\" \"$HERMES_DASHBOARD_PORT\" \\\n\
-        \"$HERMES_DASHBOARD_OPEN_BROWSER\" \"$HERMES_DASHBOARD_ALLOW_PUBLIC\" \\\n\
-        \"$HERMES_DASHBOARD_EMBEDDED_CHAT\" >> '{}'\n\
-      exit 0\n\
-      ;;\n\
-  esac\n\
-fi\n\
-exit 7\n",
-                log.display(),
-                log.display()
-            ),
-        );
-
-        set_env_var("HERMES_DASHBOARD_PYTHON", &fake_python);
         set_env_var("HERMES_WEB_DIST", temp.join("built-dist"));
         set_env_var("HERMES_DASHBOARD_TUI", "1");
+        set_env_var("HERMES_DASHBOARD_TEST_EXIT_AFTER_BIND", "1");
 
         launch_dashboard(DashboardArgs {
-            port: 8123,
+            port: 0,
             host: String::from("0.0.0.0"),
             no_open: true,
             insecure: true,
@@ -780,13 +680,9 @@ exit 7\n",
         })
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("deps"));
-        assert!(output.contains("launch host=0.0.0.0 port=8123 open=0 insecure=1 chat=1"));
-
-        remove_env_var("HERMES_DASHBOARD_PYTHON");
         remove_env_var("HERMES_WEB_DIST");
         remove_env_var("HERMES_DASHBOARD_TUI");
+        remove_env_var("HERMES_DASHBOARD_TEST_EXIT_AFTER_BIND");
         let _ = fs::remove_dir_all(temp);
     }
 }

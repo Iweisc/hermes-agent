@@ -7,6 +7,7 @@ mod completion;
 mod config_cmd;
 mod curator_cmd;
 mod dashboard_cmd;
+mod dashboard_server;
 mod debug;
 mod doctor;
 mod dump;
