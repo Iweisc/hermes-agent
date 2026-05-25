@@ -10,7 +10,10 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hermes_core::{HermesContext, HermesError, SessionCreate, SessionStore};
+use hermes_core::{
+    DelegateExecutor, HermesContext, HermesError, MessageAppend, MessageRecord, ModelOverrides,
+    SessionCreate, SessionStore, ToolRuntime,
+};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -345,6 +348,7 @@ print(json.dumps({
 const INITIAL_SESSION_INFO_HELPER: &str = r#"
 import json
 import os
+import sys
 
 result = {
     "model": "",
@@ -371,11 +375,13 @@ try:
 except Exception:
     pass
 
-print(json.dumps(result))
+sys.__stdout__.write(json.dumps(result))
+sys.__stdout__.flush()
 "#;
 
 const GATEWAY_READY_HELPER: &str = r#"
 import json
+import sys
 
 result = {"skin": {}}
 try:
@@ -385,11 +391,74 @@ try:
 except Exception:
     pass
 
-print(json.dumps(result))
+sys.__stdout__.write(json.dumps(result))
+sys.__stdout__.flush()
+"#;
+
+const CONFIG_SET_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "cfg",
+    "method": "config.set",
+    "params": payload,
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
+const CONFIG_GET_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "cfg",
+    "method": "config.get",
+    "params": payload,
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
+const DISPATCH_RPC_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "helper",
+    "method": payload.get("method", ""),
+    "params": payload.get("params", {}) or {},
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
+const SKIN_PAYLOAD_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import resolve_skin
+
+sys.__stdout__.write(json.dumps(resolve_skin()))
+sys.__stdout__.flush()
 "#;
 
 #[derive(Debug, Clone)]
 struct HelperContext {
+    context: HermesContext,
     hermes_home: PathBuf,
     project_root: PathBuf,
     python: PathBuf,
@@ -430,6 +499,7 @@ struct ProxyState {
     child_to_local: HashMap<String, String>,
     next_internal_request: u64,
     next_local_session: u64,
+    next_paste: u64,
     next_prompt_request: u64,
     pending: HashMap<String, PendingRequest>,
     prompt_requests: HashMap<String, PromptRequestBinding>,
@@ -455,6 +525,7 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| "unable to resolve Python interpreter for tui_gateway proxy".to_string())?;
     let work_root = PathBuf::from(&session_cwd);
     let helper = HelperContext {
+        context: context.clone(),
         hermes_home: context.hermes_home(),
         project_root: project_root.clone(),
         python: python.clone(),
@@ -525,7 +596,7 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
         };
 
         if let Some(response) =
-            handle_native_request(&request, &store, &state, &helper, &child_stdin)?
+            handle_native_request(&request, &store, &state, &helper, &stdout, &child_stdin)?
         {
             write_json(&stdout, &response)?;
             continue;
@@ -542,6 +613,7 @@ fn handle_native_request(
     store: &SessionStore,
     state: &Arc<Mutex<ProxyState>>,
     helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
     child_stdin: &Arc<Mutex<ChildStdin>>,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
@@ -619,9 +691,54 @@ fn handle_native_request(
         }
         "session.resume" => handle_session_resume(id, &params, store, state, helper)?,
         "session.close" => handle_session_close(id, &params, store, state, child_stdin)?,
+        "session.branch" => handle_session_branch(id, &params, store, state, helper)?,
         "session.title" => handle_session_title(id, &params, store, state)?,
+        "session.save" => handle_session_save(id, &params, store, state)?,
+        "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
+        "session.compress" => handle_session_compress(id, &params, state, child_stdin)?,
+        "rollback.list" => {
+            handle_session_bound_child_request(id, "rollback.list", &params, state, child_stdin)?
+        }
+        "rollback.diff" => {
+            handle_session_bound_child_request(id, "rollback.diff", &params, state, child_stdin)?
+        }
+        "rollback.restore" => {
+            handle_session_bound_child_request(id, "rollback.restore", &params, state, child_stdin)?
+        }
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
+        "delegation.status" => {
+            forward_child_request(id, "delegation.status", &params, state, child_stdin, false)?
+        }
+        "delegation.pause" => {
+            forward_child_request(id, "delegation.pause", &params, state, child_stdin, false)?
+        }
+        "subagent.interrupt" => {
+            forward_child_request(id, "subagent.interrupt", &params, state, child_stdin, false)?
+        }
+        "spawn_tree.save" => handle_helper_dispatch(id, "spawn_tree.save", &params, helper)?,
+        "spawn_tree.list" => handle_helper_dispatch(id, "spawn_tree.list", &params, helper)?,
+        "spawn_tree.load" => handle_helper_dispatch(id, "spawn_tree.load", &params, helper)?,
+        "process.stop" => {
+            forward_child_request(id, "process.stop", &params, state, child_stdin, false)?
+        }
+        "reload.env" => {
+            forward_child_request(id, "reload.env", &params, state, child_stdin, false)?
+        }
+        "paste.collapse" => handle_paste_collapse(id, &params, state, helper)?,
+        "model.options" => {
+            forward_child_request(id, "model.options", &params, state, child_stdin, true)?
+        }
+        "model.save_key" => {
+            forward_child_request(id, "model.save_key", &params, state, child_stdin, true)?
+        }
+        "model.disconnect" => {
+            forward_child_request(id, "model.disconnect", &params, state, child_stdin, true)?
+        }
+        "config.get" => handle_config_get(id, &params, state, helper, child_stdin)?,
+        "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
+        "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
         "session.interrupt" => handle_session_interrupt(id, &params, state, helper, child_stdin)?,
         "session.steer" => handle_session_steer(id, &params, state, child_stdin)?,
@@ -880,6 +997,7 @@ fn handle_session_close(
             json!({"session_id": binding.child_id}),
             Some(local_id.to_string()),
             None,
+            None,
         )?;
     } else if let Some(store_session_id) = binding.store_session_id.as_deref() {
         if let Some(record) = store.get_session(store_session_id)? {
@@ -892,6 +1010,98 @@ fn handle_session_close(
     }
     release_local_session(state, local_id)?;
     Ok(Some(ok_response(id, json!({"closed": true}))))
+}
+
+fn handle_session_branch(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(parent_session_id) = binding.store_session_id.as_deref() else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let history = store.get_messages(parent_session_id)?;
+    if history.is_empty() {
+        return Ok(Some(error_response(
+            id,
+            4008,
+            "nothing to branch — send a message first",
+        )));
+    }
+
+    let branch_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let title = if branch_name.is_empty() {
+        let current = store
+            .get_session_title(parent_session_id)?
+            .unwrap_or_else(|| "branch".to_string());
+        store.get_next_title_in_lineage(&current)?
+    } else {
+        branch_name.to_string()
+    };
+
+    let store_session_id = new_store_session_id();
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            store
+                .get_session(parent_session_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.model)
+        });
+    store.create_session(&SessionCreate {
+        id: store_session_id.clone(),
+        source: "tui".to_string(),
+        user_id: None,
+        model: model.clone(),
+        model_config: None,
+        system_prompt: None,
+        parent_session_id: Some(parent_session_id.to_string()),
+    })?;
+    for message in history {
+        store.append_message(&store_session_id, &message_record_to_append(&message))?;
+    }
+    store.set_session_title(&store_session_id, &title)?;
+
+    let info = initial_session_info(helper, model.as_deref());
+    let session_id = create_local_session(state, Some(store_session_id.clone()), binding.cols)?;
+    if let Some(info_object) = info.as_object().cloned() {
+        update_session_info_cache(state, &session_id, info_object.clone())?;
+        if let Some(usage) = info_object.get("usage").and_then(Value::as_object) {
+            update_session_usage_cache(state, &session_id, usage.clone())?;
+        }
+    }
+
+    Ok(Some(ok_response(
+        id,
+        json!({
+            "session_id": session_id,
+            "title": title,
+            "parent": parent_session_id,
+        }),
+    )))
 }
 
 fn resolve_resume_session(
@@ -999,6 +1209,118 @@ fn handle_session_title(
     }
 }
 
+fn handle_session_save(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(store_session_id) = lookup_store_session_id(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let messages = store
+        .get_messages(&store_session_id)?
+        .into_iter()
+        .map(message_record_to_chat_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            store
+                .get_session(&store_session_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.model)
+        })
+        .unwrap_or_default();
+    let filename = std::env::current_dir()?.join(format!(
+        "hermes_conversation_{}.json",
+        current_filename_timestamp()
+    ));
+    fs::write(
+        &filename,
+        serde_json::to_vec_pretty(&json!({
+            "model": model,
+            "messages": messages,
+        }))?,
+    )?;
+    Ok(Some(ok_response(
+        id,
+        json!({"file": filename.display().to_string()}),
+    )))
+}
+
+fn handle_session_undo(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    if binding.running {
+        return Ok(Some(error_response(
+            id,
+            4009,
+            "session busy — /interrupt the current turn before /undo",
+        )));
+    }
+    let Some(store_session_id) = binding.store_session_id.as_deref() else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+
+    let records = store.get_messages(store_session_id)?;
+    let (retained, removed) = trim_last_exchange(records);
+    if removed <= 0 {
+        return Ok(Some(ok_response(id, json!({"removed": 0}))));
+    }
+
+    store.clear_messages(store_session_id)?;
+    for message in retained {
+        store.append_message(store_session_id, &message_record_to_append(&message))?;
+    }
+
+    if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+        send_internal_child_request(
+            child_stdin,
+            state,
+            "session.close",
+            json!({"session_id": child_id}),
+            Some(local_id.to_string()),
+            None,
+            Some("child.close"),
+        )?;
+    }
+
+    Ok(Some(ok_response(id, json!({"removed": removed}))))
+}
+
 fn handle_session_usage(
     id: Value,
     params: &Map<String, Value>,
@@ -1101,6 +1423,363 @@ fn handle_session_status(
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
 }
 
+fn handle_session_compress(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    if !session_exists(state, local_id)? {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    }
+
+    mark_store_session_dirty(state, local_id)?;
+    ensure_child_session(child_stdin, state, local_id)?;
+    let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4001,
+            "child session not materialized",
+        )));
+    };
+
+    let mut forwarded_params = params.clone();
+    forwarded_params.insert("session_id".to_string(), json!(child_id));
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        "session.compress",
+        Value::Object(forwarded_params),
+        Some(local_id.to_string()),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn handle_session_bound_child_request(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    if !session_exists(state, local_id)? {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    }
+    ensure_child_session(child_stdin, state, local_id)?;
+    let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4001,
+            "child session not materialized",
+        )));
+    };
+
+    let mut forwarded_params = params.clone();
+    forwarded_params.insert("session_id".to_string(), json!(child_id));
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        method,
+        Value::Object(forwarded_params),
+        Some(local_id.to_string()),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn handle_helper_dispatch(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let response = run_python_helper_json(
+        helper,
+        DISPATCH_RPC_HELPER,
+        Some(&json!({"method": method, "params": params})),
+    )
+    .map_err(|error| format!("{method} helper failed: {error}"))?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn forward_child_request(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+    map_session_id: bool,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let mut forwarded_params = params.clone();
+    if map_session_id
+        && let Some(local_id) = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        if session_exists(state, local_id)? {
+            ensure_child_session(child_stdin, state, local_id)?;
+            if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+                forwarded_params.insert("session_id".to_string(), json!(child_id));
+            } else {
+                forwarded_params.remove("session_id");
+            }
+        }
+    }
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        method,
+        Value::Object(forwarded_params),
+        if map_session_id {
+            params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        },
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn handle_config_get(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let key = params
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let local_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if local_id.is_some()
+        && requires_child_config_get(key)
+        && let Some(child_id) = lookup_child_session_id(state, local_id.unwrap_or_default())?
+    {
+        let mut forwarded_params = params.clone();
+        forwarded_params.insert("session_id".to_string(), json!(child_id));
+        let response = send_blocking_child_request(
+            child_stdin,
+            state,
+            "config.get",
+            Value::Object(forwarded_params),
+            Some(local_id.unwrap_or_default().to_string()),
+        )?;
+        return Ok(Some(rebind_response_id(response, id)));
+    }
+
+    let response = run_python_helper_json(helper, CONFIG_GET_HELPER, Some(&json!(params)))
+        .map_err(|error| format!("config.get helper failed: {error}"))?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn handle_config_set(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(key) = params
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4002, "config key required")));
+    };
+    let local_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if local_id.is_some() && requires_child_config_set(key) {
+        let local_id = local_id.unwrap_or_default();
+        if !session_exists(state, local_id)? {
+            return Ok(Some(error_response(id, 4001, "session not found")));
+        }
+        ensure_child_session(child_stdin, state, local_id)?;
+        let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+            return Ok(Some(error_response(
+                id,
+                4001,
+                "child session not materialized",
+            )));
+        };
+
+        let mut forwarded_params = params.clone();
+        forwarded_params.insert("session_id".to_string(), json!(child_id));
+        let response = send_blocking_child_request(
+            child_stdin,
+            state,
+            "config.set",
+            Value::Object(forwarded_params),
+            Some(local_id.to_string()),
+        )?;
+        return Ok(Some(rebind_response_id(response, id)));
+    }
+
+    let response = run_python_helper_json(helper, CONFIG_SET_HELPER, Some(&json!(params)))
+        .map_err(|error| format!("config.set helper failed: {error}"))?;
+    let response = rebind_response_id(response, id);
+    if key == "skin" && response.get("result").is_some() {
+        let skin =
+            run_python_helper_json(helper, SKIN_PAYLOAD_HELPER, None).unwrap_or_else(|_| json!({}));
+        write_json(
+            stdout,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "skin.changed",
+                    "payload": skin,
+                },
+            }),
+        )?;
+    }
+    Ok(Some(response))
+}
+
+fn handle_paste_collapse(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Ok(Some(error_response(id, 4004, "empty paste")));
+    }
+
+    let counter = next_paste_counter(state)?;
+    let line_count = text.matches('\n').count() + 1;
+    let paste_dir = helper.hermes_home.join("pastes");
+    fs::create_dir_all(&paste_dir)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let paste_file = paste_dir.join(format!("paste_{counter}_{timestamp}.txt"));
+    fs::write(&paste_file, text)?;
+
+    Ok(Some(ok_response(
+        id,
+        json!({
+            "placeholder": format!("[Pasted text #{counter}: {line_count} lines → {}]", paste_file.display()),
+            "path": paste_file.display().to_string(),
+            "lines": line_count,
+        }),
+    )))
+}
+
+fn requires_child_config_get(key: &str) -> bool {
+    matches!(key, "fast")
+}
+
+fn requires_child_config_set(key: &str) -> bool {
+    matches!(
+        key,
+        "model" | "fast" | "verbose" | "yolo" | "reasoning" | "personality"
+    )
+}
+
+fn handle_prompt_background(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if text.is_empty() {
+        return Ok(Some(error_response(id, 4012, "text required")));
+    }
+
+    let task_id = new_background_task_id();
+    let event_task_id = task_id.clone();
+    let parent = local_id.to_string();
+    let context = helper.context.clone();
+    let work_root = helper.work_root.clone();
+    let stdout = Arc::clone(stdout);
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    thread::spawn(move || {
+        let result = run_background_prompt(&context, &work_root, &text, model);
+        let body = match result {
+            Ok(text) => text,
+            Err(error) => format!("error: {error}"),
+        };
+        let _ = write_json(
+            &stdout,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "background.complete",
+                    "session_id": parent,
+                    "payload": {"task_id": event_task_id, "text": body},
+                },
+            }),
+        );
+    });
+
+    Ok(Some(ok_response(id, json!({"task_id": task_id}))))
+}
+
 fn handle_session_interrupt(
     id: Value,
     params: &Map<String, Value>,
@@ -1136,6 +1815,7 @@ fn handle_session_interrupt(
             state,
             "session.interrupt",
             json!({"session_id": binding.child_id}),
+            None,
             None,
             None,
         )?;
@@ -1179,6 +1859,7 @@ fn handle_prompt_submit(
         state,
         "prompt.submit",
         Value::Object(forwarded_params),
+        Some(local_id.to_string()),
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -1215,6 +1896,7 @@ fn handle_session_steer(
             state,
             "session.steer",
             json!({"session_id": binding.child_id, "text": text}),
+            Some(local_id.to_string()),
         )?;
         return Ok(Some(rebind_response_id(response, id)));
     }
@@ -1307,6 +1989,7 @@ fn handle_text_respond(
         state,
         method,
         json!({request_key: binding.child_request_id, value_key: value}),
+        None,
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -1337,6 +2020,7 @@ fn handle_terminal_resize(
             state,
             "terminal.resize",
             json!({"session_id": child_id, "cols": cols}),
+            None,
             None,
             None,
         )?;
@@ -1865,18 +2549,33 @@ fn rewrite_child_response(
         if let Some(response_tx) = pending.response_tx {
             let _ = response_tx.send(Value::Object(object.clone()));
         }
-        if pending.method == "session.close" {
-            if let Some(local_sid) = pending.local_session_id {
-                release_local_session(state, &local_sid)?;
+        match pending.method.as_str() {
+            "session.close" => {
+                if let Some(local_sid) = pending.local_session_id {
+                    release_local_session(state, &local_sid)?;
+                }
             }
+            "child.close" => {
+                if let Some(local_sid) = pending.local_session_id {
+                    detach_child_session(state, &local_sid)?;
+                }
+            }
+            _ => {}
         }
         return Ok(pending.suppress_output);
     };
 
-    if let Some(local_sid) = pending.local_session_id.as_deref()
-        && let Some(session_key) = result.get("session_key").and_then(Value::as_str)
-    {
-        update_store_session_id(state, local_sid, session_key)?;
+    if let Some(local_sid) = pending.local_session_id.as_deref() {
+        if let Some(session_key) = result.get("session_key").and_then(Value::as_str) {
+            update_store_session_id(state, local_sid, session_key)?;
+        } else if let Some(session_key) = result
+            .get("info")
+            .and_then(Value::as_object)
+            .and_then(|info| info.get("session_key"))
+            .and_then(Value::as_str)
+        {
+            update_store_session_id(state, local_sid, session_key)?;
+        }
     }
 
     match pending.method.as_str() {
@@ -1918,6 +2617,11 @@ fn rewrite_child_response(
         "session.close" => {
             if let Some(local_sid) = pending.local_session_id {
                 release_local_session(state, &local_sid)?;
+            }
+        }
+        "child.close" => {
+            if let Some(local_sid) = pending.local_session_id {
+                detach_child_session(state, &local_sid)?;
             }
         }
         _ => {}
@@ -2016,6 +2720,22 @@ fn attach_child_to_local(
         guard
             .child_to_local
             .insert(child_id.to_string(), local_id.to_string());
+    }
+    Ok(())
+}
+
+fn detach_child_session(
+    state: &Arc<Mutex<ProxyState>>,
+    local_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while detaching child session")?;
+    if let Some(binding) = guard.sessions.get_mut(local_id) {
+        let previous_child_id = std::mem::take(&mut binding.child_id);
+        if !previous_child_id.is_empty() {
+            guard.child_to_local.remove(&previous_child_id);
+        }
     }
     Ok(())
 }
@@ -2246,8 +2966,34 @@ fn current_timestamp_seconds() -> f64 {
         .as_secs_f64()
 }
 
+fn new_background_task_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("bg_{:06x}", (now.as_nanos() & 0x00ff_ffff) as u64)
+}
+
+fn current_filename_timestamp() -> String {
+    let timestamp = current_timestamp_seconds();
+    run_python_filename_timestamp(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+}
+
 fn format_timestamp(timestamp: f64) -> String {
     run_python_datetime_format(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+}
+
+fn run_python_filename_timestamp(timestamp: f64) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg("from datetime import datetime; import sys; print(datetime.fromtimestamp(float(sys.argv[1])).strftime('%Y%m%d_%H%M%S'))")
+        .arg(format!("{timestamp}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err("python3 filename timestamp formatting failed".into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 fn run_python_datetime_format(timestamp: f64) -> Result<String, Box<dyn Error>> {
@@ -2351,6 +3097,7 @@ fn sync_pending_images(
             json!({"session_id": child_id, "path": path}),
             None,
             None,
+            None,
         )?;
     }
     Ok(())
@@ -2377,6 +3124,7 @@ fn ensure_child_session(
         json!({"session_id": store_session_id, "cols": binding.cols}),
         Some(local_id.to_string()),
         Some(store_session_id),
+        None,
     )?;
     for _ in 0..300 {
         if lookup_child_session_id(state, local_id)?.is_some() {
@@ -2394,6 +3142,7 @@ fn send_internal_child_request(
     params: Value,
     local_session_id: Option<String>,
     resume_target: Option<String>,
+    tracked_method: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let request_id = {
         let mut guard = state
@@ -2405,7 +3154,7 @@ fn send_internal_child_request(
             request_id.clone(),
             PendingRequest {
                 local_session_id,
-                method: method.to_string(),
+                method: tracked_method.unwrap_or(method).to_string(),
                 resume_target,
                 response_tx: None,
                 suppress_output: true,
@@ -2433,6 +3182,7 @@ fn send_blocking_child_request(
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     params: Value,
+    local_session_id: Option<String>,
 ) -> Result<Value, Box<dyn Error>> {
     let (response_tx, response_rx) = mpsc::channel();
     let request_id = {
@@ -2444,7 +3194,7 @@ fn send_blocking_child_request(
         guard.pending.insert(
             request_id.clone(),
             PendingRequest {
-                local_session_id: None,
+                local_session_id,
                 method: method.to_string(),
                 resume_target: None,
                 response_tx: Some(response_tx),
@@ -2561,6 +3311,117 @@ fn content_text(content: Option<&Value>) -> String {
     }
 }
 
+fn run_background_prompt(
+    context: &HermesContext,
+    work_root: &Path,
+    prompt: &str,
+    model: Option<String>,
+) -> Result<String, Box<dyn Error>> {
+    let config = context.load_config_document()?;
+    let session_store = context.open_session_store()?;
+    let overrides = ModelOverrides {
+        model,
+        provider: None,
+        base_url: None,
+        api_key: None,
+        api_mode: None,
+    };
+    let enabled_toolsets = config.config.toolsets.clone();
+    let delegate = DelegateExecutor::new(
+        context.clone(),
+        config.clone(),
+        "rust-background-delegate",
+        enabled_toolsets.clone(),
+        overrides.clone(),
+        work_root.to_path_buf(),
+    );
+    let runtime = ToolRuntime::new(work_root.to_path_buf())
+        .with_hermes_home(context.hermes_home())
+        .with_clarify_callback(|question, _choices| {
+            Err(format!(
+                "Clarify is unavailable in background tasks: {question}"
+            ))
+        })
+        .with_delegate_callback(move |request| delegate.execute(request));
+    let result = context.run_chat_completions_turn(
+        &config,
+        prompt,
+        &runtime,
+        Some(&enabled_toolsets),
+        &overrides,
+        None,
+        Some(&session_store),
+    )?;
+    Ok(result.final_response)
+}
+
+fn message_record_to_chat_message(message: MessageRecord) -> Result<Value, HermesError> {
+    let mut map = Map::new();
+    map.insert("role".to_string(), Value::String(message.role));
+    map.insert(
+        "content".to_string(),
+        message.content.unwrap_or(Value::Null),
+    );
+    if let Some(tool_call_id) = message.tool_call_id {
+        map.insert("tool_call_id".to_string(), Value::String(tool_call_id));
+    }
+    if let Some(tool_calls) = message.tool_calls {
+        if !tool_calls.is_array() {
+            return Err(HermesError::State {
+                action: "saving session transcript",
+                detail: "Stored tool_calls payload was not an array.".to_string(),
+            });
+        }
+        map.insert("tool_calls".to_string(), tool_calls);
+    }
+    if let Some(reasoning_details) = message.reasoning_details {
+        map.insert("reasoning_details".to_string(), reasoning_details);
+    }
+    if let Some(codex_reasoning_items) = message.codex_reasoning_items {
+        map.insert("codex_reasoning_items".to_string(), codex_reasoning_items);
+    }
+    if let Some(codex_message_items) = message.codex_message_items {
+        map.insert("codex_message_items".to_string(), codex_message_items);
+    }
+    Ok(Value::Object(map))
+}
+
+fn message_record_to_append(message: &MessageRecord) -> MessageAppend {
+    MessageAppend {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_name: message.tool_name.clone(),
+        token_count: message.token_count,
+        finish_reason: message.finish_reason.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning_details: message.reasoning_details.clone(),
+        codex_reasoning_items: message.codex_reasoning_items.clone(),
+        codex_message_items: message.codex_message_items.clone(),
+    }
+}
+
+fn trim_last_exchange(mut records: Vec<MessageRecord>) -> (Vec<MessageRecord>, i64) {
+    let mut removed = 0_i64;
+    while records
+        .last()
+        .is_some_and(|message| matches!(message.role.trim(), "assistant" | "tool"))
+    {
+        records.pop();
+        removed += 1;
+    }
+    if records
+        .last()
+        .is_some_and(|message| message.role.trim() == "user")
+    {
+        records.pop();
+        removed += 1;
+    }
+    (records, removed)
+}
+
 fn active_store_session_ids(
     state: &Arc<Mutex<ProxyState>>,
 ) -> Result<HashSet<String>, Box<dyn Error>> {
@@ -2574,6 +3435,14 @@ fn active_store_session_ids(
         .collect())
 }
 
+fn next_paste_counter(state: &Arc<Mutex<ProxyState>>) -> Result<u64, Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while incrementing paste counter")?;
+    guard.next_paste = guard.next_paste.saturating_add(1);
+    Ok(guard.next_paste)
+}
+
 fn run_python_helper_json(
     helper: &HelperContext,
     script: &str,
@@ -2584,6 +3453,7 @@ fn run_python_helper_json(
         .arg("-c")
         .arg(script)
         .current_dir(&helper.work_root)
+        .env("HERMES_HOME", &helper.hermes_home)
         .env("HERMES_PYTHON_SRC_ROOT", &helper.project_root)
         .env("PYTHONPATH", &helper.python_path)
         .stdin(Stdio::piped())
@@ -3305,12 +4175,18 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use hermes_core::{MessageAppend, SessionCreate};
 
     fn test_state() -> Arc<Mutex<ProxyState>> {
         Arc::new(Mutex::new(ProxyState::default()))
+    }
+
+    fn cwd_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     #[test]
@@ -3562,6 +4438,168 @@ mod tests {
     }
 
     #[test]
+    fn session_branch_native_creates_lazy_child_session_with_copied_history() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-branch-parent".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-branch".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .set_session_title("stored-branch-parent", "Parent title")
+            .unwrap();
+        for (role, content) in [("user", "hello"), ("assistant", "hi")] {
+            store
+                .append_message(
+                    "stored-branch-parent",
+                    &MessageAppend {
+                        role: role.to_string(),
+                        content: Some(json!(content)),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: None,
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        codex_reasoning_items: None,
+                        codex_message_items: None,
+                    },
+                )
+                .unwrap();
+        }
+        let local_id =
+            create_local_session(&state, Some("stored-branch-parent".to_string()), 92).unwrap();
+
+        let response = handle_session_branch(
+            json!("r-branch"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &helper_context(),
+        )
+        .unwrap()
+        .expect("native session.branch response");
+
+        let new_local_id = response["result"]["session_id"].as_str().unwrap();
+        assert_ne!(new_local_id, "rs_tui_00000001");
+        assert_eq!(response["result"]["title"], json!("Parent title #2"));
+        assert_eq!(response["result"]["parent"], json!("stored-branch-parent"));
+
+        let branched_store_id = lookup_store_session_id(&state, new_local_id)
+            .unwrap()
+            .expect("branched store session id");
+        let branched_record = store
+            .get_session(&branched_store_id)
+            .unwrap()
+            .expect("branched session row");
+        assert_eq!(
+            branched_record.parent_session_id.as_deref(),
+            Some("stored-branch-parent")
+        );
+        assert_eq!(branched_record.model.as_deref(), Some("gpt-branch"));
+        assert_eq!(
+            store
+                .get_session_title(&branched_store_id)
+                .unwrap()
+                .as_deref(),
+            Some("Parent title #2")
+        );
+
+        let copied = store.get_messages(&branched_store_id).unwrap();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].role, "user");
+        assert_eq!(copied[0].content, Some(json!("hello")));
+        assert_eq!(copied[1].role, "assistant");
+        assert_eq!(copied[1].content, Some(json!("hi")));
+        assert!(
+            lookup_child_session_id(&state, new_local_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_branch_native_rejects_empty_session() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-empty-branch".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-empty".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        let local_id =
+            create_local_session(&state, Some("stored-empty-branch".to_string()), 80).unwrap();
+
+        let response = handle_session_branch(
+            json!("r-empty-branch"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &helper_context(),
+        )
+        .unwrap()
+        .expect("native session.branch response");
+
+        assert_eq!(response["error"]["code"], json!(4008));
+    }
+
+    #[test]
+    fn prompt_background_requires_text() {
+        let state = test_state();
+        let local_id = create_local_session(&state, Some("stored-bg".to_string()), 80).unwrap();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+
+        let response = handle_prompt_background(
+            json!("r-bg-empty"),
+            json!({"session_id": local_id, "text": ""})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+        )
+        .unwrap()
+        .expect("prompt.background response");
+
+        assert_eq!(response["error"]["code"], json!(4012));
+    }
+
+    #[test]
+    fn prompt_background_rejects_missing_session() {
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+
+        let response = handle_prompt_background(
+            json!("r-bg-missing"),
+            json!({"session_id": "rs_tui_missing", "text": "hello"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+        )
+        .unwrap()
+        .expect("prompt.background response");
+
+        assert_eq!(response["error"]["code"], json!(4001));
+    }
+
+    #[test]
     fn session_close_native_releases_local_session_binding() {
         let state = test_state();
         let store = test_store();
@@ -3681,12 +4719,19 @@ mod tests {
     }
 
     fn helper_context() -> HelperContext {
+        helper_context_at(std::env::temp_dir())
+    }
+
+    fn helper_context_at(hermes_home: PathBuf) -> HelperContext {
+        let project_root = project_root();
         HelperContext {
-            hermes_home: std::env::temp_dir(),
-            project_root: project_root(),
-            python: PathBuf::from("python3"),
-            python_path: String::new(),
-            work_root: project_root(),
+            context: HermesContext::new(std::env::temp_dir())
+                .with_hermes_home_env(Some(hermes_home.clone())),
+            hermes_home,
+            python: resolve_repo_python(&project_root).unwrap_or_else(|| PathBuf::from("python3")),
+            python_path: compose_python_path(&project_root),
+            work_root: project_root.clone(),
+            project_root,
         }
     }
 
@@ -3770,6 +4815,158 @@ mod tests {
         .unwrap();
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn session_save_native_writes_current_session_transcript_json() {
+        let _cwd_guard = cwd_lock().lock().unwrap();
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-save".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-save".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                "stored-save",
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(json!("hello")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        let local_id = create_local_session(&state, Some("stored-save".to_string()), 80).unwrap();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-save-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_root).unwrap();
+
+        let response = handle_session_save(
+            json!("r-save"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+        )
+        .unwrap()
+        .expect("native session.save response");
+
+        std::env::set_current_dir(&old_cwd).unwrap();
+
+        let file = response["result"]["file"].as_str().unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved["model"], json!("gpt-save"));
+        assert_eq!(saved["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["messages"][0]["role"], json!("user"));
+        assert_eq!(saved["messages"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn session_undo_native_rewrites_store_and_detaches_child_session() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-undo".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-undo".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for (role, content) in [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+            ("assistant", "second answer"),
+        ] {
+            store
+                .append_message(
+                    "stored-undo",
+                    &MessageAppend {
+                        role: role.to_string(),
+                        content: Some(json!(content)),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: None,
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        codex_reasoning_items: None,
+                        codex_message_items: None,
+                    },
+                )
+                .unwrap();
+        }
+        let local_id = create_local_session(&state, Some("stored-undo".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-undo", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "child.close");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"closed\":true}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_undo(
+            json!("r-undo"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("native session.undo response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["result"]["removed"], json!(2));
+        assert!(
+            lookup_child_session_id(&state, "rs_tui_00000001")
+                .unwrap()
+                .is_none()
+        );
+        assert!(session_exists(&state, "rs_tui_00000001").unwrap());
+
+        let messages = store.get_messages("stored-undo").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, Some(json!("first question")));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, Some(json!("first answer")));
     }
 
     #[test]
@@ -3927,6 +5124,379 @@ mod tests {
         assert_eq!(response["result"]["status"], json!("streaming"));
         let guard = state.lock().unwrap();
         assert!(guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
+    fn session_compress_with_child_reanchors_store_session_from_nested_info() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-compress-before".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-compress", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "session.compress");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"compressed\",\"removed\":2,\"info\":{{\"session_key\":\"stored-compress-after\",\"model\":\"demo/model\"}},\"messages\":[]}}}}"
+                ),
+            );
+        });
+
+        mark_store_session_dirty(&state, &local_id).unwrap();
+        let response = handle_session_compress(
+            json!("r-compress-child"),
+            json!({"session_id": local_id, "focus_topic": "summary"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("session.compress response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-compress-child"));
+        assert_eq!(response["result"]["status"], json!("compressed"));
+        assert_eq!(response["result"]["removed"], json!(2));
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.sessions[&local_id].store_session_id.as_deref(),
+            Some("stored-compress-after")
+        );
+        assert!(!guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
+    fn rollback_restore_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-rollback".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-rollback", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "rollback.restore");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"success\":true,\"history_removed\":2,\"restored_to\":\"abc123\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_bound_child_request(
+            json!("r-rollback-restore"),
+            "rollback.restore",
+            json!({"session_id": local_id, "hash": "abc123"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("rollback.restore response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-rollback-restore"));
+        assert_eq!(response["result"]["success"], json!(true));
+        assert_eq!(response["result"]["history_removed"], json!(2));
+        assert_eq!(response["result"]["restored_to"], json!("abc123"));
+    }
+
+    #[test]
+    fn config_set_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-config-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-config", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "config.set");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"key\":\"reasoning\",\"value\":\"high\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_config_set(
+            json!("r-config-child"),
+            json!({"key": "reasoning", "session_id": local_id, "value": "high"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-config-child"));
+        assert_eq!(response["result"]["key"], json!("reasoning"));
+        assert_eq!(response["result"]["value"], json!("high"));
+    }
+
+    #[test]
+    fn config_set_helper_path_uses_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-config-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let (_child, child_stdin) = dummy_child_stdin();
+
+        let response = handle_config_set(
+            json!("r-config-helper"),
+            json!({"key": "busy", "value": "queue"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context_at(hermes_home.clone()),
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+
+        assert_eq!(response["id"], json!("r-config-helper"));
+        assert_eq!(response["result"]["key"], json!("busy"));
+        assert_eq!(response["result"]["value"], json!("queue"));
+        let config_text = fs::read_to_string(hermes_home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("busy_input_mode: queue"));
+    }
+
+    #[test]
+    fn config_get_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-config-get-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-config-get", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "config.get");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"fast\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_config_get(
+            json!("r-config-get-child"),
+            json!({"key": "fast", "session_id": local_id})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-config-get-child"));
+        assert_eq!(response["result"]["value"], json!("fast"));
+    }
+
+    #[test]
+    fn config_get_helper_path_reads_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-config-get-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let (_child, child_stdin) = dummy_child_stdin();
+        let helper = helper_context_at(hermes_home.clone());
+
+        let _ = handle_config_set(
+            json!("r-config-helper-set"),
+            json!({"key": "busy", "value": "queue"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper,
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+        let response = handle_config_get(
+            json!("r-config-helper-get"),
+            json!({"key": "busy"}).as_object().unwrap(),
+            &state,
+            &helper,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get response");
+        let mtime = handle_config_get(
+            json!("r-config-helper-mtime"),
+            json!({"key": "mtime"}).as_object().unwrap(),
+            &state,
+            &helper,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.get mtime response");
+
+        assert_eq!(response["id"], json!("r-config-helper-get"));
+        assert_eq!(response["result"]["value"], json!("queue"));
+        assert!(mtime["result"]["mtime"].as_f64().unwrap_or_default() > 0.0);
+    }
+
+    #[test]
+    fn model_options_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-model-options".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-model-options", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "model.options");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"model\":\"demo/model\",\"provider\":\"demo\",\"providers\":[]}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request(
+            json!("r-model-options"),
+            "model.options",
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            true,
+        )
+        .unwrap()
+        .expect("model.options response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-model-options"));
+        assert_eq!(response["result"]["model"], json!("demo/model"));
+        assert_eq!(response["result"]["provider"], json!("demo"));
+    }
+
+    #[test]
+    fn spawn_tree_helper_dispatch_uses_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-spawn-tree-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let helper = helper_context_at(hermes_home.clone());
+
+        let save = handle_helper_dispatch(
+            json!("r-spawn-save"),
+            "spawn_tree.save",
+            json!({
+                "session_id": "rs_tui_00000001",
+                "finished_at": 1234.0,
+                "started_at": 1200.0,
+                "label": "demo",
+                "subagents": [{"id": "sub-1"}]
+            })
+            .as_object()
+            .unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.save response");
+        let path = save["result"]["path"].as_str().unwrap().to_string();
+        let listed = handle_helper_dispatch(
+            json!("r-spawn-list"),
+            "spawn_tree.list",
+            json!({"session_id": "rs_tui_00000001", "limit": 10})
+                .as_object()
+                .unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.list response");
+        let loaded = handle_helper_dispatch(
+            json!("r-spawn-load"),
+            "spawn_tree.load",
+            json!({"path": path}).as_object().unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.load response");
+
+        assert_eq!(listed["id"], json!("r-spawn-list"));
+        assert_eq!(listed["result"]["entries"][0]["label"], json!("demo"));
+        assert_eq!(loaded["result"]["session_id"], json!("rs_tui_00000001"));
+        assert_eq!(loaded["result"]["subagents"][0]["id"], json!("sub-1"));
+    }
+
+    #[test]
+    fn paste_collapse_writes_paste_file_in_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-paste-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+
+        let response = handle_paste_collapse(
+            json!("r-paste"),
+            json!({"text": "one\ntwo"}).as_object().unwrap(),
+            &state,
+            &helper_context_at(hermes_home.clone()),
+        )
+        .unwrap()
+        .expect("paste.collapse response");
+
+        let path = response["result"]["path"].as_str().unwrap();
+        let written = fs::read_to_string(path).unwrap();
+        assert_eq!(written, "one\ntwo");
+        assert_eq!(response["result"]["lines"], json!(2));
+        assert!(
+            response["result"]["placeholder"]
+                .as_str()
+                .unwrap()
+                .contains("Pasted text #1")
+        );
     }
 
     #[test]
