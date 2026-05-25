@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Subcommand;
 use hermes_core::{EnvLoadReport, HermesConfig, HermesContext, LoadedConfig, ModelOverrides};
+use serde_json::Value as JsonValue;
 use serde_yaml::{Mapping, Number, Sequence, Value};
 
 const API_KEYS: &[(&str, &str)] = &[
@@ -521,6 +522,34 @@ fn set_config_value(
         display_yaml_value(&parsed),
         context.config_path().display()
     );
+    Ok(())
+}
+
+pub(crate) fn set_config_json_value(
+    context: &HermesContext,
+    key: &str,
+    value: &JsonValue,
+) -> Result<(), Box<dyn Error>> {
+    let trimmed_key = key.trim();
+    if trimmed_key.is_empty() {
+        return Err("config key cannot be empty".into());
+    }
+    if is_env_key(trimmed_key) {
+        return Err("JSON config persistence does not support env keys".into());
+    }
+
+    let mut user_config = read_raw_yaml_mapping(&context.config_path())?;
+    let parsed = serde_yaml::to_value(value)?;
+    set_nested_value(&mut user_config, trimmed_key, parsed.clone())?;
+    write_yaml_mapping(&context.config_path(), &user_config)?;
+
+    if let Some((_, env_key)) = CONFIG_TO_ENV_SYNC
+        .iter()
+        .find(|(path, _)| *path == trimmed_key)
+    {
+        save_env_value(context.env_path(), env_key, &scalar_to_env_string(&parsed))?;
+    }
+
     Ok(())
 }
 
