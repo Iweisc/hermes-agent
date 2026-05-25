@@ -271,6 +271,12 @@ impl HermesContext {
                 iteration: api_calls,
                 prev_tools: extract_prev_tools(&messages),
             });
+            apply_pending_steer_before_api_call(
+                &tool_runtime,
+                &mut messages,
+                session_store,
+                session_id.as_deref(),
+            );
             let response = send_model_request(
                 &client,
                 &runtime_model,
@@ -392,12 +398,15 @@ impl HermesContext {
             for tool_call in pending_tool_calls {
                 tool_calls += 1;
                 tool_runtime.maybe_checkpoint_before_tool(&tool_call.name, &tool_call.json);
-                let result = crate::tools::dispatch_tool_with_messages(
+                let mut result = crate::tools::dispatch_tool_with_messages(
                     &tool_call.name,
                     tool_call.json,
                     &tool_runtime,
                     &messages,
                 );
+                if let Some(steer_text) = tool_runtime.drain_pending_steer() {
+                    result.push_str(&steer_marker(&steer_text));
+                }
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -3867,6 +3876,52 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn steer_marker(text: &str) -> String {
+    format!("\n\nUser guidance: {}", text.trim())
+}
+
+fn apply_pending_steer_before_api_call(
+    runtime: &ToolRuntime,
+    messages: &mut [Value],
+    session_store: Option<&SessionStore>,
+    session_id: Option<&str>,
+) {
+    let Some(steer_text) = runtime.drain_pending_steer() else {
+        return;
+    };
+    let marker = steer_marker(&steer_text);
+    if append_steer_to_last_tool_message(messages, &marker) {
+        if let (Some(store), Some(session_id)) = (session_store, session_id) {
+            let _ = store.append_to_last_tool_message(session_id, &marker);
+        }
+        return;
+    }
+    runtime.restore_pending_steer(&steer_text);
+}
+
+fn append_steer_to_last_tool_message(messages: &mut [Value], marker: &str) -> bool {
+    for message in messages.iter_mut().rev() {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        match object.get_mut("content") {
+            Some(Value::String(content)) => content.push_str(marker),
+            Some(content) => {
+                let replacement = format!("{}{}", content, marker);
+                *content = Value::String(replacement);
+            }
+            None => {
+                object.insert("content".to_string(), Value::String(marker.to_string()));
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn unix_ts_nanos() -> u128 {

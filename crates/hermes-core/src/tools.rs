@@ -391,6 +391,7 @@ pub struct ToolRuntime {
     cwd: PathBuf,
     hermes_home: PathBuf,
     current_session_id: Option<String>,
+    pending_steer: Arc<Mutex<Option<String>>>,
     todo_store: Arc<Mutex<TodoStore>>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
     available_tool_names: Option<BTreeSet<String>>,
@@ -415,6 +416,7 @@ impl ToolRuntime {
             cwd: cwd.into(),
             hermes_home: default_hermes_home(),
             current_session_id: None,
+            pending_steer: Arc::new(Mutex::new(None)),
             todo_store: Arc::new(Mutex::new(TodoStore::default())),
             memory_store: None,
             available_tool_names: None,
@@ -466,6 +468,42 @@ impl ToolRuntime {
     pub fn hydrate_todo_from_messages(&self, messages: &[crate::MessageRecord]) {
         if let Ok(mut store) = self.todo_store.lock() {
             store.hydrate_from_messages(messages);
+        }
+    }
+
+    pub fn steer(&self, text: &str) -> bool {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let Ok(mut pending) = self.pending_steer.lock() else {
+            return false;
+        };
+        if let Some(existing) = pending.as_mut() {
+            existing.push('\n');
+            existing.push_str(cleaned);
+        } else {
+            *pending = Some(cleaned.to_string());
+        }
+        true
+    }
+
+    pub fn drain_pending_steer(&self) -> Option<String> {
+        self.pending_steer.lock().ok()?.take()
+    }
+
+    pub fn restore_pending_steer(&self, text: &str) {
+        let cleaned = text.trim();
+        if cleaned.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_steer.lock() {
+            if let Some(existing) = pending.as_mut() {
+                existing.push('\n');
+                existing.push_str(cleaned);
+            } else {
+                *pending = Some(cleaned.to_string());
+            }
         }
     }
 
@@ -4804,6 +4842,21 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0]["content"], json!("restored"));
         assert_eq!(todos[0]["status"], json!("in_progress"));
+    }
+
+    #[test]
+    fn runtime_steer_queue_concatenates_and_drains() {
+        let runtime = ToolRuntime::default();
+        assert!(!runtime.steer("   "));
+        assert!(runtime.steer("first"));
+        assert!(runtime.steer("second"));
+        assert_eq!(
+            runtime.drain_pending_steer().as_deref(),
+            Some("first\nsecond")
+        );
+        assert_eq!(runtime.drain_pending_steer(), None);
+        runtime.restore_pending_steer("again");
+        assert_eq!(runtime.drain_pending_steer().as_deref(), Some("again"));
     }
 
     #[test]

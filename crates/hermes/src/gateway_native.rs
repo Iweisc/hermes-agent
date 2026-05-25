@@ -27,6 +27,7 @@ use crate::python_bridge::{project_root, resolve_repo_python};
 struct NativeGatewaySessionState {
     cwd: PathBuf,
     cols: u16,
+    pending_steer: Option<String>,
     overrides: ModelOverrides,
 }
 
@@ -43,6 +44,7 @@ struct NativeGatewayServer<'a> {
 
 struct ActiveTurn {
     session_id: String,
+    runtime: ToolRuntime,
     turn: GatewayTurnSession,
 }
 
@@ -216,7 +218,7 @@ impl<'a> NativeGatewayServer<'a> {
         if prompt_active
             && !matches!(
                 method,
-                "clarify.respond" | "approval.respond" | "session.interrupt"
+                "clarify.respond" | "approval.respond" | "session.interrupt" | "session.steer"
             )
         {
             return write_jsonrpc_error(
@@ -235,6 +237,7 @@ impl<'a> NativeGatewayServer<'a> {
             "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
             "session.branch" => self.handle_session_branch(params),
+            "session.steer" => self.handle_session_steer(params),
             "session.undo" => self.handle_session_undo(params),
             "session.usage" => self.handle_session_usage(params),
             "session.delete" => self.handle_session_delete(params),
@@ -299,6 +302,7 @@ impl<'a> NativeGatewayServer<'a> {
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 cols: parse_terminal_cols(params.get("cols"))?,
+                pending_steer: None,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -372,6 +376,7 @@ impl<'a> NativeGatewayServer<'a> {
             NativeGatewaySessionState {
                 cwd: cwd_from_record(&record),
                 cols: 80,
+                pending_steer: None,
                 overrides: overrides_from_record(&record),
             },
         );
@@ -486,11 +491,49 @@ impl<'a> NativeGatewayServer<'a> {
         self.session_store
             .set_session_title(&new_session_id, &title)
             .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
-        self.sessions.insert(new_session_id.clone(), state);
+        let mut branched_state = state;
+        branched_state.pending_steer = None;
+        self.sessions.insert(new_session_id.clone(), branched_state);
         Ok(json!({
             "session_id": new_session_id,
             "title": title,
             "parent": session_id,
+        }))
+    }
+
+    fn handle_session_steer(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let text = params
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (4002, String::from("text is required"), None))?;
+        if let Some(active) = self.active_turn.as_ref()
+            && active.session_id == session_id
+        {
+            let accepted = active.runtime.steer(text);
+            return Ok(json!({
+                "status": if accepted { "queued" } else { "rejected" },
+                "text": text,
+            }));
+        }
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        if let Some(existing) = state.pending_steer.as_mut() {
+            existing.push('\n');
+            existing.push_str(text);
+        } else {
+            state.pending_steer = Some(text.to_string());
+        }
+        Ok(json!({
+            "status": "queued",
+            "text": text,
         }))
     }
 
@@ -711,18 +754,26 @@ impl<'a> NativeGatewayServer<'a> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| (-32602, String::from("text is required"), None))?
             .to_string();
-        let state = self
+        let mut state = self
             .sessions
             .get(&session_id)
             .cloned()
             .ok_or_else(|| (-32004, String::from("session not found"), None))?;
+        let runtime = ToolRuntime::new(&state.cwd)
+            .with_hermes_home(self.context.hermes_home())
+            .with_current_session_id(Some(session_id.clone()));
+        if let Some(pending_steer) = state.pending_steer.take() {
+            let _ = runtime.steer(&pending_steer);
+            if let Some(saved_state) = self.sessions.get_mut(&session_id) {
+                saved_state.pending_steer = None;
+            }
+        }
+        let active_runtime = runtime.clone();
         let rx = spawn_chat_turn_with_events(
             self.context.clone(),
             self.config.clone(),
             Value::String(text),
-            ToolRuntime::new(&state.cwd)
-                .with_hermes_home(self.context.hermes_home())
-                .with_current_session_id(Some(session_id.clone())),
+            runtime,
             self.config.config.toolsets.clone(),
             state.overrides.clone(),
             Some(session_id.clone()),
@@ -733,6 +784,7 @@ impl<'a> NativeGatewayServer<'a> {
         );
         self.active_turn = Some(ActiveTurn {
             session_id: session_id.clone(),
+            runtime: active_runtime,
             turn: GatewayTurnSession::new(rx),
         });
         write_jsonrpc_event(
@@ -2366,6 +2418,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2632,6 +2685,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: temp.path().to_path_buf(),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2833,6 +2887,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -2930,6 +2985,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: PathBuf::from("/tmp/demo"),
                 cols: 120,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("override-model")),
                     provider: Some(String::from("demo-provider")),
@@ -2996,6 +3052,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: PathBuf::from("."),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -3058,6 +3115,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: PathBuf::from("."),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("override-model")),
                     ..ModelOverrides::default()
@@ -3085,6 +3143,115 @@ mod tests {
         assert_eq!(usage_frame["result"]["cache_write"], json!(7));
         assert_eq!(usage_frame["result"]["cost_status"], json!("estimated"));
         assert_eq!(usage_frame["result"]["cost_usd"], json!(0.1334));
+    }
+
+    #[test]
+    fn native_gateway_session_steer_queues_idle_guidance_for_next_prompt() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"steer.txt\",\"content\":\"hello\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Queued steer applied."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        store
+            .create_session(&SessionCreate {
+                id: String::from("steer-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("steer-session"),
+            NativeGatewaySessionState {
+                cwd: temp.path().to_path_buf(),
+                cols: 80,
+                pending_steer: None,
+                overrides: ModelOverrides {
+                    model: Some(String::from("test-model")),
+                    provider: Some(String::from("custom")),
+                    base_url: Some(base_url),
+                    api_key: Some(String::from("test-key")),
+                    api_mode: Some(String::from("chat_completions")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut steer = Vec::new();
+        server
+            .handle_request(
+                "session.steer",
+                json!(1),
+                json!({"session_id":"steer-session","text":"Prefer concise tool output"}),
+                &mut steer,
+                false,
+            )
+            .unwrap();
+        let steer_frame = serde_json::from_slice::<Value>(&steer).unwrap();
+        assert_eq!(steer_frame["result"]["status"], json!("queued"));
+        assert_eq!(
+            server.sessions["steer-session"].pending_steer.as_deref(),
+            Some("Prefer concise tool output")
+        );
+
+        let mut output = Vec::new();
+        let result = server
+            .handle_prompt_submit(
+                &mut output,
+                json!({"session_id":"steer-session","text":"Write the file"}),
+            )
+            .unwrap();
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(server.sessions["steer-session"].pending_steer, None);
+
+        let tool_message = store
+            .get_messages("steer-session")
+            .unwrap()
+            .into_iter()
+            .find(|message| message.tool_name.as_deref() == Some("write_file"))
+            .unwrap();
+        assert!(
+            tool_message
+                .content
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("User guidance: Prefer concise tool output")
+        );
     }
 
     #[test]
@@ -3174,6 +3341,7 @@ mod tests {
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     ..ModelOverrides::default()

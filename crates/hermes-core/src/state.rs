@@ -1158,6 +1158,46 @@ impl SessionStore {
         Ok(removed_ids.len())
     }
 
+    pub fn append_to_last_tool_message(
+        &self,
+        session_id: &str,
+        suffix: &str,
+    ) -> Result<bool, HermesError> {
+        if suffix.is_empty() {
+            return Ok(false);
+        }
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(state_err("opening steer update transaction"))?;
+        let row = tx
+            .query_row(
+                "SELECT id, content
+                 FROM messages
+                 WHERE session_id = ? AND role = 'tool'
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                [session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(state_err("loading last tool message"))?;
+        let Some((message_id, content)) = row else {
+            tx.rollback()
+                .map_err(state_err("rolling back steer update transaction"))?;
+            return Ok(false);
+        };
+        let updated_content = format!("{}{}", content.unwrap_or_default(), suffix);
+        tx.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            params![updated_content, message_id],
+        )
+        .map_err(state_err("updating last tool message"))?;
+        tx.commit()
+            .map_err(state_err("committing steer update transaction"))?;
+        Ok(true)
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<bool, HermesError> {
         let tx = self
             .connection
@@ -1978,6 +2018,87 @@ mod tests {
         assert_eq!(usage.estimated_cost_usd, Some(0.1334));
         assert_eq!(usage.actual_cost_usd, Some(0.09));
         assert_eq!(usage.cost_status.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn append_to_last_tool_message_updates_latest_tool_entry() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-steer"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        for message in [
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(Value::String(String::from("{\"first\":true}"))),
+                tool_call_id: Some(String::from("call-1")),
+                tool_calls: None,
+                tool_name: Some(String::from("write_file")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(Value::String(String::from("note"))),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(Value::String(String::from("{\"second\":true}"))),
+                tool_call_id: Some(String::from("call-2")),
+                tool_calls: None,
+                tool_name: Some(String::from("terminal")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store
+                .append_message("sess-steer", &message)
+                .expect("append message");
+        }
+
+        assert!(
+            store
+                .append_to_last_tool_message("sess-steer", "\n\nUser guidance: adjust")
+                .expect("append steer")
+        );
+        let messages = store.get_messages("sess-steer").expect("get messages");
+        assert_eq!(
+            messages[2].content,
+            Some(Value::String(String::from(
+                "{\"second\":true}\n\nUser guidance: adjust"
+            )))
+        );
+        assert_eq!(
+            messages[0].content,
+            Some(Value::String(String::from("{\"first\":true}")))
+        );
     }
 
     #[test]
