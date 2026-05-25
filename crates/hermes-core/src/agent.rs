@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     HermesContext, HermesError, LoadedConfig, MessageAppend, ModelOverrides, SessionCreate,
-    SessionStore, ToolRuntime, dispatch_tool, get_tool_definitions,
+    SessionStore, ToolRuntime, build_memory_context_block, dispatch_tool, get_tool_definitions,
 };
 
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
@@ -135,9 +135,91 @@ impl HermesContext {
         if let Err(error) = tool_runtime.load_memory_store(&loaded.config.memory) {
             log::warn!(target: "run_agent", "memory bootstrap skipped: {error}");
         }
+        let mut prior_user_turns = 0_u64;
+        let mut prior_messages = Vec::new();
+        let mut system_prompt_override = None;
+        let mut session_id = None;
+
+        if let Some(store) = session_store
+            && let Some(session_hint) = session_hint.and_then(non_empty_trimmed)
+        {
+            let resolved =
+                store
+                    .resolve_session_id(&session_hint)?
+                    .ok_or_else(|| HermesError::State {
+                        action: "resolving session",
+                        detail: format!("No unique session matched '{session_hint}'."),
+                    })?;
+            let session = store
+                .get_session(&resolved)?
+                .ok_or_else(|| HermesError::State {
+                    action: "loading session",
+                    detail: format!("Session '{resolved}' no longer exists."),
+                })?;
+            system_prompt_override = session.system_prompt.as_deref().and_then(non_empty_trimmed);
+            prior_messages = store.get_messages(&resolved)?;
+            prior_user_turns = prior_messages
+                .iter()
+                .filter(|msg| msg.role == "user")
+                .count() as u64;
+            tool_runtime = tool_runtime.with_current_session_id(Some(resolved.clone()));
+            tool_runtime.hydrate_todo_from_messages(&prior_messages);
+            session_id = Some(resolved);
+        }
+
+        if session_id.is_none() {
+            let new_session_id = format!("rs_{:x}", unix_ts_nanos());
+            tool_runtime = tool_runtime.with_current_session_id(Some(new_session_id.clone()));
+            session_id = Some(new_session_id);
+        }
+
+        if !loaded.config.memory.provider.trim().is_empty()
+            && let Some(current_session_id) = tool_runtime.current_session_id()
+        {
+            let init_kwargs = json!({
+                "hermes_home": tool_runtime.hermes_home().display().to_string(),
+                "platform": "cli",
+                "agent_context": "primary",
+                "agent_identity": self.current_profile_name(),
+                "agent_workspace": tool_runtime.cwd().display().to_string(),
+            });
+            match crate::memory::ExternalMemoryProviderRuntime::start(
+                loaded.config.memory.provider.trim(),
+                tool_runtime.hermes_home(),
+                current_session_id,
+                init_kwargs,
+            ) {
+                Ok(provider) => {
+                    log::info!(
+                        target: "run_agent",
+                        "external memory provider '{}' initialized",
+                        provider.provider_name()
+                    );
+                    tool_runtime = tool_runtime.with_external_memory_provider(Some(provider));
+                }
+                Err(error) => {
+                    log::warn!(
+                        target: "run_agent",
+                        "external memory provider '{}' skipped: {}",
+                        loaded.config.memory.provider.trim(),
+                        error
+                    );
+                }
+            }
+        }
+
         let disabled_toolsets =
             (!loaded.config.memory.any_enabled()).then(|| vec![String::from("memory")]);
-        let tools = get_tool_definitions(enabled_toolsets, disabled_toolsets.as_deref());
+        let mut tools = get_tool_definitions(enabled_toolsets, disabled_toolsets.as_deref());
+        let mut seen_tool_names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for tool in tool_runtime.external_memory_tool_definitions() {
+            if seen_tool_names.insert(tool.name.clone()) {
+                tools.push(tool);
+            }
+        }
         tool_runtime = tool_runtime.with_available_tool_names(
             tools
                 .iter()
@@ -146,58 +228,28 @@ impl HermesContext {
         );
         let mut system_prompt = build_system_prompt(&tool_runtime, &loaded.config.memory)?;
         let mut messages = Vec::new();
-        let mut session_id = None;
-
-        if let Some(store) = session_store {
-            if let Some(session_hint) = session_hint.and_then(non_empty_trimmed) {
-                let resolved =
-                    store
-                        .resolve_session_id(&session_hint)?
-                        .ok_or_else(|| HermesError::State {
-                            action: "resolving session",
-                            detail: format!("No unique session matched '{session_hint}'."),
-                        })?;
-                let session = store
-                    .get_session(&resolved)?
-                    .ok_or_else(|| HermesError::State {
-                        action: "loading session",
-                        detail: format!("Session '{resolved}' no longer exists."),
-                    })?;
-                if let Some(saved_prompt) =
-                    session.system_prompt.as_deref().and_then(non_empty_trimmed)
-                {
-                    system_prompt = saved_prompt;
-                }
-                let prior_messages = store.get_messages(&resolved)?;
-                tool_runtime = tool_runtime.with_current_session_id(Some(resolved.clone()));
-                tool_runtime.hydrate_todo_from_messages(&prior_messages);
-                messages.push(json!({
-                    "role": "system",
-                    "content": system_prompt,
-                }));
-                for prior in prior_messages {
-                    messages.push(message_record_to_chat_message(prior)?);
-                }
-                session_id = Some(resolved);
-            }
+        if let Some(saved_prompt) = system_prompt_override {
+            system_prompt = saved_prompt;
         }
-
-        if messages.is_empty() {
-            messages.push(json!({
-                "role": "system",
-                "content": system_prompt,
-            }));
+        messages.push(json!({
+            "role": "system",
+            "content": system_prompt,
+        }));
+        for prior in prior_messages {
+            messages.push(message_record_to_chat_message(prior)?);
         }
+        let current_turn_user_idx = messages.len();
         messages.push(json!({
             "role": "user",
             "content": user_content.clone(),
         }));
 
         if let Some(store) = session_store {
-            if session_id.is_none() {
-                let new_session_id = format!("rs_{:x}", unix_ts_nanos());
+            if let Some(session_id) = session_id.as_deref()
+                && store.get_session(session_id)?.is_none()
+            {
                 store.create_session(&SessionCreate {
-                    id: new_session_id.clone(),
+                    id: session_id.to_string(),
                     source: "rust-agent".to_string(),
                     user_id: None,
                     model: Some(runtime_model.model.clone()),
@@ -209,8 +261,6 @@ impl HermesContext {
                     system_prompt: Some(system_prompt.clone()),
                     parent_session_id: None,
                 })?;
-                tool_runtime = tool_runtime.with_current_session_id(Some(new_session_id.clone()));
-                session_id = Some(new_session_id);
             }
             if let Some(session_id) = session_id.as_deref() {
                 let _ = store.append_message(
@@ -233,39 +283,123 @@ impl HermesContext {
             }
         }
 
-        let client = build_http_client()?;
-        let mut api_calls = 0_u64;
-        let mut tool_calls = 0_u64;
+        let turn_number = prior_user_turns.saturating_add(1);
+        let user_text = match &user_content {
+            Value::String(text) => text.trim().to_string(),
+            _ => String::new(),
+        };
+        if let Err(error) = tool_runtime.external_memory_on_turn_start(turn_number, &user_text) {
+            log::debug!(target: "run_agent", "memory on_turn_start failed: {error}");
+        }
+        let external_prefetch = match tool_runtime.external_memory_prefetch(&user_text) {
+            Ok(value) => value,
+            Err(error) => {
+                log::debug!(target: "run_agent", "memory prefetch failed: {error}");
+                String::new()
+            }
+        };
 
-        for _ in 0..loaded.config.agent.max_turns {
-            api_calls += 1;
-            let response = send_model_request(
-                &client,
-                &runtime_model,
-                &messages,
-                &tools,
-                session_id.as_deref(),
-            )?;
-            let NormalizedAssistantResponse {
-                content: assistant_content,
-                tool_calls: pending_tool_calls,
-                finish_reason,
-                reasoning,
-                reasoning_details,
-                codex_reasoning_items,
-                codex_message_items,
-            } = response;
+        let turn_result = (|| -> Result<AgentTurnResult, HermesError> {
+            let client = build_http_client()?;
+            let mut api_calls = 0_u64;
+            let mut tool_calls = 0_u64;
 
-            if pending_tool_calls.is_empty() {
-                let final_response = assistant_content
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| HermesError::State {
-                        action: "parsing assistant response",
-                        detail: "Assistant response had no text content.".to_string(),
-                    })?
-                    .to_string();
+            for _ in 0..loaded.config.agent.max_turns {
+                api_calls += 1;
+                let request_messages =
+                    build_request_messages(&messages, current_turn_user_idx, &external_prefetch);
+                let response = send_model_request(
+                    &client,
+                    &runtime_model,
+                    &request_messages,
+                    &tools,
+                    session_id.as_deref(),
+                )?;
+                let NormalizedAssistantResponse {
+                    content: assistant_content,
+                    tool_calls: pending_tool_calls,
+                    finish_reason,
+                    reasoning,
+                    reasoning_details,
+                    codex_reasoning_items,
+                    codex_message_items,
+                } = response;
+
+                if pending_tool_calls.is_empty() {
+                    let final_response = assistant_content
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| HermesError::State {
+                            action: "parsing assistant response",
+                            detail: "Assistant response had no text content.".to_string(),
+                        })?
+                        .to_string();
+                    if let Some(store) = session_store
+                        && let Some(session_id) = session_id.as_deref()
+                    {
+                        let _ = store.append_message(
+                            session_id,
+                            &MessageAppend {
+                                role: "assistant".to_string(),
+                                content: Some(Value::String(final_response.clone())),
+                                tool_call_id: None,
+                                tool_calls: None,
+                                tool_name: None,
+                                token_count: None,
+                                finish_reason: finish_reason.clone(),
+                                reasoning: reasoning.clone(),
+                                reasoning_content: None,
+                                reasoning_details: reasoning_details.clone(),
+                                codex_reasoning_items: codex_reasoning_items.clone(),
+                                codex_message_items: codex_message_items.clone(),
+                            },
+                        );
+                    }
+                    if !user_text.is_empty() {
+                        if let Err(error) =
+                            tool_runtime.external_memory_sync_turn(&user_text, &final_response)
+                        {
+                            log::debug!(target: "run_agent", "memory sync_turn failed: {error}");
+                        }
+                        if let Err(error) = tool_runtime.external_memory_queue_prefetch(&user_text)
+                        {
+                            log::debug!(
+                                target: "run_agent",
+                                "memory queue_prefetch failed: {error}"
+                            );
+                        }
+                    }
+                    return Ok(AgentTurnResult {
+                        final_response,
+                        api_calls,
+                        tool_calls,
+                        model: runtime_model.model,
+                        provider: runtime_model.provider,
+                        base_url: runtime_model.base_url,
+                        session_id,
+                    });
+                }
+
+                let normalized_tool_calls = pending_tool_calls
+                    .iter()
+                    .map(|tool_call| {
+                        json!({
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments_raw,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "tool_calls": normalized_tool_calls,
+                }));
                 if let Some(store) = session_store
                     && let Some(session_id) = session_id.as_deref()
                 {
@@ -273,12 +407,12 @@ impl HermesContext {
                         session_id,
                         &MessageAppend {
                             role: "assistant".to_string(),
-                            content: Some(Value::String(final_response.clone())),
+                            content: assistant_content.clone().map(Value::String),
                             tool_call_id: None,
-                            tool_calls: None,
+                            tool_calls: Some(Value::Array(normalized_tool_calls.clone())),
                             tool_name: None,
                             token_count: None,
-                            finish_reason: finish_reason.clone(),
+                            finish_reason: None,
                             reasoning: reasoning.clone(),
                             reasoning_content: None,
                             reasoning_details: reasoning_details.clone(),
@@ -287,97 +421,53 @@ impl HermesContext {
                         },
                     );
                 }
-                return Ok(AgentTurnResult {
-                    final_response,
-                    api_calls,
-                    tool_calls,
-                    model: runtime_model.model,
-                    provider: runtime_model.provider,
-                    base_url: runtime_model.base_url,
-                    session_id,
-                });
-            }
 
-            let normalized_tool_calls = pending_tool_calls
-                .iter()
-                .map(|tool_call| {
-                    json!({
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": tool_call.arguments_raw,
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            messages.push(json!({
-                "role": "assistant",
-                "content": assistant_content,
-                "tool_calls": normalized_tool_calls,
-            }));
-            if let Some(store) = session_store
-                && let Some(session_id) = session_id.as_deref()
-            {
-                let _ = store.append_message(
-                    session_id,
-                    &MessageAppend {
-                        role: "assistant".to_string(),
-                        content: assistant_content.clone().map(Value::String),
-                        tool_call_id: None,
-                        tool_calls: Some(Value::Array(normalized_tool_calls.clone())),
-                        tool_name: None,
-                        token_count: None,
-                        finish_reason: None,
-                        reasoning: reasoning.clone(),
-                        reasoning_content: None,
-                        reasoning_details: reasoning_details.clone(),
-                        codex_reasoning_items: codex_reasoning_items.clone(),
-                        codex_message_items: codex_message_items.clone(),
-                    },
-                );
-            }
-
-            for tool_call in pending_tool_calls {
-                tool_calls += 1;
-                let result = dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                }));
-                if let Some(store) = session_store
-                    && let Some(session_id) = session_id.as_deref()
-                {
-                    let _ = store.append_message(
-                        session_id,
-                        &MessageAppend {
-                            role: "tool".to_string(),
-                            content: Some(Value::String(result)),
-                            tool_call_id: Some(tool_call.id),
-                            tool_calls: None,
-                            tool_name: Some(tool_call.name),
-                            token_count: None,
-                            finish_reason: None,
-                            reasoning: None,
-                            reasoning_content: None,
-                            reasoning_details: None,
-                            codex_reasoning_items: None,
-                            codex_message_items: None,
-                        },
-                    );
+                for tool_call in pending_tool_calls {
+                    tool_calls += 1;
+                    let result = dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    }));
+                    if let Some(store) = session_store
+                        && let Some(session_id) = session_id.as_deref()
+                    {
+                        let _ = store.append_message(
+                            session_id,
+                            &MessageAppend {
+                                role: "tool".to_string(),
+                                content: Some(Value::String(result)),
+                                tool_call_id: Some(tool_call.id),
+                                tool_calls: None,
+                                tool_name: Some(tool_call.name),
+                                token_count: None,
+                                finish_reason: None,
+                                reasoning: None,
+                                reasoning_content: None,
+                                reasoning_details: None,
+                                codex_reasoning_items: None,
+                                codex_message_items: None,
+                            },
+                        );
+                    }
                 }
             }
+
+            Err(HermesError::State {
+                action: "running agent turn",
+                detail: format!(
+                    "Reached max_turns ({}) without a final assistant response.",
+                    loaded.config.agent.max_turns
+                ),
+            })
+        })();
+
+        if let Err(error) = tool_runtime.external_memory_shutdown() {
+            log::debug!(target: "run_agent", "memory shutdown failed: {error}");
         }
 
-        Err(HermesError::State {
-            action: "running agent turn",
-            detail: format!(
-                "Reached max_turns ({}) without a final assistant response.",
-                loaded.config.agent.max_turns
-            ),
-        })
+        turn_result
     }
 }
 
@@ -450,6 +540,9 @@ fn build_system_prompt(
     {
         sections.push(block);
     }
+    if let Some(block) = runtime.external_memory_system_prompt_block() {
+        sections.push(block);
+    }
     if runtime
         .available_tool_names()
         .is_some_and(|tools| tools.contains("kanban_show"))
@@ -457,6 +550,50 @@ fn build_system_prompt(
         sections.push(KANBAN_GUIDANCE.to_string());
     }
     Ok(sections.join("\n\n"))
+}
+
+fn build_request_messages(
+    messages: &[Value],
+    current_turn_user_idx: usize,
+    external_prefetch: &str,
+) -> Vec<Value> {
+    let injection = build_memory_context_block(external_prefetch);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if index != current_turn_user_idx || injection.is_empty() {
+                return message.clone();
+            }
+            let mut cloned = message.clone();
+            if let Some(content) = cloned.get_mut("content") {
+                append_injection_to_user_content(content, &injection);
+            }
+            cloned
+        })
+        .collect()
+}
+
+fn append_injection_to_user_content(content: &mut Value, injection: &str) {
+    match content {
+        Value::String(text) => {
+            if text.trim().is_empty() {
+                *text = injection.to_string();
+            } else {
+                text.push_str("\n\n");
+                text.push_str(injection);
+            }
+        }
+        Value::Array(items) => {
+            items.push(json!({
+                "type": "text",
+                "text": injection,
+            }));
+        }
+        other => {
+            *other = Value::String(injection.to_string());
+        }
+    }
 }
 
 fn build_http_client() -> Result<Client, HermesError> {
@@ -3702,6 +3839,7 @@ fn unix_ts_nanos() -> u128 {
 mod tests {
     use super::*;
 
+    use std::env;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -3781,6 +3919,54 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENROUTER_API_KEY");
         }
+    }
+
+    #[test]
+    fn build_request_messages_injects_prefetch_only_into_current_user_turn() {
+        let messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "earlier"}),
+            json!({"role": "assistant", "content": "reply"}),
+            json!({"role": "user", "content": "remember me"}),
+        ];
+
+        let request_messages = build_request_messages(&messages, 3, "remembered: remember me");
+
+        assert_eq!(request_messages[0], messages[0]);
+        assert_eq!(request_messages[1], messages[1]);
+        assert_eq!(request_messages[2], messages[2]);
+        let injected = request_messages[3]["content"].as_str().unwrap();
+        assert!(injected.starts_with("remember me"));
+        assert!(injected.contains("<memory-context>"));
+        assert!(injected.contains("remembered: remember me"));
+    }
+
+    #[test]
+    fn build_request_messages_appends_prefetch_block_to_multimodal_user_turn() {
+        let messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}}
+                ]
+            }),
+        ];
+
+        let request_messages = build_request_messages(&messages, 1, "vision memory");
+
+        assert_eq!(request_messages[0], messages[0]);
+        let content = request_messages[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["text"], json!("describe this"));
+        assert_eq!(
+            content[2],
+            json!({
+                "type": "text",
+                "text": build_memory_context_block("vision memory"),
+            })
+        );
     }
 
     #[test]

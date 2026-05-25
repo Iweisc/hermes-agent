@@ -43,7 +43,7 @@ use crate::kanban::{
     kanban_block_schema, kanban_comment_schema, kanban_complete_schema, kanban_create_schema,
     kanban_heartbeat_schema, kanban_link_schema, kanban_show_schema,
 };
-use crate::memory::MemoryStore;
+use crate::memory::{ExternalMemoryProviderRuntime, MemoryStore};
 use crate::moa::{handle_mixture_of_agents, mixture_of_agents_available, mixture_of_agents_schema};
 use crate::rl::{
     handle_rl_check_status, handle_rl_edit_config, handle_rl_get_current_config,
@@ -305,6 +305,7 @@ pub struct ToolRuntime {
     current_session_id: Option<String>,
     todo_store: Arc<Mutex<TodoStore>>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
+    external_memory_provider: Option<Arc<Mutex<ExternalMemoryProviderRuntime>>>,
     available_tool_names: Option<BTreeSet<String>>,
     clarify_callback: Option<ClarifyCallback>,
     delegate_callback: Option<DelegateCallback>,
@@ -318,6 +319,7 @@ impl ToolRuntime {
             current_session_id: None,
             todo_store: Arc::new(Mutex::new(TodoStore::default())),
             memory_store: None,
+            external_memory_provider: None,
             available_tool_names: None,
             clarify_callback: None,
             delegate_callback: None,
@@ -339,6 +341,10 @@ impl ToolRuntime {
 
     pub fn current_session_id(&self) -> Option<&str> {
         self.current_session_id.as_deref()
+    }
+
+    pub fn current_session_id_or_empty(&self) -> &str {
+        self.current_session_id.as_deref().unwrap_or("")
     }
 
     pub fn with_current_session_id(mut self, value: Option<String>) -> Self {
@@ -364,6 +370,14 @@ impl ToolRuntime {
         self
     }
 
+    pub fn with_external_memory_provider(
+        mut self,
+        value: Option<ExternalMemoryProviderRuntime>,
+    ) -> Self {
+        self.external_memory_provider = value.map(|provider| Arc::new(Mutex::new(provider)));
+        self
+    }
+
     pub fn load_memory_store(&mut self, config: &crate::MemoryConfig) -> Result<(), String> {
         if !config.any_enabled() {
             self.memory_store = None;
@@ -380,6 +394,152 @@ impl ToolRuntime {
         let store = self.memory_store.as_ref()?;
         let store = store.lock().ok()?;
         store.format_for_system_prompt(target)
+    }
+
+    pub fn external_memory_system_prompt_block(&self) -> Option<String> {
+        let provider = self.external_memory_provider.as_ref()?;
+        let provider = provider.lock().ok()?;
+        let block = provider.system_prompt_block().trim();
+        (!block.is_empty()).then(|| block.to_string())
+    }
+
+    pub fn external_memory_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(provider) = provider.lock() else {
+            return Vec::new();
+        };
+        provider
+            .tool_schemas()
+            .into_iter()
+            .filter_map(|schema| {
+                let name = schema
+                    .get("name")
+                    .and_then(Value::as_str)?
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                let description = schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                Some(ToolDefinition {
+                    name,
+                    toolset: "memory".to_string(),
+                    description,
+                    emoji: "x".to_string(),
+                    schema,
+                })
+            })
+            .collect()
+    }
+
+    pub fn external_memory_has_tool(&self, name: &str) -> bool {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return false;
+        };
+        let Ok(provider) = provider.lock() else {
+            return false;
+        };
+        provider.has_tool(name)
+    }
+
+    pub fn external_memory_handle_tool_call(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Result<String, String> {
+        let provider = self
+            .external_memory_provider
+            .as_ref()
+            .ok_or_else(|| "external memory provider is not configured".to_string())?;
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.handle_tool_call(name, args, self.current_session_id_or_empty())
+    }
+
+    pub fn external_memory_on_turn_start(
+        &self,
+        turn_number: u64,
+        message: &str,
+    ) -> Result<(), String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.on_turn_start(turn_number, message, json!({"platform": "rust-agent"}))
+    }
+
+    pub fn external_memory_prefetch(&self, query: &str) -> Result<String, String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(String::new());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.prefetch(query, self.current_session_id_or_empty())
+    }
+
+    pub fn external_memory_queue_prefetch(&self, query: &str) -> Result<(), String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.queue_prefetch(query, self.current_session_id_or_empty())
+    }
+
+    pub fn external_memory_sync_turn(
+        &self,
+        user_content: &str,
+        assistant_content: &str,
+    ) -> Result<(), String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.sync_turn(
+            user_content,
+            assistant_content,
+            self.current_session_id_or_empty(),
+        )
+    }
+
+    pub fn external_memory_on_memory_write(
+        &self,
+        action: &str,
+        target: &str,
+        content: &str,
+        metadata: Value,
+    ) -> Result<(), String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.on_memory_write(action, target, content, metadata)
+    }
+
+    pub fn external_memory_shutdown(&self) -> Result<(), String> {
+        let Some(provider) = self.external_memory_provider.as_ref() else {
+            return Ok(());
+        };
+        let mut provider = provider
+            .lock()
+            .map_err(|_| "external memory provider lock poisoned".to_string())?;
+        provider.shutdown()
     }
 
     pub fn with_clarify_callback<F>(mut self, callback: F) -> Self
@@ -1687,6 +1847,11 @@ pub fn coerce_tool_args(tool_name: &str, args: Value) -> Value {
 }
 
 pub fn dispatch_tool(name: &str, args: Value, runtime: &ToolRuntime) -> String {
+    if runtime.external_memory_has_tool(name) {
+        return runtime
+            .external_memory_handle_tool_call(name, &args)
+            .unwrap_or_else(tool_error);
+    }
     let Some(entry) = tool_entry(name) else {
         return tool_error(format!("unknown tool: {name}"));
     };
@@ -2343,7 +2508,27 @@ fn handle_memory(args: &Value, runtime: &ToolRuntime) -> String {
     };
 
     match result {
-        Ok(value) => tool_result(value),
+        Ok(value) => {
+            if matches!(action.as_str(), "add" | "replace") {
+                let metadata = json!({
+                    "write_origin": "assistant_tool",
+                    "execution_context": "foreground",
+                    "session_id": runtime.current_session_id_or_empty(),
+                    "tool_name": "memory",
+                });
+                let content = args
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let _ = runtime.external_memory_on_memory_write(
+                    action.as_str(),
+                    target.as_str(),
+                    content,
+                    metadata,
+                );
+            }
+            tool_result(value)
+        }
         Err(error) => tool_error(error),
     }
 }
@@ -3486,6 +3671,8 @@ fn default_hermes_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
 
     use tempfile::TempDir;
 

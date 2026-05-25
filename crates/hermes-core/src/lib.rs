@@ -66,6 +66,7 @@ pub use kanban::{
 pub use logging::{
     LoggingMode, LoggingSetup, clear_session_context, enable_verbose_logging, set_session_context,
 };
+pub use memory::build_memory_context_block;
 pub use providers::{
     ProviderProfile, auto_provider_candidates, get_provider_profile, infer_api_mode_from_base_url,
     infer_provider_from_base_url, list_provider_profiles, normalize_model_for_provider,
