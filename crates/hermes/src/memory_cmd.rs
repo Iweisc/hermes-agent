@@ -722,15 +722,38 @@ fn load_bridged_provider_spec(
 }
 
 fn schema_free_provider_has_no_setup_hooks(context: &HermesContext, provider_name: &str) -> bool {
+    provider_source_omits_hooks(
+        context,
+        provider_name,
+        &["get_config_schema", "post_setup", "save_config"],
+    )
+}
+
+fn schema_free_provider_has_no_status_hooks(context: &HermesContext, provider_name: &str) -> bool {
+    provider_source_omits_hooks(
+        context,
+        provider_name,
+        &[
+            "get_config_schema",
+            "post_setup",
+            "save_config",
+            "is_available",
+        ],
+    )
+}
+
+fn provider_source_omits_hooks(
+    context: &HermesContext,
+    provider_name: &str,
+    hooks: &[&str],
+) -> bool {
     let Some(dir) = find_memory_provider_dir(context, provider_name) else {
         return false;
     };
     let Ok(source) = fs::read_to_string(dir.join("__init__.py")) else {
         return false;
     };
-    !["get_config_schema", "post_setup", "save_config"]
-        .iter()
-        .any(|needle| source.contains(needle))
+    !hooks.iter().any(|needle| source.contains(needle))
 }
 
 fn load_bridged_provider_metadata(
@@ -766,6 +789,14 @@ fn load_provider_status_metadata(
     }
     if let Some(metadata) = manifest_provider_metadata(context, provider_name)? {
         return Ok(metadata);
+    }
+    if schema_free_provider_has_no_status_hooks(context, provider_name) {
+        return Ok(BridgedProviderMetadata {
+            has_post_setup: false,
+            has_save_config: false,
+            is_available: true,
+            schema: Vec::new(),
+        });
     }
     load_bridged_provider_metadata(context, provider_name)
 }
@@ -4142,6 +4173,50 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
+    fn render_status_schema_free_custom_provider_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: custom\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("custom"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Plugin:    installed ✓"));
+        assert!(output.contains("Status:    available ✓"));
+        assert!(!output.contains("Missing:"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn render_status_reports_unavailable_provider_requirements() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -4163,6 +4238,11 @@ exit 9\n",
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
         write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("__init__.py"),
+            "class Custom(MemoryProvider):\n    def get_config_schema(self):\n        return []\n    def is_available(self):\n        return False\n",
+        )
+        .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let loaded = LoadedConfig {
             path: home.join("config.yaml"),
@@ -4215,6 +4295,11 @@ exit 9\n",
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
         write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("__init__.py"),
+            "class Custom(MemoryProvider):\n    def is_available(self):\n        return True\n",
+        )
+        .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let loaded = LoadedConfig {
             path: home.join("config.yaml"),
