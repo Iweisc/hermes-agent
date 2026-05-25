@@ -174,6 +174,14 @@ fn print_curator_run(context: &HermesContext, args: RunArgs) -> Result<(), Box<d
         return Ok(());
     }
 
+    if args.dry_run && agent_created_report(context)?.is_empty() {
+        println!("auto (preview): 0 candidate skill(s) — no transitions applied in dry-run");
+        println!(
+            "dry-run: no changes applied. When the report lands, read it with `hermes curator status` and run `hermes curator run` (no flag) to apply."
+        );
+        return Ok(());
+    }
+
     let mut envs = vec![(
         "HERMES_CURATOR_RUN_DRY".to_string(),
         if args.dry_run { "1" } else { "0" }.to_string(),
@@ -2265,13 +2273,55 @@ exit 9\n",
             &context,
             RunArgs {
                 synchronous: true,
-                dry_run: true,
+                dry_run: false,
             },
         )
         .unwrap();
 
         let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("run dry=1"));
+        assert!(output.contains("run dry=0"));
+
+        remove_env_var("HERMES_CURATOR_PYTHON");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn curator_run_sync_dry_run_with_no_skills_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let home = temp_path("curator-run-empty-dry");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let fake_python = home.join("python3");
+        let log = home.join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  printf 'called\\n' >> '{}'\n\
+  exit 9\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_CURATOR_PYTHON", &fake_python);
+        print_curator_run(
+            &context,
+            RunArgs {
+                synchronous: true,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!log.exists());
 
         remove_env_var("HERMES_CURATOR_PYTHON");
         let _ = fs::remove_dir_all(home);
