@@ -1545,6 +1545,25 @@ pub struct GatewayToolApprovalPromptPlan {
     pub fallback_message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayToolApprovalPromptButton {
+    pub choice: GatewayToolApprovalChoice,
+    pub label: String,
+    pub callback_data: String,
+}
+
+impl GatewayToolApprovalPromptButton {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.label.trim().is_empty() {
+            return Err("tool approval button label must not be empty".to_string());
+        }
+        if self.callback_data.trim().is_empty() {
+            return Err("tool approval button callback_data must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl GatewayToolApprovalPromptPlan {
     pub fn validate(&self) -> Result<(), String> {
         if self.approval_id.trim().is_empty() {
@@ -1563,6 +1582,58 @@ impl GatewayToolApprovalPromptPlan {
             return Err("tool approval prompt fallback_message must not be empty".to_string());
         }
         Ok(())
+    }
+
+    pub fn callback_ref(
+        &self,
+        choice: GatewayToolApprovalChoice,
+    ) -> GatewayToolApprovalCallbackRef {
+        GatewayToolApprovalCallbackRef {
+            choice,
+            approval_id: self.approval_id.clone(),
+        }
+    }
+
+    pub fn buttons(&self) -> Result<Vec<Vec<GatewayToolApprovalPromptButton>>, String> {
+        self.validate()?;
+        let first_row = vec![
+            GatewayToolApprovalPromptButton {
+                choice: GatewayToolApprovalChoice::Once,
+                label: "Allow Once".to_string(),
+                callback_data: self
+                    .callback_ref(GatewayToolApprovalChoice::Once)
+                    .to_callback_data(),
+            },
+            GatewayToolApprovalPromptButton {
+                choice: GatewayToolApprovalChoice::Session,
+                label: "Allow Session".to_string(),
+                callback_data: self
+                    .callback_ref(GatewayToolApprovalChoice::Session)
+                    .to_callback_data(),
+            },
+        ];
+        let second_row = vec![
+            GatewayToolApprovalPromptButton {
+                choice: GatewayToolApprovalChoice::Always,
+                label: "Always Allow".to_string(),
+                callback_data: self
+                    .callback_ref(GatewayToolApprovalChoice::Always)
+                    .to_callback_data(),
+            },
+            GatewayToolApprovalPromptButton {
+                choice: GatewayToolApprovalChoice::Deny,
+                label: "Deny".to_string(),
+                callback_data: self
+                    .callback_ref(GatewayToolApprovalChoice::Deny)
+                    .to_callback_data(),
+            },
+        ];
+        for row in [&first_row, &second_row] {
+            for button in row {
+                button.validate()?;
+            }
+        }
+        Ok(vec![first_row, second_row])
     }
 }
 
@@ -1624,6 +1695,10 @@ impl GatewayToolApprovalCallbackRef {
             choice: GatewayToolApprovalChoice::from_token(choice)?,
             approval_id: approval_id.to_string(),
         }))
+    }
+
+    pub fn to_callback_data(&self) -> String {
+        format!("ea:{}:{}", self.choice.as_str(), self.approval_id)
     }
 }
 
@@ -3411,6 +3486,24 @@ impl GatewayRuntime {
                 result: Self::format_tool_approval_command_execution(&request, resolved_count),
             },
         })
+    }
+
+    pub fn execute_tool_approval_callback_data(
+        &mut self,
+        callback_data: &str,
+        actor_display: &str,
+        resolved_count: usize,
+    ) -> Result<Option<GatewayToolApprovalCallbackOutcome>, String> {
+        let Some(callback_ref) = GatewayToolApprovalCallbackRef::from_callback_data(callback_data)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.complete_tool_approval_callback_by_id(
+            &callback_ref.approval_id,
+            callback_ref.choice,
+            actor_display,
+            resolved_count,
+        )?))
     }
 
     pub fn begin_slash_confirm_request(
@@ -9931,6 +10024,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_approval_prompt_plan_builds_button_callback_rows() {
+        let plan = GatewayToolApprovalPromptPlan {
+            approval_id: "42".to_string(),
+            session_key: "session-1".to_string(),
+            command: "rm -rf /tmp/x".to_string(),
+            description: "recursive delete".to_string(),
+            fallback_message: "fallback".to_string(),
+        };
+
+        let rows = plan.buttons().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].label, "Allow Once");
+        assert_eq!(rows[0][0].callback_data, "ea:once:42");
+        assert_eq!(rows[0][1].callback_data, "ea:session:42");
+        assert_eq!(rows[1][0].callback_data, "ea:always:42");
+        assert_eq!(rows[1][1].callback_data, "ea:deny:42");
+    }
+
+    #[test]
     fn tool_approval_callback_ref_parses_exec_approval_callback_data() {
         assert_eq!(
             GatewayToolApprovalCallbackRef::from_callback_data("ea:always:42").unwrap(),
@@ -9938,6 +10050,14 @@ mod tests {
                 choice: GatewayToolApprovalChoice::Always,
                 approval_id: "42".to_string(),
             })
+        );
+        assert_eq!(
+            GatewayToolApprovalCallbackRef {
+                choice: GatewayToolApprovalChoice::Session,
+                approval_id: "abc".to_string(),
+            }
+            .to_callback_data(),
+            "ea:session:abc"
         );
         assert_eq!(
             GatewayToolApprovalCallbackRef::from_callback_data("noop").unwrap(),
@@ -10207,6 +10327,58 @@ mod tests {
             GatewayToolApprovalCallbackOutcome::NoPending {
                 message: "This approval has already been resolved.".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn runtime_execute_tool_approval_callback_data_composes_parse_and_resolution() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let plan = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/x", "recursive delete")
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .execute_tool_approval_callback_data(
+                    &plan
+                        .callback_ref(GatewayToolApprovalChoice::Session)
+                        .to_callback_data(),
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            Some(GatewayToolApprovalCallbackOutcome::Resolved {
+                execution: GatewayToolApprovalCallbackExecution {
+                    presentation: GatewayToolApprovalCallbackPresentation {
+                        acknowledgement_label: "✅ Approved for session".to_string(),
+                        decision_text: "✅ Approved for session by Kai".to_string(),
+                    },
+                    result: GatewayToolApprovalCommandExecution::Resolved {
+                        request: GatewayToolApprovalRequest {
+                            session_key: "session-1".to_string(),
+                            choice: GatewayToolApprovalChoice::Session,
+                            resolve_all: false,
+                        },
+                        resolved_count: 1,
+                        message:
+                            "✅ Command approved (pattern approved for this session). The agent is resuming..."
+                                .to_string(),
+                        resume_typing: true,
+                    },
+                },
+            })
+        );
+        assert_eq!(
+            runtime
+                .execute_tool_approval_callback_data("slash_confirm:1:once", "Kai", 1)
+                .unwrap(),
+            None
         );
     }
 
