@@ -2,6 +2,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
+from gateway.platform_registry import PlatformEntry, platform_registry
+
 
 # ---------------------------------------------------------------------------
 # get_disabled_skills
@@ -74,6 +76,26 @@ class TestSaveDisabledSkills:
         save_disabled_skills(config, {"skill-x"})
         assert "skills" in config
         assert "disabled" in config["skills"]
+
+
+def test_select_platform_includes_registered_plugin_platform(monkeypatch):
+    from hermes_cli.skills_config import _get_platforms, _select_platform
+
+    entry = PlatformEntry(
+        name="irc",
+        label="IRC",
+        adapter_factory=lambda cfg: object(),
+        check_fn=lambda: True,
+        source="plugin",
+    )
+    platform_registry.register(entry)
+    try:
+        options = [("global", "All platforms (global default)")] + list(_get_platforms().items())
+        irc_index = next(i for i, (key, _label) in enumerate(options, 1) if key == "irc")
+        monkeypatch.setattr("builtins.input", lambda _prompt="": str(irc_index))
+        assert _select_platform() == "irc"
+    finally:
+        platform_registry.unregister("irc")
 
 
 # ---------------------------------------------------------------------------

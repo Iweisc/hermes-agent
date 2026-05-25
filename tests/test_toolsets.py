@@ -198,6 +198,41 @@ class TestRegistryOwnedToolsets:
         assert resolve_toolset("test-live-toolset") == ["test_live_toolset_tool"]
 
 
+class TestDynamicPlatformToolsets:
+    def test_registered_plugin_platform_gets_hermes_toolset(self, monkeypatch):
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="irc_whois",
+            toolset="irc",
+            schema=_make_schema("irc_whois", "IRC whois"),
+            handler=_dummy_handler,
+        )
+
+        monkeypatch.setattr("tools.registry.registry", reg)
+
+        entry = PlatformEntry(
+            name="irc",
+            label="IRC",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        platform_registry.register(entry)
+        try:
+            toolset = get_toolset("hermes-irc")
+            assert toolset is not None
+            assert "irc_whois" in toolset["tools"]
+            assert "send_message" in toolset["tools"]
+            assert validate_toolset("hermes-irc") is True
+            assert "hermes-irc" in get_toolset_names()
+            assert "hermes-irc" in get_all_toolsets()
+            assert "irc_whois" in resolve_toolset("hermes-irc")
+        finally:
+            platform_registry.unregister("irc")
+
+
 class TestToolsetConsistency:
     """Verify structural integrity of the built-in TOOLSETS dict."""
 

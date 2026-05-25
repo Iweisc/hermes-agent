@@ -20,10 +20,16 @@ from tools.tool_backend_helpers import (
     resolve_openai_audio_api_key,
 )
 
+def _default_platform_toolset(platform: str) -> str:
+    try:
+        from hermes_cli.platforms import get_all_platforms
 
-_DEFAULT_PLATFORM_TOOLSETS = {
-    "cli": "hermes-cli",
-}
+        info = get_all_platforms().get(platform)
+        if info is not None:
+            return info.default_toolset
+    except Exception:
+        pass
+    return "hermes-cli" if platform == "cli" else f"hermes-{platform}"
 
 
 def _uses_gateway(section: object) -> bool:
@@ -94,7 +100,7 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
 
     platform_toolsets = config.get("platform_toolsets")
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
-        platform_toolsets = {"cli": [_DEFAULT_PLATFORM_TOOLSETS["cli"]]}
+        platform_toolsets = {"cli": [_default_platform_toolset("cli")]}
 
     target_tools = set(resolve_toolset(toolset_key))
     if not target_tools:
@@ -104,10 +110,10 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
         if isinstance(raw_toolsets, list):
             toolset_names = list(raw_toolsets)
         else:
-            default_toolset = _DEFAULT_PLATFORM_TOOLSETS.get(platform)
+            default_toolset = _default_platform_toolset(platform)
             toolset_names = [default_toolset] if default_toolset else []
         if not toolset_names:
-            default_toolset = _DEFAULT_PLATFORM_TOOLSETS.get(platform)
+            default_toolset = _default_platform_toolset(platform)
             if default_toolset:
                 toolset_names = [default_toolset]
 

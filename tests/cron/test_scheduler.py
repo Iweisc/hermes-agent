@@ -312,6 +312,46 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_signal_group_target(self):
+        job = {
+            "deliver": "signal:group:abc123",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "signal",
+            "chat_id": "group:abc123",
+            "thread_id": None,
+        }
+
+    def test_explicit_wecom_callback_scoped_chat_id(self):
+        job = {
+            "deliver": "wecom_callback:wwcorp123:user_a",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "wecom_callback",
+            "chat_id": "wwcorp123:user_a",
+            "thread_id": None,
+        }
+
+    def test_explicit_feishu_thread_target(self):
+        job = {
+            "deliver": "feishu:oc_home:omt-thread-123",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "feishu",
+            "chat_id": "oc_home",
+            "thread_id": "omt-thread-123",
+        }
+
+    def test_webhook_url_target_is_not_split_on_colons(self):
+        job = {
+            "deliver": "webhook:https://hooks.example.com/alerts",
+        }
+        assert _resolve_delivery_target(job) == {
+            "platform": "webhook",
+            "chat_id": "https://hooks.example.com/alerts",
+            "thread_id": None,
+        }
+
     def test_list_form_deliver_is_normalized(self, monkeypatch):
         """deliver=['telegram'] (Python list) should resolve like 'telegram' string.
 

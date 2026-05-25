@@ -75,6 +75,25 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_toolset_descriptions_refresh_from_live_toolsets(self):
+        fake_toolsets = {
+            "terminal": {"tools": ["terminal"]},
+            "irc": {"tools": ["irc_whois"]},
+            "delegation": {"tools": ["delegate_task"]},
+            "hermes-irc": {"tools": ["send_message", "irc_whois"]},
+        }
+        with patch("toolsets.get_all_toolsets", return_value=fake_toolsets):
+            self.assertTrue(check_delegate_requirements())
+
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        top_desc = props["toolsets"]["description"]
+        task_desc = props["tasks"]["items"]["properties"]["toolsets"]["description"]
+        self.assertIn("'irc'", top_desc)
+        self.assertIn("'terminal'", top_desc)
+        self.assertNotIn("'delegation'", top_desc)
+        self.assertNotIn("'hermes-irc'", top_desc)
+        self.assertIn("'irc'", task_desc)
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):

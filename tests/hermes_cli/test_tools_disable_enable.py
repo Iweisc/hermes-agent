@@ -2,6 +2,8 @@
 from argparse import Namespace
 from unittest.mock import patch
 
+from gateway.platform_registry import PlatformEntry, platform_registry
+
 from hermes_cli.tools_config import tools_disable_enable_command
 
 
@@ -58,6 +60,27 @@ class TestToolsEnableBuiltin:
             tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
         saved = mock_save.call_args[0][0]
         assert saved["platform_toolsets"]["cli"].count("web") == 1
+
+    def test_enable_accepts_registered_plugin_platform(self):
+        config = {"platform_toolsets": {"irc": ["web"]}}
+        entry = PlatformEntry(
+            name="irc",
+            label="IRC",
+            adapter_factory=lambda cfg: object(),
+            check_fn=lambda: True,
+            source="plugin",
+        )
+        platform_registry.register(entry)
+        try:
+            with patch("hermes_cli.tools_config.load_config", return_value=config), \
+                 patch("hermes_cli.tools_config.save_config") as mock_save:
+                tools_disable_enable_command(
+                    Namespace(tools_action="enable", names=["terminal"], platform="irc")
+                )
+        finally:
+            platform_registry.unregister("irc")
+        saved = mock_save.call_args[0][0]
+        assert "terminal" in saved["platform_toolsets"]["irc"]
 
 
 # ── MCP tool disable ────────────────────────────────────────────────────────

@@ -534,6 +534,10 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
         )
         return {**toolset, "tools": merged_tools}
 
+    dynamic_platform_toolset = _get_dynamic_platform_toolset(name)
+    if dynamic_platform_toolset:
+        return dynamic_platform_toolset
+
     registry_toolset = name
     description = f"Plugin toolset: {name}"
     alias_target = registry.get_toolset_alias_target(name)
@@ -598,27 +602,6 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
     # Get toolset definition
     toolset = get_toolset(name)
     if not toolset:
-        # Auto-generate a toolset for plugin platforms (hermes-<name>).
-        # Gives them _HERMES_CORE_TOOLS plus any tools the plugin registered
-        # into a toolset matching the platform name.
-        if name.startswith("hermes-"):
-            platform_name = name[len("hermes-"):]
-            try:
-                from gateway.platform_registry import platform_registry
-                if platform_registry.is_registered(platform_name):
-                    plugin_tools = set(_HERMES_CORE_TOOLS)
-                    try:
-                        from tools.registry import registry
-                        plugin_tools.update(
-                            e.name for e in registry._tools.values()
-                            if e.toolset == platform_name
-                        )
-                    except Exception:
-                        pass
-                    return list(plugin_tools)
-            except Exception:
-                pass
-
         return []
 
     # Collect direct tools
@@ -670,6 +653,19 @@ def _get_plugin_toolset_names() -> Set[str]:
         return set()
 
 
+def _get_dynamic_platform_toolset_names() -> Set[str]:
+    """Return synthetic hermes-<platform> toolsets for registered plugin platforms."""
+    try:
+        from gateway.platform_registry import platform_registry
+        return {
+            f"hermes-{entry.name}"
+            for entry in platform_registry.plugin_entries()
+            if f"hermes-{entry.name}" not in TOOLSETS
+        }
+    except Exception:
+        return set()
+
+
 def _get_registry_toolset_aliases() -> Dict[str, str]:
     """Return explicit toolset aliases registered in the live registry."""
     try:
@@ -677,6 +673,39 @@ def _get_registry_toolset_aliases() -> Dict[str, str]:
         return registry.get_registered_toolset_aliases()
     except Exception:
         return {}
+
+
+def _get_dynamic_platform_toolset(name: str) -> Optional[Dict[str, Any]]:
+    """Build a synthetic toolset definition for a registered plugin platform."""
+    if not name.startswith("hermes-"):
+        return None
+
+    platform_name = name[len("hermes-"):]
+    try:
+        from gateway.platform_registry import platform_registry
+
+        entry = platform_registry.get(platform_name)
+        if not entry:
+            return None
+    except Exception:
+        return None
+
+    extra_tools: List[str] = []
+    try:
+        from tools.registry import registry
+
+        extra_tools = registry.get_tool_names_for_toolset(platform_name)
+    except Exception:
+        pass
+
+    return {
+        "description": (
+            f"{entry.label} platform toolset - full Hermes core tools"
+            " plus platform-specific plugin tools"
+        ),
+        "tools": sorted(set(_HERMES_CORE_TOOLS) | set(extra_tools)),
+        "includes": [],
+    }
 
 
 def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
@@ -701,6 +730,12 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
         toolset = get_toolset(display_name)
         if toolset:
             result[display_name] = toolset
+    for ts_name in sorted(_get_dynamic_platform_toolset_names()):
+        if ts_name in result:
+            continue
+        toolset = get_toolset(ts_name)
+        if toolset:
+            result[ts_name] = toolset
     return result
 
 
@@ -722,6 +757,7 @@ def get_toolset_names() -> List[str]:
                 break
         else:
             names.add(ts_name)
+    names.update(_get_dynamic_platform_toolset_names())
     return sorted(names)
 
 
@@ -743,6 +779,8 @@ def validate_toolset(name: str) -> bool:
     if name in TOOLSETS:
         return True
     if name in _get_plugin_toolset_names():
+        return True
+    if name in _get_dynamic_platform_toolset_names():
         return True
     return name in _get_registry_toolset_aliases()
 

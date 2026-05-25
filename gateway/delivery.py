@@ -72,15 +72,39 @@ class DeliveryTarget:
             return cls(platform=Platform.LOCAL)
         
         # Check for platform:chat_id or platform:chat_id:thread_id format
-        # Use the original case for chat_id/thread_id to preserve case-sensitive IDs
+        # Use the original case for chat_id/thread_id to preserve case-sensitive IDs.
+        # Platform-specific parsing delegates to send_message's target parser so
+        # cron/delivery routing stays aligned with explicit send_message targets.
         if ":" in target_stripped:
-            parts = target_stripped.split(":", 2)
-            platform_str = parts[0].lower()  # Platform names are case-insensitive
-            chat_id = parts[1] if len(parts) > 1 else None
-            thread_id = parts[2] if len(parts) > 2 else None
             try:
+                platform_str, target_ref = target_stripped.split(":", 1)
+                platform_str = platform_str.lower()
                 platform = Platform(platform_str)
-                return cls(platform=platform, chat_id=chat_id, thread_id=thread_id, is_explicit=True)
+                try:
+                    from tools.send_message_tool import _parse_target_ref
+
+                    chat_id, thread_id, is_explicit = _parse_target_ref(platform_str, target_ref)
+                except Exception:
+                    chat_id, thread_id, is_explicit = None, None, False
+
+                if is_explicit:
+                    return cls(
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        is_explicit=True,
+                    )
+
+                # Keep non-explicit targets intact. Some valid raw IDs and URLs
+                # contain ':' but are not thread targets (e.g. Matrix aliases,
+                # webhook URLs), and send_message/cron both pass them through as
+                # a whole chat_id rather than inventing a thread split.
+                return cls(
+                    platform=platform,
+                    chat_id=target_ref,
+                    thread_id=None,
+                    is_explicit=True,
+                )
             except ValueError:
                 # Unknown platform, treat as local
                 return cls(platform=Platform.LOCAL)
@@ -252,7 +276,5 @@ class DeliveryRouter:
         if target.thread_id and "thread_id" not in send_metadata:
             send_metadata["thread_id"] = target.thread_id
         return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
-
-
 
 

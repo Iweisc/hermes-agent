@@ -25,11 +25,19 @@ _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::(
 # Must be uppercase alphanumeric, 9+ chars. User IDs (U...) and workspace IDs
 # (W...) are NOT valid chat.postMessage channel values — posting to them fails
 # because the API requires a conversation ID. To DM a user you must first call
-# conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
-# through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
+# conversations.open to obtain a D... ID. Thread replies optionally append the
+# parent thread_ts after a colon: C123ABCDEF:1749236185.123456.
+_SLACK_TARGET_RE = re.compile(
+    r"^\s*([CGD][A-Z0-9]{8,})(?::([0-9]+(?:\.[0-9]+)?))?\s*$"
+)
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
+_SIGNAL_GROUP_TARGET_RE = re.compile(r"^\s*(group:\S+)\s*$")
+_WECOM_CALLBACK_TARGET_RE = re.compile(r"^\s*([^:\s]+:[^:\s]+)\s*$")
+_WHATSAPP_TARGET_RE = re.compile(
+    r"^\s*([A-Za-z0-9._:-]+@(?:lid|g\.us|s\.whatsapp\.net|broadcast))\s*$",
+    re.IGNORECASE,
+)
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 # Platforms that address recipients by phone number and accept E.164 format
@@ -184,21 +192,21 @@ def _handle_send(args):
 
     # Resolve human-friendly channel names to numeric IDs
     if target_ref and not is_explicit:
+        resolved = None
         try:
             from gateway.channel_directory import resolve_channel_name
             resolved = resolve_channel_name(platform_name, target_ref)
-            if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
-            else:
-                return json.dumps({
-                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
-                })
         except Exception:
-            return json.dumps({
-                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
-                f"Try using a numeric channel ID instead."
-            })
+            resolved = None
+
+        if resolved:
+            parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_name, resolved)
+            if resolved_is_explicit:
+                chat_id, thread_id = parsed_chat_id, parsed_thread_id
+            else:
+                chat_id, thread_id = resolved, None
+        else:
+            chat_id, thread_id = target_ref, None
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -325,7 +333,7 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "slack":
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
-            return match.group(1), None, True
+            return match.group(1), match.group(2), True
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -337,6 +345,18 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "signal":
+        match = _SIGNAL_GROUP_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
+    if platform_name == "wecom_callback":
+        match = _WECOM_CALLBACK_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
+    if platform_name == "whatsapp":
+        match = _WHATSAPP_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -416,8 +436,8 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_via_adapter(platform, pconfig, chat_id, chunk):
-    """Send a message via a live gateway adapter (for plugin platforms).
+async def _send_via_adapter(platform, pconfig, chat_id, chunk, thread_id=None):
+    """Send a message via a live gateway adapter.
 
     Falls back to error if no adapter is connected for this platform.
     """
@@ -428,7 +448,8 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
             adapter = runner.adapters.get(platform)
             if adapter:
                 from gateway.platforms.base import SendResult
-                result = await adapter.send(chat_id=chat_id, content=chunk)
+                metadata = {"thread_id": thread_id} if thread_id else None
+                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
                 if result.success:
                     return {"success": True, "message_id": result.message_id}
                 return {"error": f"Adapter send failed: {result.error}"}
@@ -654,7 +675,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         else:
             # Plugin platform — route through the gateway's live adapter
             # if available, otherwise report the error.
-            result = await _send_via_adapter(platform, pconfig, chat_id, chunk)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+            )
 
         if isinstance(result, dict) and result.get("error"):
             return result

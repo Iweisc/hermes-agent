@@ -1,5 +1,8 @@
 """Tests for Nous subscription feature detection."""
 
+from gateway.platform_registry import PlatformEntry, platform_registry
+from tools.registry import ToolRegistry
+
 from hermes_cli import nous_subscription as ns
 
 
@@ -192,3 +195,31 @@ def test_get_gateway_eligible_tools_ignores_quoted_false_opt_in(monkeypatch):
     assert "web" in has_direct
     assert "web" not in already_managed
     assert set(unconfigured) == {"image_gen", "tts", "browser"}
+
+
+def test_toolset_enabled_uses_registered_plugin_platform_default(monkeypatch):
+    reg = ToolRegistry()
+    reg.register(
+        name="irc_whois",
+        toolset="irc",
+        schema={
+            "name": "irc_whois",
+            "description": "IRC whois",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda *_a, **_k: "{}",
+    )
+    monkeypatch.setattr("tools.registry.registry", reg)
+
+    entry = PlatformEntry(
+        name="irc",
+        label="IRC",
+        adapter_factory=lambda cfg: object(),
+        check_fn=lambda: True,
+        source="plugin",
+    )
+    platform_registry.register(entry)
+    try:
+        assert ns._toolset_enabled({"platform_toolsets": {"irc": None}}, "irc") is True
+    finally:
+        platform_registry.unregister("irc")

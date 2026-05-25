@@ -149,6 +149,24 @@ PLATFORMS = {
 }
 
 
+def _get_platforms() -> Dict[str, Dict[str, str]]:
+    """Return built-in platform metadata plus any live plugin platforms."""
+    platforms = dict(PLATFORMS)
+    try:
+        from hermes_cli.platforms import get_all_platforms
+
+        for key, info in get_all_platforms().items():
+            if key in platforms:
+                continue
+            platforms[key] = {
+                "label": info.label,
+                "default_toolset": info.default_toolset,
+            }
+    except Exception:
+        pass
+    return platforms
+
+
 # ─── Tool Categories (provider-aware configuration) ──────────────────────────
 # Maps toolset keys to their provider options. When a toolset is newly enabled,
 # we use this to show provider selection and prompt for the right API keys.
@@ -764,7 +782,7 @@ def _run_post_setup(post_setup_key: str):
 
 # ─── Platform / Toolset Helpers ───────────────────────────────────────────────
 
-def _get_enabled_platforms() -> List[str]:
+def _get_enabled_platforms(config: Optional[dict] = None) -> List[str]:
     """Return platform keys that are configured (have tokens or are CLI)."""
     enabled = ["cli"]
     if get_env_value("TELEGRAM_BOT_TOKEN"):
@@ -777,6 +795,16 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
+    configured_platforms = set()
+    if isinstance(config, dict):
+        platform_toolsets = config.get("platform_toolsets")
+        if isinstance(platform_toolsets, dict):
+            configured_platforms = {str(key) for key in platform_toolsets}
+    for platform in _get_platforms():
+        if platform in enabled or platform == "api_server":
+            continue
+        if platform in configured_platforms or platform not in PLATFORMS:
+            enabled.append(platform)
     return enabled
 
 
@@ -788,7 +816,7 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
     on environment variables.
     """
     if platforms is None:
-        platforms = _get_enabled_platforms()
+        platforms = _get_enabled_platforms(config)
 
     summary: Dict[str, Set[str]] = {}
     for pkey in platforms:
@@ -820,13 +848,14 @@ def _get_platform_tools(
     include_default_mcp_servers: bool = True,
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
-    from toolsets import resolve_toolset, TOOLSETS
+    from toolsets import resolve_toolset, TOOLSETS, get_all_toolsets
 
+    platforms = _get_platforms()
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
 
     if toolset_names is None or not isinstance(toolset_names, list):
-        plat_info = PLATFORMS.get(platform)
+        plat_info = platforms.get(platform)
         if plat_info:
             default_ts = plat_info["default_toolset"]
         else:
@@ -840,7 +869,7 @@ def _get_platform_tools(
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    platform_default_keys = {p["default_toolset"] for p in platforms.values()}
 
     # If the saved list contains any configurable keys directly, the user
     # has explicitly configured this platform — use direct membership.
@@ -894,7 +923,7 @@ def _get_platform_tools(
     # checklist or in a user-saved config.  Must run in BOTH branches —
     # otherwise saving via `hermes tools` (which flips has_explicit_config
     # to True) silently drops them.
-    _plat_info = PLATFORMS.get(platform)
+    _plat_info = platforms.get(platform)
     _default_ts = _plat_info["default_toolset"] if _plat_info else f"hermes-{platform}"
     platform_tool_universe = set(resolve_toolset(_default_ts))
     configurable_tool_universe = set()
@@ -904,9 +933,10 @@ def _get_platform_tools(
     for ts_key in enabled_toolsets:
         claimed.update(resolve_toolset(ts_key))
     skip = configurable_keys | plugin_ts_keys | platform_default_keys
-    skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
+    all_toolsets = get_all_toolsets()
+    skip |= {k for k in all_toolsets if k.startswith("hermes-")}
     skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}
-    for ts_key, ts_def in TOOLSETS.items():
+    for ts_key, ts_def in all_toolsets.items():
         if ts_key in skip:
             continue
         if ts_def.get("includes"):
@@ -1015,7 +1045,7 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     # Also exclude platform default toolsets (hermes-cli, hermes-telegram, etc.)
     # These are "super" toolsets that resolve to ALL tools, so preserving them
     # would silently override the user's unchecked selections on the next read.
-    platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
+    platform_default_keys = {p["default_toolset"] for p in _get_platforms().values()}
 
     # Get existing toolsets for this platform
     existing_toolsets = cfg_get(config, "platform_toolsets", platform, default=[])
@@ -1864,7 +1894,7 @@ def _toolset_enabled_for_reconfigure(ts_key: str, config: dict) -> bool:
     Reconfigure must include enabled-but-unconfigured categories so users can
     finish provider/API-key setup without disabling and re-enabling the toolset.
     """
-    for platform in PLATFORMS:
+    for platform in _get_platforms():
         if not _toolset_allowed_for_platform(ts_key, platform):
             continue
         try:
@@ -2057,7 +2087,8 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     """
     if config is None:
         config = load_config()
-    enabled_platforms = _get_enabled_platforms()
+    enabled_platforms = _get_enabled_platforms(config)
+    platforms = _get_platforms()
 
     print()
 
@@ -2068,7 +2099,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         print()
         summary = _platform_toolset_summary(config, enabled_platforms)
         for pkey in enabled_platforms:
-            pinfo = PLATFORMS[pkey]
+            pinfo = platforms[pkey]
             enabled = summary.get(pkey, set())
             count = len(enabled)
             print(color(f"  {pinfo['label']}", Colors.BOLD) + color(f"  ({count}/{total})", Colors.DIM))
@@ -2089,7 +2120,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     # ── First-time install: linear flow, no platform menu ──
     if first_install:
         for pkey in enabled_platforms:
-            pinfo = PLATFORMS[pkey]
+            pinfo = platforms[pkey]
             current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
 
             # Uncheck toolsets that should be off by default
@@ -2151,7 +2182,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     platform_choices = []
     platform_keys = []
     for pkey in enabled_platforms:
-        pinfo = PLATFORMS[pkey]
+        pinfo = platforms[pkey]
         current = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
         count = len(current)
         total = len(_get_effective_configurable_toolsets())
@@ -2206,7 +2237,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                     prev = _get_platform_tools(config, pk, include_default_mcp_servers=False)
                     added = new_enabled - prev
                     removed = prev - new_enabled
-                    pinfo_inner = PLATFORMS[pk]
+                    pinfo_inner = platforms[pk]
                     if added or removed:
                         print(color(f"  {pinfo_inner['label']}:", Colors.DIM))
                         for ts in sorted(added):
@@ -2227,14 +2258,14 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                 for ci, pk in enumerate(platform_keys):
                     new_count = len(_get_platform_tools(config, pk, include_default_mcp_servers=False))
                     total = len(_get_effective_configurable_toolsets())
-                    platform_choices[ci] = f"Configure {PLATFORMS[pk]['label']}  ({new_count}/{total} enabled)"
+                    platform_choices[ci] = f"Configure {platforms[pk]['label']}  ({new_count}/{total} enabled)"
             else:
                 print(color("  No changes", Colors.DIM))
             print()
             continue
 
         pkey = platform_keys[idx]
-        pinfo = PLATFORMS[pkey]
+        pinfo = platforms[pkey]
 
         # Get current enabled toolsets for this platform
         current_enabled = _get_platform_tools(config, pkey, include_default_mcp_servers=False)
@@ -2501,9 +2532,10 @@ def tools_disable_enable_command(args):
     action = args.tools_action
     platform = getattr(args, "platform", "cli")
     config = load_config()
+    platforms = _get_platforms()
 
-    if platform not in PLATFORMS:
-        _print_error(f"Unknown platform '{platform}'. Valid: {', '.join(PLATFORMS)}")
+    if platform not in platforms:
+        _print_error(f"Unknown platform '{platform}'. Valid: {', '.join(platforms)}")
         return
 
     if action == "list":

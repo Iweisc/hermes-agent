@@ -77,27 +77,66 @@ class TestCaseSensitiveChatIdParsing:
     
     def test_slack_chat_id_with_thread_preserved(self):
         """Slack channel:thread IDs should preserve case."""
-        target = DeliveryTarget.parse("slack:C123ABC:thread123")
+        target = DeliveryTarget.parse("slack:C123ABCDEF:1749236185.123456")
         assert target.platform == Platform.SLACK
-        assert target.chat_id == "C123ABC"
-        assert target.thread_id == "thread123"
+        assert target.chat_id == "C123ABCDEF"
+        assert target.thread_id == "1749236185.123456"
     
     def test_matrix_room_id_preserved(self):
-        """Matrix room IDs like !RoomABC:example.org should preserve case.
-        
-        Note: Matrix room IDs contain colons (e.g., !RoomABC:example.org).
-        Due to the platform:chat_id:thread_id format, these are parsed as
-        chat_id=!RoomABC and thread_id=example.org. This is a known limitation
-        of the current format. The fix preserves case but doesn't change the
-        parsing structure.
-        """
+        """Matrix room IDs like !RoomABC:example.org stay intact."""
         target = DeliveryTarget.parse("matrix:!RoomABC:example.org")
         assert target.platform == Platform.MATRIX
-        # The room ID is split at the first colon after the platform prefix
-        # This is a format limitation - the case is preserved but the structure is split
-        assert target.chat_id == "!RoomABC"
-        assert target.thread_id == "example.org"
-    
+        assert target.chat_id == "!RoomABC:example.org"
+        assert target.thread_id is None
+
+    def test_matrix_user_id_preserved(self):
+        target = DeliveryTarget.parse("matrix:@Hermes:example.org")
+        assert target.platform == Platform.MATRIX
+        assert target.chat_id == "@Hermes:example.org"
+        assert target.thread_id is None
+
+    def test_matrix_alias_kept_as_single_chat_id(self):
+        target = DeliveryTarget.parse("matrix:#general:example.org")
+        assert target.platform == Platform.MATRIX
+        assert target.chat_id == "#general:example.org"
+        assert target.thread_id is None
+
+    def test_phone_targets_preserve_e164_format(self):
+        target = DeliveryTarget.parse("signal:+15551234567")
+        assert target.platform == Platform.SIGNAL
+        assert target.chat_id == "+15551234567"
+        assert target.thread_id is None
+
+    def test_signal_group_target_preserved(self):
+        target = DeliveryTarget.parse("signal:group:abc123")
+        assert target.platform == Platform.SIGNAL
+        assert target.chat_id == "group:abc123"
+        assert target.thread_id is None
+
+    def test_wecom_callback_scoped_chat_id_preserved(self):
+        target = DeliveryTarget.parse("wecom_callback:wwcorp123:user_a")
+        assert target.platform == Platform.WECOM_CALLBACK
+        assert target.chat_id == "wwcorp123:user_a"
+        assert target.thread_id is None
+
+    def test_yuanbao_direct_target_preserved(self):
+        target = DeliveryTarget.parse("yuanbao:direct:acct-123")
+        assert target.platform == Platform.YUANBAO
+        assert target.chat_id == "direct:acct-123"
+        assert target.thread_id is None
+
+    def test_feishu_thread_target_preserved(self):
+        target = DeliveryTarget.parse("feishu:oc_home:omt-thread-123")
+        assert target.platform == Platform.FEISHU
+        assert target.chat_id == "oc_home"
+        assert target.thread_id == "omt-thread-123"
+
+    def test_webhook_url_kept_as_single_chat_id(self):
+        target = DeliveryTarget.parse("webhook:https://hooks.example.com/alerts")
+        assert target.platform == Platform.WEBHOOK
+        assert target.chat_id == "https://hooks.example.com/alerts"
+        assert target.thread_id is None
+
     def test_mixed_case_chat_id_roundtrip(self):
         """Mixed-case chat IDs should survive parse-to_string roundtrip."""
         original = "telegram:ChatId123ABC"
@@ -121,6 +160,3 @@ class TestPlatformNameCaseInsensitivity:
         target = DeliveryTarget.parse("TeleGram:12345")
         assert target.platform == Platform.TELEGRAM
         assert target.chat_id == "12345"
-
-
-

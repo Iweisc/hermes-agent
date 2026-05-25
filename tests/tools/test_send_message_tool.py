@@ -29,6 +29,7 @@ from tools.send_message_tool import (
     _send_signal,
     _send_telegram,
     _send_to_platform,
+    _send_via_adapter,
     send_message_tool,
 )
 
@@ -180,6 +181,40 @@ class TestSendMessageTool:
             media_files=[],
         )
 
+    def test_explicit_feishu_thread_target_preserves_thread_id(self):
+        feishu_cfg = SimpleNamespace(enabled=True, token="tok", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.FEISHU: feishu_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.channel_directory.resolve_channel_name") as resolve_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:oc_home:omt-thread-123",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        resolve_mock.assert_not_called()
+        send_mock.assert_awaited_once_with(
+            Platform.FEISHU,
+            feishu_cfg,
+            "oc_home",
+            "hello",
+            thread_id="omt-thread-123",
+            media_files=[],
+        )
+
     def test_mirror_receives_current_session_user_id(self):
         config, _telegram_cfg = _make_config()
 
@@ -239,6 +274,106 @@ class TestSendMessageTool:
         assert "error" in result
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
+
+    def test_whatsapp_raw_jid_target_skips_directory_resolution(self):
+        whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"bridge_port": 3000})
+        config = SimpleNamespace(
+            platforms={Platform.WHATSAPP: whatsapp_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.channel_directory.resolve_channel_name") as resolve_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "whatsapp:test-user@lid",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        resolve_mock.assert_not_called()
+        send_mock.assert_awaited_once_with(
+            Platform.WHATSAPP,
+            whatsapp_cfg,
+            "test-user@lid",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_raw_string_target_without_directory_match_is_passed_through(self):
+        homeassistant_cfg = SimpleNamespace(enabled=True, token="tok", extra={"url": "https://hass.example.com"})
+        config = SimpleNamespace(
+            platforms={Platform.HOMEASSISTANT: homeassistant_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "homeassistant:mobile_app_phone",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.HOMEASSISTANT,
+            homeassistant_cfg,
+            "mobile_app_phone",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
+
+    def test_raw_string_target_directory_lookup_exception_still_passes_through(self):
+        mattermost_cfg = SimpleNamespace(enabled=True, token="tok", extra={"url": "https://mm.example.com"})
+        config = SimpleNamespace(
+            platforms={Platform.MATTERMOST: mattermost_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.channel_directory.resolve_channel_name", side_effect=RuntimeError("cache unavailable")), \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "mattermost:channel-id-123",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.MATTERMOST,
+            mattermost_cfg,
+            "channel-id-123",
+            "hello",
+            thread_id=None,
+            media_files=[],
+        )
 
 
 class TestSendTelegramMediaDelivery:
@@ -623,6 +758,179 @@ class TestSendToPlatformWhatsapp:
         async_mock.assert_awaited_once_with({"bridge_port": 3000}, chat_id, "hello from hermes")
 
 
+class TestSendToPlatformAdditionalRoutes:
+    def test_email_routes_via_send_email(self):
+        send = AsyncMock(return_value={"success": True, "platform": "email", "chat_id": "user@example.com"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={"address": "bot@example.com"})
+
+        with patch("tools.send_message_tool._send_email", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.EMAIL, cfg, "user@example.com", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with({"address": "bot@example.com"}, "user@example.com", "hello")
+
+    def test_sms_routes_via_send_sms(self):
+        send = AsyncMock(return_value={"success": True, "platform": "sms", "chat_id": "+15551234567"})
+        cfg = SimpleNamespace(enabled=True, api_key="twilio-token", token=None, extra={})
+
+        with patch("tools.send_message_tool._send_sms", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.SMS, cfg, "+15551234567", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with("twilio-token", "+15551234567", "hello")
+
+    def test_mattermost_routes_via_send_mattermost(self):
+        send = AsyncMock(return_value={"success": True, "platform": "mattermost", "chat_id": "channel-id-1"})
+        cfg = SimpleNamespace(enabled=True, token="mm-token", extra={"url": "https://mm.example.com"})
+
+        with patch("tools.send_message_tool._send_mattermost", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.MATTERMOST, cfg, "channel-id-1", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with("mm-token", {"url": "https://mm.example.com"}, "channel-id-1", "hello")
+
+    def test_homeassistant_routes_via_send_homeassistant(self):
+        send = AsyncMock(return_value={"success": True, "platform": "homeassistant", "chat_id": "notify.mobile_app"})
+        cfg = SimpleNamespace(enabled=True, token="hass-token", extra={"url": "https://hass.example.com"})
+
+        with patch("tools.send_message_tool._send_homeassistant", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.HOMEASSISTANT, cfg, "notify.mobile_app", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with("hass-token", {"url": "https://hass.example.com"}, "notify.mobile_app", "hello")
+
+    def test_dingtalk_routes_via_send_dingtalk(self):
+        send = AsyncMock(return_value={"success": True, "platform": "dingtalk", "chat_id": "cid123"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={"webhook_url": "https://api.dingtalk.com/robot/send"})
+
+        with patch("tools.send_message_tool._send_dingtalk", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.DINGTALK, cfg, "cid123", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with({"webhook_url": "https://api.dingtalk.com/robot/send"}, "cid123", "hello")
+
+    def test_weixin_text_routes_via_send_weixin(self):
+        send = AsyncMock(return_value={"success": True, "platform": "weixin", "chat_id": "wxid_test123"})
+        cfg = SimpleNamespace(enabled=True, token="wx-token", extra={"account_id": "bot-account"})
+
+        with patch("tools.send_message_tool._send_weixin", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.WEIXIN, cfg, "wxid_test123", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(cfg, "wxid_test123", "hello", media_files=[])
+
+    def test_wecom_routes_via_send_wecom(self):
+        send = AsyncMock(return_value={"success": True, "platform": "wecom", "chat_id": "staff-user-1"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={"corp_id": "ww123"})
+
+        with patch("tools.send_message_tool._send_wecom", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.WECOM, cfg, "staff-user-1", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with({"corp_id": "ww123"}, "staff-user-1", "hello")
+
+    def test_bluebubbles_routes_via_send_bluebubbles(self):
+        send = AsyncMock(return_value={"success": True, "platform": "bluebubbles", "chat_id": "chat-guid"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={"server_url": "https://bb.example.com"})
+
+        with patch("tools.send_message_tool._send_bluebubbles", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.BLUEBUBBLES, cfg, "chat-guid", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with({"server_url": "https://bb.example.com"}, "chat-guid", "hello")
+
+    def test_qqbot_routes_via_send_qqbot(self):
+        send = AsyncMock(return_value={"success": True, "platform": "qqbot", "chat_id": "guild-channel-1"})
+        cfg = SimpleNamespace(enabled=True, token="secret", extra={"app_id": "123"})
+
+        with patch("tools.send_message_tool._send_qqbot", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.QQBOT, cfg, "guild-channel-1", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(cfg, "guild-channel-1", "hello")
+
+    def test_yuanbao_routes_via_send_yuanbao(self):
+        send = AsyncMock(return_value={"success": True, "platform": "yuanbao", "chat_id": "direct:acct-1"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={})
+
+        with patch("tools.send_message_tool._send_yuanbao", send):
+            result = asyncio.run(
+                _send_to_platform(Platform.YUANBAO, cfg, "direct:acct-1", "hello")
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with("direct:acct-1", "hello")
+
+
+class TestSendViaAdapterFallback:
+    def test_send_via_adapter_passes_thread_metadata(self):
+        adapter = SimpleNamespace(
+            send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+        )
+        runner = SimpleNamespace(adapters={Platform.WECOM_CALLBACK: adapter})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={})
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = asyncio.run(
+                _send_via_adapter(
+                    Platform.WECOM_CALLBACK,
+                    cfg,
+                    "wwcorp123:user_a",
+                    "hello",
+                    thread_id="t42",
+                )
+            )
+
+        assert result == {"success": True, "message_id": "m1"}
+        adapter.send.assert_awaited_once_with(
+            chat_id="wwcorp123:user_a",
+            content="hello",
+            metadata={"thread_id": "t42"},
+        )
+
+    def test_send_to_platform_routes_wecom_callback_via_adapter(self):
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "m1"})
+        cfg = SimpleNamespace(enabled=True, token=None, extra={})
+
+        with patch("tools.send_message_tool._send_via_adapter", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.WECOM_CALLBACK,
+                    cfg,
+                    "wwcorp123:user_a",
+                    "hello",
+                    thread_id="t42",
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.WECOM_CALLBACK,
+            cfg,
+            "wwcorp123:user_a",
+            "hello",
+            thread_id="t42",
+        )
+
+
 class TestSendTelegramHtmlDetection:
     """Verify that messages containing HTML tags are sent with parse_mode=HTML
     and that plain / markdown messages use MarkdownV2."""
@@ -849,11 +1157,57 @@ class TestParseTargetRefE164:
         assert _parse_target_ref("signal", "+12abc4567890")[2] is False
         assert _parse_target_ref("signal", "+")[2] is False
 
+    def test_signal_group_target_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("signal", "group:abc123")
+        assert chat_id == "group:abc123"
+        assert thread_id is None
+        assert is_explicit is True
+
     def test_e164_prefix_only_matches_phone_platforms(self):
         """'+' prefix must NOT be treated as explicit for non-phone platforms."""
         assert _parse_target_ref("telegram", "+15551234567")[2] is False
         assert _parse_target_ref("discord", "+15551234567")[2] is False
         assert _parse_target_ref("matrix", "+15551234567")[2] is False
+
+
+class TestParseTargetRefWecomCallback:
+    def test_scoped_chat_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "wecom_callback", "wwcorp123:user_a"
+        )
+        assert chat_id == "wwcorp123:user_a"
+        assert thread_id is None
+        assert is_explicit is True
+
+
+class TestParseTargetRefFeishu:
+    def test_chat_id_with_thread_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "feishu", "oc_home:omt-thread-123"
+        )
+        assert chat_id == "oc_home"
+        assert thread_id == "omt-thread-123"
+        assert is_explicit is True
+
+    def test_open_id_without_thread_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("feishu", "ou_member123")
+        assert chat_id == "ou_member123"
+        assert thread_id is None
+        assert is_explicit is True
+
+
+class TestParseTargetRefWhatsapp:
+    def test_whatsapp_lid_target_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("whatsapp", "test-user@lid")
+        assert chat_id == "test-user@lid"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_whatsapp_group_target_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("whatsapp", "12345@g.us")
+        assert chat_id == "12345@g.us"
+        assert thread_id is None
+        assert is_explicit is True
 
 
 class TestParseTargetRefSlack:
@@ -870,6 +1224,14 @@ class TestParseTargetRefSlack:
 
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
+
+    def test_thread_target_preserves_thread_ts(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "slack", "C0B0QV5434G:1749236185.123456"
+        )
+        assert chat_id == "C0B0QV5434G"
+        assert thread_id == "1749236185.123456"
+        assert is_explicit is True
 
     def test_user_id_is_not_explicit(self):
         """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
