@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -238,6 +239,7 @@ where
 {
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/health/detailed", get(handle_health_detailed))
         .route("/v1/health", get(handle_health))
         .route(
             "/v1/capabilities",
@@ -286,8 +288,30 @@ async fn handle_health(
         StatusCode::OK,
         json!({
             "status": "ok",
-            "platform": "api_server",
+            "platform": "hermes-agent",
             "model": state.settings.model_name,
+        }),
+        &state.settings,
+        headers.get(ORIGIN),
+    )
+}
+
+async fn handle_health_detailed(
+    State(state): State<Arc<NativeApiServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    let runtime = read_gateway_runtime_status(&state.context);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "status": "ok",
+            "platform": "hermes-agent",
+            "gateway_state": runtime.get("gateway_state").cloned().unwrap_or(Value::Null),
+            "platforms": runtime.get("platforms").cloned().unwrap_or_else(|| json!({})),
+            "active_agents": runtime.get("active_agents").cloned().unwrap_or_else(|| json!(0)),
+            "exit_reason": runtime.get("exit_reason").cloned().unwrap_or(Value::Null),
+            "updated_at": runtime.get("updated_at").cloned().unwrap_or(Value::Null),
+            "pid": std::process::id(),
         }),
         &state.settings,
         headers.get(ORIGIN),
@@ -352,10 +376,12 @@ async fn handle_capabilities(
                 "runs_conversation_history": true,
                 "runs_instructions": true,
                 "tool_progress_events": true,
+                "session_continuity_header": "X-Hermes-Session-Id",
                 "cors": !state.settings.cors_origins.is_empty(),
             },
             "endpoints": {
                 "health": { "method": "GET", "path": "/health" },
+                "health_detailed": { "method": "GET", "path": "/health/detailed" },
                 "health_v1": { "method": "GET", "path": "/v1/health" },
                 "models": { "method": "GET", "path": "/v1/models" },
                 "capabilities": { "method": "GET", "path": "/v1/capabilities" },
@@ -1232,6 +1258,17 @@ fn derive_chat_session_id(system_prompt: Option<&str>, first_user_message: &str)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("api-{hex}")
+}
+
+fn read_gateway_runtime_status(context: &HermesContext) -> serde_json::Map<String, Value> {
+    let path = context.hermes_home().join("gateway_state.json");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return serde_json::Map::new();
+    };
+    parsed.as_object().cloned().unwrap_or_default()
 }
 
 fn extract_last_user_content(messages: &[Value]) -> Result<Value, String> {
@@ -3446,6 +3483,76 @@ mod tests {
         let _ = shutdown_tx.send(());
         server_thread.join().unwrap();
         join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_health_detailed_reads_gateway_state() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (_temp, context, loaded) =
+            temp_context("platforms:\n  api_server:\n    enabled: true\n");
+        fs::write(
+            context.hermes_home().join("gateway_state.json"),
+            r#"{"gateway_state":"draining","exit_reason":"restart","active_agents":2,"platforms":{"telegram":{"state":"fatal","error_message":"boom"}},"updated_at":"2026-05-25T12:00:00Z"}"#,
+        )
+        .unwrap();
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let response: Value = client
+            .get(format!("http://{addr}/health/detailed"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(response["status"], json!("ok"));
+        assert_eq!(response["platform"], json!("hermes-agent"));
+        assert_eq!(response["gateway_state"], json!("draining"));
+        assert_eq!(response["exit_reason"], json!("restart"));
+        assert_eq!(response["active_agents"], json!(2));
+        assert_eq!(
+            response["platforms"]["telegram"]["error_message"],
+            json!("boom")
+        );
+        assert_eq!(response["updated_at"], json!("2026-05-25T12:00:00Z"));
+        assert!(response["pid"].as_u64().is_some());
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
     }
 
     #[test]
