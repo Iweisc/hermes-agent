@@ -1485,9 +1485,9 @@ fn build_responses_messages(
     })
 }
 
-fn build_stored_conversation_history(
+fn build_stored_conversation_history_with_assistant(
     messages: &[Value],
-    final_response: &str,
+    assistant_response: Option<&str>,
     instructions: Option<&str>,
 ) -> Vec<Value> {
     let mut conversation_history = messages.to_vec();
@@ -1504,11 +1504,24 @@ fn build_stored_conversation_history(
     {
         conversation_history.remove(0);
     }
-    conversation_history.push(json!({
-        "role": "assistant",
-        "content": final_response,
-    }));
+    if let Some(response) = assistant_response
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        conversation_history.push(json!({
+            "role": "assistant",
+            "content": response,
+        }));
+    }
     conversation_history
+}
+
+fn build_stored_conversation_history(
+    messages: &[Value],
+    final_response: &str,
+    instructions: Option<&str>,
+) -> Vec<Value> {
+    build_stored_conversation_history_with_assistant(messages, Some(final_response), instructions)
 }
 
 fn json_response(
@@ -1719,7 +1732,37 @@ fn responses_streaming_response(
                 }
             }),
         );
+        if should_store {
+            persist_stream_response_snapshot(
+                &state_for_stream,
+                &settings.model_name,
+                &response_id_for_stream,
+                created_at,
+                "in_progress",
+                Vec::new(),
+                None,
+                None,
+                &messages,
+                instructions.as_deref(),
+                conversation.as_deref(),
+                session_id.as_deref(),
+            );
+        }
         if !send_sse_chunk(&body_tx, &interrupt_requested, created_chunk).await {
+            if should_store {
+                persist_incomplete_stream_response_snapshot(
+                    &state_for_stream,
+                    &settings.model_name,
+                    &response_id_for_stream,
+                    created_at,
+                    &emitted_items,
+                    &final_text,
+                    &messages,
+                    instructions.as_deref(),
+                    conversation.as_deref(),
+                    session_id.as_deref(),
+                );
+            }
             return;
         }
 
@@ -1763,6 +1806,20 @@ fn responses_streaming_response(
                     );
                     output_index += 1;
                     if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                 }
@@ -1798,6 +1855,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, done_chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                     let output_item = json!({
@@ -1826,6 +1897,20 @@ fn responses_streaming_response(
                     );
                     output_index += 1;
                     if !send_sse_chunk(&body_tx, &interrupt_requested, added_chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                     let done_chunk = format_sse_event(
@@ -1838,6 +1923,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, done_chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                 }
@@ -1862,6 +1961,20 @@ fn responses_streaming_response(
                         output_index += 1;
                         message_opened = true;
                         if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            if should_store {
+                                persist_incomplete_stream_response_snapshot(
+                                    &state_for_stream,
+                                    &settings.model_name,
+                                    &response_id_for_stream,
+                                    created_at,
+                                    &emitted_items,
+                                    &final_text,
+                                    &messages,
+                                    instructions.as_deref(),
+                                    conversation.as_deref(),
+                                    session_id.as_deref(),
+                                );
+                            }
                             return;
                         }
                     }
@@ -1879,6 +1992,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                 }
@@ -1892,6 +2019,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                 }
@@ -1915,6 +2056,20 @@ fn responses_streaming_response(
                             );
                             message_output_index = Some(output_index);
                             if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                                if should_store {
+                                    persist_incomplete_stream_response_snapshot(
+                                        &state_for_stream,
+                                        &settings.model_name,
+                                        &response_id_for_stream,
+                                        created_at,
+                                        &emitted_items,
+                                        &final_text,
+                                        &messages,
+                                        instructions.as_deref(),
+                                        conversation.as_deref(),
+                                        session_id.as_deref(),
+                                    );
+                                }
                                 return;
                             }
                         }
@@ -1932,6 +2087,20 @@ fn responses_streaming_response(
                             }),
                         );
                         if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            if should_store {
+                                persist_incomplete_stream_response_snapshot(
+                                    &state_for_stream,
+                                    &settings.model_name,
+                                    &response_id_for_stream,
+                                    created_at,
+                                    &emitted_items,
+                                    &final_text,
+                                    &messages,
+                                    instructions.as_deref(),
+                                    conversation.as_deref(),
+                                    session_id.as_deref(),
+                                );
+                            }
                             return;
                         }
                     }
@@ -1948,6 +2117,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, text_done).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                     let message_item = json!({
@@ -1971,6 +2154,20 @@ fn responses_streaming_response(
                         }),
                     );
                     if !send_sse_chunk(&body_tx, &interrupt_requested, item_done).await {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
                         return;
                     }
                     emitted_items.push(message_item.clone());
@@ -2007,6 +2204,22 @@ fn responses_streaming_response(
                     return;
                 }
                 LiveResponseEvent::Failed(error) => {
+                    if should_store {
+                        persist_stream_response_snapshot(
+                            &state_for_stream,
+                            &settings.model_name,
+                            &response_id_for_stream,
+                            created_at,
+                            "failed",
+                            emitted_items.clone(),
+                            Some(final_text.as_str()),
+                            Some(error.as_str()),
+                            &messages,
+                            instructions.as_deref(),
+                            conversation.as_deref(),
+                            session_id.as_deref(),
+                        );
+                    }
                     let chunk = format_sse_event(
                         "response.failed",
                         &mut sequence_number,
@@ -2080,14 +2293,121 @@ fn build_completed_responses_payload_with_output(
     created_at: u64,
     output: Vec<Value>,
 ) -> Value {
+    build_responses_payload_with_status_and_output(
+        model_name,
+        response_id,
+        created_at,
+        "completed",
+        output,
+        None,
+    )
+}
+
+fn build_responses_payload_with_status_and_output(
+    model_name: &str,
+    response_id: &str,
+    created_at: u64,
+    status: &str,
+    output: Vec<Value>,
+    error: Option<Value>,
+) -> Value {
     json!({
         "id": response_id,
         "object": "response",
         "created_at": created_at,
-        "status": "completed",
+        "status": status,
         "model": model_name,
         "output": output,
+        "error": error,
     })
+}
+
+fn append_stream_assistant_message(output: &mut Vec<Value>, assistant_text: Option<&str>) {
+    if let Some(text) = assistant_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        output.push(json!({
+            "id": format!("msg-rs-{:x}", unix_ts_nanos()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }],
+        }));
+    }
+}
+
+fn persist_stream_response_snapshot(
+    state: &NativeApiServerState,
+    model_name: &str,
+    response_id: &str,
+    created_at: u64,
+    status: &str,
+    output: Vec<Value>,
+    assistant_text: Option<&str>,
+    error_message: Option<&str>,
+    messages: &[Value],
+    instructions: Option<&str>,
+    conversation: Option<&str>,
+    session_id: Option<&str>,
+) {
+    let mut snapshot_output = output;
+    append_stream_assistant_message(&mut snapshot_output, assistant_text);
+    let response_body = build_responses_payload_with_status_and_output(
+        model_name,
+        response_id,
+        created_at,
+        status,
+        snapshot_output,
+        error_message.map(|message| {
+            json!({
+                "message": message,
+                "type": "server_error",
+            })
+        }),
+    );
+    let conversation_history =
+        build_stored_conversation_history_with_assistant(messages, assistant_text, instructions);
+    store_response_snapshot(
+        state,
+        &response_body,
+        &conversation_history,
+        instructions,
+        conversation,
+        session_id,
+    );
+}
+
+fn persist_incomplete_stream_response_snapshot(
+    state: &NativeApiServerState,
+    model_name: &str,
+    response_id: &str,
+    created_at: u64,
+    output: &[Value],
+    assistant_text: &str,
+    messages: &[Value],
+    instructions: Option<&str>,
+    conversation: Option<&str>,
+    session_id: Option<&str>,
+) {
+    persist_stream_response_snapshot(
+        state,
+        model_name,
+        response_id,
+        created_at,
+        "incomplete",
+        output.to_vec(),
+        Some(assistant_text),
+        None,
+        messages,
+        instructions,
+        conversation,
+        session_id,
+    );
 }
 
 fn store_response_snapshot(
@@ -2841,6 +3161,23 @@ mod tests {
         (format!("http://{}", addr), join)
     }
 
+    fn extract_sse_event_payload(body: &str, event_name: &str) -> Value {
+        let expected_event = format!("event: {event_name}");
+        for block in body.split("\n\n") {
+            let mut saw_event = false;
+            for line in block.lines() {
+                if line == expected_event {
+                    saw_event = true;
+                    continue;
+                }
+                if saw_event && let Some(payload) = line.strip_prefix("data: ") {
+                    return serde_json::from_str(payload).unwrap();
+                }
+            }
+        }
+        panic!("missing SSE event: {event_name}");
+    }
+
     #[test]
     fn loads_native_api_server_settings_from_env_and_raw_config() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
@@ -3567,6 +3904,89 @@ mod tests {
         assert!(body.contains("event: response.output_item.done"));
         assert!(body.contains("\"text\":\"session tool stream hello\""));
         assert!(body.contains("event: response.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_failed_stream_persists_response_snapshot() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) = mock_model_server(response_body);
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let body = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "say hi",
+                "stream": true,
+            }))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.failed"));
+        let created = extract_sse_event_payload(&body, "response.created");
+        let response_id = created["response"]["id"].as_str().unwrap();
+
+        let stored: Value = client
+            .get(format!("http://{addr}/v1/responses/{response_id}"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(stored["status"], json!("failed"));
+        assert_eq!(stored["id"], json!(response_id));
 
         let _ = shutdown_tx.send(());
         server_thread.join().unwrap();
