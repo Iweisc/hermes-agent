@@ -1372,6 +1372,7 @@ def _session_info(agent) -> dict:
     service_tier = getattr(agent, "service_tier", None) or ""
     info: dict = {
         "model": getattr(agent, "model", ""),
+        "session_key": getattr(agent, "session_id", "") or "",
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -3144,7 +3145,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
-            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            payload = {
+                "text": raw,
+                "usage": _get_usage(agent),
+                "status": status,
+                "session_key": session.get("session_key") or "",
+            }
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

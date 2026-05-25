@@ -1730,6 +1730,7 @@ fn rewrite_child_event(
     if let Some(local_sid) = local_sid.clone() {
         cache_child_event_state(state, &local_sid, params)?;
     }
+    strip_internal_session_key(params);
     if let Some(event_type) = params.get("type").and_then(Value::as_str)
         && matches!(
             event_type,
@@ -1760,6 +1761,14 @@ fn cache_child_event_state(
     match event_type {
         "session.info" => {
             if let Some(payload) = params.get("payload").and_then(Value::as_object) {
+                if let Some(session_key) = payload
+                    .get("session_key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    update_store_session_id(state, local_session_id, session_key)?;
+                }
                 update_session_info_cache(state, local_session_id, payload.clone())?;
                 if let Some(usage) = payload.get("usage").and_then(Value::as_object) {
                     update_session_usage_cache(state, local_session_id, usage.clone())?;
@@ -1769,19 +1778,37 @@ fn cache_child_event_state(
         "message.start" => set_session_running(state, local_session_id, true)?,
         "message.complete" => {
             set_session_running(state, local_session_id, false)?;
-            if let Some(usage) = params
-                .get("payload")
-                .and_then(Value::as_object)
-                .and_then(|payload| payload.get("usage"))
-                .and_then(Value::as_object)
-            {
-                update_session_usage_cache(state, local_session_id, usage.clone())?;
+            if let Some(payload) = params.get("payload").and_then(Value::as_object) {
+                if let Some(session_key) = payload
+                    .get("session_key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    update_store_session_id(state, local_session_id, session_key)?;
+                }
+                if let Some(usage) = payload.get("usage").and_then(Value::as_object) {
+                    update_session_usage_cache(state, local_session_id, usage.clone())?;
+                }
             }
         }
         "error" => set_session_running(state, local_session_id, false)?,
         _ => {}
     }
     Ok(())
+}
+
+fn strip_internal_session_key(params: &mut Map<String, Value>) {
+    let event_type = params
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(event_type, "session.info" | "message.complete") {
+        return;
+    }
+    if let Some(payload) = params.get_mut("payload").and_then(Value::as_object_mut) {
+        payload.remove("session_key");
+    }
 }
 
 fn claim_pending_resume_child_session(
@@ -3743,6 +3770,73 @@ mod tests {
         .unwrap();
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn session_info_event_reanchors_store_session_id_and_hides_internal_key() {
+        let state = test_state();
+        bind_child_session(&state, "child-info-key", Some("stored-stale".to_string())).unwrap();
+        mark_store_session_dirty(&state, "rs_tui_00000001").unwrap();
+
+        let rewritten = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"session.info","session_id":"child-info-key","payload":{"model":"gpt-live","session_key":"stored-live","usage":{"total":5}}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed["params"]["session_id"], json!("rs_tui_00000001"));
+        assert_eq!(
+            parsed["params"]["payload"].get("session_key"),
+            None,
+            "internal session_key should not leak to the public event stream"
+        );
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.sessions["rs_tui_00000001"]
+                .store_session_id
+                .as_deref(),
+            Some("stored-live")
+        );
+        assert!(!guard.sessions["rs_tui_00000001"].store_session_dirty);
+    }
+
+    #[test]
+    fn message_complete_event_reanchors_store_session_id_and_hides_internal_key() {
+        let state = test_state();
+        bind_child_session(
+            &state,
+            "child-complete-key",
+            Some("stored-before".to_string()),
+        )
+        .unwrap();
+        mark_store_session_dirty(&state, "rs_tui_00000001").unwrap();
+
+        let rewritten = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"message.complete","session_id":"child-complete-key","payload":{"text":"done","status":"complete","session_key":"stored-after","usage":{"calls":3,"total":21}}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed["params"]["session_id"], json!("rs_tui_00000001"));
+        assert_eq!(
+            parsed["params"]["payload"].get("session_key"),
+            None,
+            "internal session_key should not leak to the public event stream"
+        );
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.sessions["rs_tui_00000001"]
+                .store_session_id
+                .as_deref(),
+            Some("stored-after")
+        );
+        assert!(!guard.sessions["rs_tui_00000001"].store_session_dirty);
+        assert_eq!(guard.sessions["rs_tui_00000001"].usage["calls"], json!(3));
+        assert_eq!(guard.sessions["rs_tui_00000001"].usage["total"], json!(21));
     }
 
     #[test]
