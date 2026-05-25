@@ -799,16 +799,13 @@ fn manifest_provider_metadata(
     let Some(setup) = manifest.setup else {
         return Ok(None);
     };
-    if setup.post_setup {
-        return Ok(None);
-    }
 
     let is_available = setup.is_available.unwrap_or_else(|| {
         manifest_required_fields_available(context, provider_name, setup.schema.as_slice())
     });
 
     Ok(Some(BridgedProviderMetadata {
-        has_post_setup: false,
+        has_post_setup: setup.post_setup,
         has_save_config: setup.save_config,
         is_available,
         schema: setup.schema,
@@ -4091,6 +4088,56 @@ exit 9\n",
 
         remove_env_var("HERMES_MEMORY_PYTHON");
         remove_env_var("CUSTOM_ENDPOINT");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn render_status_uses_post_setup_manifest_metadata_without_python() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("plugin.yaml"),
+            "description: Custom post-setup provider\nsetup:\n  post_setup: true\n  schema:\n    - key: api_key\n      env_var: CUSTOM_API_KEY\n      required: true\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: custom\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("custom"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        remove_env_var("CUSTOM_API_KEY");
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Plugin:    installed ✓"));
+        assert!(output.contains("Status:    not available ✗"));
+        assert!(output.contains("✗ CUSTOM_API_KEY"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
