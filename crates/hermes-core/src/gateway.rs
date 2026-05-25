@@ -1629,8 +1629,12 @@ impl GatewayToolApprovalCallbackRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayToolApprovalCallbackOutcome {
-    NoPending { message: String },
-    Resolved { execution: GatewayToolApprovalCallbackExecution },
+    NoPending {
+        message: String,
+    },
+    Resolved {
+        execution: GatewayToolApprovalCallbackExecution,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2492,6 +2496,9 @@ pub enum GatewayHostHandleOutcome {
     RepliedUnauthorizedDmPairing {
         session_key: String,
         response: GatewayIngressHostResponse,
+    },
+    ToolApprovalCommand {
+        decision: GatewayToolApprovalCommandDecision,
     },
     ExecQuickCommand {
         request: GatewayQuickCommandRequestPlan,
@@ -4050,6 +4057,19 @@ impl GatewayRuntime {
         busy: Option<&GatewayBusyReplyContext>,
         handler: &mut H,
     ) -> Result<GatewayHostHandleOutcome, String> {
+        self.handle_event_host_authorized_with_tool_approval(
+            event, authorized, false, busy, handler,
+        )
+    }
+
+    pub fn handle_event_host_authorized_with_tool_approval<H: GatewayIngressEffectHandler>(
+        &mut self,
+        event: MessageEvent,
+        authorized: bool,
+        tool_approval_live: bool,
+        busy: Option<&GatewayBusyReplyContext>,
+        handler: &mut H,
+    ) -> Result<GatewayHostHandleOutcome, String> {
         let authorization = if event.internal {
             GatewayAuthorizationStatus::Authorized
         } else if !source_has_user_identity(&event.source) {
@@ -4059,10 +4079,11 @@ impl GatewayRuntime {
         } else {
             GatewayAuthorizationStatus::Unauthorized
         };
-        self.handle_event_host_with_authorization(
+        self.handle_event_host_with_authorization_and_tool_approval(
             event,
             authorization,
             UnauthorizedDmBehavior::Ignore,
+            tool_approval_live,
             busy,
             handler,
         )
@@ -4073,6 +4094,27 @@ impl GatewayRuntime {
         event: MessageEvent,
         authorization: GatewayAuthorizationStatus,
         unauthorized_dm_behavior: UnauthorizedDmBehavior,
+        busy: Option<&GatewayBusyReplyContext>,
+        handler: &mut H,
+    ) -> Result<GatewayHostHandleOutcome, String> {
+        self.handle_event_host_with_authorization_and_tool_approval(
+            event,
+            authorization,
+            unauthorized_dm_behavior,
+            false,
+            busy,
+            handler,
+        )
+    }
+
+    pub fn handle_event_host_with_authorization_and_tool_approval<
+        H: GatewayIngressEffectHandler,
+    >(
+        &mut self,
+        event: MessageEvent,
+        authorization: GatewayAuthorizationStatus,
+        unauthorized_dm_behavior: UnauthorizedDmBehavior,
+        tool_approval_live: bool,
         busy: Option<&GatewayBusyReplyContext>,
         handler: &mut H,
     ) -> Result<GatewayHostHandleOutcome, String> {
@@ -4108,6 +4150,10 @@ impl GatewayRuntime {
                 });
             }
             return Ok(GatewayHostHandleOutcome::DroppedUnauthorizedColdPath { session_key });
+        }
+
+        if let Some(decision) = self.begin_tool_approval_host_command(&event, tool_approval_live)? {
+            return Ok(GatewayHostHandleOutcome::ToolApprovalCommand { decision });
         }
 
         let execution = self.handle_event_host(event, busy, handler)?;
@@ -9561,6 +9607,98 @@ mod tests {
         assert_eq!(request.chat_id, "12345");
         assert_eq!(request.reply_to_message_id.as_deref(), Some("msg-9"));
         assert_eq!(request.thread_id, None);
+    }
+
+    #[test]
+    fn runtime_handle_event_host_authorized_with_tool_approval_returns_approval_command_outcome() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::Running { can_steer: false },
+            },
+        );
+        let event = MessageEvent {
+            text: "/approve all session".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let result = runtime
+            .handle_event_host_authorized_with_tool_approval(event, true, true, None, &mut handler)
+            .unwrap();
+        assert_eq!(
+            result,
+            GatewayHostHandleOutcome::ToolApprovalCommand {
+                decision: GatewayToolApprovalCommandDecision::Resolve {
+                    request: GatewayToolApprovalRequest {
+                        session_key,
+                        choice: GatewayToolApprovalChoice::Session,
+                        resolve_all: true,
+                    },
+                },
+            }
+        );
+        assert!(handler.interrupts.is_empty());
+        assert!(handler.steers.is_empty());
+    }
+
+    #[test]
+    fn runtime_handle_event_host_authorized_with_tool_approval_returns_no_pending_message() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.mark_pending_tool_approval(&session_key).unwrap();
+        let event = MessageEvent {
+            text: "/deny".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let result = runtime
+            .handle_event_host_authorized_with_tool_approval(event, true, false, None, &mut handler)
+            .unwrap();
+        assert_eq!(
+            result,
+            GatewayHostHandleOutcome::ToolApprovalCommand {
+                decision: GatewayToolApprovalCommandDecision::NoPending {
+                    message: "❌ Command denied (approval was stale).".to_string(),
+                },
+            }
+        );
+        assert!(handler.interrupts.is_empty());
+        assert!(handler.steers.is_empty());
     }
 
     #[test]
