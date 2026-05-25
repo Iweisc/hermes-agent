@@ -36,7 +36,6 @@ _ALLOWED_METHODS = frozenset(
         "secret.respond",
         "session.close",
         "session.compress",
-        "session.history",
         "session.interrupt",
         "session.resume",
         "session.steer",
