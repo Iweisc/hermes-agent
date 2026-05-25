@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, TimeZone};
 use hermes_core::{
     GatewaySessionPoll, GatewayTurnSession, HermesContext, LoadedConfig, MessageRecord,
     ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
@@ -40,6 +41,7 @@ struct NativeGatewayServer<'a> {
 }
 
 struct ActiveTurn {
+    session_id: String,
     turn: GatewayTurnSession,
 }
 
@@ -231,6 +233,11 @@ impl<'a> NativeGatewayServer<'a> {
             "session.list" => self.handle_session_list(),
             "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
+            "session.delete" => self.handle_session_delete(params),
+            "session.title" => self.handle_session_title(params),
+            "session.status" => self.handle_session_status(params),
+            "session.save" => self.handle_session_save(params),
+            "session.close" => self.handle_session_close(params),
             "input.detect_drop" => Ok(json!({
                 "matched": false,
                 "text": params.get("text").and_then(Value::as_str).unwrap_or_default(),
@@ -368,6 +375,181 @@ impl<'a> NativeGatewayServer<'a> {
         }))
     }
 
+    fn handle_session_delete(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)
+            .map_err(|_| (4006, String::from("session_id required"), None))?;
+        if self.sessions.contains_key(&session_id)
+            || self
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.session_id == session_id)
+        {
+            return Err((4023, String::from("cannot delete an active session"), None));
+        }
+        let deleted = self
+            .session_store
+            .delete_session(&session_id)
+            .map_err(|error| (5036, format!("delete failed: {error}"), None))?;
+        if !deleted {
+            return Err((4007, String::from("session not found"), None));
+        }
+        Ok(json!({ "deleted": session_id }))
+    }
+
+    fn handle_session_title(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        if !self.sessions.contains_key(&session_id) {
+            return Err((4007, String::from("session not found"), None));
+        }
+        if !params
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("title"))
+        {
+            let title = self
+                .session_store
+                .get_session_title(&session_id)
+                .map_err(|error| (5007, error.to_string(), None))?
+                .unwrap_or_default();
+            return Ok(json!({
+                "title": title,
+                "session_key": session_id,
+            }));
+        }
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (4021, String::from("title required"), None))?;
+        match self.session_store.set_session_title(&session_id, title) {
+            Ok(true) => Ok(json!({"pending": false, "title": title})),
+            Ok(false) => {
+                let existing = self
+                    .session_store
+                    .get_session_title(&session_id)
+                    .map_err(|error| (5007, error.to_string(), None))?
+                    .unwrap_or_else(|| title.to_string());
+                Ok(json!({"pending": false, "title": existing}))
+            }
+            Err(error) => Err((4022, error.to_string(), None)),
+        }
+    }
+
+    fn handle_session_status(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let session = self
+            .session_store
+            .get_session(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let last_activity = self
+            .session_store
+            .get_messages(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?
+            .last()
+            .map(|message| message.timestamp)
+            .unwrap_or(session.started_at);
+        let running = self
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.session_id == session_id);
+        let provider = state
+            .overrides
+            .provider
+            .clone()
+            .unwrap_or_else(|| String::from("unknown"));
+        let model = state
+            .overrides
+            .model
+            .clone()
+            .or_else(|| session.model.clone())
+            .unwrap_or_else(|| String::from("(unknown)"));
+        let mut lines = vec![
+            String::from("Hermes TUI Status"),
+            String::new(),
+            format!("Session ID: {session_id}"),
+            format!("Path: {}", self.context.display_hermes_home()),
+        ];
+        if let Some(title) = session
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("Title: {title}"));
+        }
+        lines.extend([
+            format!("Model: {model} ({provider})"),
+            format!("Created: {}", format_local_timestamp(session.started_at)),
+            format!("Last Activity: {}", format_local_timestamp(last_activity)),
+            format!("Messages: {}", session.message_count),
+            format!("Agent Running: {}", if running { "Yes" } else { "No" }),
+        ]);
+        Ok(json!({ "output": lines.join("\n") }))
+    }
+
+    fn handle_session_save(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        if !self.sessions.contains_key(&session_id) {
+            return Err((4007, String::from("session not found"), None));
+        }
+        let session = self
+            .session_store
+            .get_session(&session_id)
+            .map_err(|error| (5011, error.to_string(), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let messages = self
+            .session_store
+            .get_messages(&session_id)
+            .map_err(|error| (5011, error.to_string(), None))?;
+        let filename = std::env::current_dir()
+            .map_err(|error| (5011, error.to_string(), None))?
+            .join(format!(
+                "hermes_conversation_{}.json",
+                Local::now().format("%Y%m%d_%H%M%S")
+            ));
+        let payload = json!({
+            "model": session.model.unwrap_or_default(),
+            "messages": transcript_messages(&messages),
+        });
+        fs::write(
+            &filename,
+            serde_json::to_vec_pretty(&payload).map_err(|error| (5011, error.to_string(), None))?,
+        )
+        .map_err(|error| (5011, error.to_string(), None))?;
+        Ok(json!({ "file": filename }))
+    }
+
+    fn handle_session_close(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let existed = self.sessions.remove(&session_id).is_some();
+        self.slash_workers.remove(&session_id);
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.session_id == session_id)
+        {
+            if let Some(active) = self.active_turn.as_mut() {
+                active.turn.cancel_pending_requests("closed");
+            }
+            self.active_turn = None;
+        }
+        Ok(json!({ "ok": existed, "closed": existed }))
+    }
+
     fn handle_prompt_submit<W: Write>(
         &mut self,
         writer: &mut W,
@@ -405,6 +587,7 @@ impl<'a> NativeGatewayServer<'a> {
             },
         );
         self.active_turn = Some(ActiveTurn {
+            session_id: session_id.clone(),
             turn: GatewayTurnSession::new(rx),
         });
         write_jsonrpc_event(
@@ -907,6 +1090,16 @@ fn kill_shell_process(pid: i32) {
     {
         let _ = pid;
     }
+}
+
+fn format_local_timestamp(timestamp: f64) -> String {
+    let secs = timestamp.floor() as i64;
+    let nanos = ((timestamp.fract().max(0.0)) * 1_000_000_000.0) as u32;
+    Local
+        .timestamp_opt(secs, nanos)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| String::from("(unknown)"))
 }
 
 fn required_session_id(params: &Value) -> Result<String, (i64, String, Option<Value>)> {
@@ -1584,6 +1777,7 @@ mod tests {
     use super::*;
 
     static PYTHON_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2007,6 +2201,174 @@ mod tests {
                 .unwrap()
                 .contains("Use the agent for dangerous commands.")
         );
+    }
+
+    #[test]
+    fn native_gateway_session_management_rpcs_round_trip() {
+        let _guard = SESSION_ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("session-rpc-test"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: Some(json!({
+                    "provider": "custom",
+                    "base_url": "http://example.test",
+                    "api_mode": "chat_completions",
+                })),
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                "session-rpc-test",
+                &hermes_core::MessageAppend {
+                    role: String::from("user"),
+                    content: Some(json!("hello")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("session-rpc-test"),
+            NativeGatewaySessionState {
+                cwd: temp.path().to_path_buf(),
+                overrides: ModelOverrides {
+                    model: Some(String::from("test-model")),
+                    provider: Some(String::from("custom")),
+                    base_url: Some(String::from("http://example.test")),
+                    api_mode: Some(String::from("chat_completions")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut title_set = Vec::new();
+        server
+            .handle_request(
+                "session.title",
+                json!(1),
+                json!({"session_id":"session-rpc-test","title":"Sprint"}),
+                &mut title_set,
+                false,
+            )
+            .unwrap();
+        let title_set_frame = serde_json::from_slice::<Value>(&title_set).unwrap();
+        assert_eq!(title_set_frame["result"]["title"], json!("Sprint"));
+
+        let mut title_get = Vec::new();
+        server
+            .handle_request(
+                "session.title",
+                json!(2),
+                json!({"session_id":"session-rpc-test"}),
+                &mut title_get,
+                false,
+            )
+            .unwrap();
+        let title_get_frame = serde_json::from_slice::<Value>(&title_get).unwrap();
+        assert_eq!(title_get_frame["result"]["title"], json!("Sprint"));
+
+        let mut status = Vec::new();
+        server
+            .handle_request(
+                "session.status",
+                json!(3),
+                json!({"session_id":"session-rpc-test"}),
+                &mut status,
+                false,
+            )
+            .unwrap();
+        let status_frame = serde_json::from_slice::<Value>(&status).unwrap();
+        assert!(
+            status_frame["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("Title: Sprint")
+        );
+
+        let mut save = Vec::new();
+        server
+            .handle_request(
+                "session.save",
+                json!(4),
+                json!({"session_id":"session-rpc-test"}),
+                &mut save,
+                false,
+            )
+            .unwrap();
+        let save_frame = serde_json::from_slice::<Value>(&save).unwrap();
+        let saved_file = PathBuf::from(save_frame["result"]["file"].as_str().unwrap());
+        assert!(saved_file.exists());
+        let saved_json = serde_json::from_slice::<Value>(&fs::read(&saved_file).unwrap()).unwrap();
+        assert_eq!(saved_json["model"], json!("test-model"));
+        assert_eq!(saved_json["messages"][0]["text"], json!("hello"));
+
+        let mut delete_active = Vec::new();
+        server
+            .handle_request(
+                "session.delete",
+                json!(5),
+                json!({"session_id":"session-rpc-test"}),
+                &mut delete_active,
+                false,
+            )
+            .unwrap();
+        let delete_active_frame = serde_json::from_slice::<Value>(&delete_active).unwrap();
+        assert_eq!(delete_active_frame["error"]["code"], json!(4023));
+
+        let mut close = Vec::new();
+        server
+            .handle_request(
+                "session.close",
+                json!(6),
+                json!({"session_id":"session-rpc-test"}),
+                &mut close,
+                false,
+            )
+            .unwrap();
+        let close_frame = serde_json::from_slice::<Value>(&close).unwrap();
+        assert_eq!(close_frame["result"]["closed"], json!(true));
+
+        let mut delete_closed = Vec::new();
+        server
+            .handle_request(
+                "session.delete",
+                json!(7),
+                json!({"session_id":"session-rpc-test"}),
+                &mut delete_closed,
+                false,
+            )
+            .unwrap();
+        let delete_closed_frame = serde_json::from_slice::<Value>(&delete_closed).unwrap();
+        assert_eq!(
+            delete_closed_frame["result"]["deleted"],
+            json!("session-rpc-test")
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
     }
 
     #[cfg(not(windows))]
