@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use clap::{Parser, Subcommand};
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, LoadedConfig, LoggingMode, ModelOverrides,
-    ToolRuntime,
+    ToolRuntime, attach_python_plugin_runtime,
 };
 
 #[derive(Parser, Debug)]
@@ -92,10 +92,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 overrides.clone(),
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             );
-            let runtime = ToolRuntime::default()
-                .with_hermes_home(context.hermes_home())
-                .with_clarify_callback(run_clarify_prompt)
-                .with_delegate_callback(move |request| delegate.execute(request));
+            let runtime = attach_python_plugin_runtime(
+                &context.hermes_home(),
+                ToolRuntime::default()
+                    .with_hermes_home(context.hermes_home())
+                    .with_clarify_callback(run_clarify_prompt),
+            )?;
+            let delegate = delegate.with_runtime_template(runtime.clone());
+            let runtime = runtime.with_delegate_callback(move |request, parent_runtime| {
+                delegate.execute(request, parent_runtime)
+            });
             let result = context.run_chat_completions_turn(
                 &config,
                 &prompt,

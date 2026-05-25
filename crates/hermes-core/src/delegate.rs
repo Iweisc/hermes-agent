@@ -39,6 +39,7 @@ pub struct DelegateExecutor {
     overrides: ModelOverrides,
     cwd: PathBuf,
     depth: usize,
+    runtime_template: Option<ToolRuntime>,
 }
 
 impl DelegateExecutor {
@@ -58,6 +59,7 @@ impl DelegateExecutor {
             overrides,
             cwd: cwd.into(),
             depth: 0,
+            runtime_template: None,
         }
     }
 
@@ -66,7 +68,16 @@ impl DelegateExecutor {
         self
     }
 
-    pub fn execute(&self, request: DelegateTaskRequest) -> Result<Value, String> {
+    pub fn with_runtime_template(mut self, runtime: ToolRuntime) -> Self {
+        self.runtime_template = Some(runtime);
+        self
+    }
+
+    pub fn execute(
+        &self,
+        request: DelegateTaskRequest,
+        parent_runtime: &ToolRuntime,
+    ) -> Result<Value, String> {
         let config = &self.loaded.config.delegation;
         let max_spawn_depth = config.max_spawn_depth.max(1) as usize;
         if self.depth >= max_spawn_depth {
@@ -154,8 +165,11 @@ impl DelegateExecutor {
             results
         };
 
+        let mut public_results = results;
+        emit_subagent_stop_hooks(parent_runtime, &mut public_results);
+
         Ok(json!({
-            "results": results,
+            "results": public_results,
             "total_duration_seconds": overall_start.elapsed().as_secs_f64(),
         }))
     }
@@ -222,6 +236,7 @@ impl DelegateExecutor {
                 "model": result.model,
                 "session_id": result.session_id,
                 "exit_reason": "completed",
+                "_child_role": role,
             }),
             Err(error) => json!({
                 "task_index": task_index,
@@ -231,6 +246,7 @@ impl DelegateExecutor {
                 "api_calls": 0,
                 "tool_calls": 0,
                 "duration_seconds": start.elapsed().as_secs_f64(),
+                "_child_role": role,
             }),
         }
     }
@@ -243,6 +259,13 @@ impl DelegateExecutor {
     ) -> ToolRuntime {
         let mut runtime =
             ToolRuntime::new(self.cwd.clone()).with_hermes_home(self.context.hermes_home());
+        if let Some(template) = self.runtime_template.as_ref() {
+            runtime = runtime.with_dynamic_runtime_from(template);
+        } else if let Ok(attached) =
+            crate::attach_python_plugin_runtime(&self.context.hermes_home(), runtime.clone())
+        {
+            runtime = attached;
+        }
         if role == "orchestrator" {
             let child_executor = Self {
                 context: self.context.clone(),
@@ -252,9 +275,11 @@ impl DelegateExecutor {
                 overrides: child_overrides,
                 cwd: self.cwd.clone(),
                 depth: self.depth + 1,
+                runtime_template: self.runtime_template.clone(),
             };
-            runtime =
-                runtime.with_delegate_callback(move |request| child_executor.execute(request));
+            runtime = runtime.with_delegate_callback(move |request, parent_runtime| {
+                child_executor.execute(request, parent_runtime)
+            });
         }
         runtime
     }
@@ -300,6 +325,29 @@ impl DelegateExecutor {
         child_toolsets.sort();
         child_toolsets.dedup();
         Ok(child_toolsets)
+    }
+}
+
+fn emit_subagent_stop_hooks(parent_runtime: &ToolRuntime, results: &mut [Value]) {
+    let parent_session_id = parent_runtime.current_session_id().unwrap_or_default();
+    for entry in results {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let child_role = object.remove("_child_role").unwrap_or(Value::Null);
+        let duration_ms = object
+            .get("duration_seconds")
+            .and_then(Value::as_f64)
+            .map(|seconds| (seconds * 1000.0) as u64)
+            .unwrap_or_default();
+        let payload = json!({
+            "parent_session_id": parent_session_id,
+            "child_role": child_role,
+            "child_summary": object.get("summary").cloned().unwrap_or(Value::Null),
+            "child_status": object.get("status").cloned().unwrap_or(Value::Null),
+            "duration_ms": duration_ms,
+        });
+        let _ = parent_runtime.invoke_hook("subagent_stop", &payload);
     }
 }
 

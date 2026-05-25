@@ -1196,6 +1196,7 @@ dependencies = [
  "libc",
  "log",
  "md5",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

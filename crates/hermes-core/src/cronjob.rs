@@ -1278,7 +1278,11 @@ fn run_agent_cron_job(
     );
     let runtime = ToolRuntime::new(job_cwd)
         .with_hermes_home(context.hermes_home())
-        .with_delegate_callback(move |request| delegate.execute(request));
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
+    let runtime = crate::attach_python_plugin_runtime(&context.hermes_home(), runtime.clone())
+        .unwrap_or(runtime);
 
     match context.run_chat_completions_turn(
         &cron_loaded,

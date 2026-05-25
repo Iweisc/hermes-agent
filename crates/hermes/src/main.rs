@@ -21,6 +21,7 @@ mod mcp_server;
 mod memory_cmd;
 mod model_cmd;
 mod pairing_cmd;
+mod plugin_runtime;
 mod plugins_cmd;
 mod profile_cmd;
 mod python_bridge;
@@ -52,8 +53,8 @@ use clap::{Args, Parser, Subcommand};
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, KanbanDispatchOptions, LoadedConfig,
     LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once,
-    get_tool_definitions, handle_cronjob, is_container, is_wsl, kanban_has_spawnable_ready,
-    run_cron_job_now, run_due_cron_jobs, run_kanban_task,
+    dispatch_python_plugin_cli_command, get_tool_definitions, handle_cronjob, is_container, is_wsl,
+    kanban_has_spawnable_ready, run_cron_job_now, run_due_cron_jobs, run_kanban_task,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -195,6 +196,8 @@ enum Command {
     Update(update_cmd::UpdateArgs),
     Whatsapp,
     Status,
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -370,7 +373,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         context.current_profile_name(),
         context.hermes_home().display()
     );
-    let argv = std::iter::once(String::from("hermes")).chain(profile_override.args);
+    let forwarded_args = profile_override.args.clone();
+    let argv = std::iter::once(String::from("hermes")).chain(forwarded_args.clone());
     let cli = Cli::parse_from(argv);
 
     match cli.command.unwrap_or(Command::Status) {
@@ -442,10 +446,66 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
+        Command::External(args) => run_external_command(&context, &forwarded_args, &args)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
     }
 
     Ok(())
+}
+
+fn run_external_command(
+    context: &HermesContext,
+    forwarded_args: &[String],
+    args: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(command_name) = args
+        .first()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Err("missing external command".into());
+    };
+    if forwarded_args
+        .first()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        != Some(command_name)
+    {
+        return Err("invalid external command argv".into());
+    }
+    let known_commands = plugin_runtime::discover_enabled_cli_commands(context)?;
+    if !known_commands
+        .iter()
+        .any(|command| command.name == command_name)
+    {
+        return Err(format!("unknown command '{command_name}'").into());
+    }
+
+    let hermes_home = context.hermes_home();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let result = dispatch_python_plugin_cli_command(&hermes_home, &cwd, forwarded_args).map_err(
+        |error| format!("failed to dispatch plugin CLI command '{command_name}': {error}"),
+    )?;
+    if !result.stdout.is_empty() {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(result.stdout.as_bytes())?;
+        stdout.flush()?;
+    }
+    if !result.stderr.is_empty() {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(result.stderr.as_bytes())?;
+        stderr.flush()?;
+    }
+    if result.exit_code == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "plugin CLI command '{command_name}' exited with status {}",
+        result.exit_code
+    )
+    .into())
 }
 
 fn print_paths(context: &HermesContext, config: &LoadedConfig, logging: &LoggingSetup) {
@@ -673,11 +733,6 @@ fn run_chat(
         api_key,
         api_mode,
     };
-    let disabled = disabled_memory_toolsets(&config.config.memory);
-    let tool_names = get_tool_definitions(Some(&enabled_toolsets), disabled.as_deref())
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect::<Vec<_>>();
     let delegate = DelegateExecutor::new(
         context.clone(),
         config.clone(),
@@ -686,12 +741,16 @@ fn run_chat(
         overrides.clone(),
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
-    let mut runtime = ToolRuntime::default()
-        .with_hermes_home(context.hermes_home())
-        .with_available_tool_names(tool_names)
-        .with_clarify_callback(run_clarify_prompt)
-        .with_delegate_callback(move |request| delegate.execute(request));
-    let _ = runtime.load_memory_store(&config.config.memory);
+    let runtime = plugin_runtime::attach_python_plugin_runtime(
+        context,
+        ToolRuntime::default()
+            .with_hermes_home(context.hermes_home())
+            .with_clarify_callback(run_clarify_prompt),
+    )?;
+    let delegate = delegate.with_runtime_template(runtime.clone());
+    let runtime = runtime.with_delegate_callback(move |request, parent_runtime| {
+        delegate.execute(request, parent_runtime)
+    });
     let result = context.run_chat_completions_turn(
         config,
         &prompt,
@@ -1511,6 +1570,17 @@ mod tests {
             Some(Command::Cron {
                 command: Some(CronCommand::Remove { job_id }),
             }) => assert_eq!(job_id, "cron_123"),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_external_plugin_command() {
+        let cli = Cli::try_parse_from(["hermes", "meet", "setup"]).unwrap();
+        match cli.command {
+            Some(Command::External(args)) => {
+                assert_eq!(args, vec![String::from("meet"), String::from("setup")]);
+            }
             other => panic!("unexpected parse result: {other:?}"),
         }
     }

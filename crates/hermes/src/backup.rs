@@ -1084,16 +1084,20 @@ mod tests {
         .unwrap();
 
         assert!(!target_home.path().join("evil.txt").exists());
-        assert!(!target_home
-            .path()
-            .join(".hermes")
-            .join("..")
-            .join("evil.txt")
-            .exists());
-        assert!(target_home
-            .path()
-            .join(".hermes")
-            .join("config.yaml")
-            .exists());
+        assert!(
+            !target_home
+                .path()
+                .join(".hermes")
+                .join("..")
+                .join("evil.txt")
+                .exists()
+        );
+        assert!(
+            target_home
+                .path()
+                .join(".hermes")
+                .join("config.yaml")
+                .exists()
+        );
     }
 }

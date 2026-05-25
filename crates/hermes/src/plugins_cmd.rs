@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -11,6 +11,11 @@ use serde_yaml::{Mapping, Value};
 use tempfile::TempDir;
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
+use crate::plugin_runtime::{
+    PluginSource, discover_context_engines as discover_context_engine_plugins,
+    discover_general_plugins, discover_memory_providers as discover_memory_provider_plugins,
+    is_effectively_enabled,
+};
 use crate::python_bridge::project_root;
 
 #[derive(Subcommand, Debug)]
@@ -597,11 +602,14 @@ fn configure_general_plugins(
     enabled: &BTreeSet<String>,
     disabled: &BTreeSet<String>,
 ) -> Result<(), Box<dyn Error>> {
+    let plugins = discover_general_plugins(context)?;
     println!("\nGeneral Plugins");
     for (index, entry) in entries.iter().enumerate() {
-        let marker = if disabled.contains(&entry.name) {
-            " "
-        } else if enabled.contains(&entry.name) {
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.name == entry.name)
+            .ok_or_else(|| format!("plugin '{}' disappeared during configuration", entry.name))?;
+        let marker = if is_effectively_enabled(plugin, enabled, disabled) {
             "x"
         } else {
             " "
@@ -611,7 +619,9 @@ fn configure_general_plugins(
             label.push_str(" — ");
             label.push_str(entry.description.trim());
         }
-        if entry.source == "bundled" {
+        if plugin.kind.is_auto_enabled(plugin.source) {
+            label.push_str(" [auto]");
+        } else if entry.source == "bundled" {
             label.push_str(" [bundled]");
         }
         println!("  {:>2}. [{}] {}", index + 1, marker, label);
@@ -629,7 +639,8 @@ fn configure_general_plugins(
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            (enabled.contains(&entry.name) && !disabled.contains(&entry.name)).then_some(index)
+            let plugin = plugins.iter().find(|plugin| plugin.name == entry.name)?;
+            is_effectively_enabled(plugin, enabled, disabled).then_some(index)
         })
         .collect::<BTreeSet<_>>();
 
@@ -653,10 +664,17 @@ fn configure_general_plugins(
     let mut new_enabled = BTreeSet::new();
     let mut new_disabled = disabled.clone();
     for (index, entry) in entries.iter().enumerate() {
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.name == entry.name)
+            .ok_or_else(|| format!("plugin '{}' disappeared during configuration", entry.name))?;
         if chosen.contains(&index) {
-            new_enabled.insert(entry.name.clone());
+            if !plugin.kind.is_auto_enabled(plugin.source) {
+                new_enabled.insert(entry.name.clone());
+            }
             new_disabled.remove(&entry.name);
         } else {
+            new_enabled.remove(&entry.name);
             new_disabled.insert(entry.name.clone());
         }
     }
@@ -820,8 +838,8 @@ fn configure_context_engine(
 }
 
 fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
-    let entries = discover_all_plugins(context)?;
-    if entries.is_empty() {
+    let plugins = discover_general_plugins(context)?;
+    if plugins.is_empty() {
         println!("No plugins installed.");
         println!("Install with: hermes plugins install owner/repo");
         return Ok(());
@@ -838,17 +856,24 @@ fn print_list(context: &HermesContext) -> Result<(), Box<dyn Error>> {
         "{:<24} {:<12} {:<12} {:<10} -----------",
         "------------------------", "------------", "------------", "----------"
     );
-    for entry in entries {
-        let status = if disabled.contains(&entry.name) {
+    for plugin in plugins {
+        let source = if plugin.source == PluginSource::User && plugin.path.join(".git").exists() {
+            "git"
+        } else {
+            plugin.source.as_str()
+        };
+        let status = if disabled.contains(&plugin.name) {
             "disabled"
-        } else if enabled.contains(&entry.name) {
+        } else if plugin.kind.is_auto_enabled(plugin.source) {
+            "auto"
+        } else if enabled.contains(&plugin.name) {
             "enabled"
         } else {
             "not enabled"
         };
         println!(
             "{:<24} {:<12} {:<12} {:<10} {}",
-            entry.name, status, entry.version, entry.source, entry.description
+            plugin.name, status, plugin.version, source, plugin.description
         );
     }
     println!();
@@ -863,13 +888,22 @@ fn enable_plugin(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn 
         .ok_or_else(|| format!("plugin '{}' is not installed or bundled", raw_name.trim()))?;
     let mut enabled = load_plugin_set(context, "enabled")?;
     let mut disabled = load_plugin_set(context, "disabled")?;
+    let plugins = discover_general_plugins(context)?;
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .ok_or_else(|| format!("plugin '{}' is not installed or bundled", raw_name.trim()))?;
 
-    if enabled.contains(&name) && !disabled.contains(&name) {
+    if is_effectively_enabled(plugin, &enabled, &disabled) {
         println!("Plugin '{name}' is already enabled.");
         return Ok(());
     }
 
-    enabled.insert(name.clone());
+    if plugin.kind.is_auto_enabled(plugin.source) {
+        enabled.remove(&name);
+    } else {
+        enabled.insert(name.clone());
+    }
     disabled.remove(&name);
     save_plugin_set(context, "enabled", &enabled)?;
     save_plugin_set(context, "disabled", &disabled)?;
@@ -882,8 +916,13 @@ fn disable_plugin(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn
         .ok_or_else(|| format!("plugin '{}' is not installed or bundled", raw_name.trim()))?;
     let mut enabled = load_plugin_set(context, "enabled")?;
     let mut disabled = load_plugin_set(context, "disabled")?;
+    let plugins = discover_general_plugins(context)?;
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.name == name)
+        .ok_or_else(|| format!("plugin '{}' is not installed or bundled", raw_name.trim()))?;
 
-    if !enabled.contains(&name) && disabled.contains(&name) {
+    if !is_effectively_enabled(plugin, &enabled, &disabled) && disabled.contains(&name) {
         println!("Plugin '{name}' is already disabled.");
         return Ok(());
     }
@@ -915,48 +954,22 @@ fn remove_plugin(context: &HermesContext, raw_name: &str) -> Result<(), Box<dyn 
 }
 
 fn discover_all_plugins(context: &HermesContext) -> Result<Vec<PluginEntry>, Box<dyn Error>> {
-    let mut seen = BTreeMap::<String, PluginEntry>::new();
-
-    let bundled_root = bundled_plugins_dir();
-    if bundled_root.is_dir() {
-        for child in fs::read_dir(&bundled_root)? {
-            let child = child?;
-            let path = child.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let dir_name = child.file_name().to_string_lossy().to_string();
-            if dir_name == "memory" || dir_name == "context_engine" {
-                continue;
-            }
-            let Some(entry) = plugin_entry_from_dir(&path, "bundled")? else {
-                continue;
-            };
-            seen.entry(entry.name.clone()).or_insert(entry);
-        }
-    }
-
-    let user_root = user_plugins_dir(context)?;
-    if user_root.is_dir() {
-        for child in fs::read_dir(&user_root)? {
-            let child = child?;
-            let path = child.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let source = if path.join(".git").exists() {
-                "git"
+    let mut entries = discover_general_plugins(context)?
+        .into_iter()
+        .map(|plugin| PluginEntry {
+            name: plugin.name,
+            version: plugin.version,
+            description: plugin.description,
+            source: if plugin.source == PluginSource::User && plugin.path.join(".git").exists() {
+                String::from("git")
             } else {
-                "user"
-            };
-            let Some(entry) = plugin_entry_from_dir(&path, source)? else {
-                continue;
-            };
-            seen.insert(entry.name.clone(), entry);
-        }
-    }
-
-    Ok(seen.into_values().collect())
+                plugin.source.as_str().to_string()
+            },
+            path: plugin.path,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
 }
 
 fn plugin_entry_from_dir(path: &Path, source: &str) -> Result<Option<PluginEntry>, Box<dyn Error>> {
@@ -1010,7 +1023,7 @@ fn manifest_path(path: &Path) -> Option<PathBuf> {
     yml.exists().then_some(yml)
 }
 
-fn bundled_plugins_dir() -> PathBuf {
+pub(crate) fn bundled_plugins_dir() -> PathBuf {
     if let Some(value) = std::env::var_os("HERMES_BUNDLED_PLUGINS") {
         let trimmed = value.to_string_lossy().trim().to_string();
         if !trimmed.is_empty() {
@@ -1020,101 +1033,33 @@ fn bundled_plugins_dir() -> PathBuf {
     project_root().join("plugins")
 }
 
-fn user_plugins_dir(context: &HermesContext) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn user_plugins_dir(context: &HermesContext) -> Result<PathBuf, Box<dyn Error>> {
     let path = context.hermes_home().join("plugins");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
 
 fn discover_memory_providers(context: &HermesContext) -> Vec<ProviderInfo> {
-    let bundled = project_root().join("plugins").join("memory");
-    let user = context.hermes_home().join("plugins");
-    discover_provider_dirs(&bundled, Some(&user), looks_like_memory_provider)
+    discover_memory_provider_plugins(context)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|provider| ProviderInfo {
+            name: provider.name,
+            description: provider.description,
+        })
+        .collect()
 }
 
 fn discover_context_engines(
     context: &HermesContext,
 ) -> Result<Vec<ProviderOption>, Box<dyn Error>> {
-    let bundled = project_root().join("plugins").join("context_engine");
-    let user = context.hermes_home().join("plugins");
-    let providers = discover_provider_dirs(&bundled, Some(&user), looks_like_context_engine);
-    Ok(providers
+    Ok(discover_context_engine_plugins(context)?
         .into_iter()
         .map(|provider| ProviderOption {
             name: provider.name,
             description: provider.description,
         })
         .collect())
-}
-
-fn discover_provider_dirs(
-    bundled_root: &Path,
-    user_root: Option<&Path>,
-    predicate: fn(&Path) -> bool,
-) -> Vec<ProviderInfo> {
-    let mut results = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for (root, require_marker) in [
-        (bundled_root, false),
-        (user_root.unwrap_or(Path::new("")), true),
-    ] {
-        if root.as_os_str().is_empty() || !root.is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !path.is_dir() || name.starts_with(['.', '_']) || seen.contains(&name) {
-                continue;
-            }
-            let init = path.join("__init__.py");
-            if !init.exists() {
-                continue;
-            }
-            if require_marker && !predicate(&init) {
-                continue;
-            }
-            let description = read_plugin_description(&path).unwrap_or_default();
-            seen.insert(name.clone());
-            results.push(ProviderInfo { name, description });
-        }
-    }
-
-    results.sort_by(|left, right| left.name.cmp(&right.name));
-    results
-}
-
-fn looks_like_memory_provider(init_file: &Path) -> bool {
-    let Ok(source) = fs::read_to_string(init_file) else {
-        return false;
-    };
-    let prefix = source.chars().take(8_192).collect::<String>();
-    prefix.contains("register_memory_provider") || prefix.contains("MemoryProvider")
-}
-
-fn looks_like_context_engine(init_file: &Path) -> bool {
-    let Ok(source) = fs::read_to_string(init_file) else {
-        return false;
-    };
-    let prefix = source.chars().take(8_192).collect::<String>();
-    prefix.contains("register_context_engine") || prefix.contains("ContextEngine")
-}
-
-fn read_plugin_description(dir: &Path) -> Option<String> {
-    let manifest = manifest_path(dir)?;
-    let text = fs::read_to_string(manifest).ok()?;
-    let parsed = serde_yaml::from_str::<Value>(&text).ok()?;
-    parsed
-        .as_mapping()
-        .and_then(|mapping| mapping.get(Value::String(String::from("description"))))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn current_memory_provider(context: &HermesContext) -> Result<String, Box<dyn Error>> {
@@ -1182,32 +1127,10 @@ fn resolve_existing_plugin_name(
     raw_name: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let requested = validate_plugin_name(raw_name)?;
-    if let Some((name, _)) = resolve_installed_plugin(context, &requested)? {
-        return Ok(Some(name));
-    }
-
-    let bundled_root = bundled_plugins_dir();
-    if bundled_root.is_dir() {
-        let direct = bundled_root.join(&requested);
-        if direct.is_dir() && manifest_path(&direct).is_some() {
-            return Ok(Some(requested));
-        }
-        for child in fs::read_dir(bundled_root)? {
-            let child = child?;
-            let path = child.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(entry) = plugin_entry_from_dir(&path, "bundled")? else {
-                continue;
-            };
-            if entry.name == requested {
-                return Ok(Some(entry.name));
-            }
-        }
-    }
-
-    Ok(None)
+    Ok(discover_general_plugins(context)?
+        .into_iter()
+        .find(|plugin| plugin.name == requested)
+        .map(|plugin| plugin.name))
 }
 
 fn resolve_installed_plugin(
@@ -1238,7 +1161,7 @@ fn resolve_installed_plugin(
     Ok(None)
 }
 
-fn load_plugin_set(
+pub(crate) fn load_plugin_set(
     context: &HermesContext,
     field: &str,
 ) -> Result<BTreeSet<String>, Box<dyn Error>> {

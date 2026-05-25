@@ -8,8 +8,8 @@ use chrono::{LocalResult, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use hermes_core::{
     EnvLoadReport, HermesContext, LoadedConfig, LoggingMode, MessageAppend, MessageRecord,
-    ModelOverrides, SessionCreate, SessionRecord, SessionStore, get_provider_profile,
-    get_tool_definitions, normalize_provider_alias,
+    ModelOverrides, SessionCreate, SessionRecord, SessionStore, attach_python_plugin_runtime,
+    get_provider_profile, get_tool_definitions, normalize_provider_alias,
 };
 use serde_json::{Value, json};
 
@@ -572,9 +572,13 @@ impl<'a> AcpServer<'a> {
             return write_jsonrpc_result(writer, id, result).map_err(|error| error.to_string());
         }
 
-        let runtime = hermes_core::ToolRuntime::new(&state.cwd)
-            .with_hermes_home(self.context.hermes_home())
-            .with_current_session_id(Some(session_id.clone()));
+        let runtime = attach_python_plugin_runtime(
+            &self.context.hermes_home(),
+            hermes_core::ToolRuntime::new(&state.cwd)
+                .with_hermes_home(self.context.hermes_home())
+                .with_current_session_id(Some(session_id.clone())),
+        )
+        .map_err(|error| error.to_string())?;
         let enabled_toolsets = vec![String::from("hermes-acp")];
         let result = self.context.run_chat_turn_with_user_content(
             self.config,

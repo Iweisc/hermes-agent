@@ -12,6 +12,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
+use crate::plugin_runtime::{discover_memory_provider_plugins, find_memory_provider_plugin};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Subcommand, Debug)]
@@ -2982,89 +2983,21 @@ fn prompt_yes(prompt: &str) -> Result<bool, Box<dyn Error>> {
 }
 
 fn discover_memory_providers(context: &HermesContext) -> Vec<ProviderInfo> {
-    let bundled = project_root().join("plugins").join("memory");
-    let user = context.hermes_home().join("plugins");
-    discover_memory_providers_from_roots(&bundled, Some(&user))
+    discover_memory_provider_plugins(context)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|provider| ProviderInfo {
+            name: provider.name,
+            description: provider.description,
+        })
+        .collect()
 }
 
 fn find_memory_provider_dir(context: &HermesContext, provider_name: &str) -> Option<PathBuf> {
-    let bundled = project_root()
-        .join("plugins")
-        .join("memory")
-        .join(provider_name);
-    if bundled.is_dir() && bundled.join("__init__.py").exists() {
-        return Some(bundled);
-    }
-
-    let user = context.hermes_home().join("plugins").join(provider_name);
-    if user.is_dir()
-        && user.join("__init__.py").exists()
-        && looks_like_memory_provider(&user.join("__init__.py"))
-    {
-        return Some(user);
-    }
-    None
-}
-
-fn discover_memory_providers_from_roots(
-    bundled_root: &Path,
-    user_root: Option<&Path>,
-) -> Vec<ProviderInfo> {
-    let mut results = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-
-    for (root, require_marker) in [
-        (bundled_root, false),
-        (user_root.unwrap_or(Path::new("")), true),
-    ] {
-        if root.as_os_str().is_empty() || !root.is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !path.is_dir() || name.starts_with(['.', '_']) || seen.contains(&name) {
-                continue;
-            }
-            let init = path.join("__init__.py");
-            if !init.exists() {
-                continue;
-            }
-            if require_marker && !looks_like_memory_provider(&init) {
-                continue;
-            }
-            let description = read_plugin_description(&path).unwrap_or_default();
-            seen.insert(name.clone());
-            results.push(ProviderInfo { name, description });
-        }
-    }
-
-    results.sort_by(|left, right| left.name.cmp(&right.name));
-    results
-}
-
-fn looks_like_memory_provider(init_file: &Path) -> bool {
-    let Ok(source) = fs::read_to_string(init_file) else {
-        return false;
-    };
-    let prefix = source.chars().take(8_192).collect::<String>();
-    prefix.contains("register_memory_provider") || prefix.contains("MemoryProvider")
-}
-
-fn read_plugin_description(dir: &Path) -> Option<String> {
-    let plugin_yaml = dir.join("plugin.yaml");
-    let text = fs::read_to_string(plugin_yaml).ok()?;
-    let parsed = serde_yaml::from_str::<Value>(&text).ok()?;
-    parsed
-        .as_mapping()
-        .and_then(|mapping| mapping.get(Value::String(String::from("description"))))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    find_memory_provider_plugin(context, provider_name)
+        .ok()
+        .flatten()
+        .map(|plugin| plugin.path)
 }
 
 fn read_memory_plugin_manifest(dir: &Path) -> Option<MemoryPluginManifest> {
@@ -3248,20 +3181,22 @@ mod tests {
 
     #[test]
     fn discovery_prefers_bundled_provider_name_collisions() {
+        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let bundled = temp.path().join("bundled");
-        let user = temp.path().join("user");
-        fs::create_dir_all(bundled.join("honcho")).unwrap();
+        let home = temp.path().join(".hermes");
+        let user = home.join("plugins");
+        fs::create_dir_all(bundled.join("memory").join("honcho")).unwrap();
         fs::create_dir_all(user.join("honcho")).unwrap();
         fs::create_dir_all(user.join("custom")).unwrap();
 
         fs::write(
-            bundled.join("honcho").join("__init__.py"),
+            bundled.join("memory").join("honcho").join("__init__.py"),
             "class Honcho(MemoryProvider):\n    pass\n",
         )
         .unwrap();
         fs::write(
-            bundled.join("honcho").join("plugin.yaml"),
+            bundled.join("memory").join("honcho").join("plugin.yaml"),
             "description: Bundled honcho\n",
         )
         .unwrap();
@@ -3276,11 +3211,14 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_memory_providers_from_roots(&bundled, Some(&user));
+        set_env_var("HERMES_BUNDLED_PLUGINS", &bundled);
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        let providers = discover_memory_providers(&context);
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name, "custom");
         assert_eq!(providers[1].name, "honcho");
         assert_eq!(providers[1].description, "Bundled honcho");
+        remove_env_var("HERMES_BUNDLED_PLUGINS");
     }
 
     #[test]

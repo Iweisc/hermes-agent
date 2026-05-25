@@ -15,13 +15,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand};
 use getrandom::fill as fill_random;
-use hermes_core::{HermesContext, is_container, is_wsl};
+use hermes_core::{HermesContext, is_container, is_wsl, run_python_plugin_platform_setup};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
+use crate::plugin_runtime::discover_enabled_platform_plugins;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -897,7 +898,7 @@ pub(crate) fn run_gateway_setup_with_io(
         } else if gateway_platform_uses_native_standard_setup(platform) {
             configure_standard_gateway_platform_with_io(context, platform, input, output)?;
         } else {
-            run_gateway_platform_setup_bridge(accept_hooks, &platform.key)?;
+            run_gateway_platform_setup_bridge(context, accept_hooks, &platform.key)?;
         }
     }
 
@@ -1463,9 +1464,6 @@ const YUANBAO_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
-const IRC_REQUIRED_ENV: &[&str] = &["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"];
-const TEAMS_REQUIRED_ENV: &[&str] = &["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID"];
-
 const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
     GatewaySetupPlatformSpec {
         key: "telegram",
@@ -1643,7 +1641,7 @@ fn load_gateway_setup_metadata(
 }
 
 fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
-    let mut platforms = gateway_builtin_platform_specs()
+    gateway_builtin_platform_specs()
         .iter()
         .map(|spec| GatewaySetupPlatform {
             key: spec.key.to_string(),
@@ -1672,9 +1670,7 @@ fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPla
                 })
                 .collect(),
         })
-        .collect::<Vec<_>>();
-    platforms.extend(native_bundled_gateway_plugin_metadata(context));
-    platforms
+        .collect()
 }
 
 fn native_gateway_platform_status(
@@ -1800,69 +1796,24 @@ fn native_gateway_platform_status(
     }
 }
 
-fn native_bundled_gateway_plugin_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
-    vec![
-        GatewaySetupPlatform {
-            key: String::from("irc"),
-            label: String::from("IRC"),
-            emoji: String::from("💬"),
-            status: native_gateway_plugin_platform_status(
-                context,
-                "irc",
-                &[("IRC_SERVER", "server"), ("IRC_CHANNEL", "channel")],
-            ),
-            token_var: String::from("IRC_SERVER"),
-            install_hint: Some(String::from("No extra packages needed (stdlib only)")),
-            setup_instructions: Vec::new(),
-            required_env: IRC_REQUIRED_ENV
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            has_builtin_setup: false,
-            has_plugin_setup: true,
-            vars: Vec::new(),
-        },
-        GatewaySetupPlatform {
-            key: String::from("teams"),
-            label: String::from("Microsoft Teams"),
-            emoji: String::from("💼"),
-            status: native_gateway_plugin_platform_status(
-                context,
-                "teams",
-                &[
-                    ("TEAMS_CLIENT_ID", "client_id"),
-                    ("TEAMS_CLIENT_SECRET", "client_secret"),
-                    ("TEAMS_TENANT_ID", "tenant_id"),
-                ],
-            ),
-            token_var: String::from("TEAMS_CLIENT_ID"),
-            install_hint: Some(String::from("pip install microsoft-teams-apps aiohttp")),
-            setup_instructions: Vec::new(),
-            required_env: TEAMS_REQUIRED_ENV
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            has_builtin_setup: false,
-            has_plugin_setup: true,
-            vars: Vec::new(),
-        },
-    ]
-}
-
 fn native_gateway_plugin_platform_status(
     context: &HermesContext,
     platform: &str,
-    required: &[(&str, &str)],
+    required_env: &[String],
 ) -> String {
-    let configured = required
+    let configured = required_env
         .iter()
-        .filter(|(env_key, extra_key)| {
+        .filter(|env_key| {
             read_effective_env_value(context, env_key)
-                .or_else(|| read_gateway_platform_extra_value(context, platform, extra_key))
+                .or_else(|| {
+                    derive_platform_extra_key(platform, env_key).and_then(|extra_key| {
+                        read_gateway_platform_extra_value(context, platform, &extra_key)
+                    })
+                })
                 .is_some()
         })
         .count();
-    if configured == required.len() {
+    if configured == required_env.len() {
         "configured".to_string()
     } else if configured > 0 {
         "partially configured".to_string()
@@ -1873,87 +1824,52 @@ fn native_gateway_plugin_platform_status(
 
 fn load_gateway_plugin_setup_metadata(
     context: &HermesContext,
-    accept_hooks: bool,
+    _accept_hooks: bool,
 ) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
-    if !gateway_has_enabled_user_plugins(context)? {
-        return Ok(Vec::new());
-    }
-    let root = project_root();
-    let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
-        return Ok(Vec::new());
-    };
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string());
-    if accept_hooks {
-        command.env("HERMES_ACCEPT_HOOKS", "1");
-    }
-    command
-        .arg("-c")
-        .arg(GATEWAY_PLUGIN_SETUP_METADATA_BOOTSTRAP);
-
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(exit_status_message("gateway plugin metadata", output.status).into());
-    }
-    let stdout = String::from_utf8(output.stdout)?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str::<Vec<GatewaySetupPlatform>>(trimmed)
-        .map_err(|error| format!("invalid gateway plugin setup metadata: {error}").into())
-}
-
-fn gateway_has_enabled_user_plugins(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
-    let root = read_raw_yaml_mapping(&context.config_path())?;
-    let Some(plugins) = root
-        .get(YamlValue::String(String::from("plugins")))
-        .and_then(YamlValue::as_mapping)
-    else {
-        return Ok(false);
-    };
-    let Some(enabled) = plugins
-        .get(YamlValue::String(String::from("enabled")))
-        .and_then(YamlValue::as_sequence)
-    else {
-        return Ok(false);
-    };
-    Ok(enabled
-        .iter()
-        .filter_map(YamlValue::as_str)
-        .map(str::trim)
-        .any(|value| !value.is_empty()))
+    Ok(discover_enabled_platform_plugins(context)?
+        .into_iter()
+        .map(|platform| GatewaySetupPlatform {
+            status: native_gateway_plugin_platform_status(
+                context,
+                &platform.key,
+                &platform.required_env,
+            ),
+            token_var: platform.required_env.first().cloned().unwrap_or_default(),
+            install_hint: platform.install_hint,
+            setup_instructions: Vec::new(),
+            required_env: platform.required_env.clone(),
+            has_builtin_setup: false,
+            has_plugin_setup: platform.has_setup_fn,
+            vars: if platform.has_setup_fn {
+                Vec::new()
+            } else {
+                platform
+                    .required_env
+                    .iter()
+                    .map(|name| GatewaySetupVar {
+                        name: name.clone(),
+                        prompt: name.clone(),
+                        password: looks_secret_env_var(name),
+                        help: String::new(),
+                        is_allowlist: name.contains("ALLOWED_USERS"),
+                    })
+                    .collect()
+            },
+            key: platform.key,
+            label: platform.label,
+            emoji: platform.emoji,
+        })
+        .collect())
 }
 
 fn run_gateway_platform_setup_bridge(
+    context: &HermesContext,
     accept_hooks: bool,
     platform_key: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if platform_key.trim().is_empty() {
-        return Err("gateway platform key cannot be empty".into());
-    }
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
-        .ok_or("could not find a Python interpreter for gateway setup")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_GATEWAY_SETUP_PLATFORM", platform_key);
-    if accept_hooks {
-        command.env("HERMES_ACCEPT_HOOKS", "1");
-    }
-    command.arg("-c").arg(GATEWAY_SETUP_PLATFORM_BOOTSTRAP);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("gateway platform setup", status).into())
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    run_python_plugin_platform_setup(&context.hermes_home(), &cwd, platform_key, accept_hooks)
+        .map_err(|error| -> Box<dyn Error> { error.into() })
 }
 
 fn gateway_platform_uses_native_standard_setup(platform: &GatewaySetupPlatform) -> bool {
@@ -5033,6 +4949,21 @@ fn read_gateway_platform_extra_value(
         .filter(|value| !value.trim().is_empty())
 }
 
+fn derive_platform_extra_key(platform: &str, env_key: &str) -> Option<String> {
+    let prefix = format!("{}_", platform.replace('-', "_").to_ascii_uppercase());
+    let suffix = env_key.strip_prefix(&prefix)?;
+    let normalized = suffix.trim().to_ascii_lowercase().replace("__", "_");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn looks_secret_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("SECRET")
+        || upper.contains("TOKEN")
+        || upper.contains("PASSWORD")
+        || upper.contains("KEY")
+}
+
 fn yaml_scalar_string(value: &YamlValue) -> Option<String> {
     match value {
         YamlValue::String(text) => Some(text.trim().to_string()),
@@ -5106,50 +5037,6 @@ fn normalize_gateway_allowlist(var_name: &str, value: &str) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
-
-const GATEWAY_PLUGIN_SETUP_METADATA_BOOTSTRAP: &str = concat!(
-    "import json\n",
-    "from hermes_cli.gateway import _platform_status\n",
-    "from hermes_cli.plugins import discover_plugins\n",
-    "discover_plugins()\n",
-    "from gateway.platform_registry import platform_registry\n",
-    "items = []\n",
-    "for entry in platform_registry.plugin_entries():\n",
-    "    platform = {\n",
-    "        'key': entry.name,\n",
-    "        'label': entry.label,\n",
-    "        'emoji': entry.emoji,\n",
-    "        'token_var': entry.required_env[0] if entry.required_env else '',\n",
-    "        'install_hint': entry.install_hint,\n",
-    "        '_registry_entry': entry,\n",
-    "    }\n",
-    "    items.append({\n",
-    "        'key': entry.name,\n",
-    "        'label': entry.label,\n",
-    "        'emoji': entry.emoji,\n",
-    "        'status': _platform_status(platform),\n",
-    "        'token_var': platform['token_var'],\n",
-    "        'install_hint': entry.install_hint,\n",
-    "        'setup_instructions': [],\n",
-    "        'required_env': list(getattr(entry, 'required_env', []) or []),\n",
-    "        'has_builtin_setup': False,\n",
-    "        'has_plugin_setup': bool(getattr(entry, 'setup_fn', None) is not None),\n",
-    "        'vars': [],\n",
-    "    })\n",
-    "print(json.dumps(items))\n",
-);
-
-const GATEWAY_SETUP_PLATFORM_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from hermes_cli.gateway import _all_platforms, _configure_platform\n",
-    "target = os.environ['HERMES_GATEWAY_SETUP_PLATFORM']\n",
-    "for platform in _all_platforms():\n",
-    "    if platform.get('key') == target:\n",
-    "        _configure_platform(platform)\n",
-    "        break\n",
-    "else:\n",
-    "    raise SystemExit(f'unknown gateway platform: {target}')\n",
-);
 
 fn exit_status_message(command: &str, status: ExitStatus) -> String {
     match status.code() {
@@ -6643,6 +6530,61 @@ mod tests {
         (temp, ctx)
     }
 
+    fn write_bundled_platform_fixtures(root: &Path) {
+        fs::create_dir_all(root.join("platforms").join("irc")).unwrap();
+        fs::create_dir_all(root.join("platforms").join("teams")).unwrap();
+        fs::write(
+            root.join("platforms").join("irc").join("plugin.yaml"),
+            "name: irc-platform\nkind: platform\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("platforms").join("irc").join("__init__.py"),
+            "from .adapter import register\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("platforms").join("irc").join("adapter.py"),
+            r#"
+def register(ctx):
+    ctx.register_platform(
+        name="irc",
+        label="IRC",
+        required_env=["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"],
+        setup_fn=interactive_setup,
+        install_hint="No extra packages needed (stdlib only)",
+        emoji="💬",
+    )
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("platforms").join("teams").join("plugin.yaml"),
+            "name: teams-platform\nkind: platform\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("platforms").join("teams").join("__init__.py"),
+            "from .adapter import register\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("platforms").join("teams").join("adapter.py"),
+            r#"
+def register(ctx):
+    ctx.register_platform(
+        name="teams",
+        label="Microsoft Teams",
+        required_env=["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID"],
+        setup_fn=interactive_setup,
+        install_hint="pip install microsoft-teams-apps aiohttp",
+        emoji="💼",
+    )
+"#,
+        )
+        .unwrap();
+    }
+
     fn test_json_body_string(request: &[u8], key: &str) -> String {
         let request = String::from_utf8_lossy(request);
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
@@ -6847,40 +6789,61 @@ exit 9\n",
     #[test]
     #[cfg(unix)]
     fn gateway_setup_metadata_uses_native_standard_builtins_and_plugin_bridge() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _guard = test_env_lock().lock().unwrap();
         let (_home, context) = test_context();
+        let bundled = TempDir::new().unwrap();
+        write_bundled_platform_fixtures(bundled.path());
         fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::create_dir_all(
+            context
+                .hermes_home()
+                .join("plugins")
+                .join("custom-platform"),
+        )
+        .unwrap();
         fs::write(
             context.config_path(),
             "plugins:\n  enabled:\n    - custom-platform\n",
         )
         .unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'metadata accept=%s platform=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
-  cat <<'JSON'\n\
-[{{\"key\":\"customchat\",\"label\":\"Custom Chat\",\"emoji\":\"#\",\"status\":\"not configured\",\"token_var\":\"CUSTOM_TOKEN\",\"required_env\":[\"CUSTOM_TOKEN\"],\"has_plugin_setup\":true}}]\n\
-JSON\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+            context
+                .hermes_home()
+                .join("plugins")
+                .join("custom-platform")
+                .join("plugin.yaml"),
+            "name: custom-platform\nkind: platform\ndescription: Custom platform\n",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
+        fs::write(
+            context
+                .hermes_home()
+                .join("plugins")
+                .join("custom-platform")
+                .join("adapter.py"),
+            r##"
+def register(ctx):
+    ctx.register_platform(
+        name="customchat",
+        label="Custom Chat",
+        required_env=["CUSTOM_TOKEN"],
+        setup_fn=interactive_setup,
+        emoji="#",
+    )
+"##,
+        )
+        .unwrap();
+        fs::write(
+            context
+                .hermes_home()
+                .join("plugins")
+                .join("custom-platform")
+                .join("__init__.py"),
+            "from .adapter import register\n",
+        )
+        .unwrap();
+        set_env_var("HERMES_BUNDLED_PLUGINS", bundled.path());
 
-        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
         let metadata = load_gateway_setup_metadata(&context, true).unwrap();
 
         let telegram = metadata
@@ -6991,51 +6954,33 @@ exit 9\n",
             .find(|platform| platform.key == "customchat")
             .unwrap();
         assert_eq!(custom.required_env, vec!["CUSTOM_TOKEN"]);
-        let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("metadata accept=1 platform="));
-
-        remove_env_var("HERMES_GATEWAY_PYTHON");
+        assert!(custom.has_plugin_setup);
+        remove_env_var("HERMES_BUNDLED_PLUGINS");
     }
 
     #[test]
     #[cfg(unix)]
     fn gateway_setup_metadata_skips_plugin_bridge_without_enabled_user_plugins() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _guard = test_env_lock().lock().unwrap();
         let (_home, context) = test_context();
+        let bundled = TempDir::new().unwrap();
+        write_bundled_platform_fixtures(bundled.path());
         fs::create_dir_all(context.hermes_home()).unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-printf 'called\\n' >> '{}'\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        set_env_var("HERMES_BUNDLED_PLUGINS", bundled.path());
         let metadata = load_gateway_setup_metadata(&context, true).unwrap();
 
         assert!(metadata.iter().any(|platform| platform.key == "irc"));
         assert!(metadata.iter().any(|platform| platform.key == "teams"));
-        assert!(!log.exists());
-
-        remove_env_var("HERMES_GATEWAY_PYTHON");
+        assert!(!metadata.iter().any(|platform| platform.key == "customchat"));
+        remove_env_var("HERMES_BUNDLED_PLUGINS");
     }
 
     #[test]
     fn gateway_setup_metadata_reports_native_status() {
         let _guard = test_env_lock().lock().unwrap();
         let (_temp, context) = test_context();
+        let bundled = TempDir::new().unwrap();
+        write_bundled_platform_fixtures(bundled.path());
         for key in [
             "EMAIL_ADDRESS",
             "EMAIL_PASSWORD",
@@ -7096,6 +7041,7 @@ exit 9\n",
         ] {
             remove_env_var(key);
         }
+        set_env_var("HERMES_BUNDLED_PLUGINS", bundled.path());
         fs::create_dir_all(context.hermes_home().join("whatsapp").join("session")).unwrap();
         fs::write(
             context.hermes_home().join("whatsapp/session/creds.json"),
@@ -7112,9 +7058,10 @@ exit 9\n",
             "platforms:\n  irc:\n    extra:\n      server: irc.libera.chat\n      channel: '#hermes'\n",
         )
         .unwrap();
+        save_env_value(context.env_path(), "IRC_NICKNAME", "hermes-bot").unwrap();
         save_env_value(context.env_path(), "TEAMS_CLIENT_ID", "teams-client").unwrap();
 
-        let metadata = native_gateway_setup_metadata(&context);
+        let metadata = load_gateway_setup_metadata(&context, true).unwrap();
         let email = metadata
             .iter()
             .find(|platform| platform.key == "email")
@@ -7160,6 +7107,7 @@ exit 9\n",
             .find(|platform| platform.key == "qqbot")
             .unwrap();
         assert_eq!(qqbot.status, "not configured");
+        remove_env_var("HERMES_BUNDLED_PLUGINS");
         let wecom = metadata
             .iter()
             .find(|platform| platform.key == "wecom")
@@ -7174,19 +7122,22 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn gateway_setup_platform_bridge_uses_python_override_and_selected_key() {
+    fn gateway_setup_platform_bridge_uses_python_override_selected_key_and_cwd() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
+        let (_home, context) = test_context();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
         fs::write(
             &fake_python,
             format!(
                 "#!/bin/sh\n\
 if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'platform accept=%s key=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
+  printf 'platform accept=%s key=%s pwd=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" \"$PWD\" >> '{}'\n\
   exit 0\n\
 fi\n\
 exit 9\n",
@@ -7198,13 +7149,82 @@ exit 9\n",
         perms.set_mode(0o755);
         fs::set_permissions(&fake_python, perms).unwrap();
 
+        let original_cwd = env::current_dir().unwrap();
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "legacy-bridge-platform").unwrap();
+        env::set_current_dir(&workspace).unwrap();
+        run_gateway_platform_setup_bridge(&context, true, "legacy-bridge-platform").unwrap();
+        env::set_current_dir(&original_cwd).unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
         assert!(log_text.contains("platform accept=1 key=legacy-bridge-platform"));
+        assert!(log_text.contains(&format!("pwd={}", workspace.display())));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_setup_platform_bridge_discovers_project_plugin_from_cwd() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_home, context) = test_context();
+        let workspace = TempDir::new().unwrap();
+        let plugin_dir = workspace
+            .path()
+            .join(".hermes")
+            .join("plugins")
+            .join("project-platform");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(
+            context.config_path(),
+            "plugins:\n  enabled:\n    - project-platform\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: project-platform\nkind: platform\ndescription: Project platform\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            "from .adapter import register\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("adapter.py"),
+            r#"
+from pathlib import Path
+import os
+
+def interactive_setup():
+    Path(os.environ["HERMES_HOME"]).joinpath("project-platform-setup.txt").write_text("ok")
+
+def register(ctx):
+    ctx.register_platform(
+        name="projectchat",
+        label="Project Chat",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        required_env=["PROJECT_TOKEN"],
+        setup_fn=interactive_setup,
+        emoji="P",
+    )
+"#,
+        )
+        .unwrap();
+
+        let original_cwd = env::current_dir().unwrap();
+        set_env_var("HERMES_ENABLE_PROJECT_PLUGINS", "1");
+        env::set_current_dir(workspace.path()).unwrap();
+        run_gateway_platform_setup_bridge(&context, false, "projectchat").unwrap();
+        env::set_current_dir(&original_cwd).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(context.hermes_home().join("project-platform-setup.txt")).unwrap(),
+            "ok"
+        );
+
+        remove_env_var("HERMES_ENABLE_PROJECT_PLUGINS");
     }
 
     #[test]

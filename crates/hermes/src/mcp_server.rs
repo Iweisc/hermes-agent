@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use hermes_core::{HermesContext, MessageRecord, ToolRuntime, dispatch_tool};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+use crate::plugin_runtime;
+
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const QUEUE_LIMIT: usize = 1000;
 const DEFAULT_EVENT_LIMIT: usize = 20;
@@ -46,7 +48,10 @@ pub(crate) fn run_mcp_jsonrpc<R: BufRead, W: Write>(
     mut output: W,
 ) -> Result<(), Box<dyn Error>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| context.home_dir().to_path_buf());
-    let runtime = ToolRuntime::new(cwd).with_hermes_home(context.hermes_home());
+    let runtime = plugin_runtime::attach_python_plugin_runtime(
+        context,
+        ToolRuntime::new(cwd).with_hermes_home(context.hermes_home()),
+    )?;
     let mut server = NativeMcpServer {
         context: context.clone(),
         runtime,
