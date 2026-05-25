@@ -25,6 +25,7 @@ use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
 use crate::native_api_server::maybe_run_native_api_server;
 use crate::native_gateway_runtime::maybe_run_native_gateway_bundle;
 use crate::native_webhook_server::maybe_run_native_webhook_server;
+use crate::gateway_native::run_native_gateway_stdio;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -779,6 +780,16 @@ fn print_gateway_run(
         return Ok(());
     }
     if maybe_run_native_api_server(context, &args)? {
+        return Ok(());
+    }
+    if env::var("HERMES_NATIVE_TUI_GATEWAY")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        let config = context.load_config_document()?;
+        let store = context.open_session_store()?;
+        run_native_gateway_stdio(context, &config, &store)?;
         return Ok(());
     }
     let root = project_root();
@@ -7136,6 +7147,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
+        let (_ctx_temp, context) = test_context();
         let temp = TempDir::new().unwrap();
         let context = HermesContext::new(temp.path());
         let fake_python = temp.path().join("python3");

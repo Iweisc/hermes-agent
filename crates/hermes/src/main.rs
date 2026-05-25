@@ -13,6 +13,7 @@ mod doctor;
 mod dump;
 mod fallback_cmd;
 mod gateway_cmd;
+mod gateway_native;
 mod hooks;
 mod insights_cmd;
 mod login_cmd;

@@ -195,6 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .with_delegate_callback(move |request, parent_runtime| {
                     delegate.execute(request, parent_runtime)
                 });
+            let mut runtime = runtime;
             if let Some(emitter) = event_emitter.clone() {
                 if let Some(bridge) = gateway_bridge.clone() {
                     emitter.emit(&bridge.lock().unwrap().gateway_ready());

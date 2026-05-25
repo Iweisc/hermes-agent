@@ -336,6 +336,83 @@ pub fn handle_skill_view(args: &Value, runtime: &ToolRuntime) -> String {
     tool_result(Value::Object(result))
 }
 
+pub fn build_skill_invocation_message(
+    hermes_home: &Path,
+    command_name: &str,
+    user_instruction: &str,
+    session_id: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    let runtime = ToolRuntime::new(".").with_hermes_home(hermes_home);
+    let skills_root = runtime.hermes_home().join("skills");
+    if !skills_root.exists() {
+        return Ok(None);
+    }
+    let skills = discover_skills(&skills_root)?;
+    let normalized = normalize_skill_command_name(command_name);
+    let Some(skill) = skills
+        .into_iter()
+        .find(|skill| normalize_skill_command_name(&skill.name) == normalized)
+    else {
+        return Ok(None);
+    };
+
+    let content = fs::read_to_string(&skill.skill_md)
+        .map_err(|error| format!("Failed to read skill '{}': {error}", skill.name))?;
+    let mut parts = vec![
+        format!(
+            "[IMPORTANT: The user has invoked the \"{}\" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]",
+            skill.name
+        ),
+        String::new(),
+        content.trim().to_string(),
+    ];
+    parts.push(String::new());
+    parts.push(format!("[Skill directory: {}]", skill.skill_dir.display()));
+    parts.push(
+        "Resolve relative paths in this skill against that directory before loading files or running scripts."
+            .to_string(),
+    );
+    if let Some(linked) = linked_files(&skill.skill_dir) {
+        let mut supporting = Vec::new();
+        for value in linked.values() {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    if let Some(text) = item.as_str() {
+                        supporting.push(text.to_string());
+                    }
+                }
+            }
+        }
+        if !supporting.is_empty() {
+            supporting.sort();
+            parts.push(String::new());
+            parts.push("[This skill has supporting files:]".to_string());
+            for file in supporting {
+                parts.push(format!(
+                    "- {file}  ->  {}",
+                    skill.skill_dir.join(&file).display()
+                ));
+            }
+            parts.push(
+                "Load supporting files with skill_view(name, file_path) or run scripts directly by absolute path."
+                    .to_string(),
+            );
+        }
+    }
+    let trimmed_instruction = user_instruction.trim();
+    if !trimmed_instruction.is_empty() {
+        parts.push(String::new());
+        parts.push(format!(
+            "The user has provided the following instruction alongside the skill invocation: {trimmed_instruction}"
+        ));
+    }
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        parts.push(String::new());
+        parts.push(format!("[Runtime note: session_id={session_id}]"));
+    }
+    Ok(Some((skill.name, parts.join("\n"))))
+}
+
 pub fn handle_skill_manage(args: &Value, runtime: &ToolRuntime) -> String {
     let action = match required_non_empty_string(args, "action") {
         Ok(value) => value,
@@ -737,6 +814,15 @@ fn find_skill(skills_root: &Path, skills: &[SkillEntry], name: &str) -> Option<S
         .cloned()
 }
 
+fn normalize_skill_command_name(name: &str) -> String {
+    let mut normalized = name.to_ascii_lowercase().replace([' ', '_'], "-");
+    normalized.retain(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+    while normalized.contains("--") {
+        normalized = normalized.replace("--", "-");
+    }
+    normalized.trim_matches('-').to_string()
+}
+
 fn parse_frontmatter(content: &str) -> (BTreeMap<String, YamlValue>, String) {
     let trimmed = content
         .strip_prefix("---\n")
@@ -1097,6 +1183,31 @@ Use this workflow.
             parsed["linked_files"]["references"][0],
             json!("references/api.md")
         );
+    }
+
+    #[test]
+    fn build_skill_invocation_message_loads_skill_and_user_instruction() {
+        let temp = TempDir::new().unwrap();
+        write_skill(temp.path());
+
+        let built = build_skill_invocation_message(
+            temp.path(),
+            "axolotl",
+            "focus on staging",
+            Some("sess-1"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(built.0, "axolotl");
+        assert!(
+            built
+                .1
+                .contains("The user has invoked the \"axolotl\" skill")
+        );
+        assert!(built.1.contains("focus on staging"));
+        assert!(built.1.contains("references/api.md"));
+        assert!(built.1.contains("session_id=sess-1"));
     }
 
     #[test]
