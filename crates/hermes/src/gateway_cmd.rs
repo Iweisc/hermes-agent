@@ -1152,6 +1152,13 @@ const SIGNAL_SETUP_INSTRUCTIONS: &[&str] = &[
     "4. Signal account numbers should use E.164 format, e.g. +15551234567",
 ];
 
+const DINGTALK_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Go to https://open-dev.dingtalk.com and create an application, or use device authorization",
+    "2. Under Credentials, copy the AppKey (Client ID) and AppSecret (Client Secret)",
+    "3. Enable Stream Mode under the bot settings",
+    "4. Add the bot to a group chat or message it directly",
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1510,8 +1517,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "DingTalk",
         emoji: "💬",
         token_var: "DINGTALK_CLIENT_ID",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: DINGTALK_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -2213,6 +2220,10 @@ fn configure_native_gateway_builtin_platform_with_io(
             configure_signal_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
+        "dingtalk" => {
+            configure_dingtalk_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -2568,6 +2579,257 @@ fn probe_signal_http_daemon(url: &str) -> Result<u16, Box<dyn Error>> {
         .get(format!("{}/api/v1/check", url.trim_end_matches('/')))
         .send()?;
     Ok(response.status().as_u16())
+}
+
+fn configure_dingtalk_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    if let Some(existing) = read_effective_env_value(context, "DINGTALK_CLIENT_ID") {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "{} is already configured (Client ID: {existing}).",
+            platform.label
+        )?;
+        if !prompt_gateway_yes_no(
+            input,
+            output,
+            format!("Reconfigure {}?", platform.label).as_str(),
+            false,
+        )? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    let method = prompt_gateway_menu_choice(
+        input,
+        output,
+        "Choose setup method",
+        &[
+            "Device authorization (scan/open DingTalk authorization link)",
+            "Manual input (Client ID and Client Secret)",
+        ],
+    )?;
+
+    let configured = if method == 0 {
+        match dingtalk_device_authorize_with_io(output) {
+            Ok((client_id, client_secret)) => {
+                save_env_value(context.env_path(), "DINGTALK_CLIENT_ID", &client_id)?;
+                save_env_value(context.env_path(), "DINGTALK_CLIENT_SECRET", &client_secret)?;
+                save_env_value(context.env_path(), "DINGTALK_ALLOW_ALL_USERS", "true")?;
+                writeln!(output, "  Device authorization successful.")?;
+                true
+            }
+            Err(error) => {
+                writeln!(output, "  Device authorization failed: {error}")?;
+                writeln!(output, "  Continuing with manual input.")?;
+                configure_dingtalk_manual_credentials(context, input, output)?
+            }
+        }
+    } else {
+        configure_dingtalk_manual_credentials(context, input, output)?
+    };
+
+    if configured {
+        save_env_value(context.env_path(), "DINGTALK_ALLOW_ALL_USERS", "true")?;
+        writeln!(output)?;
+        writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    }
+    Ok(())
+}
+
+fn configure_dingtalk_manual_credentials(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<bool, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Enter the DingTalk application credentials from the developer console."
+    )?;
+    let Some(client_id) = prompt_gateway_required_line(
+        input,
+        output,
+        "  AppKey (Client ID)",
+        "Skipped — DingTalk won't work without a Client ID.",
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(client_secret) = prompt_gateway_required_line(
+        input,
+        output,
+        "  AppSecret (Client Secret)",
+        "Skipped — DingTalk won't work without a Client Secret.",
+    )?
+    else {
+        return Ok(false);
+    };
+    save_env_value(context.env_path(), "DINGTALK_CLIENT_ID", &client_id)?;
+    save_env_value(context.env_path(), "DINGTALK_CLIENT_SECRET", &client_secret)?;
+    Ok(true)
+}
+
+fn dingtalk_device_authorize_with_io(
+    output: &mut dyn Write,
+) -> Result<(String, String), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "  Initializing DingTalk device authorization...")?;
+    writeln!(
+        output,
+        "  Note: the authorization page may be branded OpenClaw."
+    )?;
+
+    let base = env::var("DINGTALK_REGISTRATION_BASE_URL")
+        .unwrap_or_else(|_| String::from("https://oapi.dingtalk.com"))
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if base.is_empty() {
+        return Err("DingTalk registration base URL cannot be empty".into());
+    }
+    let source = env::var("DINGTALK_REGISTRATION_SOURCE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from("openClaw"));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+
+    let init = dingtalk_registration_api_post(
+        &client,
+        &base,
+        "/app/registration/init",
+        serde_json::json!({ "source": source }),
+    )?;
+    let nonce = dingtalk_json_string(&init, "nonce")
+        .ok_or("DingTalk registration init response missing nonce")?;
+
+    let begin = dingtalk_registration_api_post(
+        &client,
+        &base,
+        "/app/registration/begin",
+        serde_json::json!({ "nonce": nonce }),
+    )?;
+    let device_code = dingtalk_json_string(&begin, "device_code")
+        .ok_or("DingTalk registration begin response missing device_code")?;
+    let verification_uri = dingtalk_json_string(&begin, "verification_uri_complete")
+        .ok_or("DingTalk registration begin response missing verification URI")?;
+    let expires_in = dingtalk_json_u64(&begin, "expires_in").unwrap_or(7200);
+    let interval = dingtalk_json_u64(&begin, "interval").unwrap_or(3).max(1);
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Open this link or scan it from DingTalk to authorize:"
+    )?;
+    writeln!(output, "  {verification_uri}")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Waiting for authorization... (timeout: {expires_in}s)"
+    )?;
+
+    dingtalk_wait_for_registration_success(&client, &base, &device_code, interval, expires_in)
+}
+
+fn dingtalk_registration_api_post(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    path: &str,
+    payload: JsonValue,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let url = format!("{base}{path}");
+    let response = client.post(&url).json(&payload).send()?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("DingTalk registration HTTP {status} at {path}").into());
+    }
+    let data = response.json::<JsonValue>()?;
+    let errcode = data
+        .get("errcode")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(-1);
+    if errcode != 0 {
+        let errmsg = data
+            .get("errmsg")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown error");
+        return Err(
+            format!("DingTalk registration API error at {path}: {errmsg} ({errcode})").into(),
+        );
+    }
+    Ok(data)
+}
+
+fn dingtalk_wait_for_registration_success(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    device_code: &str,
+    interval_secs: u64,
+    expires_in_secs: u64,
+) -> Result<(String, String), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(expires_in_secs.max(1));
+    let interval = Duration::from_secs(interval_secs.max(1));
+    while Instant::now() < deadline {
+        sleep(interval);
+        let poll = dingtalk_registration_api_post(
+            client,
+            base,
+            "/app/registration/poll",
+            serde_json::json!({ "device_code": device_code }),
+        )?;
+        let status = dingtalk_json_string(&poll, "status")
+            .unwrap_or_else(|| String::from("UNKNOWN"))
+            .to_ascii_uppercase();
+        match status.as_str() {
+            "WAITING" => continue,
+            "SUCCESS" => {
+                let client_id = dingtalk_json_string(&poll, "client_id")
+                    .ok_or("DingTalk authorization succeeded without client_id")?;
+                let client_secret = dingtalk_json_string(&poll, "client_secret")
+                    .ok_or("DingTalk authorization succeeded without client_secret")?;
+                return Ok((client_id, client_secret));
+            }
+            "FAIL" | "EXPIRED" | "UNKNOWN" => {
+                let reason = dingtalk_json_string(&poll, "fail_reason").unwrap_or(status);
+                return Err(format!("DingTalk authorization failed: {reason}").into());
+            }
+            _ => return Err(format!("Unexpected DingTalk authorization status: {status}").into()),
+        }
+    }
+    Err("DingTalk authorization timed out, please retry".into())
+}
+
+fn dingtalk_json_string(value: &JsonValue, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn dingtalk_json_u64(value: &JsonValue, key: &str) -> Option<u64> {
+    value.get(key).and_then(JsonValue::as_u64)
 }
 
 fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
@@ -4810,7 +5072,14 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "dingtalk")
             .unwrap();
-        assert!(dingtalk.has_builtin_setup);
+        assert!(!dingtalk.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(dingtalk));
+
+        let feishu = metadata
+            .iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap();
+        assert!(feishu.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -4902,6 +5171,9 @@ exit 9\n",
             "SIGNAL_ACCOUNT",
             "SIGNAL_ALLOWED_USERS",
             "SIGNAL_GROUP_ALLOWED_USERS",
+            "DINGTALK_CLIENT_ID",
+            "DINGTALK_CLIENT_SECRET",
+            "DINGTALK_ALLOW_ALL_USERS",
         ] {
             remove_env_var(key);
         }
@@ -4954,6 +5226,11 @@ exit 9\n",
             .find(|platform| platform.key == "signal")
             .unwrap();
         assert_eq!(signal.status, "not configured");
+        let dingtalk = metadata
+            .iter()
+            .find(|platform| platform.key == "dingtalk")
+            .unwrap();
+        assert_eq!(dingtalk.status, "not configured");
     }
 
     #[test]
@@ -4983,10 +5260,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "dingtalk").unwrap();
+        run_gateway_platform_setup_bridge(true, "feishu").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=dingtalk"));
+        assert!(log_text.contains("platform accept=1 key=feishu"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -5145,6 +5422,93 @@ exit 9\n",
         } else {
             remove_env_var("PATH");
         }
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+        remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_dingtalk_gateway_platform_uses_native_device_flow_without_bridge() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "DINGTALK_CLIENT_ID",
+            "DINGTALK_CLIENT_SECRET",
+            "DINGTALK_ALLOW_ALL_USERS",
+            "DINGTALK_REGISTRATION_BASE_URL",
+            "DINGTALK_REGISTRATION_SOURCE",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("DINGTALK_REGISTRATION_BASE_URL", format!("http://{addr}"));
+        let server = std::thread::spawn(move || {
+            let responses = [
+                r#"{"errcode":0,"nonce":"nonce-1"}"#,
+                r#"{"errcode":0,"device_code":"device-1","verification_uri_complete":"https://example.com/verify","expires_in":5,"interval":1}"#,
+                r#"{"errcode":0,"status":"SUCCESS","client_id":"ding-client","client_secret":"ding-secret"}"#,
+            ];
+            for body in responses {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "dingtalk")
+            .unwrap();
+        let mut input = Cursor::new("1\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("DINGTALK_CLIENT_ID=ding-client"));
+        assert!(env_text.contains("DINGTALK_CLIENT_SECRET=ding-secret"));
+        assert!(env_text.contains("DINGTALK_ALLOW_ALL_USERS=true"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "dingtalk")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        remove_env_var("DINGTALK_REGISTRATION_BASE_URL");
+        remove_env_var("DINGTALK_REGISTRATION_SOURCE");
         remove_env_var("HERMES_GATEWAY_PYTHON");
         remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
     }
