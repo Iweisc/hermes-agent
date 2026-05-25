@@ -23,7 +23,7 @@
       "plans/rust_port_integration.json",
       "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "cfc77f771cbd"
+    "state_fingerprint": "fb7a8dccdbb5"
   },
   "merge_order": [
     {
@@ -188,23 +188,10 @@
         "crates/hermes/src/completion.rs",
         "crates/hermes/src/curator_cmd.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-core/src/config.rs",
-        "crates/hermes-core/src/tts.rs",
-        "plugins/model-providers/ai-gateway/__init__.py",
-        "plugins/model-providers/anthropic/__init__.py",
-        "plugins/model-providers/bedrock/__init__.py",
-        "plugins/model-providers/copilot/__init__.py",
-        "plugins/model-providers/deepseek/__init__.py",
-        "plugins/model-providers/gemini/__init__.py",
-        "plugins/model-providers/minimax/__init__.py",
-        "plugins/model-providers/opencode-zen/__init__.py",
-        "plugins/model-providers/xai/__init__.py",
-        "plugins/model-providers/zai/__init__.py"
-      ],
-      "head": "c01d3df83",
-      "subject": "test: stabilize skills cmd github mock server"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "27fbc086b",
+      "subject": "test: restore provider env override parity"
     },
     {
       "worktree": "agent-03",
@@ -248,6 +235,7 @@
       "status": "dirty",
       "observed_dirty_files": [
         "crates/hermes-core/src/agent.rs",
+        "crates/hermes-core/src/auth.rs",
         "crates/hermes-core/src/lib.rs"
       ],
       "head": "632289b32",
@@ -266,10 +254,12 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/lib.rs",
+        "crates/hermes-core/src/skills.rs",
         "crates/hermes/src/gateway_native.rs"
       ],
-      "head": "75aee9d7c",
-      "subject": "Add native gateway shell exec support"
+      "head": "3c7c25921",
+      "subject": "Add native gateway session RPCs"
     },
     {
       "worktree": "agent-07",
@@ -323,12 +313,10 @@
         "ui-tui/package.json",
         "scripts/smoke_tui_rust_backend.py"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-agent/src/tui_gateway.rs"
-      ],
-      "head": "64948db2c",
-      "subject": "WIP: move TUI background prompts into Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "e4638770f",
+      "subject": "WIP: move TUI helper and model RPCs into Rust gateway"
     },
     {
       "worktree": "agent-10",
@@ -414,7 +402,8 @@
         "crates/hermes-core/src/agent.rs",
         "crates/hermes-core/src/lib.rs",
         "crates/hermes-core/src/skills.rs",
-        "crates/hermes/src/native_api_server.rs"
+        "crates/hermes/src/native_api_server.rs",
+        "crates/hermes/src/native_webhook_server.rs"
       ],
       "head": "3e5283934",
       "subject": "WIP: extend native gateway API runtime"
@@ -565,7 +554,7 @@
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 11 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 9 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -595,7 +584,7 @@
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=11, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=9, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -987,6 +976,7 @@
     {
       "path": "crates/hermes-core/src/skills.rs",
       "workers": [
+        "agent-06",
         "agent-07",
         "agent-14"
       ],
@@ -1212,8 +1202,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "11 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=11.",
+      "summary": "9 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=9.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1407,8 +1397,8 @@
       ]
     }
   ],
-  "last_synced_at": "2026-05-25T15:50:10+00:00",
-  "state_fingerprint": "cfc77f771cbd",
+  "last_synced_at": "2026-05-25T16:01:56+00:00",
+  "state_fingerprint": "fb7a8dccdbb5",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
