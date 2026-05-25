@@ -472,7 +472,7 @@ export type GatewayEvent =
       type: 'browser.progress'
     }
   | {
-      payload?: { cwd?: string; python?: string; stderr_tail?: string }
+      payload?: { command?: string; cwd?: string; python?: string; stderr_tail?: string }
       session_id?: string
       type: 'gateway.start_timeout'
     }

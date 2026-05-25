@@ -8,6 +8,7 @@
     "start": "tsx src/entry.tsx",
     "build": "npm run build --prefix packages/hermes-ink && tsc -p tsconfig.build.json && npm run build:compile && chmod +x dist/entry.js",
     "build:compile": "babel dist --out-dir dist --config-file ./babel.compiler.config.cjs --extensions .js --keep-file-extension",
+    "smoke:rust-backend": "python3 ../scripts/smoke_tui_rust_backend.py",
     "type-check": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src/ packages/",
     "lint:fix": "eslint src/ packages/ --fix",

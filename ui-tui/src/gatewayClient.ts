@@ -38,6 +38,53 @@ const resolvePython = (root: string) => {
   return hit || (process.platform === 'win32' ? 'python' : 'python3')
 }
 
+const parseArgsJson = (raw: string | undefined): string[] => {
+  const text = raw?.trim()
+
+  if (!text) {
+    return []
+  }
+
+  try {
+    const parsed = JSON.parse(text)
+
+    return Array.isArray(parsed) ? parsed.map(value => String(value)) : []
+  } catch {
+    return text.split(/\s+/).filter(Boolean)
+  }
+}
+
+const resolveRustGateway = (root: string) => {
+  const configuredBin = process.env.HERMES_TUI_GATEWAY_BIN?.trim()
+
+  if (configuredBin) {
+    return {
+      args: parseArgsJson(process.env.HERMES_TUI_GATEWAY_ARGS_JSON),
+      command: configuredBin,
+      cwd: process.env.HERMES_CWD || root,
+      label: [configuredBin, ...parseArgsJson(process.env.HERMES_TUI_GATEWAY_ARGS_JSON)].join(' ').trim() || configuredBin
+    }
+  }
+
+  if (existsSync(resolve(root, 'Cargo.toml'))) {
+    return {
+      args: ['run', '-q', '-p', 'hermes-rs-cli', '--bin', 'hermes', '--', 'tui-gateway'],
+      command: 'cargo',
+      cwd: root,
+      label: 'cargo run -q -p hermes-rs-cli --bin hermes -- tui-gateway'
+    }
+  }
+
+  const hermes = process.env.HERMES_BIN?.trim() || 'hermes'
+
+  return {
+    args: ['tui-gateway'],
+    command: hermes,
+    cwd: process.env.HERMES_CWD || root,
+    label: `${hermes} tui-gateway`
+  }
+}
+
 const asGatewayEvent = (value: unknown): GatewayEvent | null =>
   value && typeof value === 'object' && !Array.isArray(value) && typeof (value as { type?: unknown }).type === 'string'
     ? (value as GatewayEvent)
@@ -63,6 +110,7 @@ export class GatewayClient extends EventEmitter {
   private subscribed = false
   private stdoutRl: ReturnType<typeof createInterface> | null = null
   private stderrRl: ReturnType<typeof createInterface> | null = null
+  private backendLabel = ''
 
   constructor() {
     super()
@@ -90,11 +138,23 @@ export class GatewayClient extends EventEmitter {
 
   start() {
     const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
-    const python = resolvePython(root)
-    const cwd = process.env.HERMES_CWD || root
+    const legacyPython = resolvePython(root)
+    const usePythonBackend =
+      /^(1|true|yes|on)$/i.test((process.env.HERMES_TUI_USE_PYTHON ?? '').trim()) ||
+      (process.env.HERMES_TUI_BACKEND ?? '').trim().toLowerCase() === 'python'
+    const backend = usePythonBackend
+      ? {
+          args: ['-m', 'tui_gateway.entry'],
+          command: legacyPython,
+          cwd: process.env.HERMES_CWD || root,
+          label: `${legacyPython} -m tui_gateway.entry`
+        }
+      : resolveRustGateway(root)
+    const cwd = backend.cwd
     const env = { ...process.env }
     const pyPath = env.PYTHONPATH?.trim()
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
+    this.backendLabel = backend.label
 
     this.ready = false
     this.bufferedEvents.clear()
@@ -124,14 +184,14 @@ export class GatewayClient extends EventEmitter {
       // readable on slow boots.
       const stderrTail = this.getLogTail(20)
 
-      this.pushLog(`[startup] timed out waiting for gateway.ready (python=${python}, cwd=${cwd})`)
+      this.pushLog(`[startup] timed out waiting for gateway.ready (command=${this.backendLabel}, cwd=${cwd})`)
       this.publish({
         type: 'gateway.start_timeout',
-        payload: { cwd, python, stderr_tail: stderrTail }
+        payload: { command: this.backendLabel, cwd, python: usePythonBackend ? legacyPython : undefined, stderr_tail: stderrTail }
       })
     }, STARTUP_TIMEOUT_MS)
 
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.proc = spawn(backend.command, backend.args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })
     this.stdoutRl.on('line', raw => {
