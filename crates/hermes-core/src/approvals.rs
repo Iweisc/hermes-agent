@@ -206,6 +206,18 @@ impl ApprovalManager {
     }
 }
 
+pub fn shell_command_block_reason(command: &str) -> Option<String> {
+    let normalized = normalize_command_for_detection(command);
+    if let Some(description) = detect_rule_match(&normalized, hardline_rules()) {
+        return Some(format!(
+            "blocked: {description}. Use the agent for dangerous commands."
+        ));
+    }
+    detect_dangerous_command(&normalized).map(|(_, description)| {
+        format!("blocked: {description}. Use the agent for dangerous commands.")
+    })
+}
+
 fn hardline_rules() -> &'static [(Regex, &'static str)] {
     static RULES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     RULES.get_or_init(|| {
@@ -513,5 +525,15 @@ mod tests {
             None,
         );
         assert_eq!(result, ApprovalCheckResult::Approved);
+    }
+
+    #[test]
+    fn shell_command_block_reason_matches_dangerous_and_safe_commands() {
+        assert!(
+            shell_command_block_reason("rm -rf /tmp/demo")
+                .unwrap()
+                .contains("dangerous commands")
+        );
+        assert_eq!(shell_command_block_reason("printf hello"), None);
     }
 }

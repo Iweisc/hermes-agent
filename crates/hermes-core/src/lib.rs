@@ -45,7 +45,9 @@ mod web;
 mod yuanbao;
 
 pub use agent::AgentTurnResult;
-pub use approvals::{ApprovalCheckResult, ApprovalManager, ApprovalRequest};
+pub use approvals::{
+    ApprovalCheckResult, ApprovalManager, ApprovalRequest, shell_command_block_reason,
+};
 pub use auth::{
     AuthStatusSummary, CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials,
     GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials,

@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hermes_core::{
     GatewaySessionPoll, GatewayTurnSession, HermesContext, LoadedConfig, MessageRecord,
     ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
-    spawn_chat_turn_with_events,
+    shell_command_block_reason, spawn_chat_turn_with_events,
 };
 use regex::Regex;
 use serde_json::{Value, json};
@@ -51,6 +53,10 @@ struct SlashWorker {
 
 #[cfg(test)]
 static SLASH_WORKER_PYTHON_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+const SHELL_EXEC_TIMEOUT_SECS: u64 = 30;
+const SHELL_EXEC_STDOUT_LIMIT: usize = 4_000;
+const SHELL_EXEC_STDERR_LIMIT: usize = 2_000;
 
 impl<'a> NativeGatewayServer<'a> {
     fn new(
@@ -233,6 +239,7 @@ impl<'a> NativeGatewayServer<'a> {
             "config.get" => self.handle_config_get(params),
             "complete.path" => self.handle_complete_path(params),
             "complete.slash" => self.handle_complete_slash(params),
+            "shell.exec" => self.handle_shell_exec(params),
             "slash.exec" => self.handle_slash_exec(params),
             "prompt.submit" => {
                 return match self.handle_prompt_submit(writer, params) {
@@ -542,6 +549,20 @@ impl<'a> NativeGatewayServer<'a> {
         }))
     }
 
+    fn handle_shell_exec(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let command = params
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (4004, String::from("empty command"), None))?;
+        if let Some(message) = shell_command_block_reason(command) {
+            return Err((4005, message, None));
+        }
+        let cwd = std::env::current_dir().map_err(|error| (5003, error.to_string(), None))?;
+        run_shell_exec(command, &cwd)
+    }
+
     fn handle_slash_exec(&mut self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
         let session_id = required_session_id(&params)?;
         let command = params
@@ -800,6 +821,91 @@ impl Drop for SlashWorker {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn run_shell_exec(command: &str, cwd: &Path) -> Result<Value, (i64, String, Option<Value>)> {
+    let child = shell_exec_command(command, cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| (5003, error.to_string(), None))?;
+    let pid = child.id() as i32;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    let output = match rx.recv_timeout(Duration::from_secs(SHELL_EXEC_TIMEOUT_SECS)) {
+        Ok(result) => result.map_err(|error| (5003, error.to_string(), None))?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill_shell_process(pid);
+            return Err((
+                5002,
+                format!("command timed out ({SHELL_EXEC_TIMEOUT_SECS}s)"),
+                None,
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err((5003, String::from("shell worker disconnected"), None));
+        }
+    };
+
+    Ok(json!({
+        "stdout": truncate_tail(&String::from_utf8_lossy(&output.stdout), SHELL_EXEC_STDOUT_LIMIT),
+        "stderr": truncate_tail(&String::from_utf8_lossy(&output.stderr), SHELL_EXEC_STDERR_LIMIT),
+        "code": output.status.code().unwrap_or_default(),
+    }))
+}
+
+fn shell_exec_command(command: &str, cwd: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut builder = Command::new("cmd");
+        builder.arg("/C").arg(command).current_dir(cwd);
+        builder
+    }
+    #[cfg(not(windows))]
+    {
+        let mut builder = Command::new("bash");
+        builder.arg("-lc").arg(command).current_dir(cwd);
+        #[cfg(unix)]
+        unsafe {
+            builder.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        builder
+    }
+}
+
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn kill_shell_process(pid: i32) {
+    #[cfg(unix)]
+    {
+        if pid <= 0 {
+            return;
+        }
+        // SAFETY: negative pid targets the process group created in pre_exec.
+        let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
+        thread::sleep(Duration::from_millis(250));
+        // SAFETY: same as above, escalated after a short grace period.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
     }
 }
 
@@ -1856,6 +1962,51 @@ mod tests {
         );
         assert!(frames[3]["result"]["mtime"].as_f64().unwrap() > 0.0);
         assert_eq!(frames[4]["result"]["session_id"], json!("recent-session"));
+    }
+
+    #[test]
+    fn native_gateway_shell_exec_runs_command_and_blocks_dangerous_commands() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+
+        let mut output = Vec::new();
+        server
+            .handle_request(
+                "shell.exec",
+                json!(1),
+                json!({"command":"printf alpha; printf beta >&2; exit 7"}),
+                &mut output,
+                false,
+            )
+            .unwrap();
+        let frame = serde_json::from_slice::<Value>(&output).unwrap();
+        assert_eq!(frame["result"]["stdout"], json!("alpha"));
+        assert_eq!(frame["result"]["stderr"], json!("beta"));
+        assert_eq!(frame["result"]["code"], json!(7));
+
+        let mut blocked = Vec::new();
+        server
+            .handle_request(
+                "shell.exec",
+                json!(2),
+                json!({"command":"rm -rf /tmp/native-gateway-test"}),
+                &mut blocked,
+                false,
+            )
+            .unwrap();
+        let blocked_frame = serde_json::from_slice::<Value>(&blocked).unwrap();
+        assert_eq!(blocked_frame["error"]["code"], json!(4005));
+        assert!(
+            blocked_frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Use the agent for dangerous commands.")
+        );
     }
 
     #[cfg(not(windows))]
