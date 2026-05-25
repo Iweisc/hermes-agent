@@ -28,6 +28,66 @@ pub struct PluginCliDispatchResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCliCommand {
+    pub name: String,
+    pub help: String,
+    pub description: String,
+    pub plugin_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformSurface {
+    pub key: String,
+    pub label: String,
+    pub required_env: Vec<String>,
+    pub install_hint: Option<String>,
+    pub emoji: String,
+    pub has_setup_fn: bool,
+    pub plugin_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardSurface {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub icon: String,
+    pub version: String,
+    pub entry: String,
+    pub css: Option<String>,
+    pub api: Option<String>,
+    pub slots: Vec<String>,
+    pub tab_path: String,
+    pub tab_position: String,
+    pub tab_override: Option<String>,
+    pub tab_hidden: bool,
+    pub source: PluginSource,
+    pub dashboard_dir: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DashboardManifest {
+    name: Option<String>,
+    label: Option<String>,
+    description: Option<String>,
+    icon: Option<String>,
+    version: Option<String>,
+    entry: Option<String>,
+    css: Option<String>,
+    api: Option<String>,
+    slots: Option<Vec<String>>,
+    tab: Option<DashboardTab>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DashboardTab {
+    path: Option<String>,
+    position: Option<String>,
+    override_path: Option<String>,
+    hidden: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 struct PythonPluginBridge {
     python: PathBuf,
@@ -528,6 +588,98 @@ pub fn dispatch_python_plugin_cli_command(
     PythonPluginBridge::new(hermes_home, cwd)?.run_cli_command(argv)
 }
 
+pub fn discover_enabled_plugin_cli_commands(
+    hermes_home: &Path,
+    cwd: &Path,
+) -> Vec<PluginCliCommand> {
+    let mut seen = BTreeSet::new();
+    let mut commands = Vec::new();
+    for plugin in discover_enabled_general_plugins(hermes_home, cwd) {
+        for command in plugin.cli_commands {
+            if seen.insert(command.name.clone()) {
+                commands.push(command);
+            }
+        }
+    }
+    if let Some(memory_command) = discover_active_memory_cli_command(hermes_home)
+        && seen.insert(memory_command.name.clone())
+    {
+        commands.push(memory_command);
+    }
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    commands
+}
+
+pub fn discover_enabled_plugin_platforms(hermes_home: &Path, cwd: &Path) -> Vec<PlatformSurface> {
+    let mut surfaces = Vec::new();
+    for plugin in discover_enabled_general_plugins(hermes_home, cwd) {
+        if plugin.platforms.is_empty() {
+            continue;
+        }
+        surfaces.extend(plugin.platforms);
+    }
+    surfaces.sort_by(|left, right| left.key.cmp(&right.key));
+    surfaces
+}
+
+pub fn discover_scanned_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
+    let mut winners = BTreeMap::<String, DiscoveredPlugin>::new();
+    for (root, source) in [
+        (bundled_plugins_dir(), PluginSource::Bundled),
+        (user_plugins_dir(hermes_home), PluginSource::User),
+        (project_plugins_dir(cwd), PluginSource::Project),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for plugin in scan_plugin_tree(&root, source) {
+            winners.insert(plugin.key.clone(), plugin);
+        }
+    }
+    winners.into_values().collect()
+}
+
+pub fn discover_memory_provider_plugins(hermes_home: &Path) -> Vec<DiscoveredPlugin> {
+    let mut plugins = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (root, source, prefix, require_marker) in [
+        (
+            bundled_plugins_dir().join("memory"),
+            PluginSource::Bundled,
+            "memory",
+            false,
+        ),
+        (user_plugins_dir(hermes_home), PluginSource::User, "", true),
+    ] {
+        for plugin in scan_memory_provider_root(&root, source, prefix, require_marker) {
+            if seen.insert(plugin.name.clone()) {
+                plugins.push(plugin);
+            }
+        }
+    }
+    plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.key.cmp(&right.key)));
+    plugins
+}
+
+pub fn discover_dashboard_surfaces(hermes_home: &Path, cwd: &Path) -> Vec<DashboardSurface> {
+    let mut dashboards = BTreeMap::<String, DashboardSurface>::new();
+    for (root, source) in [
+        (user_plugins_dir(hermes_home), PluginSource::User),
+        (bundled_plugins_dir(), PluginSource::Bundled),
+        (project_plugins_dir(cwd), PluginSource::Project),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for dashboard in scan_dashboard_tree(&root, source) {
+            dashboards
+                .entry(dashboard.name.clone())
+                .or_insert(dashboard);
+        }
+    }
+    dashboards.into_values().collect()
+}
+
 pub fn run_python_plugin_platform_setup(
     hermes_home: &Path,
     cwd: &Path,
@@ -615,14 +767,24 @@ fn attach_python_plugin_callbacks_with_bridge(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PluginSource {
+pub enum PluginSource {
     Bundled,
     User,
     Project,
 }
 
+impl PluginSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PluginKind {
+pub enum PluginKind {
     Standalone,
     Backend,
     Exclusive,
@@ -632,39 +794,34 @@ enum PluginKind {
 }
 
 impl PluginKind {
-    fn is_auto_enabled(self, source: PluginSource) -> bool {
+    pub fn is_auto_enabled(self, source: PluginSource) -> bool {
         source == PluginSource::Bundled && matches!(self, Self::Backend | Self::Platform)
     }
 }
 
-#[derive(Debug, Clone)]
-struct DiscoveredPlugin {
-    key: String,
-    name: String,
-    kind: PluginKind,
-    source: PluginSource,
-    provides_hooks: Vec<String>,
-    tool_definitions: Vec<ToolDefinition>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredPlugin {
+    pub key: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub kind: PluginKind,
+    pub source: PluginSource,
+    pub path: PathBuf,
+    pub requires_env: Vec<String>,
+    pub provides_tools: Vec<String>,
+    pub provides_hooks: Vec<String>,
+    pub tool_definitions: Vec<ToolDefinition>,
+    pub cli_commands: Vec<PluginCliCommand>,
+    pub platforms: Vec<PlatformSurface>,
 }
 
 fn discover_enabled_general_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
     let enabled = load_plugin_set(hermes_home, "enabled");
     let disabled = load_plugin_set(hermes_home, "disabled");
-    let mut winners = BTreeMap::<String, DiscoveredPlugin>::new();
-    for (root, source) in [
-        (bundled_plugins_dir(), PluginSource::Bundled),
-        (user_plugins_dir(hermes_home), PluginSource::User),
-        (project_plugins_dir(cwd), PluginSource::Project),
-    ] {
-        if !root.is_dir() {
-            continue;
-        }
-        for plugin in scan_plugin_tree(&root, source) {
-            winners.insert(plugin.key.clone(), plugin);
-        }
-    }
-    winners
-        .into_values()
+    discover_scanned_plugins(hermes_home, cwd)
+        .into_iter()
         .filter(|plugin| {
             !matches!(
                 plugin.kind,
@@ -784,6 +941,93 @@ fn scan_plugin_tree_level(
     }
 }
 
+fn scan_memory_provider_root(
+    root: &Path,
+    source: PluginSource,
+    prefix: &str,
+    require_marker: bool,
+) -> Vec<DiscoveredPlugin> {
+    let mut plugins = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return plugins;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(plugin) = parse_memory_provider_dir(&path, prefix, source, require_marker) else {
+            continue;
+        };
+        plugins.push(plugin);
+    }
+    plugins
+}
+
+fn scan_dashboard_tree(root: &Path, source: PluginSource) -> Vec<DashboardSurface> {
+    let mut dashboards = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return dashboards;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest = path.join("dashboard").join("manifest.json");
+        if !manifest.exists() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<DashboardManifest>(&text) else {
+            continue;
+        };
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let name = parsed
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&dir_name)
+            .to_string();
+        let tab = parsed.tab.unwrap_or_default();
+        let tab_path = tab
+            .path
+            .as_deref()
+            .filter(|value| value.starts_with('/'))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("/{name}"));
+        let tab_position = tab
+            .position
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("end")
+            .to_string();
+        dashboards.push(DashboardSurface {
+            name: name.clone(),
+            label: parsed.label.unwrap_or_else(|| name.clone()),
+            description: parsed.description.unwrap_or_default(),
+            icon: parsed.icon.unwrap_or_else(|| String::from("Puzzle")),
+            version: parsed.version.unwrap_or_else(|| String::from("0.0.0")),
+            entry: parsed
+                .entry
+                .unwrap_or_else(|| String::from("dist/index.js")),
+            css: parsed.css,
+            api: parsed.api,
+            slots: parsed.slots.unwrap_or_default(),
+            tab_path,
+            tab_position,
+            tab_override: tab.override_path.filter(|value| value.starts_with('/')),
+            tab_hidden: tab.hidden.unwrap_or(false),
+            source,
+            dashboard_dir: path.join("dashboard"),
+        });
+    }
+    dashboards
+}
+
 fn plugin_manifest_path(path: &Path) -> Option<PathBuf> {
     let yaml = path.join("plugin.yaml");
     if yaml.exists() {
@@ -813,13 +1057,118 @@ fn parse_plugin_manifest(
         return None;
     }
     let source_text = read_plugin_source_files(plugin_dir);
+    let cli_commands = discover_plugin_cli_commands_from_source(&source_text, &name);
+    let platforms = discover_platform_surfaces_from_source(&source_text, &name);
+    let tool_definitions = discover_tool_definitions_from_source(&source_text);
+    let mut provides_tools = mapping_string_list(mapping, "provides_tools");
+    for definition in &tool_definitions {
+        if !provides_tools.iter().any(|tool| tool == &definition.name) {
+            provides_tools.push(definition.name.clone());
+        }
+    }
+    let mut provides_hooks = mapping_string_list(mapping, "provides_hooks");
+    if provides_hooks.is_empty() {
+        provides_hooks = mapping_string_list(mapping, "hooks");
+    }
+    for hook in discover_hook_registrations_from_source(&source_text) {
+        if !provides_hooks.iter().any(|existing| existing == &hook) {
+            provides_hooks.push(hook);
+        }
+    }
     Some(DiscoveredPlugin {
         key: key.clone(),
+        cli_commands,
         name,
+        version: mapping_string(mapping, "version").unwrap_or_default(),
+        description: mapping_string(mapping, "description").unwrap_or_default(),
+        author: mapping_string(mapping, "author").unwrap_or_default(),
         kind: determine_plugin_kind(&key, mapping_string(mapping, "kind"), &source_text),
+        platforms,
+        path: plugin_dir.to_path_buf(),
+        requires_env: mapping_string_list(mapping, "requires_env"),
+        provides_tools,
+        provides_hooks,
         source,
-        provides_hooks: discover_hook_registrations_from_source(&source_text),
-        tool_definitions: discover_tool_definitions_from_source(&source_text),
+        tool_definitions,
+    })
+}
+
+fn parse_memory_provider_dir(
+    plugin_dir: &Path,
+    prefix: &str,
+    source: PluginSource,
+    require_marker: bool,
+) -> Option<DiscoveredPlugin> {
+    let init_file = plugin_dir.join("__init__.py");
+    if !init_file.exists() {
+        return None;
+    }
+    let dir_name = plugin_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if dir_name.is_empty() || dir_name.starts_with(['.', '_']) {
+        return None;
+    }
+
+    let key = if prefix.is_empty() {
+        dir_name.clone()
+    } else {
+        format!("{prefix}/{dir_name}")
+    };
+    let source_text = read_plugin_source_files(plugin_dir);
+    if source_text.trim().is_empty() {
+        return None;
+    }
+
+    let manifest = plugin_manifest_path(plugin_dir)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_yaml::from_str::<YamlValue>(&text).ok())
+        .and_then(|value| value.as_mapping().cloned());
+    let raw_kind = manifest
+        .as_ref()
+        .and_then(|mapping| mapping_string(mapping, "kind"));
+    let kind = determine_plugin_kind(&key, raw_kind, &source_text);
+    if kind != PluginKind::Exclusive {
+        return None;
+    }
+    if require_marker
+        && !source_text.contains("register_memory_provider")
+        && !source_text.contains("MemoryProvider")
+    {
+        return None;
+    }
+
+    let description = manifest
+        .as_ref()
+        .and_then(|mapping| mapping_string(mapping, "description"))
+        .unwrap_or_default();
+    Some(DiscoveredPlugin {
+        key,
+        name: dir_name,
+        version: manifest
+            .as_ref()
+            .and_then(|mapping| mapping_string(mapping, "version"))
+            .unwrap_or_default(),
+        description,
+        author: manifest
+            .as_ref()
+            .and_then(|mapping| mapping_string(mapping, "author"))
+            .unwrap_or_default(),
+        kind,
+        source,
+        path: plugin_dir.to_path_buf(),
+        requires_env: manifest
+            .as_ref()
+            .map(|mapping| mapping_string_list(mapping, "requires_env"))
+            .unwrap_or_default(),
+        provides_tools: Vec::new(),
+        provides_hooks: Vec::new(),
+        tool_definitions: Vec::new(),
+        cli_commands: Vec::new(),
+        platforms: Vec::new(),
     })
 }
 
@@ -895,6 +1244,79 @@ fn mapping_string(mapping: &serde_yaml::Mapping, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn mapping_string_list(mapping: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    let Some(value) = mapping.get(YamlValue::String(key.to_string())) else {
+        return Vec::new();
+    };
+    match value {
+        YamlValue::Sequence(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                YamlValue::String(text) => {
+                    let trimmed = text.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+                YamlValue::Mapping(mapping) => mapping
+                    .get(YamlValue::String(String::from("name")))
+                    .and_then(YamlValue::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn discover_active_memory_cli_command(hermes_home: &Path) -> Option<PluginCliCommand> {
+    let config_path = hermes_home.join("config.yaml");
+    let provider = fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<YamlValue>(&text).ok())
+        .and_then(|value| {
+            value
+                .as_mapping()
+                .and_then(|mapping| mapping.get(YamlValue::String(String::from("memory"))))
+                .and_then(YamlValue::as_mapping)
+                .and_then(|mapping| mapping.get(YamlValue::String(String::from("provider"))))
+                .and_then(YamlValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default();
+    if provider.is_empty() {
+        return None;
+    }
+    let candidates = [
+        bundled_plugins_dir().join("memory").join(&provider),
+        user_plugins_dir(hermes_home).join(&provider),
+    ];
+    let plugin_dir = candidates
+        .into_iter()
+        .find(|path| path.join("cli.py").exists())?;
+    let description = plugin_manifest_path(&plugin_dir)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_yaml::from_str::<YamlValue>(&text).ok())
+        .and_then(|value| {
+            value
+                .as_mapping()
+                .and_then(|mapping| mapping_string(mapping, "description"))
+        })
+        .unwrap_or_default();
+    Some(PluginCliCommand {
+        name: provider.clone(),
+        help: if description.is_empty() {
+            format!("Manage {provider} memory plugin")
+        } else {
+            description.clone()
+        },
+        description,
+        plugin_name: provider,
+    })
+}
+
 pub fn discover_tool_definitions_from_source(source_text: &str) -> Vec<ToolDefinition> {
     let mut tools = discover_direct_tool_registrations(source_text);
     if tools.is_empty() {
@@ -918,6 +1340,57 @@ pub fn discover_hook_registrations_from_source(source_text: &str) -> Vec<String>
         }
     }
     hooks
+}
+
+pub fn discover_plugin_cli_commands_from_source(
+    source_text: &str,
+    plugin_name: &str,
+) -> Vec<PluginCliCommand> {
+    let mut commands = Vec::new();
+    let mut blocks = extract_call_blocks(source_text, "ctx.register_cli_command");
+    if blocks.is_empty() {
+        blocks = extract_call_blocks(source_text, "register_cli_command");
+    }
+    for block in blocks {
+        let Some(name) = extract_keyword_string(&block, "name") else {
+            continue;
+        };
+        let help = extract_keyword_string(&block, "help").unwrap_or_default();
+        let description = extract_keyword_string(&block, "description").unwrap_or_default();
+        commands.push(PluginCliCommand {
+            name,
+            help,
+            description,
+            plugin_name: plugin_name.to_string(),
+        });
+    }
+    commands
+}
+
+pub fn discover_platform_surfaces_from_source(
+    source_text: &str,
+    plugin_name: &str,
+) -> Vec<PlatformSurface> {
+    let mut platforms = Vec::new();
+    let mut blocks = extract_call_blocks(source_text, "ctx.register_platform");
+    if blocks.is_empty() {
+        blocks = extract_call_blocks(source_text, "register_platform");
+    }
+    for block in blocks {
+        let Some(key) = extract_keyword_string(&block, "name") else {
+            continue;
+        };
+        platforms.push(PlatformSurface {
+            key: key.clone(),
+            label: extract_keyword_string(&block, "label").unwrap_or_else(|| titleize(&key)),
+            required_env: extract_keyword_string_list(&block, "required_env"),
+            install_hint: extract_keyword_string(&block, "install_hint"),
+            emoji: extract_keyword_string(&block, "emoji").unwrap_or_default(),
+            has_setup_fn: keyword_present(&block, "setup_fn"),
+            plugin_name: plugin_name.to_string(),
+        });
+    }
+    platforms
 }
 
 fn discover_direct_tool_registrations(source_text: &str) -> Vec<ToolDefinition> {
@@ -1065,6 +1538,38 @@ fn extract_keyword_string(block: &str, key: &str) -> Option<String> {
         .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
         .map(|value| value.as_str().trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn extract_keyword_string_list(block: &str, key: &str) -> Vec<String> {
+    let pattern = format!(r#"(?s)\b{}\s*=\s*\[(.*?)\]"#, regex::escape(key));
+    let Some(regex) = Regex::new(&pattern).ok() else {
+        return Vec::new();
+    };
+    let Some(captures) = regex.captures(block) else {
+        return Vec::new();
+    };
+    let Some(body) = captures.get(1) else {
+        return Vec::new();
+    };
+    let Some(string_re) = Regex::new(r#"(?:"([^"]*)"|'([^']*)')"#).ok() else {
+        return Vec::new();
+    };
+    string_re
+        .captures_iter(body.as_str())
+        .filter_map(|caps| {
+            caps.get(1)
+                .or_else(|| caps.get(2))
+                .map(|value| value.as_str().trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn keyword_present(block: &str, key: &str) -> bool {
+    let pattern = format!(r#"\b{}\s*="#, regex::escape(key));
+    Regex::new(&pattern)
+        .map(|regex| regex.is_match(block))
+        .unwrap_or(false)
 }
 
 fn extract_first_string_argument(block: &str) -> Option<String> {
@@ -1334,6 +1839,21 @@ fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
         .map(|index| start + index)
+}
+
+fn titleize(value: &str) -> String {
+    value
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
