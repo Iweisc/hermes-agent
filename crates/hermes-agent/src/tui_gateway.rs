@@ -11,7 +11,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hermes_core::{
-    HermesContext, HermesError, MessageAppend, MessageRecord, SessionCreate, SessionStore,
+    DelegateExecutor, HermesContext, HermesError, MessageAppend, MessageRecord, ModelOverrides,
+    SessionCreate, SessionStore, ToolRuntime,
 };
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -392,6 +393,7 @@ print(json.dumps(result))
 
 #[derive(Debug, Clone)]
 struct HelperContext {
+    context: HermesContext,
     hermes_home: PathBuf,
     project_root: PathBuf,
     python: PathBuf,
@@ -457,6 +459,7 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| "unable to resolve Python interpreter for tui_gateway proxy".to_string())?;
     let work_root = PathBuf::from(&session_cwd);
     let helper = HelperContext {
+        context: context.clone(),
         hermes_home: context.hermes_home(),
         project_root: project_root.clone(),
         python: python.clone(),
@@ -527,7 +530,7 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
         };
 
         if let Some(response) =
-            handle_native_request(&request, &store, &state, &helper, &child_stdin)?
+            handle_native_request(&request, &store, &state, &helper, &stdout, &child_stdin)?
         {
             write_json(&stdout, &response)?;
             continue;
@@ -544,6 +547,7 @@ fn handle_native_request(
     store: &SessionStore,
     state: &Arc<Mutex<ProxyState>>,
     helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
     child_stdin: &Arc<Mutex<ChildStdin>>,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
@@ -627,6 +631,7 @@ fn handle_native_request(
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
         "session.interrupt" => handle_session_interrupt(id, &params, state, helper, child_stdin)?,
         "session.steer" => handle_session_steer(id, &params, state, child_stdin)?,
@@ -1309,6 +1314,71 @@ fn handle_session_status(
         ),
     ]);
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
+}
+
+fn handle_prompt_background(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if text.is_empty() {
+        return Ok(Some(error_response(id, 4012, "text required")));
+    }
+
+    let task_id = new_background_task_id();
+    let event_task_id = task_id.clone();
+    let parent = local_id.to_string();
+    let context = helper.context.clone();
+    let work_root = helper.work_root.clone();
+    let stdout = Arc::clone(stdout);
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    thread::spawn(move || {
+        let result = run_background_prompt(&context, &work_root, &text, model);
+        let body = match result {
+            Ok(text) => text,
+            Err(error) => format!("error: {error}"),
+        };
+        let _ = write_json(
+            &stdout,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "background.complete",
+                    "session_id": parent,
+                    "payload": {"task_id": event_task_id, "text": body},
+                },
+            }),
+        );
+    });
+
+    Ok(Some(ok_response(id, json!({"task_id": task_id}))))
 }
 
 fn handle_session_interrupt(
@@ -2487,6 +2557,13 @@ fn current_timestamp_seconds() -> f64 {
         .as_secs_f64()
 }
 
+fn new_background_task_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("bg_{:06x}", (now.as_nanos() & 0x00ff_ffff) as u64)
+}
+
 fn current_filename_timestamp() -> String {
     let timestamp = current_timestamp_seconds();
     run_python_filename_timestamp(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
@@ -2822,6 +2899,50 @@ fn content_text(content: Option<&Value>) -> String {
         Some(other) => other.to_string(),
         None => String::new(),
     }
+}
+
+fn run_background_prompt(
+    context: &HermesContext,
+    work_root: &Path,
+    prompt: &str,
+    model: Option<String>,
+) -> Result<String, Box<dyn Error>> {
+    let config = context.load_config_document()?;
+    let session_store = context.open_session_store()?;
+    let overrides = ModelOverrides {
+        model,
+        provider: None,
+        base_url: None,
+        api_key: None,
+        api_mode: None,
+    };
+    let enabled_toolsets = config.config.toolsets.clone();
+    let delegate = DelegateExecutor::new(
+        context.clone(),
+        config.clone(),
+        "rust-background-delegate",
+        enabled_toolsets.clone(),
+        overrides.clone(),
+        work_root.to_path_buf(),
+    );
+    let runtime = ToolRuntime::new(work_root.to_path_buf())
+        .with_hermes_home(context.hermes_home())
+        .with_clarify_callback(|question, _choices| {
+            Err(format!(
+                "Clarify is unavailable in background tasks: {question}"
+            ))
+        })
+        .with_delegate_callback(move |request| delegate.execute(request));
+    let result = context.run_chat_completions_turn(
+        &config,
+        prompt,
+        &runtime,
+        Some(&enabled_toolsets),
+        &overrides,
+        None,
+        Some(&session_store),
+    )?;
+    Ok(result.final_response)
 }
 
 fn message_record_to_chat_message(message: MessageRecord) -> Result<Value, HermesError> {
@@ -4019,6 +4140,47 @@ mod tests {
     }
 
     #[test]
+    fn prompt_background_requires_text() {
+        let state = test_state();
+        let local_id = create_local_session(&state, Some("stored-bg".to_string()), 80).unwrap();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+
+        let response = handle_prompt_background(
+            json!("r-bg-empty"),
+            json!({"session_id": local_id, "text": ""})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+        )
+        .unwrap()
+        .expect("prompt.background response");
+
+        assert_eq!(response["error"]["code"], json!(4012));
+    }
+
+    #[test]
+    fn prompt_background_rejects_missing_session() {
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+
+        let response = handle_prompt_background(
+            json!("r-bg-missing"),
+            json!({"session_id": "rs_tui_missing", "text": "hello"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+        )
+        .unwrap()
+        .expect("prompt.background response");
+
+        assert_eq!(response["error"]["code"], json!(4001));
+    }
+
+    #[test]
     fn session_close_native_releases_local_session_binding() {
         let state = test_state();
         let store = test_store();
@@ -4139,6 +4301,8 @@ mod tests {
 
     fn helper_context() -> HelperContext {
         HelperContext {
+            context: HermesContext::new(std::env::temp_dir())
+                .with_hermes_home_env(Some(std::env::temp_dir())),
             hermes_home: std::env::temp_dir(),
             project_root: project_root(),
             python: PathBuf::from("python3"),
