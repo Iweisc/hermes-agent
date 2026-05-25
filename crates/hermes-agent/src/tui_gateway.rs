@@ -10,7 +10,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hermes_core::{HermesContext, HermesError, SessionCreate, SessionStore};
+use hermes_core::{
+    HermesContext, HermesError, MessageAppend, MessageRecord, SessionCreate, SessionStore,
+};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -620,6 +622,8 @@ fn handle_native_request(
         "session.resume" => handle_session_resume(id, &params, store, state, helper)?,
         "session.close" => handle_session_close(id, &params, store, state, child_stdin)?,
         "session.title" => handle_session_title(id, &params, store, state)?,
+        "session.save" => handle_session_save(id, &params, store, state)?,
+        "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
@@ -880,6 +884,7 @@ fn handle_session_close(
             json!({"session_id": binding.child_id}),
             Some(local_id.to_string()),
             None,
+            None,
         )?;
     } else if let Some(store_session_id) = binding.store_session_id.as_deref() {
         if let Some(record) = store.get_session(store_session_id)? {
@@ -997,6 +1002,118 @@ fn handle_session_title(
         Err(HermesError::State { detail, .. }) => Ok(Some(error_response(id, 4022, &detail))),
         Err(error) => Ok(Some(error_response(id, 5007, &error.to_string()))),
     }
+}
+
+fn handle_session_save(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(store_session_id) = lookup_store_session_id(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let messages = store
+        .get_messages(&store_session_id)?
+        .into_iter()
+        .map(message_record_to_chat_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            store
+                .get_session(&store_session_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.model)
+        })
+        .unwrap_or_default();
+    let filename = std::env::current_dir()?.join(format!(
+        "hermes_conversation_{}.json",
+        current_filename_timestamp()
+    ));
+    fs::write(
+        &filename,
+        serde_json::to_vec_pretty(&json!({
+            "model": model,
+            "messages": messages,
+        }))?,
+    )?;
+    Ok(Some(ok_response(
+        id,
+        json!({"file": filename.display().to_string()}),
+    )))
+}
+
+fn handle_session_undo(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    if binding.running {
+        return Ok(Some(error_response(
+            id,
+            4009,
+            "session busy — /interrupt the current turn before /undo",
+        )));
+    }
+    let Some(store_session_id) = binding.store_session_id.as_deref() else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+
+    let records = store.get_messages(store_session_id)?;
+    let (retained, removed) = trim_last_exchange(records);
+    if removed <= 0 {
+        return Ok(Some(ok_response(id, json!({"removed": 0}))));
+    }
+
+    store.clear_messages(store_session_id)?;
+    for message in retained {
+        store.append_message(store_session_id, &message_record_to_append(&message))?;
+    }
+
+    if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+        send_internal_child_request(
+            child_stdin,
+            state,
+            "session.close",
+            json!({"session_id": child_id}),
+            Some(local_id.to_string()),
+            None,
+            Some("child.close"),
+        )?;
+    }
+
+    Ok(Some(ok_response(id, json!({"removed": removed}))))
 }
 
 fn handle_session_usage(
@@ -1136,6 +1253,7 @@ fn handle_session_interrupt(
             state,
             "session.interrupt",
             json!({"session_id": binding.child_id}),
+            None,
             None,
             None,
         )?;
@@ -1337,6 +1455,7 @@ fn handle_terminal_resize(
             state,
             "terminal.resize",
             json!({"session_id": child_id, "cols": cols}),
+            None,
             None,
             None,
         )?;
@@ -1865,10 +1984,18 @@ fn rewrite_child_response(
         if let Some(response_tx) = pending.response_tx {
             let _ = response_tx.send(Value::Object(object.clone()));
         }
-        if pending.method == "session.close" {
-            if let Some(local_sid) = pending.local_session_id {
-                release_local_session(state, &local_sid)?;
+        match pending.method.as_str() {
+            "session.close" => {
+                if let Some(local_sid) = pending.local_session_id {
+                    release_local_session(state, &local_sid)?;
+                }
             }
+            "child.close" => {
+                if let Some(local_sid) = pending.local_session_id {
+                    detach_child_session(state, &local_sid)?;
+                }
+            }
+            _ => {}
         }
         return Ok(pending.suppress_output);
     };
@@ -1918,6 +2045,11 @@ fn rewrite_child_response(
         "session.close" => {
             if let Some(local_sid) = pending.local_session_id {
                 release_local_session(state, &local_sid)?;
+            }
+        }
+        "child.close" => {
+            if let Some(local_sid) = pending.local_session_id {
+                detach_child_session(state, &local_sid)?;
             }
         }
         _ => {}
@@ -2016,6 +2148,22 @@ fn attach_child_to_local(
         guard
             .child_to_local
             .insert(child_id.to_string(), local_id.to_string());
+    }
+    Ok(())
+}
+
+fn detach_child_session(
+    state: &Arc<Mutex<ProxyState>>,
+    local_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while detaching child session")?;
+    if let Some(binding) = guard.sessions.get_mut(local_id) {
+        let previous_child_id = std::mem::take(&mut binding.child_id);
+        if !previous_child_id.is_empty() {
+            guard.child_to_local.remove(&previous_child_id);
+        }
     }
     Ok(())
 }
@@ -2246,8 +2394,27 @@ fn current_timestamp_seconds() -> f64 {
         .as_secs_f64()
 }
 
+fn current_filename_timestamp() -> String {
+    let timestamp = current_timestamp_seconds();
+    run_python_filename_timestamp(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+}
+
 fn format_timestamp(timestamp: f64) -> String {
     run_python_datetime_format(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+}
+
+fn run_python_filename_timestamp(timestamp: f64) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg("from datetime import datetime; import sys; print(datetime.fromtimestamp(float(sys.argv[1])).strftime('%Y%m%d_%H%M%S'))")
+        .arg(format!("{timestamp}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err("python3 filename timestamp formatting failed".into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 fn run_python_datetime_format(timestamp: f64) -> Result<String, Box<dyn Error>> {
@@ -2351,6 +2518,7 @@ fn sync_pending_images(
             json!({"session_id": child_id, "path": path}),
             None,
             None,
+            None,
         )?;
     }
     Ok(())
@@ -2377,6 +2545,7 @@ fn ensure_child_session(
         json!({"session_id": store_session_id, "cols": binding.cols}),
         Some(local_id.to_string()),
         Some(store_session_id),
+        None,
     )?;
     for _ in 0..300 {
         if lookup_child_session_id(state, local_id)?.is_some() {
@@ -2394,6 +2563,7 @@ fn send_internal_child_request(
     params: Value,
     local_session_id: Option<String>,
     resume_target: Option<String>,
+    tracked_method: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let request_id = {
         let mut guard = state
@@ -2405,7 +2575,7 @@ fn send_internal_child_request(
             request_id.clone(),
             PendingRequest {
                 local_session_id,
-                method: method.to_string(),
+                method: tracked_method.unwrap_or(method).to_string(),
                 resume_target,
                 response_tx: None,
                 suppress_output: true,
@@ -2559,6 +2729,73 @@ fn content_text(content: Option<&Value>) -> String {
         Some(other) => other.to_string(),
         None => String::new(),
     }
+}
+
+fn message_record_to_chat_message(message: MessageRecord) -> Result<Value, HermesError> {
+    let mut map = Map::new();
+    map.insert("role".to_string(), Value::String(message.role));
+    map.insert(
+        "content".to_string(),
+        message.content.unwrap_or(Value::Null),
+    );
+    if let Some(tool_call_id) = message.tool_call_id {
+        map.insert("tool_call_id".to_string(), Value::String(tool_call_id));
+    }
+    if let Some(tool_calls) = message.tool_calls {
+        if !tool_calls.is_array() {
+            return Err(HermesError::State {
+                action: "saving session transcript",
+                detail: "Stored tool_calls payload was not an array.".to_string(),
+            });
+        }
+        map.insert("tool_calls".to_string(), tool_calls);
+    }
+    if let Some(reasoning_details) = message.reasoning_details {
+        map.insert("reasoning_details".to_string(), reasoning_details);
+    }
+    if let Some(codex_reasoning_items) = message.codex_reasoning_items {
+        map.insert("codex_reasoning_items".to_string(), codex_reasoning_items);
+    }
+    if let Some(codex_message_items) = message.codex_message_items {
+        map.insert("codex_message_items".to_string(), codex_message_items);
+    }
+    Ok(Value::Object(map))
+}
+
+fn message_record_to_append(message: &MessageRecord) -> MessageAppend {
+    MessageAppend {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_name: message.tool_name.clone(),
+        token_count: message.token_count,
+        finish_reason: message.finish_reason.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning_details: message.reasoning_details.clone(),
+        codex_reasoning_items: message.codex_reasoning_items.clone(),
+        codex_message_items: message.codex_message_items.clone(),
+    }
+}
+
+fn trim_last_exchange(mut records: Vec<MessageRecord>) -> (Vec<MessageRecord>, i64) {
+    let mut removed = 0_i64;
+    while records
+        .last()
+        .is_some_and(|message| matches!(message.role.trim(), "assistant" | "tool"))
+    {
+        records.pop();
+        removed += 1;
+    }
+    if records
+        .last()
+        .is_some_and(|message| message.role.trim() == "user")
+    {
+        records.pop();
+        removed += 1;
+    }
+    (records, removed)
 }
 
 fn active_store_session_ids(
@@ -3305,12 +3542,18 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use hermes_core::{MessageAppend, SessionCreate};
 
     fn test_state() -> Arc<Mutex<ProxyState>> {
         Arc::new(Mutex::new(ProxyState::default()))
+    }
+
+    fn cwd_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     #[test]
@@ -3770,6 +4013,158 @@ mod tests {
         .unwrap();
 
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn session_save_native_writes_current_session_transcript_json() {
+        let _cwd_guard = cwd_lock().lock().unwrap();
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-save".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-save".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                "stored-save",
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(json!("hello")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        let local_id = create_local_session(&state, Some("stored-save".to_string()), 80).unwrap();
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-save-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_root).unwrap();
+
+        let response = handle_session_save(
+            json!("r-save"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+        )
+        .unwrap()
+        .expect("native session.save response");
+
+        std::env::set_current_dir(&old_cwd).unwrap();
+
+        let file = response["result"]["file"].as_str().unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        assert_eq!(saved["model"], json!("gpt-save"));
+        assert_eq!(saved["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["messages"][0]["role"], json!("user"));
+        assert_eq!(saved["messages"][0]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn session_undo_native_rewrites_store_and_detaches_child_session() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-undo".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-undo".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for (role, content) in [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+            ("assistant", "second answer"),
+        ] {
+            store
+                .append_message(
+                    "stored-undo",
+                    &MessageAppend {
+                        role: role.to_string(),
+                        content: Some(json!(content)),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: None,
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        codex_reasoning_items: None,
+                        codex_message_items: None,
+                    },
+                )
+                .unwrap();
+        }
+        let local_id = create_local_session(&state, Some("stored-undo".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-undo", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "child.close");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"closed\":true}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_undo(
+            json!("r-undo"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("native session.undo response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["result"]["removed"], json!(2));
+        assert!(
+            lookup_child_session_id(&state, "rs_tui_00000001")
+                .unwrap()
+                .is_none()
+        );
+        assert!(session_exists(&state, "rs_tui_00000001").unwrap());
+
+        let messages = store.get_messages("stored-undo").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, Some(json!("first question")));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, Some(json!("first answer")));
     }
 
     #[test]
