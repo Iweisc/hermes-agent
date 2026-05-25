@@ -1032,12 +1032,19 @@ async fn run_chat_session_messages_async(
     model: Option<String>,
     messages: Vec<Value>,
     session_id: String,
-    _interrupt_requested: Option<Arc<AtomicBool>>,
-    _progress_callback: Option<AgentProgressCallback>,
+    interrupt_requested: Option<Arc<AtomicBool>>,
+    progress_callback: Option<AgentProgressCallback>,
 ) -> Result<hermes_core::AgentTurnResult, String> {
     tokio::task::spawn_blocking(move || {
-        run_chat_session_messages(&state, model, &messages, &session_id)
-            .map_err(|error| error.to_string())
+        run_chat_session_messages(
+            &state,
+            model,
+            &messages,
+            &session_id,
+            interrupt_requested.as_ref(),
+            progress_callback.as_ref(),
+        )
+        .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1108,6 +1115,8 @@ fn run_chat_session_messages(
     model: Option<String>,
     messages: &[Value],
     session_id: &str,
+    interrupt_requested: Option<&Arc<AtomicBool>>,
+    progress_callback: Option<&AgentProgressCallback>,
 ) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
     let user_content =
         extract_last_user_content(messages).map_err(|error| io::Error::other(error))?;
@@ -1157,15 +1166,19 @@ fn run_chat_session_messages(
     if session_store.get_messages(session_id)?.is_empty() {
         seed_chat_completion_session_history(&session_store, session_id, messages)?;
     }
-    Ok(state.context.run_chat_turn_with_user_content(
-        &state.loaded,
-        user_content,
-        &runtime,
-        Some(&enabled_toolsets),
-        &overrides,
-        Some(session_id),
-        Some(&session_store),
-    )?)
+    Ok(state
+        .context
+        .run_chat_turn_with_user_content_interruptible(
+            &state.loaded,
+            user_content,
+            &runtime,
+            Some(&enabled_toolsets),
+            &overrides,
+            Some(session_id),
+            Some(&session_store),
+            interrupt_requested,
+            progress_callback,
+        )?)
 }
 
 fn normalize_responses_input(input: &Value) -> Result<Vec<Value>, String> {
@@ -3448,6 +3461,111 @@ mod tests {
         assert!(body.contains("\"type\":\"function_call_output\""));
         assert!(body.contains("event: response.output_item.done"));
         assert!(body.contains("\"text\":\"tool stream hello\""));
+        assert!(body.contains("event: response.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_responses_stream_tool_events_with_session_id() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_todo_stream_session",
+                                "type": "function",
+                                "function": {
+                                    "name": "todo",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "session tool stream hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |_| {},
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let response = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "say hi",
+                "stream": true,
+                "session_id": "sess-response-stream-1",
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Hermes-Session-Id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sess-response-stream-1"
+        );
+        let body = response.text().unwrap();
+        assert!(body.contains("\"type\":\"function_call\""));
+        assert!(body.contains("\"call_id\":\"call_todo_stream_session\""));
+        assert!(body.contains("\"type\":\"function_call_output\""));
+        assert!(body.contains("event: response.output_item.done"));
+        assert!(body.contains("\"text\":\"session tool stream hello\""));
         assert!(body.contains("event: response.completed"));
 
         let _ = shutdown_tx.send(());

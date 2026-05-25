@@ -153,6 +153,31 @@ impl HermesContext {
         session_hint: Option<&str>,
         session_store: Option<&SessionStore>,
     ) -> Result<AgentTurnResult, HermesError> {
+        self.run_chat_turn_with_user_content_interruptible(
+            loaded,
+            user_content,
+            runtime,
+            enabled_toolsets,
+            overrides,
+            session_hint,
+            session_store,
+            None,
+            None,
+        )
+    }
+
+    pub fn run_chat_turn_with_user_content_interruptible(
+        &self,
+        loaded: &LoadedConfig,
+        user_content: Value,
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        session_hint: Option<&str>,
+        session_store: Option<&SessionStore>,
+        interrupt_requested: Option<&Arc<AtomicBool>>,
+        progress_callback: Option<&AgentProgressCallback>,
+    ) -> Result<AgentTurnResult, HermesError> {
         if !content_has_meaningful_user_input(&user_content) {
             return Err(HermesError::State {
                 action: "running agent turn",
@@ -268,6 +293,7 @@ impl HermesContext {
         let mut tool_calls = 0_u64;
 
         for _ in 0..loaded.config.agent.max_turns {
+            ensure_run_not_interrupted(interrupt_requested)?;
             api_calls += 1;
             let response = send_model_request(
                 &client,
@@ -276,6 +302,7 @@ impl HermesContext {
                 &tools,
                 session_id.as_deref(),
             )?;
+            ensure_run_not_interrupted(interrupt_requested)?;
             let NormalizedAssistantResponse {
                 content: assistant_content,
                 tool_calls: pending_tool_calls,
@@ -285,6 +312,18 @@ impl HermesContext {
                 codex_reasoning_items,
                 codex_message_items,
             } = response;
+            if let Some(reasoning) = reasoning
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ReasoningAvailable {
+                        text: reasoning.to_string(),
+                    },
+                );
+            }
 
             if pending_tool_calls.is_empty() {
                 let final_response = assistant_content
@@ -296,6 +335,12 @@ impl HermesContext {
                         detail: "Assistant response had no text content.".to_string(),
                     })?
                     .to_string();
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::MessageDelta {
+                        delta: final_response.clone(),
+                    },
+                );
                 if let Some(store) = session_store
                     && let Some(session_id) = session_id.as_deref()
                 {
@@ -370,8 +415,32 @@ impl HermesContext {
             }
 
             for tool_call in pending_tool_calls {
+                ensure_run_not_interrupted(interrupt_requested)?;
                 tool_calls += 1;
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ToolStarted {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        arguments: tool_call.arguments_raw.clone(),
+                    },
+                );
+                let started_at = Instant::now();
                 let result = dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                let duration_secs = started_at.elapsed().as_secs_f64();
+                let is_error = tool_result_indicates_error(&result);
+                emit_progress_event(
+                    progress_callback,
+                    AgentProgressEvent::ToolCompleted {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        arguments: tool_call.arguments_raw.clone(),
+                        result: result.clone(),
+                        duration_secs,
+                        is_error,
+                    },
+                );
+                ensure_run_not_interrupted(interrupt_requested)?;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
