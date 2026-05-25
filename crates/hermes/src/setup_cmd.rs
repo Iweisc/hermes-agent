@@ -5195,12 +5195,11 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        let mut input = io::Cursor::new(b"18\n".to_vec());
+        let mut input = io::Cursor::new(b"20\n".to_vec());
         let mut output = Vec::new();
         run_native_gateway_setup_with_io(&context, &mut input, &mut output).unwrap();
 
-        let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("accept= key="));
+        assert!(!log.exists());
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.contains("Gateway Setup"));
         assert!(rendered.contains("Messaging Platforms"));

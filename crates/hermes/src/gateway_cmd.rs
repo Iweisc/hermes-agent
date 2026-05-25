@@ -16,9 +16,10 @@ use clap::{Args, Subcommand};
 use hermes_core::{HermesContext, is_container, is_wsl};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 
-use crate::config_cmd::save_env_value;
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -885,7 +886,9 @@ pub(crate) fn run_gateway_setup_with_io(
             break;
         }
         let platform = &platforms[choice];
-        if gateway_platform_uses_native_standard_setup(platform) {
+        if configure_native_gateway_plugin_platform_with_io(context, platform, input, output)? {
+            continue;
+        } else if gateway_platform_uses_native_standard_setup(platform) {
             configure_standard_gateway_platform_with_io(context, platform, input, output)?;
         } else {
             run_gateway_platform_setup_bridge(accept_hooks, &platform.key)?;
@@ -1199,6 +1202,9 @@ const YUANBAO_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
+const IRC_REQUIRED_ENV: &[&str] = &["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"];
+const TEAMS_REQUIRED_ENV: &[&str] = &["TEAMS_CLIENT_ID", "TEAMS_CLIENT_SECRET", "TEAMS_TENANT_ID"];
+
 const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
     GatewaySetupPlatformSpec {
         key: "telegram",
@@ -1364,7 +1370,7 @@ fn load_gateway_setup_metadata(
     accept_hooks: bool,
 ) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
     let mut platforms = native_gateway_setup_metadata(context);
-    for platform in load_gateway_plugin_setup_metadata(accept_hooks)? {
+    for platform in load_gateway_plugin_setup_metadata(context, accept_hooks)? {
         if platforms
             .iter()
             .all(|existing| existing.key != platform.key)
@@ -1376,7 +1382,7 @@ fn load_gateway_setup_metadata(
 }
 
 fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
-    gateway_builtin_platform_specs()
+    let mut platforms = gateway_builtin_platform_specs()
         .iter()
         .map(|spec| GatewaySetupPlatform {
             key: spec.key.to_string(),
@@ -1405,7 +1411,9 @@ fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPla
                 })
                 .collect(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    platforms.extend(native_bundled_gateway_plugin_metadata(context));
+    platforms
 }
 
 fn native_gateway_platform_status(
@@ -1491,9 +1499,84 @@ fn native_gateway_platform_status(
     }
 }
 
+fn native_bundled_gateway_plugin_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
+    vec![
+        GatewaySetupPlatform {
+            key: String::from("irc"),
+            label: String::from("IRC"),
+            emoji: String::from("💬"),
+            status: native_gateway_plugin_platform_status(
+                context,
+                "irc",
+                &[("IRC_SERVER", "server"), ("IRC_CHANNEL", "channel")],
+            ),
+            token_var: String::from("IRC_SERVER"),
+            install_hint: Some(String::from("No extra packages needed (stdlib only)")),
+            setup_instructions: Vec::new(),
+            required_env: IRC_REQUIRED_ENV
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            has_builtin_setup: false,
+            has_plugin_setup: true,
+            vars: Vec::new(),
+        },
+        GatewaySetupPlatform {
+            key: String::from("teams"),
+            label: String::from("Microsoft Teams"),
+            emoji: String::from("💼"),
+            status: native_gateway_plugin_platform_status(
+                context,
+                "teams",
+                &[
+                    ("TEAMS_CLIENT_ID", "client_id"),
+                    ("TEAMS_CLIENT_SECRET", "client_secret"),
+                    ("TEAMS_TENANT_ID", "tenant_id"),
+                ],
+            ),
+            token_var: String::from("TEAMS_CLIENT_ID"),
+            install_hint: Some(String::from("pip install microsoft-teams-apps aiohttp")),
+            setup_instructions: Vec::new(),
+            required_env: TEAMS_REQUIRED_ENV
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            has_builtin_setup: false,
+            has_plugin_setup: true,
+            vars: Vec::new(),
+        },
+    ]
+}
+
+fn native_gateway_plugin_platform_status(
+    context: &HermesContext,
+    platform: &str,
+    required: &[(&str, &str)],
+) -> String {
+    let configured = required
+        .iter()
+        .filter(|(env_key, extra_key)| {
+            read_effective_env_value(context, env_key)
+                .or_else(|| read_gateway_platform_extra_value(context, platform, extra_key))
+                .is_some()
+        })
+        .count();
+    if configured == required.len() {
+        "configured".to_string()
+    } else if configured > 0 {
+        "partially configured".to_string()
+    } else {
+        "not configured".to_string()
+    }
+}
+
 fn load_gateway_plugin_setup_metadata(
+    context: &HermesContext,
     accept_hooks: bool,
 ) -> Result<Vec<GatewaySetupPlatform>, Box<dyn Error>> {
+    if !gateway_has_enabled_user_plugins(context)? {
+        return Ok(Vec::new());
+    }
     let root = project_root();
     let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
         return Ok(Vec::new());
@@ -1521,6 +1604,27 @@ fn load_gateway_plugin_setup_metadata(
     }
     serde_json::from_str::<Vec<GatewaySetupPlatform>>(trimmed)
         .map_err(|error| format!("invalid gateway plugin setup metadata: {error}").into())
+}
+
+fn gateway_has_enabled_user_plugins(context: &HermesContext) -> Result<bool, Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let Some(plugins) = root
+        .get(YamlValue::String(String::from("plugins")))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return Ok(false);
+    };
+    let Some(enabled) = plugins
+        .get(YamlValue::String(String::from("enabled")))
+        .and_then(YamlValue::as_sequence)
+    else {
+        return Ok(false);
+    };
+    Ok(enabled
+        .iter()
+        .filter_map(YamlValue::as_str)
+        .map(str::trim)
+        .any(|value| !value.is_empty()))
 }
 
 fn run_gateway_platform_setup_bridge(
@@ -1704,6 +1808,260 @@ fn configure_standard_gateway_platform_with_io(
     Ok(())
 }
 
+fn configure_native_gateway_plugin_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<bool, Box<dyn Error>> {
+    match platform.key.as_str() {
+        "irc" => {
+            configure_irc_gateway_platform_with_io(context, input, output)?;
+            Ok(true)
+        }
+        "teams" => {
+            configure_teams_gateway_platform_with_io(context, input, output)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn configure_irc_gateway_platform_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "─── 💬 IRC Setup ───")?;
+    if let Some(existing_server) = read_effective_env_value(context, "IRC_SERVER") {
+        writeln!(output)?;
+        writeln!(output, "IRC is already configured for {existing_server}.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure IRC?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Connect Hermes to Libera.Chat, OFTC, ZNC, InspIRCd, or another IRC network."
+    )?;
+
+    let server = prompt_gateway_required_line(
+        input,
+        output,
+        "  IRC server hostname (e.g. irc.libera.chat)",
+        "Server is required — skipping IRC setup.",
+    )?;
+    let Some(server) = server else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "IRC_SERVER", &server)?;
+
+    let use_tls = prompt_gateway_yes_no(input, output, "Use TLS (recommended)?", true)?;
+    save_env_value(
+        context.env_path(),
+        "IRC_USE_TLS",
+        if use_tls { "true" } else { "false" },
+    )?;
+
+    let default_port = if use_tls { "6697" } else { "6667" };
+    let port = prompt_gateway_line(
+        input,
+        output,
+        format!("  Port (default {default_port})").as_str(),
+    )?;
+    let port = port.trim();
+    if !port.is_empty() {
+        if port.parse::<u16>().is_ok() {
+            save_env_value(context.env_path(), "IRC_PORT", port)?;
+        } else {
+            writeln!(output, "  Invalid port — using default {default_port}.")?;
+        }
+    } else if read_effective_env_value(context, "IRC_PORT").is_some() {
+        save_env_value(context.env_path(), "IRC_PORT", "")?;
+    }
+
+    let nickname = prompt_gateway_required_line(
+        input,
+        output,
+        "  Bot nickname (e.g. hermes-bot)",
+        "Nickname is required — skipping IRC setup.",
+    )?;
+    let Some(nickname) = nickname else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "IRC_NICKNAME", &nickname)?;
+
+    let channel = prompt_gateway_required_line(
+        input,
+        output,
+        "  Channel to join (e.g. #hermes, comma-separated for multiple)",
+        "Channel is required — skipping IRC setup.",
+    )?;
+    let Some(channel) = channel else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "IRC_CHANNEL", &channel)?;
+
+    writeln!(output)?;
+    writeln!(output, "  Optional authentication. Leave blank to skip.")?;
+    if prompt_gateway_yes_no(input, output, "Configure a server password?", false)? {
+        let server_password = prompt_gateway_line(input, output, "  Server password")?;
+        if !server_password.trim().is_empty() {
+            save_env_value(
+                context.env_path(),
+                "IRC_SERVER_PASSWORD",
+                server_password.trim(),
+            )?;
+        }
+    }
+    if prompt_gateway_yes_no(input, output, "Identify with NickServ on connect?", false)? {
+        let nickserv = prompt_gateway_line(input, output, "  NickServ password")?;
+        if !nickserv.trim().is_empty() {
+            save_env_value(context.env_path(), "IRC_NICKSERV_PASSWORD", nickserv.trim())?;
+        }
+    }
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  IRC nicks are not authenticated; restrict access for shared channels."
+    )?;
+    if prompt_gateway_yes_no(
+        input,
+        output,
+        "Allow all users in the channel to talk to the bot?",
+        false,
+    )? {
+        save_env_value(context.env_path(), "IRC_ALLOW_ALL_USERS", "true")?;
+        save_env_value(context.env_path(), "IRC_ALLOWED_USERS", "")?;
+        writeln!(output, "  Open access enabled for IRC.")?;
+    } else {
+        save_env_value(context.env_path(), "IRC_ALLOW_ALL_USERS", "false")?;
+        let allowed = prompt_gateway_line(
+            input,
+            output,
+            "  Allowed nicks (comma-separated, leave empty to deny everyone)",
+        )?;
+        save_env_value(
+            context.env_path(),
+            "IRC_ALLOWED_USERS",
+            &allowed.replace(' ', ""),
+        )?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "💬 IRC configured!")?;
+    Ok(())
+}
+
+fn configure_teams_gateway_platform_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "─── 💼 Microsoft Teams Setup ───")?;
+    if let Some(existing_id) = read_effective_env_value(context, "TEAMS_CLIENT_ID") {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "Teams is already configured for app ID {existing_id}."
+        )?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure Teams?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    writeln!(output, "  Install and log in with the Teams CLI first:")?;
+    writeln!(output, "    npm install -g @microsoft/teams.cli@preview")?;
+    writeln!(output, "    teams login")?;
+    writeln!(output, "  Expose port 3978 publicly, then create your bot:")?;
+    writeln!(
+        output,
+        "    teams app create --name \"Hermes\" --endpoint \"https://<tunnel>/api/messages\""
+    )?;
+
+    let client_id = prompt_gateway_required_line(
+        input,
+        output,
+        "  Client ID",
+        "Client ID is required — skipping Teams setup.",
+    )?;
+    let Some(client_id) = client_id else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "TEAMS_CLIENT_ID", &client_id)?;
+
+    let client_secret = prompt_gateway_required_line(
+        input,
+        output,
+        "  Client secret",
+        "Client secret is required — skipping Teams setup.",
+    )?;
+    let Some(client_secret) = client_secret else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "TEAMS_CLIENT_SECRET", &client_secret)?;
+
+    let tenant_id = prompt_gateway_required_line(
+        input,
+        output,
+        "  Tenant ID",
+        "Tenant ID is required — skipping Teams setup.",
+    )?;
+    let Some(tenant_id) = tenant_id else {
+        return Ok(());
+    };
+    save_env_value(context.env_path(), "TEAMS_TENANT_ID", &tenant_id)?;
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  To find your AAD object ID for the allowlist: teams status --verbose"
+    )?;
+    if prompt_gateway_yes_no(
+        input,
+        output,
+        "Restrict access to specific users? (recommended)",
+        true,
+    )? {
+        let allowed =
+            prompt_gateway_line(input, output, "  Allowed AAD object IDs (comma-separated)")?;
+        save_env_value(
+            context.env_path(),
+            "TEAMS_ALLOWED_USERS",
+            &allowed.replace(' ', ""),
+        )?;
+        remove_env_key_if_present(&context.env_path(), "TEAMS_ALLOW_ALL_USERS")?;
+    } else {
+        save_env_value(context.env_path(), "TEAMS_ALLOW_ALL_USERS", "true")?;
+        writeln!(output, "  Open access enabled for Teams.")?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "💼 Microsoft Teams configured!")?;
+    Ok(())
+}
+
+fn prompt_gateway_required_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    prompt: &str,
+    missing_message: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let value = prompt_gateway_line(input, output, prompt)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        writeln!(output, "  {missing_message}")?;
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 fn prompt_gateway_menu_choice(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
@@ -1775,6 +2133,32 @@ fn read_effective_env_value(context: &HermesContext, key: &str) -> Option<String
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| read_env_file_value(&context.env_path(), key))
+}
+
+fn read_gateway_platform_extra_value(
+    context: &HermesContext,
+    platform: &str,
+    key: &str,
+) -> Option<String> {
+    let root = read_raw_yaml_mapping(&context.config_path()).ok()?;
+    root.get(YamlValue::String(String::from("platforms")))
+        .and_then(YamlValue::as_mapping)?
+        .get(YamlValue::String(platform.to_string()))
+        .and_then(YamlValue::as_mapping)?
+        .get(YamlValue::String(String::from("extra")))
+        .and_then(YamlValue::as_mapping)?
+        .get(YamlValue::String(key.to_string()))
+        .and_then(yaml_scalar_string)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn yaml_scalar_string(value: &YamlValue) -> Option<String> {
+    match value {
+        YamlValue::String(text) => Some(text.trim().to_string()),
+        YamlValue::Number(number) => Some(number.to_string()),
+        YamlValue::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn read_env_file_value(path: &Path, key: &str) -> Option<String> {
@@ -3558,6 +3942,12 @@ exit 9\n",
 
         let _guard = test_env_lock().lock().unwrap();
         let (_home, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        fs::write(
+            context.config_path(),
+            "plugins:\n  enabled:\n    - custom-platform\n",
+        )
+        .unwrap();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
@@ -3568,7 +3958,7 @@ exit 9\n",
 if [ \"$1\" = \"-c\" ]; then\n\
   printf 'metadata accept=%s platform=%s\\n' \"$HERMES_ACCEPT_HOOKS\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
   cat <<'JSON'\n\
-[{{\"key\":\"irc\",\"label\":\"IRC\",\"emoji\":\"#\",\"status\":\"not configured\",\"token_var\":\"IRC_SERVER\",\"required_env\":[\"IRC_SERVER\",\"IRC_CHANNEL\"],\"has_plugin_setup\":true}}]\n\
+[{{\"key\":\"customchat\",\"label\":\"Custom Chat\",\"emoji\":\"#\",\"status\":\"not configured\",\"token_var\":\"CUSTOM_TOKEN\",\"required_env\":[\"CUSTOM_TOKEN\"],\"has_plugin_setup\":true}}]\n\
 JSON\n\
   exit 0\n\
 fi\n\
@@ -3602,10 +3992,53 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "irc")
             .unwrap();
-        assert_eq!(irc.required_env, vec!["IRC_SERVER", "IRC_CHANNEL"]);
+        assert_eq!(
+            irc.required_env,
+            vec!["IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"]
+        );
         assert!(irc.has_plugin_setup);
+        let custom = metadata
+            .iter()
+            .find(|platform| platform.key == "customchat")
+            .unwrap();
+        assert_eq!(custom.required_env, vec!["CUSTOM_TOKEN"]);
         let log_text = fs::read_to_string(&log).unwrap();
         assert!(log_text.contains("metadata accept=1 platform="));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gateway_setup_metadata_skips_plugin_bridge_without_enabled_user_plugins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_home, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        let metadata = load_gateway_setup_metadata(&context, true).unwrap();
+
+        assert!(metadata.iter().any(|platform| platform.key == "irc"));
+        assert!(metadata.iter().any(|platform| platform.key == "teams"));
+        assert!(!log.exists());
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -3620,6 +4053,11 @@ exit 9\n",
             "EMAIL_IMAP_HOST",
             "EMAIL_SMTP_HOST",
             "WHATSAPP_ENABLED",
+            "IRC_SERVER",
+            "IRC_CHANNEL",
+            "TEAMS_CLIENT_ID",
+            "TEAMS_CLIENT_SECRET",
+            "TEAMS_TENANT_ID",
         ] {
             remove_env_var(key);
         }
@@ -3634,6 +4072,12 @@ exit 9\n",
         save_env_value(context.env_path(), "EMAIL_IMAP_HOST", "imap.example.com").unwrap();
         save_env_value(context.env_path(), "EMAIL_SMTP_HOST", "smtp.example.com").unwrap();
         save_env_value(context.env_path(), "WHATSAPP_ENABLED", "true").unwrap();
+        fs::write(
+            context.config_path(),
+            "platforms:\n  irc:\n    extra:\n      server: irc.libera.chat\n      channel: '#hermes'\n",
+        )
+        .unwrap();
+        save_env_value(context.env_path(), "TEAMS_CLIENT_ID", "teams-client").unwrap();
 
         let metadata = native_gateway_setup_metadata(&context);
         let email = metadata
@@ -3646,6 +4090,16 @@ exit 9\n",
             .find(|platform| platform.key == "whatsapp")
             .unwrap();
         assert_eq!(whatsapp.status, "configured + paired");
+        let irc = metadata
+            .iter()
+            .find(|platform| platform.key == "irc")
+            .unwrap();
+        assert_eq!(irc.status, "configured");
+        let teams = metadata
+            .iter()
+            .find(|platform| platform.key == "teams")
+            .unwrap();
+        assert_eq!(teams.status, "partially configured");
     }
 
     #[test]
@@ -3750,6 +4204,44 @@ exit 9\n",
         assert!(env_text.contains("EMAIL_IMAP_HOST=imap.example.com"));
         assert!(env_text.contains("EMAIL_SMTP_HOST=smtp.example.com"));
         assert!(env_text.contains("EMAIL_ALLOWED_USERS=me@example.com,ops@example.com"));
+    }
+
+    #[test]
+    fn configure_irc_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let mut input = Cursor::new(
+            "irc.libera.chat\n\n\nhermes-bot\n#hermes\nn\ny\nnickpass\nn\nalice, bob\n",
+        );
+        let mut output = Vec::new();
+
+        configure_irc_gateway_platform_with_io(&context, &mut input, &mut output).unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("IRC_SERVER=irc.libera.chat"));
+        assert!(env_text.contains("IRC_USE_TLS=true"));
+        assert!(env_text.contains("IRC_NICKNAME=hermes-bot"));
+        assert!(env_text.contains("IRC_CHANNEL=#hermes"));
+        assert!(env_text.contains("IRC_NICKSERV_PASSWORD=nickpass"));
+        assert!(env_text.contains("IRC_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("IRC_ALLOWED_USERS=alice,bob"));
+    }
+
+    #[test]
+    fn configure_teams_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let mut input = Cursor::new("client-id\nclient-secret\ntenant-id\n\nuser-1, user-2\n");
+        let mut output = Vec::new();
+
+        configure_teams_gateway_platform_with_io(&context, &mut input, &mut output).unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TEAMS_CLIENT_ID=client-id"));
+        assert!(env_text.contains("TEAMS_CLIENT_SECRET=client-secret"));
+        assert!(env_text.contains("TEAMS_TENANT_ID=tenant-id"));
+        assert!(env_text.contains("TEAMS_ALLOWED_USERS=user-1,user-2"));
+        assert!(!env_text.contains("TEAMS_ALLOW_ALL_USERS=true"));
     }
 
     #[test]
