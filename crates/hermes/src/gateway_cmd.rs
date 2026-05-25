@@ -1159,6 +1159,13 @@ const DINGTALK_SETUP_INSTRUCTIONS: &[&str] = &[
     "4. Add the bot to a group chat or message it directly",
 ];
 
+const WECOM_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Create a smart robot in WeCom Application → Workspace → Smart Robot",
+    "2. Select API Mode and copy the Bot ID and Secret, or use QR setup below",
+    "3. The bot connects by WebSocket — no public callback URL is required",
+    "4. Restrict access with WECOM_ALLOWED_USERS or DM pairing for production use",
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1535,8 +1542,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "WeCom (Enterprise WeChat)",
         emoji: "💬",
         token_var: "WECOM_BOT_ID",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: WECOM_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -1709,6 +1716,16 @@ fn native_gateway_platform_status(
             if val.is_some() && password.is_some() {
                 "configured".to_string()
             } else if val.is_some() || password.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "wecom" => {
+            let secret = read_effective_env_value(context, "WECOM_SECRET");
+            if val.is_some() && secret.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || secret.is_some() {
                 "partially configured".to_string()
             } else {
                 "not configured".to_string()
@@ -2222,6 +2239,10 @@ fn configure_native_gateway_builtin_platform_with_io(
         }
         "dingtalk" => {
             configure_dingtalk_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
+        "wecom" => {
+            configure_wecom_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -2830,6 +2851,359 @@ fn dingtalk_json_string(value: &JsonValue, key: &str) -> Option<String> {
 
 fn dingtalk_json_u64(value: &JsonValue, key: &str) -> Option<u64> {
     value.get(key).and_then(JsonValue::as_u64)
+}
+
+fn configure_wecom_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_bot_id = read_effective_env_value(context, "WECOM_BOT_ID");
+    let existing_secret = read_effective_env_value(context, "WECOM_SECRET");
+    if existing_bot_id.is_some() && existing_secret.is_some() {
+        writeln!(output)?;
+        writeln!(output, "WeCom is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure WeCom?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    let method = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How would you like to set up WeCom?",
+        &[
+            "Scan QR code to obtain Bot ID and Secret automatically (recommended)",
+            "Enter existing Bot ID and Secret manually",
+        ],
+    )?;
+
+    let configured = if method == 0 {
+        match wecom_qr_scan_for_bot_info_with_io(output) {
+            Ok(Some((bot_id, secret))) => {
+                save_env_value(context.env_path(), "WECOM_BOT_ID", &bot_id)?;
+                save_env_value(context.env_path(), "WECOM_SECRET", &secret)?;
+                writeln!(output, "  QR scan successful. Bot ID and Secret saved.")?;
+                true
+            }
+            Ok(None) => {
+                writeln!(
+                    output,
+                    "  QR scan did not complete. Continuing with manual input."
+                )?;
+                configure_wecom_manual_credentials(context, input, output)?
+            }
+            Err(error) => {
+                writeln!(output, "  QR scan failed: {error}")?;
+                writeln!(output, "  Continuing with manual input.")?;
+                configure_wecom_manual_credentials(context, input, output)?
+            }
+        }
+    } else {
+        configure_wecom_manual_credentials(context, input, output)?
+    };
+
+    if !configured {
+        return Ok(());
+    }
+
+    configure_wecom_access_policy(context, input, output)?;
+
+    writeln!(output)?;
+    writeln!(output, "  Chat ID for scheduled results and notifications.")?;
+    let home = prompt_gateway_line(
+        input,
+        output,
+        "  Home chat ID (optional, for cron/notifications)",
+    )?;
+    if !home.trim().is_empty() {
+        save_env_value(context.env_path(), "WECOM_HOME_CHANNEL", home.trim())?;
+        writeln!(output, "  Home channel set to {}", home.trim())?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    Ok(())
+}
+
+fn configure_wecom_manual_credentials(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<bool, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  1. Go to WeCom Application → Workspace → Smart Robot → Create smart robots"
+    )?;
+    writeln!(output, "  2. Select API Mode")?;
+    writeln!(
+        output,
+        "  3. Copy the Bot ID and Secret from the bot's credentials info"
+    )?;
+    writeln!(
+        output,
+        "  4. The bot connects via WebSocket — no public endpoint needed"
+    )?;
+
+    let Some(bot_id) = prompt_gateway_required_line(
+        input,
+        output,
+        "  Bot ID",
+        "Skipped — WeCom won't work without a Bot ID.",
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(secret) = prompt_gateway_required_line(
+        input,
+        output,
+        "  Secret",
+        "Skipped — WeCom won't work without a Secret.",
+    )?
+    else {
+        return Ok(false);
+    };
+    save_env_value(context.env_path(), "WECOM_BOT_ID", &bot_id)?;
+    save_env_value(context.env_path(), "WECOM_SECRET", &secret)?;
+    Ok(true)
+}
+
+fn configure_wecom_access_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  The gateway denies all users by default for security."
+    )?;
+    writeln!(
+        output,
+        "  Enter user IDs to create an allowlist, or leave empty."
+    )?;
+    let allowed = prompt_gateway_line(
+        input,
+        output,
+        "  Allowed user IDs (comma-separated, or empty)",
+    )?;
+    if !allowed.trim().is_empty() {
+        let cleaned = normalize_gateway_allowlist("WECOM_ALLOWED_USERS", allowed.trim());
+        save_env_value(context.env_path(), "WECOM_ALLOWED_USERS", &cleaned)?;
+        remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+        writeln!(
+            output,
+            "  Saved — only these users can interact with the bot."
+        )?;
+        return Ok(());
+    }
+
+    writeln!(output)?;
+    let access_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should unauthorized users be handled?",
+        &[
+            "Enable open access (anyone can message the bot)",
+            "Use DM pairing (unknown users request access, you approve with 'hermes pairing approve')",
+            "Disable direct messages",
+            "Skip for now (bot will deny all users until configured)",
+        ],
+    )?;
+    match access_idx {
+        0 => {
+            save_env_value(context.env_path(), "WECOM_DM_POLICY", "open")?;
+            save_env_value(context.env_path(), "GATEWAY_ALLOW_ALL_USERS", "true")?;
+            writeln!(output, "  Open access enabled.")?;
+        }
+        1 => {
+            save_env_value(context.env_path(), "WECOM_DM_POLICY", "pairing")?;
+            remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+            writeln!(
+                output,
+                "  DM pairing mode selected. Approve codes with `hermes pairing approve`."
+            )?;
+        }
+        2 => {
+            save_env_value(context.env_path(), "WECOM_DM_POLICY", "disabled")?;
+            remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+            writeln!(output, "  Direct messages disabled.")?;
+        }
+        3 => {
+            remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+            writeln!(
+                output,
+                "  Skipped — configure later with `hermes gateway setup`."
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn wecom_qr_scan_for_bot_info_with_io(
+    output: &mut dyn Write,
+) -> Result<Option<(String, String)>, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "  Requesting WeCom QR authorization code...")?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let generated = wecom_get_json(&client, &wecom_qr_generate_url(), "generate QR code")?;
+    let scode = wecom_nested_json_string(&generated, &["data", "scode"])
+        .ok_or("WeCom QR response missing scode")?;
+    let auth_url = wecom_nested_json_string(&generated, &["data", "auth_url"]);
+    let page_url = wecom_qr_code_page_url(&scode);
+
+    writeln!(output)?;
+    writeln!(output, "  Open this URL in WeCom on your phone:")?;
+    writeln!(output, "  {page_url}")?;
+    if let Some(auth_url) = auth_url.filter(|value| value != &page_url) {
+        writeln!(output, "  Auth URL: {auth_url}")?;
+    }
+    writeln!(output)?;
+    writeln!(output, "  Waiting for QR scan confirmation...")?;
+
+    let interval = Duration::from_millis(wecom_env_u64("WECOM_QR_POLL_INTERVAL_MS", 3000).max(1));
+    let timeout_ms = wecom_env_u64("WECOM_QR_TIMEOUT_MS", 300_000).max(1);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        let poll = wecom_get_json(&client, &wecom_qr_query_url(&scode), "query QR scan result")?;
+        let status = wecom_nested_json_string(&poll, &["data", "status"])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if status == "success" {
+            let bot_id = wecom_nested_json_string(&poll, &["data", "bot_info", "botid"])
+                .or_else(|| wecom_nested_json_string(&poll, &["data", "bot_info", "bot_id"]))
+                .ok_or("WeCom QR success response missing bot ID")?;
+            let secret = wecom_nested_json_string(&poll, &["data", "bot_info", "secret"])
+                .ok_or("WeCom QR success response missing secret")?;
+            return Ok(Some((bot_id, secret)));
+        }
+        if matches!(
+            status.as_str(),
+            "failed" | "fail" | "expired" | "cancelled" | "canceled"
+        ) {
+            return Err(format!("WeCom QR scan status: {status}").into());
+        }
+        sleep(interval);
+    }
+    Ok(None)
+}
+
+fn wecom_get_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    action: &str,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let response = client.get(url).send()?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("WeCom {action} returned HTTP {status}").into());
+    }
+    Ok(response.json::<JsonValue>()?)
+}
+
+fn wecom_qr_generate_url() -> String {
+    let base = env::var("WECOM_QR_GENERATE_URL")
+        .unwrap_or_else(|_| String::from("https://work.weixin.qq.com/ai/qc/generate"))
+        .trim()
+        .to_string();
+    if base.contains("source=") {
+        base
+    } else {
+        append_url_query_param(&base, "source", "hermes")
+    }
+}
+
+fn wecom_qr_query_url(scode: &str) -> String {
+    let base = env::var("WECOM_QR_QUERY_URL")
+        .unwrap_or_else(|_| String::from("https://work.weixin.qq.com/ai/qc/query_result"))
+        .trim()
+        .to_string();
+    append_url_query_param(&base, "scode", scode)
+}
+
+fn wecom_qr_code_page_url(scode: &str) -> String {
+    let base = env::var("WECOM_QR_CODE_PAGE")
+        .unwrap_or_else(|_| {
+            String::from("https://work.weixin.qq.com/ai/qc/gen?source=hermes&scode=")
+        })
+        .trim()
+        .to_string();
+    let encoded = percent_encode_url_component(scode);
+    if base.contains("{scode}") {
+        return base.replace("{scode}", &encoded);
+    }
+    if base.ends_with('=') || base.ends_with('/') {
+        format!("{base}{encoded}")
+    } else {
+        append_url_query_param(&base, "scode", scode)
+    }
+}
+
+fn append_url_query_param(url: &str, key: &str, value: &str) -> String {
+    let separator = if url.contains('?') {
+        if url.ends_with('?') || url.ends_with('&') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+    format!(
+        "{url}{separator}{key}={}",
+        percent_encode_url_component(value)
+    )
+}
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn wecom_env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn wecom_nested_json_string(value: &JsonValue, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
@@ -5075,6 +5449,13 @@ exit 9\n",
         assert!(!dingtalk.has_builtin_setup);
         assert!(!gateway_platform_uses_native_standard_setup(dingtalk));
 
+        let wecom = metadata
+            .iter()
+            .find(|platform| platform.key == "wecom")
+            .unwrap();
+        assert!(!wecom.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(wecom));
+
         let feishu = metadata
             .iter()
             .find(|platform| platform.key == "feishu")
@@ -5174,6 +5555,11 @@ exit 9\n",
             "DINGTALK_CLIENT_ID",
             "DINGTALK_CLIENT_SECRET",
             "DINGTALK_ALLOW_ALL_USERS",
+            "WECOM_BOT_ID",
+            "WECOM_SECRET",
+            "WECOM_ALLOWED_USERS",
+            "WECOM_DM_POLICY",
+            "WECOM_HOME_CHANNEL",
         ] {
             remove_env_var(key);
         }
@@ -5231,6 +5617,11 @@ exit 9\n",
             .find(|platform| platform.key == "dingtalk")
             .unwrap();
         assert_eq!(dingtalk.status, "not configured");
+        let wecom = metadata
+            .iter()
+            .find(|platform| platform.key == "wecom")
+            .unwrap();
+        assert_eq!(wecom.status, "not configured");
     }
 
     #[test]
@@ -5511,6 +5902,171 @@ exit 9\n",
         remove_env_var("DINGTALK_REGISTRATION_SOURCE");
         remove_env_var("HERMES_GATEWAY_PYTHON");
         remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_wecom_gateway_platform_uses_native_qr_flow_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "WECOM_BOT_ID",
+            "WECOM_SECRET",
+            "WECOM_ALLOWED_USERS",
+            "WECOM_DM_POLICY",
+            "WECOM_HOME_CHANNEL",
+            "GATEWAY_ALLOW_ALL_USERS",
+            "WECOM_QR_GENERATE_URL",
+            "WECOM_QR_QUERY_URL",
+            "WECOM_QR_CODE_PAGE",
+            "WECOM_QR_POLL_INTERVAL_MS",
+            "WECOM_QR_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("WECOM_QR_GENERATE_URL", format!("http://{addr}/generate"));
+        set_env_var("WECOM_QR_QUERY_URL", format!("http://{addr}/query_result"));
+        set_env_var(
+            "WECOM_QR_CODE_PAGE",
+            format!("http://{addr}/gen?source=hermes&scode="),
+        );
+        set_env_var("WECOM_QR_POLL_INTERVAL_MS", "1");
+        set_env_var("WECOM_QR_TIMEOUT_MS", "1000");
+        let server = std::thread::spawn(move || {
+            let responses = [
+                r#"{"data":{"scode":"scode-1","auth_url":"https://example.com/auth"}}"#,
+                r#"{"data":{"status":"success","bot_info":{"botid":"wecom-bot","secret":"wecom-secret"}}}"#,
+            ];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut next = 0;
+            while next < responses.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let body = responses[next];
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        next += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "wecom")
+            .unwrap();
+        let mut input = Cursor::new("1\nuser-a, user-b\nchat-1\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("WECOM_BOT_ID=wecom-bot"));
+        assert!(env_text.contains("WECOM_SECRET=wecom-secret"));
+        assert!(env_text.contains("WECOM_ALLOWED_USERS=user-a,user-b"));
+        assert!(env_text.contains("WECOM_HOME_CHANNEL=chat-1"));
+        assert!(!env_text.contains("GATEWAY_ALLOW_ALL_USERS=true"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "wecom")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        for key in [
+            "WECOM_QR_GENERATE_URL",
+            "WECOM_QR_QUERY_URL",
+            "WECOM_QR_CODE_PAGE",
+            "WECOM_QR_POLL_INTERVAL_MS",
+            "WECOM_QR_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+    }
+
+    #[test]
+    fn configure_wecom_gateway_platform_writes_manual_credentials_and_pairing_policy() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "WECOM_BOT_ID",
+            "WECOM_SECRET",
+            "WECOM_ALLOWED_USERS",
+            "WECOM_DM_POLICY",
+            "WECOM_HOME_CHANNEL",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ] {
+            remove_env_var(key);
+        }
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "wecom")
+            .unwrap();
+        let mut input = Cursor::new("2\nbot-id\nsecret\n\n2\nhome-chat\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("WECOM_BOT_ID=bot-id"));
+        assert!(env_text.contains("WECOM_SECRET=secret"));
+        assert!(env_text.contains("WECOM_DM_POLICY=pairing"));
+        assert!(env_text.contains("WECOM_HOME_CHANNEL=home-chat"));
+        assert!(!env_text.contains("GATEWAY_ALLOW_ALL_USERS=true"));
     }
 
     #[test]
