@@ -15,13 +15,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Subcommand};
 use getrandom::fill as fill_random;
+use hermes_core::gateway::{
+    GatewayHostActionHandler, GatewayNotification, GatewayReloadMcpDirective, GatewayRuntime,
+    RestartLaunchMode, format_reload_mcp_directive_message,
+};
 use hermes_core::{HermesContext, is_container, is_wsl};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 
-use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
+use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, set_config_json_value};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -138,6 +142,41 @@ struct LegacyGatewayUnit {
 struct GatewayProcess {
     pid: i64,
     command: String,
+}
+
+struct NativeGatewayHostActionHandler<'a> {
+    context: &'a HermesContext,
+}
+
+impl<'a> NativeGatewayHostActionHandler<'a> {
+    fn new(context: &'a HermesContext) -> Self {
+        Self { context }
+    }
+}
+
+impl GatewayHostActionHandler for NativeGatewayHostActionHandler<'_> {
+    fn send_notification(&mut self, _notification: &GatewayNotification) -> Result<bool, String> {
+        Err("native gateway host notifications are not implemented".to_string())
+    }
+
+    fn schedule_restart(&mut self, _launch_mode: RestartLaunchMode) -> Result<(), String> {
+        Err("native gateway restart scheduling is not implemented".to_string())
+    }
+
+    fn persist_config_value(&mut self, key: &str, value: &JsonValue) -> Result<(), String> {
+        set_config_json_value(self.context, key, value).map_err(|error| error.to_string())
+    }
+}
+
+fn execute_reload_mcp_directive_native(
+    context: &HermesContext,
+    runtime: &GatewayRuntime,
+    directive: &GatewayReloadMcpDirective,
+    reload_result: Option<&str>,
+) -> Result<String, String> {
+    let mut handler = NativeGatewayHostActionHandler::new(context);
+    let execution = runtime.execute_reload_mcp_directive(directive, &mut handler)?;
+    format_reload_mcp_directive_message(&execution, reload_result)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -6626,6 +6665,9 @@ fn remove_env_var(key: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use hermes_core::gateway::{
+        BusyInputMode, RuntimeConfig, reload_mcp_disable_confirmation_action,
+    };
     use std::io::{Cursor, Read, Write};
     use tempfile::TempDir;
 
@@ -6669,6 +6711,75 @@ mod tests {
         let mut raw = nonce.to_vec();
         raw.extend_from_slice(&in_out);
         BASE64_STANDARD.encode(raw)
+    }
+
+    #[test]
+    fn native_gateway_host_handler_persists_config_value() {
+        let (_temp, context) = test_context();
+        let mut handler = NativeGatewayHostActionHandler::new(&context);
+
+        handler
+            .persist_config_value("approvals.mcp_reload_confirm", &JsonValue::Bool(false))
+            .unwrap();
+
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("approvals:"));
+        assert!(saved.contains("mcp_reload_confirm: false"));
+    }
+
+    #[test]
+    fn execute_reload_mcp_directive_native_persists_config_and_formats_message() {
+        let (temp, context) = test_context();
+        let runtime_dir = temp.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let runtime =
+            GatewayRuntime::new(&runtime_dir, RuntimeConfig::default(), BusyInputMode::Queue)
+                .unwrap();
+
+        let message = execute_reload_mcp_directive_native(
+            &context,
+            &runtime,
+            &GatewayReloadMcpDirective::RunReload {
+                callback_presentation: None,
+                host_actions: vec![reload_mcp_disable_confirmation_action()],
+                success_suffix: Some(
+                    "Future /reload-mcp commands will run without confirmation.".to_string(),
+                ),
+            },
+            Some("MCP servers reloaded successfully."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            message,
+            "MCP servers reloaded successfully.\n\nFuture /reload-mcp commands will run without confirmation."
+        );
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("approvals:"));
+        assert!(saved.contains("mcp_reload_confirm: false"));
+    }
+
+    #[test]
+    fn execute_reload_mcp_directive_native_returns_message_without_reload_result() {
+        let (temp, context) = test_context();
+        let runtime_dir = temp.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let runtime =
+            GatewayRuntime::new(&runtime_dir, RuntimeConfig::default(), BusyInputMode::Queue)
+                .unwrap();
+
+        let message = execute_reload_mcp_directive_native(
+            &context,
+            &runtime,
+            &GatewayReloadMcpDirective::ReturnMessage {
+                callback_presentation: None,
+                message: "Cancelled MCP reload.".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(message, "Cancelled MCP reload.");
     }
 
     #[test]

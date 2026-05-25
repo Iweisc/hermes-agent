@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Duration, Local, NaiveDateTime, Timelike};
 use getrandom::fill as fill_random;
@@ -29,6 +31,8 @@ pub const UPDATE_TIMEOUT_EXIT_CODE: i32 = 124;
 pub const DEFAULT_TELEGRAM_FOLLOWUP_GRACE_SECONDS: f64 = 3.0;
 pub const STARTUP_RECENT_ACTIVITY_WINDOW_SECONDS: i64 = 120;
 pub const STUCK_LOOP_THRESHOLD: u64 = 3;
+pub const RELOAD_MCP_CONFIRM_COMMAND: &str = "reload-mcp";
+pub const RELOAD_MCP_CONFIRM_TITLE: &str = "/reload-mcp";
 pub const PAIRING_CODE_LENGTH: usize = 8;
 pub const PAIRING_CODE_TTL_SECONDS: f64 = 3600.0;
 pub const PAIRING_RATE_LIMIT_SECONDS: f64 = 600.0;
@@ -1267,6 +1271,54 @@ pub enum GatewayUpdatePromptIntercept {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayUpdatePromptChoice {
+    Yes,
+    No,
+}
+
+impl GatewayUpdatePromptChoice {
+    pub fn response_text(self) -> &'static str {
+        match self {
+            Self::Yes => "y",
+            Self::No => "n",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yes => "Yes",
+            Self::No => "No",
+        }
+    }
+
+    pub fn from_response_text(text: &str) -> Result<Self, String> {
+        match text.trim() {
+            "y" => Ok(Self::Yes),
+            "n" => Ok(Self::No),
+            _ => Err("update prompt response must be 'y' or 'n'".to_string()),
+        }
+    }
+
+    pub fn from_callback_data(data: &str) -> Result<Option<Self>, String> {
+        let data = data.trim();
+        if data.is_empty() {
+            return Err("update prompt callback data must not be empty".to_string());
+        }
+        let Some(response_text) = data.strip_prefix("update_prompt:") else {
+            return Ok(None);
+        };
+        Self::from_response_text(response_text).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayUpdatePromptCallbackExecution {
+    pub choice: GatewayUpdatePromptChoice,
+    pub acknowledgement_text: String,
+    pub answered_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewaySlashConfirmChoice {
     Once,
     Always,
@@ -1307,7 +1359,7 @@ impl GatewaySlashConfirmEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewaySlashConfirmResolution {
     pub session_key: String,
     pub confirm_id: String,
@@ -1442,7 +1494,85 @@ impl GatewayQuickCommandRequestPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayQuickCommandHostExecution {
     pub request: GatewayQuickCommandRequestPlan,
+    pub outcome: GatewayQuickCommandExecOutcome,
     pub response: GatewayIngressHostResponse,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpConfirmPlan {
+    Cancel {
+        message: String,
+    },
+    Execute {
+        host_actions: Vec<GatewayHostAction>,
+        success_suffix: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpSlashConfirmCallbackExecution {
+    NoPending,
+    Resolved {
+        resolution: GatewaySlashConfirmResolution,
+        presentation: GatewaySlashConfirmCallbackPresentation,
+        plan: GatewayReloadMcpConfirmPlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpDirective {
+    ReturnMessage {
+        callback_presentation: Option<GatewaySlashConfirmCallbackPresentation>,
+        message: String,
+    },
+    RunReload {
+        callback_presentation: Option<GatewaySlashConfirmCallbackPresentation>,
+        host_actions: Vec<GatewayHostAction>,
+        success_suffix: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpCommandDecision {
+    RequestConfirm {
+        request: GatewaySlashConfirmRequestPlan,
+    },
+    Directive {
+        directive: GatewayReloadMcpDirective,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpCallbackDecision {
+    NoPending,
+    Directive {
+        directive: GatewayReloadMcpDirective,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayReloadMcpHostEventDecision {
+    NoIntercept {
+        session_key: String,
+        cleared_stale: bool,
+    },
+    Directive {
+        directive: GatewayReloadMcpDirective,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayReloadMcpDirectiveExecution {
+    ReturnMessage {
+        callback_presentation: Option<GatewaySlashConfirmCallbackPresentation>,
+        message: String,
+        host_actions: GatewayHostExecutionReport,
+    },
+    RunReload {
+        callback_presentation: Option<GatewaySlashConfirmCallbackPresentation>,
+        success_suffix: Option<String>,
+        host_actions: GatewayHostExecutionReport,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2258,6 +2388,10 @@ pub enum GatewayHostAction {
         path: PathBuf,
         value: serde_json::Value,
     },
+    PersistConfigValue {
+        key: String,
+        value: serde_json::Value,
+    },
     WriteText {
         path: PathBuf,
         content: String,
@@ -2336,6 +2470,7 @@ pub struct GatewayHostExecutionReport {
     pub delivered_notification_targets: Vec<(String, String, Option<String>)>,
     pub failed_notification_targets: Vec<(String, String, Option<String>)>,
     pub scheduled_restarts: Vec<RestartLaunchMode>,
+    pub persisted_config_keys: Vec<String>,
 }
 
 impl GatewayHostExecutionReport {
@@ -2345,6 +2480,7 @@ impl GatewayHostExecutionReport {
             delivered_notification_targets: Vec::new(),
             failed_notification_targets: Vec::new(),
             scheduled_restarts: Vec::new(),
+            persisted_config_keys: Vec::new(),
         }
     }
 
@@ -2356,12 +2492,15 @@ impl GatewayHostExecutionReport {
         self.failed_notification_targets
             .extend(other.failed_notification_targets);
         self.scheduled_restarts.extend(other.scheduled_restarts);
+        self.persisted_config_keys
+            .extend(other.persisted_config_keys);
     }
 }
 
 pub trait GatewayHostActionHandler {
     fn send_notification(&mut self, notification: &GatewayNotification) -> Result<bool, String>;
     fn schedule_restart(&mut self, launch_mode: RestartLaunchMode) -> Result<(), String>;
+    fn persist_config_value(&mut self, key: &str, value: &serde_json::Value) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2762,6 +2901,40 @@ impl GatewayRuntime {
         Ok(plan)
     }
 
+    pub fn begin_reload_mcp_slash_confirm_request(
+        &mut self,
+        event: &MessageEvent,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmRequestPlan, String> {
+        self.begin_slash_confirm_request(
+            event,
+            RELOAD_MCP_CONFIRM_COMMAND,
+            RELOAD_MCP_CONFIRM_TITLE,
+            &reload_mcp_confirm_prompt_message(),
+            now_seconds,
+        )
+    }
+
+    pub fn begin_reload_mcp_command(
+        &mut self,
+        event: &MessageEvent,
+        confirm_required: bool,
+        now_seconds: f64,
+    ) -> Result<GatewayReloadMcpCommandDecision, String> {
+        if confirm_required {
+            let request = self.begin_reload_mcp_slash_confirm_request(event, now_seconds)?;
+            Ok(GatewayReloadMcpCommandDecision::RequestConfirm { request })
+        } else {
+            Ok(GatewayReloadMcpCommandDecision::Directive {
+                directive: GatewayReloadMcpDirective::RunReload {
+                    callback_presentation: None,
+                    host_actions: Vec::new(),
+                    success_suffix: None,
+                },
+            })
+        }
+    }
+
     pub fn handle_slash_confirm_host_event(
         &mut self,
         event: &MessageEvent,
@@ -2787,6 +2960,37 @@ impl GatewayRuntime {
             }
             GatewaySlashConfirmEventOutcome::Resolved { resolution } => {
                 Ok(GatewaySlashConfirmHostEventOutcome::Resolved { resolution })
+            }
+        }
+    }
+
+    pub fn handle_reload_mcp_slash_confirm_host_event(
+        &mut self,
+        event: &MessageEvent,
+        tool_approval_live: bool,
+        now_seconds: f64,
+    ) -> Result<GatewayReloadMcpHostEventDecision, String> {
+        match self.handle_slash_confirm_host_event(event, tool_approval_live, now_seconds)? {
+            GatewaySlashConfirmHostEventOutcome::NoIntercept {
+                session_key,
+                cleared_stale,
+            } => Ok(GatewayReloadMcpHostEventDecision::NoIntercept {
+                session_key,
+                cleared_stale,
+            }),
+            GatewaySlashConfirmHostEventOutcome::Resolved { resolution } => {
+                if resolution.command != RELOAD_MCP_CONFIRM_COMMAND {
+                    return Err(format!(
+                        "reload-mcp host event expected command '{}', got '{}'",
+                        RELOAD_MCP_CONFIRM_COMMAND, resolution.command
+                    ));
+                }
+                Ok(GatewayReloadMcpHostEventDecision::Directive {
+                    directive: reload_mcp_directive_from_plan(
+                        plan_reload_mcp_confirm_choice(resolution.choice),
+                        None,
+                    ),
+                })
             }
         }
     }
@@ -2843,6 +3047,95 @@ impl GatewayRuntime {
         }
     }
 
+    pub fn complete_reload_mcp_slash_confirm_callback(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        choice: GatewaySlashConfirmChoice,
+        actor_display: &str,
+        now_seconds: f64,
+    ) -> Result<GatewayReloadMcpSlashConfirmCallbackExecution, String> {
+        match self.complete_slash_confirm_callback(
+            session_key,
+            confirm_id,
+            choice,
+            actor_display,
+            now_seconds,
+        )? {
+            GatewaySlashConfirmCallbackExecution::NoPending => {
+                Ok(GatewayReloadMcpSlashConfirmCallbackExecution::NoPending)
+            }
+            GatewaySlashConfirmCallbackExecution::Resolved {
+                resolution,
+                presentation,
+            } => {
+                if resolution.command != RELOAD_MCP_CONFIRM_COMMAND {
+                    return Err(format!(
+                        "reload-mcp callback expected command '{}', got '{}'",
+                        RELOAD_MCP_CONFIRM_COMMAND, resolution.command
+                    ));
+                }
+                Ok(GatewayReloadMcpSlashConfirmCallbackExecution::Resolved {
+                    plan: plan_reload_mcp_confirm_choice(resolution.choice),
+                    resolution,
+                    presentation,
+                })
+            }
+        }
+    }
+
+    pub fn resolve_reload_mcp_slash_confirm_callback(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        choice: GatewaySlashConfirmChoice,
+        actor_display: &str,
+        now_seconds: f64,
+    ) -> Result<GatewayReloadMcpCallbackDecision, String> {
+        match self.complete_reload_mcp_slash_confirm_callback(
+            session_key,
+            confirm_id,
+            choice,
+            actor_display,
+            now_seconds,
+        )? {
+            GatewayReloadMcpSlashConfirmCallbackExecution::NoPending => {
+                Ok(GatewayReloadMcpCallbackDecision::NoPending)
+            }
+            GatewayReloadMcpSlashConfirmCallbackExecution::Resolved {
+                presentation, plan, ..
+            } => Ok(GatewayReloadMcpCallbackDecision::Directive {
+                directive: reload_mcp_directive_from_plan(plan, Some(presentation)),
+            }),
+        }
+    }
+
+    pub fn execute_reload_mcp_directive<H: GatewayHostActionHandler>(
+        &self,
+        directive: &GatewayReloadMcpDirective,
+        handler: &mut H,
+    ) -> Result<GatewayReloadMcpDirectiveExecution, String> {
+        match directive {
+            GatewayReloadMcpDirective::ReturnMessage {
+                callback_presentation,
+                message,
+            } => Ok(GatewayReloadMcpDirectiveExecution::ReturnMessage {
+                callback_presentation: callback_presentation.clone(),
+                message: message.clone(),
+                host_actions: GatewayHostExecutionReport::empty(),
+            }),
+            GatewayReloadMcpDirective::RunReload {
+                callback_presentation,
+                host_actions,
+                success_suffix,
+            } => Ok(GatewayReloadMcpDirectiveExecution::RunReload {
+                callback_presentation: callback_presentation.clone(),
+                success_suffix: success_suffix.clone(),
+                host_actions: execute_host_actions(host_actions, handler)?,
+            }),
+        }
+    }
+
     pub fn complete_quick_command_host_request(
         &self,
         request: &GatewayQuickCommandRequestPlan,
@@ -2852,8 +3145,24 @@ impl GatewayRuntime {
         let response = request.plan_response(outcome)?;
         Ok(GatewayQuickCommandHostExecution {
             request: request.clone(),
+            outcome: outcome.clone(),
             response,
         })
+    }
+
+    pub fn execute_quick_command_host_request(
+        &self,
+        request: &GatewayQuickCommandRequestPlan,
+    ) -> Result<GatewayQuickCommandHostExecution, String> {
+        request.validate()?;
+        let outcome =
+            execute_quick_command_subprocess(&request.shell_command).map_err(|message| {
+                format!(
+                    "quick command '/{}' execution failed: {message}",
+                    request.name
+                )
+            })?;
+        self.complete_quick_command_host_request(request, &outcome)
     }
 
     pub fn update_watcher(&self) -> &GatewayUpdateWatcherState {
@@ -2958,6 +3267,29 @@ impl GatewayRuntime {
                 Ok(GatewayUpdateNotificationExecution::Ready { outbound_message })
             }
         }
+    }
+
+    pub fn execute_update_prompt_callback_data(
+        &self,
+        home_dir: &Path,
+        callback_data: &str,
+    ) -> Result<Option<GatewayUpdatePromptCallbackExecution>, String> {
+        let Some(choice) = GatewayUpdatePromptChoice::from_callback_data(callback_data)? else {
+            return Ok(None);
+        };
+        let actions = [GatewayHostAction::WriteText {
+            path: gateway_update_response_path(home_dir),
+            content: choice.response_text().to_string(),
+        }];
+        apply_required_filesystem_actions(&actions)?;
+        Ok(Some(GatewayUpdatePromptCallbackExecution {
+            choice,
+            acknowledgement_text: format!(
+                "Sent '{}' to the update process.",
+                choice.response_text()
+            ),
+            answered_text: format!("⚕ Update prompt answered: {}", choice.label()),
+        }))
     }
 
     pub fn telegram_followup_grace_seconds(&self) -> f64 {
@@ -4456,6 +4788,7 @@ pub fn apply_filesystem_host_actions(
                     .map_err(|error| format!("serializing {} failed: {error}", path.display()))?;
                 atomic_write(path, &bytes)?;
             }
+            GatewayHostAction::PersistConfigValue { .. } => deferred.push(action.clone()),
             GatewayHostAction::WriteText { path, content } => {
                 atomic_write(path, content.as_bytes())?;
             }
@@ -4505,6 +4838,14 @@ pub fn execute_host_actions<H: GatewayHostActionHandler>(
                 let bytes = serde_json::to_vec(value)
                     .map_err(|error| format!("serializing {} failed: {error}", path.display()))?;
                 atomic_write(path, &bytes)?;
+            }
+            GatewayHostAction::PersistConfigValue { key, value } => {
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err("config persistence key must not be empty".to_string());
+                }
+                handler.persist_config_value(key, value)?;
+                report.persisted_config_keys.push(key.to_string());
             }
             GatewayHostAction::WriteText { path, content } => {
                 atomic_write(path, content.as_bytes())?;
@@ -5508,6 +5849,188 @@ pub fn plan_exec_quick_command_response(
         ));
     }
     Ok(response)
+}
+
+fn execute_quick_command_subprocess_with_timeout(
+    shell_command: &str,
+    timeout: StdDuration,
+) -> Result<GatewayQuickCommandExecOutcome, String> {
+    let shell_command = shell_command.trim();
+    if shell_command.is_empty() {
+        return Err("quick command shell_command must not be empty".to_string());
+    }
+    if timeout.is_zero() {
+        return Err("quick command timeout must be positive".to_string());
+    }
+
+    let mut child = Command::new("sh")
+        .arg("-lc")
+        .arg(shell_command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("spawning quick command failed: {error}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_handle = thread::spawn(move || -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            stdout
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("reading quick command stdout failed: {error}"))?;
+        }
+        Ok(bytes)
+    });
+    let stderr_handle = thread::spawn(move || -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            stderr
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("reading quick command stderr failed: {error}"))?;
+        }
+        Ok(bytes)
+    });
+
+    let timeout_seconds = timeout.as_secs().max(1);
+    let start = Instant::now();
+    let timed_out = loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("waiting on quick command failed: {error}"))?
+        {
+            Some(_) => break false,
+            None if start.elapsed() >= timeout => break true,
+            None => thread::sleep(StdDuration::from_millis(10)),
+        }
+    };
+
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| "quick command stdout reader thread panicked".to_string())??;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| "quick command stderr reader thread panicked".to_string())??;
+
+    if timed_out {
+        return Ok(GatewayQuickCommandExecOutcome::Timeout { timeout_seconds });
+    }
+
+    Ok(GatewayQuickCommandExecOutcome::Success {
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+    })
+}
+
+pub fn execute_quick_command_subprocess(
+    shell_command: &str,
+) -> Result<GatewayQuickCommandExecOutcome, String> {
+    execute_quick_command_subprocess_with_timeout(shell_command, StdDuration::from_secs(30))
+}
+
+pub fn reload_mcp_confirm_prompt_message() -> String {
+    "⚠️ **Confirm /reload-mcp**\n\n\
+Reloading MCP servers rebuilds the tool set for this session and \
+**invalidates the provider prompt cache** — the next message will re-send \
+full input tokens. On long-context or high-reasoning models this can be \
+expensive.\n\n\
+Choose:\n\
+• **Approve Once** — reload now\n\
+• **Always Approve** — reload now and silence this prompt permanently\n\
+• **Cancel** — leave MCP tools unchanged\n\n\
+_Text fallback: reply `/approve`, `/always`, or `/cancel`._"
+        .to_string()
+}
+
+pub fn reload_mcp_disable_confirmation_action() -> GatewayHostAction {
+    GatewayHostAction::PersistConfigValue {
+        key: "approvals.mcp_reload_confirm".to_string(),
+        value: serde_json::Value::Bool(false),
+    }
+}
+
+pub fn reload_mcp_directive_from_plan(
+    plan: GatewayReloadMcpConfirmPlan,
+    callback_presentation: Option<GatewaySlashConfirmCallbackPresentation>,
+) -> GatewayReloadMcpDirective {
+    match plan {
+        GatewayReloadMcpConfirmPlan::Cancel { message } => {
+            GatewayReloadMcpDirective::ReturnMessage {
+                callback_presentation,
+                message,
+            }
+        }
+        GatewayReloadMcpConfirmPlan::Execute {
+            host_actions,
+            success_suffix,
+        } => GatewayReloadMcpDirective::RunReload {
+            callback_presentation,
+            host_actions,
+            success_suffix,
+        },
+    }
+}
+
+pub fn plan_reload_mcp_confirm_choice(
+    choice: GatewaySlashConfirmChoice,
+) -> GatewayReloadMcpConfirmPlan {
+    match choice {
+        GatewaySlashConfirmChoice::Cancel => GatewayReloadMcpConfirmPlan::Cancel {
+            message: "🟡 /reload-mcp cancelled. MCP tools unchanged.".to_string(),
+        },
+        GatewaySlashConfirmChoice::Once => GatewayReloadMcpConfirmPlan::Execute {
+            host_actions: Vec::new(),
+            success_suffix: None,
+        },
+        GatewaySlashConfirmChoice::Always => GatewayReloadMcpConfirmPlan::Execute {
+            host_actions: vec![reload_mcp_disable_confirmation_action()],
+            success_suffix: Some(
+                "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml.".to_string(),
+            ),
+        },
+    }
+}
+
+pub fn format_reload_mcp_confirm_success_message(
+    reload_result: &str,
+    success_suffix: Option<&str>,
+) -> Result<String, String> {
+    let reload_result = reload_result.trim();
+    if reload_result.is_empty() {
+        return Err("reload-mcp result must not be empty".to_string());
+    }
+    let Some(success_suffix) = success_suffix
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(reload_result.to_string());
+    };
+    Ok(format!("{reload_result}\n\n{success_suffix}"))
+}
+
+pub fn format_reload_mcp_directive_message(
+    execution: &GatewayReloadMcpDirectiveExecution,
+    reload_result: Option<&str>,
+) -> Result<String, String> {
+    match execution {
+        GatewayReloadMcpDirectiveExecution::ReturnMessage { message, .. } => {
+            let message = message.trim();
+            if message.is_empty() {
+                return Err("reload-mcp message must not be empty".to_string());
+            }
+            Ok(message.to_string())
+        }
+        GatewayReloadMcpDirectiveExecution::RunReload { success_suffix, .. } => {
+            let reload_result =
+                reload_result.ok_or_else(|| "reload-mcp result is required".to_string())?;
+            format_reload_mcp_confirm_success_message(reload_result, success_suffix.as_deref())
+        }
+    }
 }
 
 pub fn plan_running_session_action(
@@ -6897,6 +7420,15 @@ mod tests {
             self.operations.push(format!("restart:{launch_mode:?}"));
             Ok(())
         }
+
+        fn persist_config_value(
+            &mut self,
+            key: &str,
+            value: &serde_json::Value,
+        ) -> Result<(), String> {
+            self.operations.push(format!("config:{key}={value}"));
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -7432,6 +7964,42 @@ mod tests {
             )
             .unwrap(),
             "Quick command error: boom"
+        );
+    }
+
+    #[test]
+    fn quick_command_subprocess_execution_captures_stdout_and_stderr() {
+        let outcome = execute_quick_command_subprocess_with_timeout(
+            "printf 'ok'; printf 'warn' >&2",
+            StdDuration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            GatewayQuickCommandExecOutcome::Success {
+                stdout: "ok".to_string(),
+                stderr: "warn".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn quick_command_subprocess_execution_times_out() {
+        let outcome =
+            execute_quick_command_subprocess_with_timeout("sleep 1", StdDuration::from_millis(20))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            GatewayQuickCommandExecOutcome::Timeout { timeout_seconds: 1 }
+        );
+    }
+
+    #[test]
+    fn quick_command_subprocess_execution_rejects_empty_command() {
+        assert_eq!(
+            execute_quick_command_subprocess_with_timeout("   ", StdDuration::from_secs(1))
+                .unwrap_err(),
+            "quick command shell_command must not be empty"
         );
     }
 
@@ -8604,6 +9172,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(execution.request, request);
+        assert_eq!(
+            execution.outcome,
+            GatewayQuickCommandExecOutcome::Success {
+                stdout: "ok\n".to_string(),
+                stderr: String::new(),
+            }
+        );
         assert_eq!(execution.response.message, "ok");
         assert_eq!(
             execution.response.reply_to_message_id.as_deref(),
@@ -8653,11 +9228,54 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(
+            execution.outcome,
+            GatewayQuickCommandExecOutcome::Timeout {
+                timeout_seconds: 30,
+            }
+        );
         assert!(execution.response.message.contains("timed out"));
         assert_eq!(
             execution.response.reply_to_message_id.as_deref(),
             Some("msg-9")
         );
+    }
+
+    #[test]
+    fn runtime_execute_quick_command_host_request_runs_subprocess_and_formats_response() {
+        let temp = tempdir().unwrap();
+        let runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let request = GatewayQuickCommandRequestPlan {
+            platform: telegram(),
+            chat_id: "12345".to_string(),
+            thread_id: Some("thread-4".to_string()),
+            reply_to_message_id: Some("msg-3".to_string()),
+            name: "limits".to_string(),
+            shell_command: "printf 'ok'".to_string(),
+        };
+
+        let execution = runtime
+            .execute_quick_command_host_request(&request)
+            .unwrap();
+        assert_eq!(execution.request, request);
+        assert_eq!(
+            execution.outcome,
+            GatewayQuickCommandExecOutcome::Success {
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            }
+        );
+        assert_eq!(execution.response.message, "ok");
+        assert_eq!(
+            execution.response.reply_to_message_id.as_deref(),
+            Some("msg-3")
+        );
+        assert_eq!(execution.response.thread_id.as_deref(), Some("thread-4"));
     }
 
     #[test]
@@ -9031,6 +9649,71 @@ mod tests {
             host_plan.reply.as_deref(),
             Some("✓ Sent `/foo` to the update process.")
         );
+    }
+
+    #[test]
+    fn update_prompt_choice_parses_callback_data_and_rejects_invalid_answers() {
+        assert_eq!(
+            GatewayUpdatePromptChoice::from_callback_data("update_prompt:y").unwrap(),
+            Some(GatewayUpdatePromptChoice::Yes)
+        );
+        assert_eq!(
+            GatewayUpdatePromptChoice::from_callback_data("update_prompt:n").unwrap(),
+            Some(GatewayUpdatePromptChoice::No)
+        );
+        assert_eq!(
+            GatewayUpdatePromptChoice::from_callback_data("slash_confirm:once").unwrap(),
+            None
+        );
+        assert_eq!(
+            GatewayUpdatePromptChoice::from_callback_data("update_prompt:maybe").unwrap_err(),
+            "update prompt response must be 'y' or 'n'"
+        );
+    }
+
+    #[test]
+    fn runtime_execute_update_prompt_callback_data_writes_response_and_returns_text() {
+        let temp = tempdir().unwrap();
+        let runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        let execution = runtime
+            .execute_update_prompt_callback_data(temp.path(), "update_prompt:y")
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.choice, GatewayUpdatePromptChoice::Yes);
+        assert_eq!(
+            execution.acknowledgement_text,
+            "Sent 'y' to the update process."
+        );
+        assert_eq!(execution.answered_text, "⚕ Update prompt answered: Yes");
+        assert_eq!(
+            fs::read_to_string(gateway_update_response_path(temp.path())).unwrap(),
+            "y"
+        );
+    }
+
+    #[test]
+    fn runtime_execute_update_prompt_callback_data_ignores_non_prompt_callbacks() {
+        let temp = tempdir().unwrap();
+        let runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .execute_update_prompt_callback_data(temp.path(), "slash_confirm:1:once")
+                .unwrap(),
+            None
+        );
+        assert!(!gateway_update_response_path(temp.path()).exists());
     }
 
     #[test]
@@ -10610,6 +11293,110 @@ mod tests {
     }
 
     #[test]
+    fn runtime_begin_reload_mcp_slash_confirm_request_uses_builtin_prompt() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/reload-mcp".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let plan = runtime
+            .begin_reload_mcp_slash_confirm_request(&event, 100.0)
+            .unwrap();
+        assert_eq!(plan.command, RELOAD_MCP_CONFIRM_COMMAND);
+        assert_eq!(plan.title, RELOAD_MCP_CONFIRM_TITLE);
+        assert_eq!(plan.message, reload_mcp_confirm_prompt_message());
+        assert_eq!(plan.fallback_ack, reload_mcp_confirm_prompt_message());
+    }
+
+    #[test]
+    fn runtime_begin_reload_mcp_command_uses_directive_when_confirmation_disabled() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/reload-mcp".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let decision = runtime
+            .begin_reload_mcp_command(&event, false, 100.0)
+            .unwrap();
+        assert_eq!(
+            decision,
+            GatewayReloadMcpCommandDecision::Directive {
+                directive: GatewayReloadMcpDirective::RunReload {
+                    callback_presentation: None,
+                    host_actions: Vec::new(),
+                    success_suffix: None,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_begin_reload_mcp_command_requests_confirmation_when_enabled() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/reload-mcp".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let decision = runtime
+            .begin_reload_mcp_command(&event, true, 100.0)
+            .unwrap();
+        let GatewayReloadMcpCommandDecision::RequestConfirm { request } = decision else {
+            panic!("expected reload-mcp confirmation request");
+        };
+        assert_eq!(request.command, RELOAD_MCP_CONFIRM_COMMAND);
+        assert_eq!(request.title, RELOAD_MCP_CONFIRM_TITLE);
+        assert_eq!(request.message, reload_mcp_confirm_prompt_message());
+    }
+
+    #[test]
     fn slash_confirm_request_plan_immediate_ack_depends_on_button_delivery() {
         let plan = GatewaySlashConfirmRequestPlan {
             platform: telegram(),
@@ -10626,6 +11413,32 @@ mod tests {
         assert_eq!(
             plan.immediate_ack(false).as_deref(),
             Some("Approve reloading MCP servers?")
+        );
+    }
+
+    #[test]
+    fn reload_mcp_confirm_choice_plan_matches_python_behavior() {
+        assert_eq!(
+            plan_reload_mcp_confirm_choice(GatewaySlashConfirmChoice::Cancel),
+            GatewayReloadMcpConfirmPlan::Cancel {
+                message: "🟡 /reload-mcp cancelled. MCP tools unchanged.".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_reload_mcp_confirm_choice(GatewaySlashConfirmChoice::Once),
+            GatewayReloadMcpConfirmPlan::Execute {
+                host_actions: Vec::new(),
+                success_suffix: None,
+            }
+        );
+        assert_eq!(
+            plan_reload_mcp_confirm_choice(GatewaySlashConfirmChoice::Always),
+            GatewayReloadMcpConfirmPlan::Execute {
+                host_actions: vec![reload_mcp_disable_confirmation_action()],
+                success_suffix: Some(
+                    "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml.".to_string(),
+                ),
+            }
         );
     }
 
@@ -10707,6 +11520,91 @@ mod tests {
         assert_eq!(
             outcome,
             GatewaySlashConfirmHostEventOutcome::NoIntercept {
+                session_key,
+                cleared_stale: true,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_handle_reload_mcp_slash_confirm_host_event_returns_directive() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/always".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let session_key = build_session_key(&event.source, true, false).unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register(&session_key, "confirm-1", RELOAD_MCP_CONFIRM_COMMAND, 100.0)
+            .unwrap();
+
+        let decision = runtime
+            .handle_reload_mcp_slash_confirm_host_event(&event, false, 120.0)
+            .unwrap();
+        assert_eq!(
+            decision,
+            GatewayReloadMcpHostEventDecision::Directive {
+                directive: GatewayReloadMcpDirective::RunReload {
+                    callback_presentation: None,
+                    host_actions: vec![reload_mcp_disable_confirmation_action()],
+                    success_suffix: Some(
+                        "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml.".to_string(),
+                    ),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_handle_reload_mcp_slash_confirm_host_event_returns_no_intercept_state() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "hello".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let session_key = build_session_key(&event.source, true, false).unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register(&session_key, "confirm-1", RELOAD_MCP_CONFIRM_COMMAND, 100.0)
+            .unwrap();
+
+        let decision = runtime
+            .handle_reload_mcp_slash_confirm_host_event(&event, false, 500.1)
+            .unwrap();
+        assert_eq!(
+            decision,
+            GatewayReloadMcpHostEventDecision::NoIntercept {
                 session_key,
                 cleared_stale: true,
             }
@@ -10850,6 +11748,262 @@ mod tests {
                 )
                 .unwrap(),
             GatewaySlashConfirmCallbackExecution::NoPending
+        );
+    }
+
+    #[test]
+    fn runtime_complete_reload_mcp_slash_confirm_callback_returns_plan_and_presentation() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-1", RELOAD_MCP_CONFIRM_COMMAND, 100.0)
+            .unwrap();
+
+        let outcome = runtime
+            .complete_reload_mcp_slash_confirm_callback(
+                "session-1",
+                "confirm-1",
+                GatewaySlashConfirmChoice::Always,
+                "Kai",
+                120.0,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewayReloadMcpSlashConfirmCallbackExecution::Resolved {
+                resolution: GatewaySlashConfirmResolution {
+                    session_key: "session-1".to_string(),
+                    confirm_id: "confirm-1".to_string(),
+                    command: RELOAD_MCP_CONFIRM_COMMAND.to_string(),
+                    choice: GatewaySlashConfirmChoice::Always,
+                },
+                presentation: GatewaySlashConfirmCallbackPresentation {
+                    acknowledgement_label: "🔒 Always approve".to_string(),
+                    decision_text: "🔒 Always approved by Kai".to_string(),
+                },
+                plan: GatewayReloadMcpConfirmPlan::Execute {
+                    host_actions: vec![reload_mcp_disable_confirmation_action()],
+                    success_suffix: Some(
+                        "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml.".to_string(),
+                    ),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_complete_reload_mcp_slash_confirm_callback_returns_no_pending_when_missing() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .complete_reload_mcp_slash_confirm_callback(
+                    "session-1",
+                    "confirm-1",
+                    GatewaySlashConfirmChoice::Cancel,
+                    "Kai",
+                    120.0,
+                )
+                .unwrap(),
+            GatewayReloadMcpSlashConfirmCallbackExecution::NoPending
+        );
+    }
+
+    #[test]
+    fn runtime_resolve_reload_mcp_slash_confirm_callback_returns_directives() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-1", RELOAD_MCP_CONFIRM_COMMAND, 100.0)
+            .unwrap();
+
+        let cancel = runtime
+            .resolve_reload_mcp_slash_confirm_callback(
+                "session-1",
+                "confirm-1",
+                GatewaySlashConfirmChoice::Cancel,
+                "Kai",
+                120.0,
+            )
+            .unwrap();
+        assert_eq!(
+            cancel,
+            GatewayReloadMcpCallbackDecision::Directive {
+                directive: GatewayReloadMcpDirective::ReturnMessage {
+                    callback_presentation: Some(GatewaySlashConfirmCallbackPresentation {
+                        acknowledgement_label: "❌ Cancelled".to_string(),
+                        decision_text: "❌ Cancelled by Kai".to_string(),
+                    }),
+                    message: "🟡 /reload-mcp cancelled. MCP tools unchanged.".to_string(),
+                }
+            }
+        );
+
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-2", RELOAD_MCP_CONFIRM_COMMAND, 130.0)
+            .unwrap();
+        let always = runtime
+            .resolve_reload_mcp_slash_confirm_callback(
+                "session-1",
+                "confirm-2",
+                GatewaySlashConfirmChoice::Always,
+                "Kai",
+                140.0,
+            )
+            .unwrap();
+        assert_eq!(
+            always,
+            GatewayReloadMcpCallbackDecision::Directive {
+                directive: GatewayReloadMcpDirective::RunReload {
+                    callback_presentation: Some(GatewaySlashConfirmCallbackPresentation {
+                        acknowledgement_label: "🔒 Always approve".to_string(),
+                        decision_text: "🔒 Always approved by Kai".to_string(),
+                    }),
+                    host_actions: vec![reload_mcp_disable_confirmation_action()],
+                    success_suffix: Some(
+                        "ℹ️ Future `/reload-mcp` calls will run without confirmation. Re-enable via `approvals.mcp_reload_confirm: true` in config.yaml.".to_string(),
+                    ),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_execute_reload_mcp_directive_applies_host_actions_and_reports_them() {
+        let temp = tempdir().unwrap();
+        let runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let mut handler = RecordingHostHandler::default();
+
+        let execution = runtime
+            .execute_reload_mcp_directive(
+                &GatewayReloadMcpDirective::RunReload {
+                    callback_presentation: Some(GatewaySlashConfirmCallbackPresentation {
+                        acknowledgement_label: "🔒 Always approve".to_string(),
+                        decision_text: "🔒 Always approved by Kai".to_string(),
+                    }),
+                    host_actions: vec![reload_mcp_disable_confirmation_action()],
+                    success_suffix: Some("Future reloads skip confirmation.".to_string()),
+                },
+                &mut handler,
+            )
+            .unwrap();
+        assert_eq!(
+            execution,
+            GatewayReloadMcpDirectiveExecution::RunReload {
+                callback_presentation: Some(GatewaySlashConfirmCallbackPresentation {
+                    acknowledgement_label: "🔒 Always approve".to_string(),
+                    decision_text: "🔒 Always approved by Kai".to_string(),
+                }),
+                success_suffix: Some("Future reloads skip confirmation.".to_string()),
+                host_actions: GatewayHostExecutionReport {
+                    attempted_notification_targets: Vec::new(),
+                    delivered_notification_targets: Vec::new(),
+                    failed_notification_targets: Vec::new(),
+                    scheduled_restarts: Vec::new(),
+                    persisted_config_keys: vec!["approvals.mcp_reload_confirm".to_string()],
+                },
+            }
+        );
+        assert_eq!(
+            handler.operations,
+            vec!["config:approvals.mcp_reload_confirm=false".to_string()]
+        );
+    }
+
+    #[test]
+    fn format_reload_mcp_confirm_success_message_appends_suffix_when_present() {
+        assert_eq!(
+            format_reload_mcp_confirm_success_message(
+                "Reloaded successfully.",
+                Some("Future reloads will skip confirmation.")
+            )
+            .unwrap(),
+            "Reloaded successfully.\n\nFuture reloads will skip confirmation."
+        );
+        assert_eq!(
+            format_reload_mcp_confirm_success_message("Reloaded successfully.", None).unwrap(),
+            "Reloaded successfully."
+        );
+        assert_eq!(
+            format_reload_mcp_confirm_success_message("   ", None).unwrap_err(),
+            "reload-mcp result must not be empty"
+        );
+    }
+
+    #[test]
+    fn format_reload_mcp_directive_message_handles_cancel_and_reload_results() {
+        assert_eq!(
+            format_reload_mcp_directive_message(
+                &GatewayReloadMcpDirectiveExecution::ReturnMessage {
+                    callback_presentation: None,
+                    message: "🟡 /reload-mcp cancelled. MCP tools unchanged.".to_string(),
+                    host_actions: GatewayHostExecutionReport::empty(),
+                },
+                None,
+            )
+            .unwrap(),
+            "🟡 /reload-mcp cancelled. MCP tools unchanged."
+        );
+        assert_eq!(
+            format_reload_mcp_directive_message(
+                &GatewayReloadMcpDirectiveExecution::RunReload {
+                    callback_presentation: None,
+                    success_suffix: Some("Future reloads skip confirmation.".to_string()),
+                    host_actions: GatewayHostExecutionReport::empty(),
+                },
+                Some("Reloaded successfully."),
+            )
+            .unwrap(),
+            "Reloaded successfully.\n\nFuture reloads skip confirmation."
+        );
+        assert_eq!(
+            format_reload_mcp_directive_message(
+                &GatewayReloadMcpDirectiveExecution::RunReload {
+                    callback_presentation: None,
+                    success_suffix: None,
+                    host_actions: GatewayHostExecutionReport::empty(),
+                },
+                None,
+            )
+            .unwrap_err(),
+            "reload-mcp result is required"
+        );
+    }
+
+    #[test]
+    fn execute_host_actions_persists_config_values_via_handler() {
+        let mut handler = RecordingHostHandler::default();
+        let actions = [reload_mcp_disable_confirmation_action()];
+
+        let report = execute_host_actions(&actions, &mut handler).unwrap();
+        assert!(report.delivered_notification_targets.is_empty());
+        assert_eq!(
+            handler.operations,
+            vec!["config:approvals.mcp_reload_confirm=false".to_string()]
         );
     }
 
