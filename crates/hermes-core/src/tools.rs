@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -2143,6 +2144,478 @@ const TOOL_ENTRIES: &[ToolEntry] = &[
     },
 ];
 
+#[derive(Debug, Default)]
+struct DynamicToolRegistry {
+    toolsets: BTreeMap<String, BTreeSet<String>>,
+    tool_to_toolset: BTreeMap<String, String>,
+}
+
+static DYNAMIC_TOOL_REGISTRY_CACHE: OnceLock<Mutex<Option<&'static DynamicToolRegistry>>> =
+    OnceLock::new();
+
+fn dynamic_tool_registry() -> &'static DynamicToolRegistry {
+    let cache = DYNAMIC_TOOL_REGISTRY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().expect("dynamic tool registry cache poisoned");
+    if let Some(existing) = *guard {
+        return existing;
+    }
+    let built = Box::leak(Box::new(build_dynamic_tool_registry()));
+    *guard = Some(built);
+    built
+}
+
+fn build_dynamic_tool_registry() -> DynamicToolRegistry {
+    let mut plugins = BTreeMap::<String, Vec<(String, String)>>::new();
+
+    for dir in discover_plugin_dirs(bundled_plugins_root(), 2) {
+        if let Some((name, tools)) = parse_plugin_tool_registrations(&dir) {
+            plugins.entry(name).or_insert(tools);
+        }
+    }
+    for dir in discover_plugin_dirs(user_plugins_root(), 2) {
+        if let Some((name, tools)) = parse_plugin_tool_registrations(&dir) {
+            plugins.insert(name, tools);
+        }
+    }
+
+    let mut registry = DynamicToolRegistry::default();
+    for tools in plugins.into_values() {
+        for (toolset, name) in tools {
+            registry
+                .toolsets
+                .entry(toolset.clone())
+                .or_default()
+                .insert(name.clone());
+            registry.tool_to_toolset.insert(name, toolset);
+        }
+    }
+    registry
+}
+
+fn parse_plugin_tool_registrations(dir: &Path) -> Option<(String, Vec<(String, String)>)> {
+    let manifest = manifest_path(dir)?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&fs::read_to_string(manifest).ok()?)
+        .unwrap_or(serde_yaml::Value::Null);
+    let mapping = parsed.as_mapping()?;
+    let plugin_name = mapping
+        .get(serde_yaml::Value::String("name".to_string()))
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            dir.file_name()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })?;
+    let provides_tools = mapping
+        .get(serde_yaml::Value::String("provides_tools".to_string()))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let init_path = dir.join("__init__.py");
+    let source = fs::read_to_string(init_path).ok()?;
+    let calls = parse_register_tool_calls(&source);
+    let mut discovered = Vec::new();
+    for (name, toolset) in &calls {
+        if let (Some(name), Some(toolset)) = (name.as_ref(), toolset.as_ref()) {
+            discovered.push((toolset.clone(), name.clone()));
+        }
+    }
+
+    let discovered_toolsets = calls
+        .iter()
+        .filter_map(|(_, toolset)| toolset.clone())
+        .collect::<BTreeSet<_>>();
+    if !provides_tools.is_empty() {
+        if discovered_toolsets.len() == 1 {
+            let toolset = discovered_toolsets
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_default();
+            for tool in &provides_tools {
+                if !discovered.iter().any(|(current_toolset, current_name)| {
+                    current_toolset == &toolset && current_name == tool
+                }) {
+                    discovered.push((toolset.clone(), tool.clone()));
+                }
+            }
+        } else {
+            let inferred = provides_tools
+                .iter()
+                .filter_map(|tool| tool_entry(tool).map(|entry| entry.toolset.to_string()))
+                .collect::<BTreeSet<_>>();
+            if inferred.len() == 1 {
+                let toolset = inferred.iter().next().cloned().unwrap_or_default();
+                for tool in provides_tools {
+                    if !discovered.iter().any(|(current_toolset, current_name)| {
+                        current_toolset == &toolset && current_name == &tool
+                    }) {
+                        discovered.push((toolset.clone(), tool));
+                    }
+                }
+            }
+        }
+    }
+
+    if discovered.is_empty() {
+        return None;
+    }
+    discovered.sort();
+    discovered.dedup();
+    Some((plugin_name, discovered))
+}
+
+fn discover_plugin_dirs(root: PathBuf, max_depth: usize) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    collect_plugin_dirs(&root, 0, max_depth, &mut results);
+    results.sort();
+    results
+}
+
+fn collect_plugin_dirs(root: &Path, depth: usize, max_depth: usize, results: &mut Vec<PathBuf>) {
+    if depth > max_depth || !root.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !path.is_dir() || name.starts_with(['.', '_']) {
+            continue;
+        }
+        if manifest_path(&path).is_some() && path.join("__init__.py").is_file() {
+            results.push(path.clone());
+        }
+        collect_plugin_dirs(&path, depth + 1, max_depth, results);
+    }
+}
+
+fn bundled_plugins_root() -> PathBuf {
+    std::env::var_os("HERMES_BUNDLED_PLUGINS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("plugins"))
+}
+
+fn user_plugins_root() -> PathBuf {
+    std::env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".hermes")))
+        .unwrap_or_else(|| PathBuf::from(".hermes"))
+        .join("plugins")
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+        })
+}
+
+fn manifest_path(path: &Path) -> Option<PathBuf> {
+    let yaml = path.join("plugin.yaml");
+    if yaml.is_file() {
+        return Some(yaml);
+    }
+    let yml = path.join("plugin.yml");
+    yml.is_file().then_some(yml)
+}
+
+fn parse_register_tool_calls(source: &str) -> Vec<(Option<String>, Option<String>)> {
+    let mut calls = Vec::new();
+    for matched in register_tool_call_regex().find_iter(source) {
+        let open_index = matched.end().saturating_sub(1);
+        let Some(close_index) = find_python_matching_delimiter(source, open_index, '(', ')') else {
+            continue;
+        };
+        let body = &source[open_index + 1..close_index];
+        let args = parse_python_keyword_args(body);
+        calls.push((
+            args.get("name")
+                .and_then(|value| parse_python_string(value)),
+            args.get("toolset")
+                .and_then(|value| parse_python_string(value)),
+        ));
+    }
+    calls
+}
+
+fn parse_python_keyword_args(body: &str) -> BTreeMap<String, String> {
+    let mut args = BTreeMap::new();
+    for item in split_python_top_level_items(body, ',') {
+        let item = strip_python_comment(&item);
+        if item.trim().is_empty() {
+            continue;
+        }
+        let Some((key, value)) = split_python_top_level_pair(&item, '=') else {
+            continue;
+        };
+        args.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    args
+}
+
+fn find_python_matching_delimiter(
+    source: &str,
+    open_index: usize,
+    open_char: char,
+    close_char: char,
+) -> Option<usize> {
+    let mut stack = vec![open_char];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for (offset, ch) in source[open_index + 1..].char_indices() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => comment = true,
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => stack.push(ch),
+            ')' => {
+                if stack.pop() != Some('(') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == ')' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == ']' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+                if stack.is_empty() && close_char == '}' {
+                    return Some(open_index + 1 + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_python_top_level_items(body: &str, separator: char) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for ch in body.chars() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => {
+                comment = true;
+            }
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '(' | '[' | '{' => {
+                stack.push(ch);
+                current.push(ch);
+            }
+            ')' | ']' | '}' => {
+                stack.pop();
+                current.push(ch);
+            }
+            _ if ch == separator && stack.is_empty() => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    items.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        items.push(trimmed.to_string());
+    }
+    items
+}
+
+fn split_python_top_level_pair(text: &str, separator: char) -> Option<(String, String)> {
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for (index, ch) in text.char_indices() {
+        if comment {
+            if ch == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '#' => comment = true,
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                stack.pop();
+            }
+            _ if ch == separator && stack.is_empty() => {
+                return Some((
+                    text[..index].trim().to_string(),
+                    text[index + ch.len_utf8()..].trim().to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn strip_python_comment(text: &str) -> String {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if let Some(active) = quote {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                result.push(ch);
+            }
+            '#' => break,
+            _ => result.push(ch),
+        }
+    }
+
+    result.trim().to_string()
+}
+
+fn parse_python_string(text: &str) -> Option<String> {
+    let trimmed = strip_python_comment(text);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = *bytes.first()?;
+    if !matches!(quote, b'\'' | b'"') || bytes.last().copied()? != quote {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    Some(
+        inner
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\\\", "\\"),
+    )
+}
+
+fn register_tool_call_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"ctx\.register_tool\s*\(").expect("register_tool regex"))
+}
+
+#[cfg(test)]
+fn reset_dynamic_tool_registry_for_tests() {
+    if let Some(cache) = DYNAMIC_TOOL_REGISTRY_CACHE.get() {
+        let mut guard = cache.lock().expect("dynamic tool registry cache poisoned");
+        *guard = None;
+    }
+}
+
 pub fn get_tool_definitions(
     enabled_toolsets: Option<&[String]>,
     disabled_toolsets: Option<&[String]>,
@@ -2206,35 +2679,71 @@ pub fn get_tool_definitions_for_runtime(
 }
 
 pub fn get_all_tool_names() -> Vec<String> {
-    TOOL_ENTRIES
+    let mut names = TOOL_ENTRIES
         .iter()
         .map(|entry| entry.name.to_string())
-        .collect()
+        .collect::<BTreeSet<_>>();
+    names.extend(dynamic_tool_registry().tool_to_toolset.keys().cloned());
+    names.into_iter().collect()
 }
 
 pub fn get_toolset_for_tool(name: &str) -> Option<String> {
-    tool_entry(name).map(|entry| entry.toolset.to_string())
+    tool_entry(name)
+        .map(|entry| entry.toolset.to_string())
+        .or_else(|| dynamic_tool_registry().tool_to_toolset.get(name).cloned())
 }
 
 pub fn get_toolset_names() -> Vec<String> {
-    TOOLSETS
+    let mut names = TOOLSETS
         .iter()
         .map(|entry| entry.name.to_string())
-        .collect()
+        .collect::<BTreeSet<_>>();
+    names.extend(dynamic_tool_registry().toolsets.keys().cloned());
+    names.into_iter().collect()
 }
 
 pub fn get_toolset_info(name: &str) -> Option<ToolsetInfo> {
-    let entry = toolset_entry(name)?;
-    let direct_tools = entry
-        .tools
-        .iter()
-        .map(|tool| (*tool).to_string())
+    let dynamic_tools = dynamic_tool_registry()
+        .toolsets
+        .get(name)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
         .collect::<Vec<_>>();
-    let includes = entry
-        .includes
-        .iter()
-        .map(|toolset| (*toolset).to_string())
-        .collect::<Vec<_>>();
+
+    let (description, mut direct_tools, includes) = if let Some(entry) = toolset_entry(name) {
+        let direct_tools = entry
+            .tools
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect::<Vec<_>>();
+        let includes = entry
+            .includes
+            .iter()
+            .map(|toolset| (*toolset).to_string())
+            .collect::<Vec<_>>();
+        (entry.description.to_string(), direct_tools, includes)
+    } else if let Some(legacy) = legacy_toolset(name) {
+        (
+            "Legacy toolset".to_string(),
+            legacy
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect::<Vec<_>>(),
+            Vec::new(),
+        )
+    } else if !dynamic_tools.is_empty() {
+        (
+            "Plugin toolset discovered from plugin registrations".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+    } else {
+        return None;
+    };
+    direct_tools.extend(dynamic_tools);
+    direct_tools.sort();
+    direct_tools.dedup();
     let resolved_tools = resolve_toolset(name);
     let implemented_tools = resolved_tools
         .iter()
@@ -2244,8 +2753,8 @@ pub fn get_toolset_info(name: &str) -> Option<ToolsetInfo> {
         .collect::<Vec<_>>();
 
     Some(ToolsetInfo {
-        name: entry.name.to_string(),
-        description: entry.description.to_string(),
+        name: name.to_string(),
+        description,
         direct_tools,
         includes,
         resolved_tools,
@@ -2268,7 +2777,9 @@ pub fn validate_toolset(name: &str) -> bool {
     if matches!(name, "all" | "*") {
         return true;
     }
-    toolset_entry(name).is_some() || legacy_toolset(name).is_some()
+    toolset_entry(name).is_some()
+        || legacy_toolset(name).is_some()
+        || dynamic_tool_registry().toolsets.contains_key(name)
 }
 
 pub fn resolve_toolset(name: &str) -> Vec<String> {
@@ -2502,27 +3013,35 @@ fn resolve_toolset_inner(name: &str, visited: &mut HashSet<String>) -> Vec<Strin
     }
 
     if let Some(legacy) = legacy_toolset(name) {
-        return legacy
+        let mut tools = legacy
             .iter()
             .filter(|tool| tool_entry(tool).is_some())
             .map(|tool| (*tool).to_string())
-            .collect();
+            .collect::<BTreeSet<_>>();
+        if let Some(dynamic) = dynamic_tool_registry().toolsets.get(name) {
+            tools.extend(dynamic.iter().cloned());
+        }
+        return tools.into_iter().collect();
     }
-
-    let Some(entry) = toolset_entry(name) else {
-        return Vec::new();
-    };
 
     let mut tools = BTreeSet::new();
-    for tool in entry.tools {
-        if tool_entry(tool).is_some() {
-            tools.insert((*tool).to_string());
+    if let Some(entry) = toolset_entry(name) {
+        for tool in entry.tools {
+            if tool_entry(tool).is_some() {
+                tools.insert((*tool).to_string());
+            }
+        }
+        for include in entry.includes {
+            for tool in resolve_toolset_inner(include, visited) {
+                tools.insert(tool);
+            }
         }
     }
-    for include in entry.includes {
-        for tool in resolve_toolset_inner(include, visited) {
-            tools.insert(tool);
-        }
+    if let Some(dynamic) = dynamic_tool_registry().toolsets.get(name) {
+        tools.extend(dynamic.iter().cloned());
+    }
+    if tools.is_empty() {
+        return Vec::new();
     }
     tools.into_iter().collect()
 }
@@ -4259,8 +4778,10 @@ fn default_hermes_home() -> PathBuf {
 mod tests {
     use super::*;
 
-    use std::sync::{Arc, Mutex};
     use std::fs;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
     use tempfile::TempDir;
 
     #[derive(Clone)]
@@ -4314,6 +4835,22 @@ mod tests {
             raw: serde_yaml::from_str(&format!("context:\n  engine: {name}\n")).unwrap(),
             config: crate::HermesConfig::default(),
             warnings: Vec::new(),
+        }
+    }
+
+    fn set_optional_env(name: &str, value: Option<&Path>) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os(name);
+        match value {
+            Some(path) => unsafe { std::env::set_var(name, path) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        previous
+    }
+
+    fn restore_optional_env(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
         }
     }
 
@@ -4856,6 +5393,128 @@ mod tests {
             fs::read_to_string(temp.path().join("sandbox.txt")).unwrap(),
             "hello from sandbox"
         );
+    }
+
+    #[test]
+    fn built_in_toolsets_merge_plugin_registered_tools() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let bundled_plugin = temp.path().join("bundled").join("demo-plugin");
+        fs::create_dir_all(&bundled_plugin).unwrap();
+        fs::write(
+            bundled_plugin.join("plugin.yaml"),
+            "name: demo-plugin\nversion: 0.1.0\ndescription: demo\n",
+        )
+        .unwrap();
+        fs::write(
+            bundled_plugin.join("__init__.py"),
+            r#"
+def register(ctx):
+    ctx.register_tool(
+        name="web_search_plus",
+        toolset="web",
+        schema={},
+        handler=None,
+    )
+"#,
+        )
+        .unwrap();
+
+        let old_bundled =
+            set_optional_env("HERMES_BUNDLED_PLUGINS", Some(&temp.path().join("bundled")));
+        let old_home = set_optional_env("HERMES_HOME", Some(&temp.path().join(".hermes")));
+        reset_dynamic_tool_registry_for_tests();
+
+        assert!(resolve_toolset("web").contains(&"web_search_plus".to_string()));
+
+        restore_optional_env("HERMES_BUNDLED_PLUGINS", old_bundled);
+        restore_optional_env("HERMES_HOME", old_home);
+        reset_dynamic_tool_registry_for_tests();
+    }
+
+    #[test]
+    fn plugin_only_toolsets_are_discovered_from_manifest_and_register_calls() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let bundled_plugin = temp.path().join("bundled").join("google_meet");
+        fs::create_dir_all(&bundled_plugin).unwrap();
+        fs::write(
+            bundled_plugin.join("plugin.yaml"),
+            "name: google_meet\nprovides_tools:\n  - meet_join\n  - meet_leave\n",
+        )
+        .unwrap();
+        fs::write(
+            bundled_plugin.join("__init__.py"),
+            r#"
+def register(ctx):
+    for name in ("meet_join", "meet_leave"):
+        ctx.register_tool(
+            name=name,
+            toolset="google_meet",
+            schema={},
+            handler=None,
+        )
+"#,
+        )
+        .unwrap();
+
+        let old_bundled =
+            set_optional_env("HERMES_BUNDLED_PLUGINS", Some(&temp.path().join("bundled")));
+        let old_home = set_optional_env("HERMES_HOME", Some(&temp.path().join(".hermes")));
+        reset_dynamic_tool_registry_for_tests();
+
+        assert!(validate_toolset("google_meet"));
+        assert_eq!(
+            resolve_toolset("google_meet"),
+            vec!["meet_join".to_string(), "meet_leave".to_string()]
+        );
+        let info = get_toolset_info("google_meet").unwrap();
+        assert_eq!(info.implemented_tools, Vec::<String>::new());
+        assert!(!info.available);
+
+        restore_optional_env("HERMES_BUNDLED_PLUGINS", old_bundled);
+        restore_optional_env("HERMES_HOME", old_home);
+        reset_dynamic_tool_registry_for_tests();
+    }
+
+    #[test]
+    fn dynamic_toolsets_reuse_builtin_availability_checks_for_known_tools() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let bundled_plugin = temp.path().join("bundled").join("search-alias");
+        fs::create_dir_all(&bundled_plugin).unwrap();
+        fs::write(
+            bundled_plugin.join("plugin.yaml"),
+            "name: search-alias\nversion: 0.1.0\ndescription: alias\n",
+        )
+        .unwrap();
+        fs::write(
+            bundled_plugin.join("__init__.py"),
+            r#"
+def register(ctx):
+    ctx.register_tool(
+        name="web_search",
+        toolset="plugin_search",
+        schema={},
+        handler=None,
+    )
+"#,
+        )
+        .unwrap();
+
+        let old_bundled =
+            set_optional_env("HERMES_BUNDLED_PLUGINS", Some(&temp.path().join("bundled")));
+        let old_home = set_optional_env("HERMES_HOME", Some(&temp.path().join(".hermes")));
+        reset_dynamic_tool_registry_for_tests();
+
+        let info = get_toolset_info("plugin_search").unwrap();
+        assert_eq!(info.resolved_tools, vec!["web_search".to_string()]);
+        assert_eq!(info.implemented_tools, vec!["web_search".to_string()]);
+        assert!(info.available);
+
+        restore_optional_env("HERMES_BUNDLED_PLUGINS", old_bundled);
+        restore_optional_env("HERMES_HOME", old_home);
+        reset_dynamic_tool_registry_for_tests();
     }
 
     #[test]
