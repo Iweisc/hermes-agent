@@ -1027,7 +1027,6 @@ pub(crate) fn run_gateway_setup_with_io(
     Ok(())
 }
 
-const NO_GATEWAY_SETUP_INSTRUCTIONS: &[&str] = &[];
 const NO_GATEWAY_SETUP_VARS: &[GatewaySetupVarSpec] = &[];
 
 const TELEGRAM_SETUP_INSTRUCTIONS: &[&str] = &[
@@ -1173,6 +1172,13 @@ const WECOM_SETUP_INSTRUCTIONS: &[&str] = &[
     "2. Select API Mode and copy the Bot ID and Secret, or use QR setup below",
     "3. The bot connects by WebSocket — no public callback URL is required",
     "4. Restrict access with WECOM_ALLOWED_USERS or DM pairing for production use",
+];
+
+const WHATSAPP_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Choose a separate bot number or personal self-chat mode",
+    "2. Hermes uses the bundled WhatsApp bridge to show a QR code",
+    "3. Scan the QR code from WhatsApp → Linked Devices → Link a Device",
+    "4. Configure WHATSAPP_ALLOWED_USERS to restrict who can talk to Hermes",
 ];
 
 const WEIXIN_SETUP_INSTRUCTIONS: &[&str] = &[
@@ -1511,8 +1517,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "WhatsApp",
         emoji: "📲",
         token_var: "WHATSAPP_ENABLED",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: WHATSAPP_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -2272,6 +2278,10 @@ fn configure_native_gateway_builtin_platform_with_io(
     output: &mut dyn Write,
 ) -> Result<bool, Box<dyn Error>> {
     match platform.key.as_str() {
+        "whatsapp" => {
+            crate::whatsapp_cmd::run_whatsapp_setup_with_io(context, input, output)?;
+            Ok(true)
+        }
         "matrix" => {
             configure_matrix_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
@@ -6904,6 +6914,13 @@ exit 9\n",
             .unwrap();
         assert!(gateway_platform_uses_native_standard_setup(bluebubbles));
 
+        let whatsapp = metadata
+            .iter()
+            .find(|platform| platform.key == "whatsapp")
+            .unwrap();
+        assert!(!whatsapp.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(whatsapp));
+
         let matrix = metadata
             .iter()
             .find(|platform| platform.key == "matrix")
@@ -7024,7 +7041,6 @@ exit 9\n",
             "EMAIL_PASSWORD",
             "EMAIL_IMAP_HOST",
             "EMAIL_SMTP_HOST",
-            "WHATSAPP_ENABLED",
             "IRC_SERVER",
             "IRC_CHANNEL",
             "TEAMS_CLIENT_ID",
@@ -7046,6 +7062,9 @@ exit 9\n",
             "DINGTALK_CLIENT_ID",
             "DINGTALK_CLIENT_SECRET",
             "DINGTALK_ALLOW_ALL_USERS",
+            "WHATSAPP_MODE",
+            "WHATSAPP_ENABLED",
+            "WHATSAPP_ALLOWED_USERS",
             "FEISHU_APP_ID",
             "FEISHU_APP_SECRET",
             "FEISHU_DOMAIN",
@@ -7180,12 +7199,129 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "whatsapp").unwrap();
+        run_gateway_platform_setup_bridge(true, "legacy-bridge-platform").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=whatsapp"));
+        assert!(log_text.contains("platform accept=1 key=legacy-bridge-platform"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_whatsapp_gateway_platform_uses_native_setup_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "WHATSAPP_MODE",
+            "WHATSAPP_ENABLED",
+            "WHATSAPP_ALLOWED_USERS",
+            "HERMES_WHATSAPP_BRIDGE_DIR",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let bridge_dir = temp.path().join("wa-bridge");
+        let fake_bin = temp.path().join("bin");
+        fs::create_dir_all(&bridge_dir).unwrap();
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::write(bridge_dir.join("bridge.js"), "console.log('bridge');\n").unwrap();
+
+        let command_log = temp.path().join("commands.log");
+        let npm = fake_bin.join("npm");
+        fs::write(
+            &npm,
+            format!(
+                "#!/bin/sh\nprintf 'npm %s\\n' \"$*\" >> '{}'\nmkdir -p node_modules\n",
+                command_log.display()
+            ),
+        )
+        .unwrap();
+        let node = fake_bin.join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\nprintf 'node %s\\n' \"$*\" >> '{}'\nSESSION=''\nPREV=''\nfor ARG in \"$@\"; do\n  if [ \"$PREV\" = '1' ]; then SESSION=\"$ARG\"; PREV=''; continue; fi\n  if [ \"$ARG\" = '--session' ]; then PREV='1'; fi\n done\nmkdir -p \"$SESSION\"\nprintf '{{}}' > \"$SESSION/creds.json\"\n",
+                command_log.display()
+            ),
+        )
+        .unwrap();
+        for path in [&npm, &node] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let fake_python = temp.path().join("python3");
+        let python_log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", python_log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let original_path = env::var_os("PATH");
+        set_env_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                env::var("PATH").unwrap_or_default()
+            ),
+        );
+        set_env_var("HERMES_WHATSAPP_BRIDGE_DIR", &bridge_dir);
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "whatsapp")
+            .unwrap();
+        let mut input = Cursor::new("1\n15551234567\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("WHATSAPP_MODE=bot"));
+        assert!(env_text.contains("WHATSAPP_ENABLED=true"));
+        assert!(env_text.contains("WHATSAPP_ALLOWED_USERS=15551234567"));
+        assert!(
+            context
+                .hermes_home()
+                .join("whatsapp")
+                .join("session")
+                .join("creds.json")
+                .exists()
+        );
+        let commands = fs::read_to_string(command_log).unwrap();
+        assert!(commands.contains("npm install --no-fund --no-audit --progress=false"));
+        assert!(commands.contains("node"));
+        assert!(!python_log.exists());
+
+        match original_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
+        remove_env_var("HERMES_WHATSAPP_BRIDGE_DIR");
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+        remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
     }
 
     #[test]

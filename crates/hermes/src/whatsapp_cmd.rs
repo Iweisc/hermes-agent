@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,6 +79,41 @@ pub fn print_whatsapp(context: &HermesContext) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    run_whatsapp_setup(context, &mut ui)
+}
+
+pub(crate) fn run_whatsapp_setup_with_io(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    struct BufferedUi<'a> {
+        input: &'a mut dyn BufRead,
+        output: &'a mut dyn Write,
+    }
+
+    impl PromptUi for BufferedUi<'_> {
+        fn is_interactive(&self) -> bool {
+            true
+        }
+
+        fn line(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+            writeln!(self.output, "{text}")?;
+            Ok(())
+        }
+
+        fn prompt(&mut self, prompt: &str) -> Result<Option<String>, Box<dyn Error>> {
+            write!(self.output, "{prompt}")?;
+            self.output.flush()?;
+            let mut line = String::new();
+            if self.input.read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            Ok(Some(line.trim().to_string()))
+        }
+    }
+
+    let mut ui = BufferedUi { input, output };
     run_whatsapp_setup(context, &mut ui)
 }
 
