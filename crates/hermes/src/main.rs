@@ -3354,19 +3354,9 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["hermes", "rollback", "diff", "2"]).unwrap();
+        let cli = Cli::try_parse_from(["hermes", "status"]).unwrap();
         match cli.command {
-            Some(Command::Rollback(SlashCompatArgs { args, .. })) => {
-                assert_eq!(args, vec![String::from("diff"), String::from("2")])
-            }
-            other => panic!("unexpected parse result: {other:?}"),
-        }
-
-        let cli = Cli::try_parse_from(["hermes", "status", "--session", "sess-1"]).unwrap();
-        match cli.command {
-            Some(Command::Status(StatusArgs { session })) => {
-                assert_eq!(session.as_deref(), Some("sess-1"));
-            }
+            Some(Command::Status) => {}
             other => panic!("unexpected parse result: {other:?}"),
         }
 
@@ -3805,71 +3795,6 @@ mod tests {
 
         let payload = fs::read_to_string(&stdin_log).unwrap();
         assert!(payload.contains("\"command\":\"/rollback diff 2\""));
-    }
-
-    #[test]
-    fn print_status_uses_worker_when_session_is_requested() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let home = temp.path().join("home");
-        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
-        context.ensure_hermes_home().unwrap();
-        let env_report = EnvLoadReport::default();
-        let config = context.load_config_document().unwrap();
-        let store = context.open_session_store().unwrap();
-        let session_id = "status-session";
-        store
-            .create_session(&SessionCreate {
-                id: session_id.to_string(),
-                source: "cli".to_string(),
-                user_id: None,
-                model: Some("test/model".to_string()),
-                model_config: None,
-                system_prompt: None,
-                parent_session_id: None,
-            })
-            .unwrap();
-
-        let argv_log = temp.path().join("argv.log");
-        let stdin_log = temp.path().join("stdin.log");
-        let python = temp.path().join("fake-python");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{argv}\"\ncat > \"{stdin}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"status ok\"}}'\n",
-            argv = argv_log.display(),
-            stdin = stdin_log.display(),
-        );
-        fs::write(&python, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
-        }
-
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
-        print_status(
-            &context,
-            &env_report,
-            &config,
-            &store,
-            StatusArgs {
-                session: Some(session_id.to_string()),
-            },
-        )
-        .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
-
-        let logged = fs::read_to_string(&argv_log).unwrap();
-        assert!(logged.contains("tui_gateway.slash_worker"));
-        assert!(logged.contains("--session-key"));
-        assert!(logged.contains(session_id));
-
-        let payload = fs::read_to_string(&stdin_log).unwrap();
-        assert!(payload.contains("\"command\":\"/status\""));
     }
 
     #[test]
