@@ -1875,6 +1875,7 @@ fn load_gateway_setup_metadata(
     Ok(platforms)
 }
 
+#[cfg(test)]
 pub(crate) fn gateway_setup_menu_choice_count(
     context: &HermesContext,
     accept_hooks: bool,
