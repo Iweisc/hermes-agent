@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 
 use clap::Subcommand;
 use hermes_core::{
@@ -9,22 +9,23 @@ use hermes_core::{
 use serde_yaml::{Mapping, Sequence, Value};
 
 use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
+use crate::model_cmd::prompt_model_selection_with_io;
 
 #[derive(Subcommand, Debug)]
 pub enum FallbackCommand {
     #[command(alias = "ls")]
     List,
     Add {
-        model: String,
+        model: Option<String>,
         #[arg(long)]
-        provider: String,
+        provider: Option<String>,
         #[arg(long = "base-url")]
         base_url: Option<String>,
         #[arg(long = "api-mode")]
         api_mode: Option<String>,
     },
     #[command(alias = "rm")]
-    Remove { index: usize },
+    Remove { index: Option<usize> },
     Clear {
         #[arg(long, short = 'y')]
         yes: bool,
@@ -51,15 +52,37 @@ pub fn print_fallback(
             provider,
             base_url,
             api_mode,
-        } => add_fallback(
-            config_path,
-            loaded,
-            &model,
-            &provider,
-            base_url.as_deref(),
-            api_mode.as_deref(),
-        )?,
-        FallbackCommand::Remove { index } => remove_fallback(config_path, index)?,
+        } => match (model, provider) {
+            (Some(model), Some(provider)) => add_fallback(
+                config_path,
+                loaded,
+                &model,
+                &provider,
+                base_url.as_deref(),
+                api_mode.as_deref(),
+            )?,
+            (None, None) => {
+                let stdin = io::stdin();
+                let stdout = io::stdout();
+                let mut input = stdin.lock();
+                let mut output = stdout.lock();
+                add_fallback_interactive_with_io(config_path, loaded, &mut input, &mut output)?;
+            }
+            _ => {
+                return Err("fallback add requires both <model> and --provider, or neither".into());
+            }
+        },
+        FallbackCommand::Remove { index } => {
+            if let Some(index) = index {
+                remove_fallback(config_path, index)?;
+            } else {
+                let stdin = io::stdin();
+                let stdout = io::stdout();
+                let mut input = stdin.lock();
+                let mut output = stdout.lock();
+                remove_fallback_with_io(config_path, &mut input, &mut output)?;
+            }
+        }
         FallbackCommand::Clear { yes } => clear_fallbacks(config_path, yes)?,
     }
     Ok(())
@@ -164,6 +187,32 @@ fn add_fallback(
     Ok(())
 }
 
+fn add_fallback_interactive_with_io(
+    config_path: &std::path::Path,
+    loaded: &LoadedConfig,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(output, "Hermes Fallback Picker")?;
+    writeln!(
+        output,
+        "  Select a provider + model to append to the fallback chain."
+    )?;
+    let Some(selection) = prompt_model_selection_with_io(loaded, input, output)? else {
+        writeln!(output, "  No fallback added.")?;
+        return Ok(());
+    };
+    add_fallback(
+        config_path,
+        loaded,
+        &selection.model,
+        &selection.provider,
+        selection.base_url.as_deref(),
+        selection.api_mode.as_deref(),
+    )
+}
+
 fn remove_fallback(config_path: &std::path::Path, index: usize) -> Result<(), Box<dyn Error>> {
     if index == 0 {
         return Err("fallback index must be 1 or greater".into());
@@ -202,6 +251,66 @@ fn remove_fallback(config_path: &std::path::Path, index: usize) -> Result<(), Bo
     }
     println!();
     Ok(())
+}
+
+fn remove_fallback_with_io(
+    config_path: &std::path::Path,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = read_raw_yaml_mapping(config_path)?;
+    let mut chain = read_chain(&root);
+    if chain.is_empty() {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "  No fallback providers configured — nothing to remove."
+        )?;
+        writeln!(output)?;
+        return Ok(());
+    }
+
+    writeln!(output)?;
+    writeln!(output, "Select a fallback to remove:")?;
+    for (index, entry) in chain.iter().enumerate() {
+        writeln!(output, "  {}. {}", index + 1, format_entry(entry))?;
+    }
+    writeln!(output, "  q. Cancel")?;
+
+    loop {
+        let response = prompt_line(input, output, "Selection")?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") {
+            writeln!(output, "  Cancelled — no change.")?;
+            return Ok(());
+        }
+        let Ok(index) = trimmed.parse::<usize>() else {
+            writeln!(output, "  Invalid selection: '{trimmed}'.")?;
+            continue;
+        };
+        if !(1..=chain.len()).contains(&index) {
+            writeln!(output, "  Selection must be between 1 and {}.", chain.len())?;
+            continue;
+        }
+
+        let removed = chain.remove(index - 1);
+        write_chain(&mut root, &chain);
+        write_yaml_mapping(config_path, &root)?;
+        writeln!(output)?;
+        writeln!(output, "  Removed fallback: {}", format_entry(&removed))?;
+        if chain.is_empty() {
+            writeln!(output, "  Fallback chain is now empty.")?;
+        } else {
+            writeln!(
+                output,
+                "  Chain is now {} {} long.",
+                chain.len(),
+                if chain.len() == 1 { "entry" } else { "entries" }
+            )?;
+        }
+        writeln!(output)?;
+        return Ok(());
+    }
 }
 
 fn clear_fallbacks(config_path: &std::path::Path, yes: bool) -> Result<(), Box<dyn Error>> {
@@ -440,10 +549,26 @@ fn mapping_string(mapping: &Mapping, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn prompt_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    label: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{label}: ")?;
+    output.flush()?;
+    let mut response = String::new();
+    let read = input.read_line(&mut response)?;
+    if read == 0 {
+        return Ok(String::new());
+    }
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -542,6 +667,81 @@ mod tests {
         let written = fs::read_to_string(home.join("config.yaml")).unwrap();
         assert!(written.contains("fallback_providers: []"));
         assert!(!written.contains("fallback_model:"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn fallback_add_without_args_is_parseable() {
+        let parsed = FallbackCommand::augment_subcommands(clap::Command::new("fallback"))
+            .try_get_matches_from(["fallback", "add"])
+            .unwrap();
+        assert!(parsed.subcommand_matches("add").is_some());
+    }
+
+    #[test]
+    fn fallback_remove_without_index_is_parseable() {
+        let parsed = FallbackCommand::augment_subcommands(clap::Command::new("fallback"))
+            .try_get_matches_from(["fallback", "remove"])
+            .unwrap();
+        assert!(parsed.subcommand_matches("remove").is_some());
+    }
+
+    #[test]
+    fn add_fallback_interactive_uses_model_picker_selection() {
+        let home = temp_path("interactive-add");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "model:\n  default: gpt-5\n  provider: openai\n",
+        )
+        .unwrap();
+        let context =
+            hermes_core::HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let loaded = context.load_config_document().unwrap();
+        let mut input = Cursor::new(b"openrouter\nanthropic/claude-sonnet-4.6\n".to_vec());
+        let mut output = Vec::new();
+        add_fallback_interactive_with_io(&context.config_path(), &loaded, &mut input, &mut output)
+            .unwrap();
+        let written = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(written.contains("provider: openrouter"));
+        assert!(written.contains("model: anthropic/claude-sonnet-4.6"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn remove_fallback_with_io_removes_selected_entry() {
+        let home = temp_path("interactive-remove");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "fallback_providers:\n  - provider: openrouter\n    model: gpt-5.4\n  - provider: nous\n    model: hermes-4\n",
+        )
+        .unwrap();
+        let mut input = Cursor::new(b"2\n".to_vec());
+        let mut output = Vec::new();
+        remove_fallback_with_io(&home.join("config.yaml"), &mut input, &mut output).unwrap();
+        let written = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(written.contains("gpt-5.4"));
+        assert!(!written.contains("hermes-4"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn remove_fallback_with_io_cancel_keeps_chain() {
+        let home = temp_path("interactive-remove-cancel");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "fallback_providers:\n  - provider: openrouter\n    model: gpt-5.4\n",
+        )
+        .unwrap();
+        let mut input = Cursor::new(b"q\n".to_vec());
+        let mut output = Vec::new();
+        remove_fallback_with_io(&home.join("config.yaml"), &mut input, &mut output).unwrap();
+        let written = fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(written.contains("gpt-5.4"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Cancelled"));
         let _ = fs::remove_dir_all(home);
     }
 }

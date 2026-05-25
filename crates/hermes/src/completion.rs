@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 
 use clap::{Args, CommandFactory, ValueEnum};
@@ -20,13 +19,14 @@ pub enum CompletionShell {
 
 #[derive(Debug, Clone, Default)]
 struct CommandInfo {
+    names: Vec<String>,
     help: String,
     flags: Vec<String>,
-    subcommands: BTreeMap<String, CommandInfo>,
+    subcommands: Vec<CommandInfo>,
 }
 
 pub fn print_completion(args: CompletionArgs) -> Result<(), Box<dyn Error>> {
-    let tree = walk_command(&mut Cli::command());
+    let tree = walk_root_command(&mut Cli::command());
     let script = match args.shell {
         CompletionShell::Bash => generate_bash(&tree),
         CompletionShell::Zsh => generate_zsh(&tree),
@@ -36,9 +36,23 @@ pub fn print_completion(args: CompletionArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn walk_root_command(command: &mut clap::Command) -> CommandInfo {
+    let mut info = walk_command(command);
+    info.names.clear();
+    info
+}
+
 fn walk_command(command: &mut clap::Command) -> CommandInfo {
     command.build();
+    let mut names = vec![command.get_name().to_string()];
+    names.extend(command.get_all_aliases().map(str::to_string));
+    names.sort();
+    names.dedup();
+    if let Some(index) = names.iter().position(|name| name == command.get_name()) {
+        names.swap(0, index);
+    }
     let mut info = CommandInfo {
+        names,
         help: clean(
             command
                 .get_about()
@@ -46,15 +60,20 @@ fn walk_command(command: &mut clap::Command) -> CommandInfo {
                 .unwrap_or_default(),
         ),
         flags: command_flags(command),
-        subcommands: BTreeMap::new(),
+        subcommands: Vec::new(),
     };
     for subcommand in command.get_subcommands_mut() {
         if subcommand.is_hide_set() {
             continue;
         }
-        info.subcommands
-            .insert(subcommand.get_name().to_string(), walk_command(subcommand));
+        info.subcommands.push(walk_command(subcommand));
     }
+    merge_compat_subcommands(&mut info);
+    info.subcommands.sort_by(|left, right| {
+        left.canonical_name()
+            .cmp(right.canonical_name())
+            .then_with(|| left.names.cmp(&right.names))
+    });
     info
 }
 
@@ -67,8 +86,14 @@ fn command_flags(command: &clap::Command) -> Vec<String> {
             if let Some(short) = arg.get_short() {
                 values.push(format!("-{short}"));
             }
+            if let Some(short_aliases) = arg.get_all_short_aliases() {
+                values.extend(short_aliases.into_iter().map(|alias| format!("-{alias}")));
+            }
             if let Some(long) = arg.get_long() {
                 values.push(format!("--{long}"));
+            }
+            if let Some(long_aliases) = arg.get_all_aliases() {
+                values.extend(long_aliases.into_iter().map(|alias| format!("--{alias}")));
             }
             values
         })
@@ -76,6 +101,137 @@ fn command_flags(command: &clap::Command) -> Vec<String> {
     flags.sort();
     flags.dedup();
     flags
+}
+
+impl CommandInfo {
+    fn canonical_name(&self) -> &str {
+        self.names.first().map(String::as_str).unwrap_or("")
+    }
+
+    fn case_pattern(&self) -> String {
+        self.names.join("|")
+    }
+
+    fn all_subcommand_names(&self) -> Vec<String> {
+        self.subcommands
+            .iter()
+            .flat_map(|info| info.names.iter().cloned())
+            .collect()
+    }
+}
+
+fn compat_command(name: &str, aliases: &[&str], subcommands: Vec<CommandInfo>) -> CommandInfo {
+    let mut names = vec![name.to_string()];
+    names.extend(aliases.iter().map(|alias| alias.to_string()));
+    CommandInfo {
+        names,
+        help: String::new(),
+        flags: Vec::new(),
+        subcommands,
+    }
+}
+
+fn merge_compat_subcommands(info: &mut CommandInfo) {
+    for compat in compat_subcommands_for(info.canonical_name()) {
+        if info
+            .subcommands
+            .iter()
+            .any(|existing| existing.canonical_name() == compat.canonical_name())
+        {
+            continue;
+        }
+        info.subcommands.push(compat);
+    }
+}
+
+fn compat_subcommands_for(name: &str) -> Vec<CommandInfo> {
+    match name {
+        "browser" => vec![
+            compat_command("connect", &[], Vec::new()),
+            compat_command("disconnect", &[], Vec::new()),
+            compat_command("status", &[], Vec::new()),
+        ],
+        "busy" => vec![
+            compat_command("queue", &[], Vec::new()),
+            compat_command("steer", &[], Vec::new()),
+            compat_command("interrupt", &[], Vec::new()),
+            compat_command("status", &[], Vec::new()),
+        ],
+        "fast" => vec![
+            compat_command("normal", &[], Vec::new()),
+            compat_command("fast", &[], Vec::new()),
+            compat_command("status", &[], Vec::new()),
+            compat_command("on", &[], Vec::new()),
+            compat_command("off", &[], Vec::new()),
+        ],
+        "footer" => vec![
+            compat_command("on", &[], Vec::new()),
+            compat_command("off", &[], Vec::new()),
+            compat_command("status", &[], Vec::new()),
+        ],
+        "goal" => vec![
+            compat_command("status", &[], Vec::new()),
+            compat_command("pause", &[], Vec::new()),
+            compat_command("resume", &[], Vec::new()),
+            compat_command("clear", &[], Vec::new()),
+        ],
+        "indicator" => vec![
+            compat_command("kaomoji", &[], Vec::new()),
+            compat_command("emoji", &[], Vec::new()),
+            compat_command("unicode", &[], Vec::new()),
+            compat_command("ascii", &[], Vec::new()),
+        ],
+        "kanban" => vec![
+            compat_command(
+                "boards",
+                &[],
+                vec![
+                    compat_command("list", &["ls"], Vec::new()),
+                    compat_command("create", &[], Vec::new()),
+                    compat_command("remove", &["rm"], Vec::new()),
+                    compat_command("switch", &[], Vec::new()),
+                    compat_command("show", &[], Vec::new()),
+                    compat_command("rename", &[], Vec::new()),
+                ],
+            ),
+            compat_command("list", &["ls"], Vec::new()),
+            compat_command("show", &[], Vec::new()),
+            compat_command("create", &[], Vec::new()),
+            compat_command("assign", &[], Vec::new()),
+            compat_command("link", &[], Vec::new()),
+            compat_command("unlink", &[], Vec::new()),
+            compat_command("claim", &[], Vec::new()),
+            compat_command("comment", &[], Vec::new()),
+            compat_command("complete", &[], Vec::new()),
+            compat_command("block", &[], Vec::new()),
+            compat_command("unblock", &[], Vec::new()),
+            compat_command("archive", &[], Vec::new()),
+            compat_command("tail", &[], Vec::new()),
+            compat_command("dispatch", &[], Vec::new()),
+            compat_command("context", &[], Vec::new()),
+            compat_command("init", &[], Vec::new()),
+            compat_command("gc", &[], Vec::new()),
+        ],
+        "reasoning" => vec![
+            compat_command("none", &[], Vec::new()),
+            compat_command("minimal", &[], Vec::new()),
+            compat_command("low", &[], Vec::new()),
+            compat_command("medium", &[], Vec::new()),
+            compat_command("high", &[], Vec::new()),
+            compat_command("xhigh", &[], Vec::new()),
+            compat_command("show", &[], Vec::new()),
+            compat_command("hide", &[], Vec::new()),
+            compat_command("on", &[], Vec::new()),
+            compat_command("off", &[], Vec::new()),
+        ],
+        "voice" => vec![
+            compat_command("on", &[], Vec::new()),
+            compat_command("off", &[], Vec::new()),
+            compat_command("tts", &[], Vec::new()),
+            compat_command("status", &[], Vec::new()),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn clean(text: String) -> String {
@@ -86,12 +242,16 @@ fn clean(text: String) -> String {
 }
 
 fn generate_bash(tree: &CommandInfo) -> String {
-    let top_cmds = tree.subcommands.keys().cloned().collect::<Vec<_>>();
+    let top_cmds = tree
+        .subcommands
+        .iter()
+        .flat_map(|info| info.names.iter().cloned())
+        .collect::<Vec<_>>();
     let top_cmds_str = top_cmds.join(" ");
     let top_flags = tree.flags.join(" ");
     let mut cases = Vec::new();
-    for (name, info) in &tree.subcommands {
-        cases.push(build_bash_case(name, info));
+    for info in &tree.subcommands {
+        cases.push(build_bash_case(info, 1));
     }
     format!(
         "# Hermes Agent bash completion\n\
@@ -140,66 +300,53 @@ fn generate_bash(tree: &CommandInfo) -> String {
     )
 }
 
-fn build_bash_case(name: &str, info: &CommandInfo) -> String {
+fn build_bash_case(info: &CommandInfo, depth: usize) -> String {
+    let indent = "        ".repeat(depth);
+    let inner = format!("{indent}    ");
     let flags = info.flags.join(" ");
     if info.subcommands.is_empty() {
         return format!(
-            "        {name})\n\
-             \t\tCOMPREPLY=($(compgen -W \"{flags}\" -- \"$cur\"))\n\
-             \t\treturn\n\
-             \t\t;;"
+            "{indent}{})\n\
+             {inner}COMPREPLY=($(compgen -W \"{flags}\" -- \"$cur\"))\n\
+             {inner}return\n\
+             {inner};;",
+            info.case_pattern(),
         );
     }
-    let subcommands = info.subcommands.keys().cloned().collect::<Vec<_>>();
+    let subcommands = info.all_subcommand_names();
     let subcommand_str = subcommands.join(" ");
-    let mut nested = Vec::new();
-    for (sub_name, sub_info) in &info.subcommands {
-        let sub_flags = sub_info.flags.join(" ");
-        nested.push(format!(
-            "                {sub_name})\n\
-             \t\t\t\tCOMPREPLY=($(compgen -W \"{sub_flags}\" -- \"$cur\"))\n\
-             \t\t\t\treturn\n\
-             \t\t\t\t;;"
-        ));
-    }
+    let nested = info
+        .subcommands
+        .iter()
+        .map(|sub_info| build_bash_case(sub_info, depth + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "        {name})\n\
-         \t\tif [[ $COMP_CWORD -eq 2 ]]; then\n\
-         \t\t\tCOMPREPLY=($(compgen -W \"{subcommand_str} {flags}\" -- \"$cur\"))\n\
-         \t\t\treturn\n\
-         \t\tfi\n\
-         \t\tcase \"$subcmd\" in\n\
+        "{indent}{})\n\
+         {inner}if [[ $COMP_CWORD -eq {} ]]; then\n\
+         {inner}    COMPREPLY=($(compgen -W \"{subcommand_str} {flags}\" -- \"$cur\"))\n\
+         {inner}    return\n\
+         {inner}fi\n\
+         {inner}case \"{}\" in\n\
          {nested}\n\
-         \t\tesac\n\
-         \t\t;;",
-        nested = nested.join("\n")
+         {inner}esac\n\
+         {inner}COMPREPLY=($(compgen -W \"{flags}\" -- \"$cur\"))\n\
+         {inner}return\n\
+         {inner};;",
+        info.case_pattern(),
+        depth + 1,
+        bash_word_expr(depth + 1),
+        nested = nested
     )
 }
 
 fn generate_zsh(tree: &CommandInfo) -> String {
     let mut top_cmds = Vec::new();
     let mut sub_cases = Vec::new();
-    for (name, info) in &tree.subcommands {
-        top_cmds.push(format!("                '{}:{}'", name, info.help));
-        if !info.subcommands.is_empty() {
-            let mut nested = Vec::new();
-            for (sub_name, sub_info) in &info.subcommands {
-                nested.push(format!(
-                    "                        '{}:{}'",
-                    sub_name, sub_info.help
-                ));
-            }
-            sub_cases.push(format!(
-                "                {name})\n\
-                 \t\t\tlocal -a {safe}_cmds\n\
-                 \t\t\t{safe}_cmds=(\n\
-                 {nested}\n\
-                 \t\t\t)\n\
-                 \t\t\t_describe '{name} command' {safe}_cmds\n\
-                 \t\t\t;;",
-                safe = name.replace('-', "_"),
-                nested = nested.join("\n")
-            ));
+    for info in &tree.subcommands {
+        top_cmds.extend(zsh_entries(std::slice::from_ref(info), 4));
+        if info.canonical_name() != "profile" && !info.subcommands.is_empty() {
+            sub_cases.push(build_zsh_case(info, 1));
         }
     }
     format!(
@@ -268,7 +415,11 @@ fn generate_zsh(tree: &CommandInfo) -> String {
 }
 
 fn generate_fish(tree: &CommandInfo) -> String {
-    let top_cmds = tree.subcommands.keys().cloned().collect::<Vec<_>>();
+    let top_cmds = tree
+        .subcommands
+        .iter()
+        .flat_map(|info| info.names.iter().cloned())
+        .collect::<Vec<_>>();
     let top_cmds_str = top_cmds.join(" ");
     let mut lines = vec![
         "# Hermes Agent fish completion".to_string(),
@@ -288,25 +439,23 @@ fn generate_fish(tree: &CommandInfo) -> String {
         "".to_string(),
         "# Top-level subcommands".to_string(),
     ];
-    for (name, info) in &tree.subcommands {
-        lines.push(format!(
-            "complete -c hermes -f -n 'not __fish_seen_subcommand_from {top_cmds_str}' -a {name} -d '{}'",
-            info.help
-        ));
+    for info in &tree.subcommands {
+        for (index, name) in info.names.iter().enumerate() {
+            let description = if index == 0 {
+                info.help.clone()
+            } else {
+                format!("Alias for {}", info.canonical_name())
+            };
+            lines.push(format!(
+                "complete -c hermes -f -n 'not __fish_seen_subcommand_from {top_cmds_str}' -a {name} -d '{}'",
+                description
+            ));
+        }
     }
     lines.push("".to_string());
     lines.push("# Subcommand completions".to_string());
-    for (name, info) in &tree.subcommands {
-        if info.subcommands.is_empty() {
-            continue;
-        }
-        lines.push(format!("# {name}"));
-        for (sub_name, sub_info) in &info.subcommands {
-            lines.push(format!(
-                "complete -c hermes -f -n '__fish_seen_subcommand_from {name}' -a {sub_name} -d '{}'",
-                sub_info.help
-            ));
-        }
+    for info in &tree.subcommands {
+        push_fish_subcommand_lines(&mut lines, info, &[]);
     }
     lines.push(
         "complete -c hermes -f -n '__fish_seen_subcommand_from use path; and __fish_seen_subcommand_from profile' -a '(__hermes_profiles)' -d 'Profile name'"
@@ -315,13 +464,141 @@ fn generate_fish(tree: &CommandInfo) -> String {
     lines.join("\n")
 }
 
+fn bash_word_expr(depth: usize) -> String {
+    match depth {
+        1 => "$cmd".to_string(),
+        2 => "$subcmd".to_string(),
+        _ => format!("${{COMP_WORDS[{depth}]}}"),
+    }
+}
+
+fn build_zsh_case(info: &CommandInfo, depth: usize) -> String {
+    let indent = zsh_indent(depth);
+    let inner = format!("{indent}    ");
+    let nested_cases = info
+        .subcommands
+        .iter()
+        .filter(|sub_info| !sub_info.subcommands.is_empty())
+        .map(|sub_info| build_zsh_case(sub_info, depth + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entries = zsh_entries(&info.subcommands, depth + 3).join("\n");
+    let safe = zsh_safe_name(info.canonical_name(), depth);
+    if nested_cases.is_empty() {
+        return format!(
+            "{indent}{})\n\
+             {inner}local -a {safe}_cmds\n\
+             {inner}{safe}_cmds=(\n\
+             {entries}\n\
+             {inner})\n\
+             {inner}_describe '{} command' {safe}_cmds\n\
+             {inner};;",
+            zsh_case_pattern(&info.names),
+            info.canonical_name(),
+        );
+    }
+    format!(
+        "{indent}{})\n\
+         {inner}case ${{line[{}}} in\n\
+         {nested_cases}\n\
+         {inner}    *)\n\
+         {inner}        local -a {safe}_cmds\n\
+         {inner}        {safe}_cmds=(\n\
+         {entries}\n\
+         {inner}        )\n\
+         {inner}        _describe '{} command' {safe}_cmds\n\
+         {inner}        ;;\n\
+         {inner}esac\n\
+         {inner};;",
+        zsh_case_pattern(&info.names),
+        depth + 1,
+        info.canonical_name(),
+    )
+}
+
+fn zsh_entries(commands: &[CommandInfo], depth: usize) -> Vec<String> {
+    let indent = zsh_indent(depth);
+    let mut entries = Vec::new();
+    for info in commands {
+        entries.push(format!("{indent}'{}:{}'", info.canonical_name(), info.help));
+        for alias in info.names.iter().skip(1) {
+            entries.push(format!(
+                "{indent}'{}:Alias for {}'",
+                alias,
+                info.canonical_name()
+            ));
+        }
+    }
+    entries
+}
+
+fn zsh_indent(depth: usize) -> String {
+    format!("                {}", "    ".repeat(depth.saturating_sub(1)))
+}
+
+fn zsh_safe_name(name: &str, depth: usize) -> String {
+    format!("{}_{}_cmds", name.replace('-', "_"), depth)
+}
+
+fn push_fish_subcommand_lines(
+    lines: &mut Vec<String>,
+    info: &CommandInfo,
+    ancestor_conditions: &[String],
+) {
+    if info.subcommands.is_empty() {
+        return;
+    }
+
+    lines.push(format!("# {}", info.canonical_name()));
+    let mut condition_parts = ancestor_conditions.to_vec();
+    condition_parts.push(format!(
+        "__fish_seen_subcommand_from {}",
+        info.names.join(" ")
+    ));
+    let child_names = info.all_subcommand_names().join(" ");
+    if !child_names.is_empty() {
+        condition_parts.push(format!("not __fish_seen_subcommand_from {child_names}"));
+    }
+    let condition = condition_parts.join("; and ");
+    for sub_info in &info.subcommands {
+        for (index, sub_name) in sub_info.names.iter().enumerate() {
+            let description = if index == 0 {
+                sub_info.help.clone()
+            } else {
+                format!("Alias for {}", sub_info.canonical_name())
+            };
+            lines.push(format!(
+                "complete -c hermes -f -n '{condition}' -a {sub_name} -d '{}'",
+                description
+            ));
+        }
+    }
+
+    let mut next_conditions = ancestor_conditions.to_vec();
+    next_conditions.push(format!(
+        "__fish_seen_subcommand_from {}",
+        info.names.join(" ")
+    ));
+    for sub_info in &info.subcommands {
+        push_fish_subcommand_lines(lines, sub_info, &next_conditions);
+    }
+}
+
+fn zsh_case_pattern(names: &[String]) -> String {
+    if names.len() <= 1 {
+        names.first().cloned().unwrap_or_default()
+    } else {
+        format!("({})", names.join("|"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn bash_completion_lists_top_level_commands() {
-        let tree = walk_command(&mut Cli::command());
+        let tree = walk_root_command(&mut Cli::command());
         let script = generate_bash(&tree);
         assert!(script.contains("debug"));
         assert!(script.contains("completion"));
@@ -330,7 +607,7 @@ mod tests {
 
     #[test]
     fn zsh_completion_includes_profile_helper() {
-        let tree = walk_command(&mut Cli::command());
+        let tree = walk_root_command(&mut Cli::command());
         let script = generate_zsh(&tree);
         assert!(script.contains("_hermes_profiles"));
         assert!(script.contains("profile command"));
@@ -338,9 +615,151 @@ mod tests {
 
     #[test]
     fn fish_completion_contains_subcommand_entries() {
-        let tree = walk_command(&mut Cli::command());
+        let tree = walk_root_command(&mut Cli::command());
         let script = generate_fish(&tree);
         assert!(script.contains("complete -c hermes"));
         assert!(script.contains("sessions"));
+    }
+
+    #[test]
+    fn completions_include_sessions_browse_and_fallback_subcommands() {
+        let tree = walk_root_command(&mut Cli::command());
+        let bash = generate_bash(&tree);
+        let fish = generate_fish(&tree);
+        assert!(bash.contains("browse"));
+        assert!(bash.contains("resume"));
+        assert!(bash.contains("fallback"));
+        assert!(fish.contains("__fish_seen_subcommand_from sessions"));
+        assert!(fish.contains("-a resume -d ''"));
+        assert!(fish.contains("__fish_seen_subcommand_from fallback"));
+        assert!(fish.contains(" -a browse "));
+        assert!(fish.contains(" -a add "));
+        assert!(fish.contains(" -a remove "));
+    }
+
+    #[test]
+    fn completions_include_alias_subcommands_and_flag_aliases() {
+        let tree = walk_root_command(&mut Cli::command());
+        let bash = generate_bash(&tree);
+        let fish = generate_fish(&tree);
+        let zsh = generate_zsh(&tree);
+
+        assert!(bash.contains("create|add"));
+        assert!(bash.contains("remove|"));
+        assert!(bash.contains("|delete"));
+        assert!(bash.contains("|rm"));
+        assert!(bash.contains("--synchronous"));
+
+        assert!(fish.contains("__fish_seen_subcommand_from fallback"));
+        assert!(fish.contains(" -a ls "));
+        assert!(fish.contains(" -a rm "));
+
+        assert!(zsh.contains("'add:Alias for create'"));
+        assert!(zsh.contains("'rm:Alias for remove'"));
+    }
+
+    #[test]
+    fn completions_include_top_level_aliases_and_nested_subcommands() {
+        let tree = walk_root_command(&mut Cli::command());
+        let bash = generate_bash(&tree);
+        let fish = generate_fish(&tree);
+        let zsh = generate_zsh(&tree);
+
+        assert!(bash.contains("${COMP_WORDS[3]}"));
+        assert!(bash.contains("export import"));
+
+        assert!(fish.contains("-a provider -d 'Alias for model'"));
+        assert!(fish.contains("-a snap -d 'Alias for snapshot'"));
+        assert!(fish.contains(
+            "__fish_seen_subcommand_from skills; and __fish_seen_subcommand_from snapshot"
+        ));
+        assert!(fish.contains(" -a export "));
+        assert!(fish.contains(" -a import "));
+
+        assert!(zsh.contains("'provider:Alias for model'"));
+        assert!(zsh.contains("'snap:Alias for snapshot'"));
+        assert!(zsh.contains("_describe 'snapshot command'"));
+        assert!(zsh.contains("'export:"));
+    }
+
+    #[test]
+    fn completions_include_kanban_compat_subcommands() {
+        let tree = walk_root_command(&mut Cli::command());
+        let bash = generate_bash(&tree);
+        let fish = generate_fish(&tree);
+        let zsh = generate_zsh(&tree);
+
+        assert!(bash.contains("boards"));
+        assert!(bash.contains("assign"));
+        assert!(bash.contains("switch"));
+
+        assert!(fish.contains("-a platforms -d 'Alias for gateway'"));
+        assert!(fish.contains("__fish_seen_subcommand_from kanban"));
+        assert!(fish.contains(" -a boards "));
+        assert!(fish.contains(" -a switch "));
+
+        assert!(zsh.contains("'platforms:Alias for gateway'"));
+        assert!(zsh.contains("_describe 'kanban command'"));
+        assert!(zsh.contains("'boards:"));
+        assert!(zsh.contains("'switch:"));
+    }
+
+    #[test]
+    fn completions_include_slash_compat_commands_and_subcommands() {
+        let tree = walk_root_command(&mut Cli::command());
+        let bash = generate_bash(&tree);
+        let fish = generate_fish(&tree);
+        let zsh = generate_zsh(&tree);
+
+        assert!(bash.contains("reasoning"));
+        assert!(bash.contains("voice"));
+        assert!(bash.contains("gquota"));
+        assert!(bash.contains("goal"));
+        assert!(bash.contains("clear"));
+        assert!(bash.contains("compress"));
+        assert!(bash.contains("image"));
+        assert!(bash.contains("new"));
+        assert!(bash.contains("paste"));
+        assert!(bash.contains("queue"));
+        assert!(bash.contains("redraw"));
+        assert!(bash.contains("restart"));
+        assert!(bash.contains("retry"));
+        assert!(bash.contains("steer"));
+        assert!(bash.contains("status"));
+        assert!(bash.contains("title"));
+        assert!(bash.contains("undo"));
+        assert!(bash.contains("background"));
+        assert!(bash.contains("show"));
+        assert!(bash.contains("hide"));
+        assert!(bash.contains("connect"));
+        assert!(bash.contains("disconnect"));
+        assert!(bash.contains("status"));
+
+        assert!(fish.contains("-a bg -d 'Alias for background'"));
+        assert!(fish.contains("-a tasks -d 'Alias for agents'"));
+        assert!(fish.contains("-a fork -d 'Alias for branch'"));
+        assert!(fish.contains("-a q -d 'Alias for queue'"));
+        assert!(fish.contains("-a reset -d 'Alias for new'"));
+        assert!(fish.contains("-a gquota -d ''"));
+        assert!(fish.contains("-a reload_mcp -d 'Alias for reload-mcp'"));
+        assert!(fish.contains("__fish_seen_subcommand_from reasoning"));
+        assert!(fish.contains(" -a xhigh "));
+        assert!(fish.contains("__fish_seen_subcommand_from goal"));
+        assert!(fish.contains(" -a pause "));
+        assert!(fish.contains("__fish_seen_subcommand_from browser"));
+        assert!(fish.contains(" -a disconnect "));
+
+        assert!(zsh.contains("'bg:Alias for background'"));
+        assert!(zsh.contains("'tasks:Alias for agents'"));
+        assert!(zsh.contains("'fork:Alias for branch'"));
+        assert!(zsh.contains("'q:Alias for queue'"));
+        assert!(zsh.contains("'reset:Alias for new'"));
+        assert!(zsh.contains("'gquota:"));
+        assert!(zsh.contains("'reload_mcp:Alias for reload-mcp'"));
+        assert!(zsh.contains("_describe 'reasoning command'"));
+        assert!(zsh.contains("'xhigh:"));
+        assert!(zsh.contains("_describe 'goal command'"));
+        assert!(zsh.contains("'pause:"));
+        assert!(zsh.contains("_describe 'browser command'"));
     }
 }

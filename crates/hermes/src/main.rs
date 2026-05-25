@@ -37,8 +37,9 @@ mod whatsapp_cmd;
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -56,6 +57,25 @@ use hermes_core::{
     run_cron_job_now, run_due_cron_jobs, run_kanban_task,
 };
 use serde_json::{Value as JsonValue, json};
+
+use crate::python_bridge::{project_root, resolve_repo_python};
+
+const INHERITED_RELAUNCH_FLAGS: &[(&str, bool)] = &[
+    ("--profile", true),
+    ("-p", true),
+    ("-m", true),
+    ("--model", true),
+    ("--provider", true),
+    ("--accept-hooks", false),
+    ("--skills", true),
+    ("-s", true),
+    ("--yolo", false),
+    ("--pass-session-id", false),
+    ("--ignore-user-config", false),
+    ("--ignore-rules", false),
+    ("--tui", false),
+    ("--dev", false),
+];
 
 #[cfg(test)]
 pub(crate) fn cli_test_env_lock() -> &'static Mutex<()> {
@@ -91,10 +111,59 @@ enum Command {
         #[command(subcommand)]
         command: Option<fallback_cmd::FallbackCommand>,
     },
+    Busy(SlashCompatArgs),
+    Browser(SlashCompatArgs),
+    Clear(SlashCompatArgs),
+    Compress(SlashCompatArgs),
+    Commands(SlashCompatArgs),
+    Copy(SlashCompatArgs),
+    Footer(SlashCompatArgs),
+    #[command(alias = "tasks")]
+    Agents(SlashCompatArgs),
+    #[command(alias = "bg", alias = "btw")]
+    Background(SlashCompatArgs),
+    #[command(alias = "fork")]
+    Branch(SlashCompatArgs),
+    #[command(alias = "provider")]
     Model {
         #[command(subcommand)]
         command: Option<model_cmd::ModelCommand>,
     },
+    Fast(SlashCompatArgs),
+    Gquota(SlashCompatArgs),
+    Goal(SlashCompatArgs),
+    History(SlashCompatArgs),
+    Image(SlashCompatArgs),
+    Indicator(SlashCompatArgs),
+    #[command(alias = "reset")]
+    New(SlashCompatArgs),
+    Paste(SlashCompatArgs),
+    Personality(SlashCompatArgs),
+    #[command(alias = "q")]
+    Queue(SlashCompatArgs),
+    Redraw(SlashCompatArgs),
+    Reasoning(SlashCompatArgs),
+    Reload(SlashCompatArgs),
+    #[command(alias = "reload_mcp")]
+    ReloadMcp(SlashCompatArgs),
+    #[command(alias = "reload_skills")]
+    ReloadSkills(SlashCompatArgs),
+    Restart(gateway_cmd::GatewayServiceArgs),
+    Resume(ResumeArgs),
+    Retry(SlashCompatArgs),
+    Save(SlashCompatArgs),
+    Skin(SlashCompatArgs),
+    #[command(alias = "sb")]
+    Statusbar(SlashCompatArgs),
+    Steer(SlashCompatArgs),
+    Stop(SlashCompatArgs),
+    Toolsets(SlashCompatArgs),
+    Title(SlashCompatArgs),
+    Undo(SlashCompatArgs),
+    Usage(SlashCompatArgs),
+    Verbose(SlashCompatArgs),
+    Voice(SlashCompatArgs),
+    Yolo(SlashCompatArgs),
     Slack {
         #[command(subcommand)]
         command: Option<slack_cmd::SlackCommand>,
@@ -105,6 +174,7 @@ enum Command {
     },
     Completion(completion::CompletionArgs),
     Dashboard(dashboard_cmd::DashboardArgs),
+    #[command(alias = "platforms")]
     Gateway(gateway_cmd::GatewayArgs),
     Skills {
         #[command(subcommand)]
@@ -114,6 +184,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<checkpoints_cmd::CheckpointsCommand>,
     },
+    #[command(alias = "snap")]
     Snapshot {
         #[command(subcommand)]
         command: Option<snapshot_cmd::SnapshotCommand>,
@@ -199,6 +270,12 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum SessionsCommand {
+    Browse {
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+        #[arg(long)]
+        source: Option<String>,
+    },
     List {
         #[arg(long, default_value_t = 20)]
         limit: i64,
@@ -347,6 +424,25 @@ enum KanbanCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    #[command(external_subcommand)]
+    Compat(Vec<String>),
+}
+
+#[derive(Args, Debug, Clone)]
+struct SlashCompatArgs {
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ResumeArgs {
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long)]
+    source: Option<String>,
+    target: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -386,7 +482,53 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Fallback { command } => {
             fallback_cmd::print_fallback(&context.config_path(), &config, command)?
         }
+        Command::Agents(args) => print_slash_compat(&session_store, "agents", args)?,
+        Command::Background(args) => print_slash_compat(&session_store, "background", args)?,
+        Command::Branch(args) => print_slash_compat(&session_store, "branch", args)?,
+        Command::Busy(args) => print_slash_compat(&session_store, "busy", args)?,
+        Command::Browser(args) => print_slash_compat(&session_store, "browser", args)?,
+        Command::Clear(args) => print_no_arg_slash_compat(&session_store, "clear", args)?,
+        Command::Compress(args) => print_compress_compat(&session_store, args)?,
+        Command::Commands(args) => print_slash_compat(&session_store, "commands", args)?,
+        Command::Copy(args) => print_slash_compat(&session_store, "copy", args)?,
+        Command::Footer(args) => print_slash_compat(&session_store, "footer", args)?,
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
+        Command::Fast(args) => print_slash_compat(&session_store, "fast", args)?,
+        Command::Gquota(args) => print_slash_compat(&session_store, "gquota", args)?,
+        Command::Goal(args) => print_goal_compat(&session_store, args)?,
+        Command::History(args) => print_slash_compat(&session_store, "history", args)?,
+        Command::Image(args) => print_image_compat(&session_store, args)?,
+        Command::Indicator(args) => print_slash_compat(&session_store, "indicator", args)?,
+        Command::New(args) => print_slash_compat(&session_store, "new", args)?,
+        Command::Paste(args) => print_paste_compat(&session_store, args)?,
+        Command::Personality(args) => print_slash_compat(&session_store, "personality", args)?,
+        Command::Queue(args) => print_send_turn_compat(&session_store, "queue", args)?,
+        Command::Redraw(args) => print_no_arg_slash_compat(&session_store, "redraw", args)?,
+        Command::Reasoning(args) => print_slash_compat(&session_store, "reasoning", args)?,
+        Command::Reload(args) => print_slash_compat(&session_store, "reload", args)?,
+        Command::ReloadMcp(args) => print_slash_compat(&session_store, "reload-mcp", args)?,
+        Command::ReloadSkills(args) => print_slash_compat(&session_store, "reload-skills", args)?,
+        Command::Restart(service) => gateway_cmd::print_gateway(
+            &context,
+            gateway_cmd::GatewayArgs {
+                accept_hooks: false,
+                command: Some(gateway_cmd::GatewayCommand::Restart(service)),
+            },
+        )?,
+        Command::Resume(args) => print_resume(&session_store, args)?,
+        Command::Retry(args) => print_retry_compat(&session_store, args)?,
+        Command::Save(args) => print_slash_compat(&session_store, "save", args)?,
+        Command::Skin(args) => print_slash_compat(&session_store, "skin", args)?,
+        Command::Statusbar(args) => print_slash_compat(&session_store, "statusbar", args)?,
+        Command::Steer(args) => print_send_turn_compat(&session_store, "steer", args)?,
+        Command::Stop(args) => print_slash_compat(&session_store, "stop", args)?,
+        Command::Toolsets(args) => print_slash_compat(&session_store, "toolsets", args)?,
+        Command::Title(args) => print_slash_compat(&session_store, "title", args)?,
+        Command::Undo(args) => print_undo_compat(&session_store, args)?,
+        Command::Usage(args) => print_slash_compat(&session_store, "usage", args)?,
+        Command::Verbose(args) => print_slash_compat(&session_store, "verbose", args)?,
+        Command::Voice(args) => print_slash_compat(&session_store, "voice", args)?,
+        Command::Yolo(args) => print_slash_compat(&session_store, "yolo", args)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
         Command::Gateway(args) => gateway_cmd::print_gateway(&context, args)?,
         Command::Skills { command } => skills_cmd::print_skills(&context, command)?,
@@ -472,6 +614,24 @@ fn print_sessions(
     command: SessionsCommand,
 ) -> Result<(), Box<dyn Error>> {
     match command {
+        SessionsCommand::Browse { limit, source } => {
+            let (limit, _) = validate_pagination(limit, 0)?;
+            let rows = session_store.search_sessions(source.as_deref(), limit, 0)?;
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let mut input = stdin.lock();
+            let mut output = stdout.lock();
+            match browse_sessions_with_io(&rows, &mut input, &mut output)? {
+                Some(session_id) => {
+                    writeln!(output, "Resuming session: {session_id}")?;
+                    output.flush()?;
+                    launch_python_resume_session(&session_id)?;
+                }
+                None => {
+                    writeln!(output, "Cancelled.")?;
+                }
+            }
+        }
         SessionsCommand::List {
             limit,
             offset,
@@ -1328,6 +1488,9 @@ fn print_kanban(
                     .unwrap_or_default()
             );
         }
+        KanbanCommand::Compat(args) => {
+            launch_python_kanban_command(&args)?;
+        }
     }
     Ok(())
 }
@@ -1362,6 +1525,23 @@ fn resolve_existing_session_id(
         .ok_or_else(|| format!("session '{candidate}' not found").into())
 }
 
+fn resolve_resume_target(
+    session_store: &hermes_core::SessionStore,
+    candidate: &str,
+) -> Result<String, Box<dyn Error>> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Err("resume target cannot be empty".into());
+    }
+    if let Some(session_id) = session_store.resolve_session_id(candidate)? {
+        return Ok(session_id);
+    }
+    if let Some(session_id) = session_store.resolve_session_by_title(candidate)? {
+        return Ok(session_id);
+    }
+    Err(format!("session '{candidate}' not found").into())
+}
+
 fn write_session_exports(
     output: &str,
     exports: &[hermes_core::ExportedSession],
@@ -1387,6 +1567,695 @@ fn write_session_exports(
     println!("exported={}", exports.len());
     println!("output={output}");
     Ok(())
+}
+
+fn print_slash_compat(
+    session_store: &hermes_core::SessionStore,
+    slash_name: &str,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    launch_python_slash_command(&session_id, slash_name, &args.args)
+}
+
+fn print_no_arg_slash_compat(
+    session_store: &hermes_core::SessionStore,
+    slash_name: &str,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args(slash_name, &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    launch_python_slash_command(&session_id, slash_name, &[])
+}
+
+fn print_goal_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let goal_text = args.args.join(" ");
+    if is_goal_control_command(&goal_text) {
+        return launch_python_slash_command(&session_id, "goal", &args.args);
+    }
+    launch_python_slash_command(&session_id, "goal", &args.args)?;
+    launch_python_chat_query(&session_id, goal_text.trim())
+}
+
+fn print_compress_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let focus_topic = args.args.join(" ");
+    let result = launch_python_session_bridge_compress(&session_id, focus_topic.trim())?;
+    if let Some(summary) = result.get("summary").and_then(JsonValue::as_str) {
+        let summary = summary.trim();
+        if !summary.is_empty() {
+            println!("{summary}");
+            return Ok(());
+        }
+    }
+    let before = result
+        .get("before_messages")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    let after = result
+        .get("after_messages")
+        .and_then(JsonValue::as_i64)
+        .unwrap_or(0);
+    println!("Compressed session history: {before} -> {after} messages.");
+    Ok(())
+}
+
+fn print_send_turn_compat(
+    session_store: &hermes_core::SessionStore,
+    command_name: &str,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let prompt = ensure_nonempty_prompt(command_name, &args.args)?;
+    launch_python_chat_query(&session_id, &prompt)
+}
+
+fn print_image_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let (image_path, prompt) = split_image_args(&args.args)?;
+    launch_python_chat_turn(&session_id, prompt.as_deref(), Some(&image_path))
+}
+
+fn print_paste_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let prompt = joined_optional_prompt(&args.args);
+    let image_path = launch_python_session_bridge_clipboard_save()?;
+    launch_python_chat_turn(&session_id, prompt.as_deref(), Some(&image_path))
+}
+
+fn print_retry_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("retry", &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let Some(result) = session_store.truncate_last_user_turn(&session_id)? else {
+        println!("No user message found to retry.");
+        return Ok(());
+    };
+    let Some(message) = result.last_user_text.as_deref() else {
+        println!("Last user message is empty.");
+        return Ok(());
+    };
+    println!("Retrying: \"{}\"", truncate_preview(message, 60));
+    launch_python_chat_query(&session_id, message)
+}
+
+fn print_undo_compat(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("undo", &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let Some(result) = session_store.truncate_last_user_turn(&session_id)? else {
+        println!("No user message found to undo.");
+        return Ok(());
+    };
+    let removed = result
+        .last_user_text
+        .as_deref()
+        .map(|text| format!(" Removed: \"{}\"", truncate_preview(text, 60)))
+        .unwrap_or_default();
+    println!("Undid {} message(s).{removed}", result.removed_count);
+    println!(
+        "  {} message(s) remaining in history.",
+        result.remaining_count
+    );
+    Ok(())
+}
+
+fn print_resume(
+    session_store: &hermes_core::SessionStore,
+    args: ResumeArgs,
+) -> Result<(), Box<dyn Error>> {
+    let target = args.target.join(" ");
+    let session_id = if target.trim().is_empty() {
+        let (limit, _) = validate_pagination(args.limit, 0)?;
+        let rows = session_store.search_sessions(args.source.as_deref(), limit, 0)?;
+        let stdin = io::stdin();
+        let stdout = io::stdout();
+        let mut input = stdin.lock();
+        let mut output = stdout.lock();
+        match browse_sessions_with_io(&rows, &mut input, &mut output)? {
+            Some(session_id) => {
+                writeln!(output, "Resuming session: {session_id}")?;
+                output.flush()?;
+                session_id
+            }
+            None => {
+                writeln!(output, "Cancelled.")?;
+                return Ok(());
+            }
+        }
+    } else {
+        let session_id = resolve_resume_target(session_store, &target)?;
+        println!("Resuming session: {session_id}");
+        session_id
+    };
+    launch_python_resume_session(&session_id)
+}
+
+fn launch_python_resume_session(session_id: &str) -> Result<(), Box<dyn Error>> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("session id cannot be empty".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for interactive resume")?;
+    let mut command = ProcessCommand::new(&python);
+    let original_argv = std::env::args().skip(1).collect::<Vec<_>>();
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("hermes_cli.main");
+    for arg in build_resume_python_args(session_id, &original_argv) {
+        command.arg(arg);
+    }
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("resume command exited with status {status}").into())
+}
+
+fn launch_python_kanban_command(args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.is_empty() {
+        return Err("kanban command cannot be empty".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for kanban compatibility command")?;
+    let mut command = ProcessCommand::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("hermes_cli.main")
+        .arg("kanban");
+    for arg in args {
+        command.arg(arg);
+    }
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("kanban command exited with status {status}").into())
+}
+
+fn resolve_slash_compat_session_id(
+    session_store: &hermes_core::SessionStore,
+    requested: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(session_id) = requested {
+        return resolve_existing_session_id(session_store, session_id);
+    }
+    Ok(session_store
+        .search_sessions(None, 1, 0)?
+        .into_iter()
+        .next()
+        .map(|row| row.id)
+        .unwrap_or_else(|| String::from("rust-cli-compat")))
+}
+
+fn ensure_no_extra_args(command_name: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(format!("usage: hermes {command_name} [--session SESSION]").into())
+}
+
+fn ensure_nonempty_prompt(command_name: &str, args: &[String]) -> Result<String, Box<dyn Error>> {
+    let prompt = args.join(" ");
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Err(format!("usage: hermes {command_name} <prompt> [--session SESSION]").into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn joined_optional_prompt(args: &[String]) -> Option<String> {
+    let prompt = args.join(" ");
+    let trimmed = prompt.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn split_image_args(args: &[String]) -> Result<(PathBuf, Option<String>), Box<dyn Error>> {
+    let Some(path) = args.first() else {
+        return Err("usage: hermes image <path> [prompt] [--session SESSION]".into());
+    };
+    let trimmed_path = path.trim();
+    if trimmed_path.is_empty() {
+        return Err("usage: hermes image <path> [prompt] [--session SESSION]".into());
+    }
+    Ok((
+        PathBuf::from(trimmed_path),
+        joined_optional_prompt(&args[1..]),
+    ))
+}
+
+fn is_goal_control_command(goal_text: &str) -> bool {
+    matches!(
+        goal_text.trim().to_ascii_lowercase().as_str(),
+        "" | "status" | "pause" | "resume" | "clear" | "stop" | "done"
+    )
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let mut preview = text.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn launch_python_slash_command(
+    session_id: &str,
+    slash_name: &str,
+    args: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let rendered = run_python_slash_command(session_id, slash_name, args)?;
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+fn run_python_slash_command(
+    session_id: &str,
+    slash_name: &str,
+    args: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("session id cannot be empty".into());
+    }
+    let slash_name = slash_name.trim();
+    if slash_name.is_empty() || slash_name.contains(char::is_whitespace) {
+        return Err("slash command name must be non-empty and contain no whitespace".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for slash compatibility command")?;
+    let mut command = ProcessCommand::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("tui_gateway.slash_worker")
+        .arg("--session-key")
+        .arg(session_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let payload = json!({
+        "id": 1,
+        "command": build_slash_command_text(slash_name, args),
+    });
+    if let Some(stdin) = child.stdin.as_mut() {
+        writeln!(stdin, "{payload}")?;
+    } else {
+        return Err("slash worker stdin was not available".into());
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "slash command exited with status {}: {stderr}",
+            output.status
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("slash worker returned no response")?;
+    let parsed: JsonValue = serde_json::from_str(response)?;
+    if !parsed
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        let error = parsed
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("slash worker failed");
+        return Err(error.to_string().into());
+    }
+    if let Some(rendered) = parsed.get("output").and_then(JsonValue::as_str) {
+        return Ok(rendered.trim_end().to_string());
+    }
+    Ok(String::new())
+}
+
+fn launch_python_session_bridge_compress(
+    session_id: &str,
+    focus_topic: &str,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("session id cannot be empty".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for compress compatibility command")?;
+    let mut command = ProcessCommand::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("tui_gateway.session_bridge")
+        .arg("compress")
+        .arg("--session-key")
+        .arg(session_id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let trimmed_focus = focus_topic.trim();
+    if !trimmed_focus.is_empty() {
+        command.arg("--focus-topic").arg(trimmed_focus);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "compress bridge exited with status {}: {stderr}",
+            output.status
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("compress bridge returned no response")?;
+    let parsed: JsonValue = serde_json::from_str(response)?;
+    if !parsed
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        let error = parsed
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("compress bridge failed");
+        return Err(error.to_string().into());
+    }
+    Ok(parsed.get("result").cloned().unwrap_or(JsonValue::Null))
+}
+
+fn launch_python_session_bridge_clipboard_save() -> Result<PathBuf, Box<dyn Error>> {
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for clipboard compatibility command")?;
+    let output = ProcessCommand::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("tui_gateway.session_bridge")
+        .arg("clipboard-save")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "clipboard bridge exited with status {}: {stderr}",
+            output.status
+        )
+        .into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or("clipboard bridge returned no response")?;
+    let parsed: JsonValue = serde_json::from_str(response)?;
+    if !parsed
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        let error = parsed
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("clipboard bridge failed");
+        return Err(error.to_string().into());
+    }
+    let path = parsed
+        .get("result")
+        .and_then(|result| result.get("path"))
+        .and_then(JsonValue::as_str)
+        .ok_or("clipboard bridge returned no path")?;
+    Ok(PathBuf::from(path))
+}
+
+fn launch_python_chat_query(session_id: &str, query: &str) -> Result<(), Box<dyn Error>> {
+    launch_python_chat_turn(session_id, Some(query), None)
+}
+
+fn launch_python_chat_turn(
+    session_id: &str,
+    query: Option<&str>,
+    image: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("session id cannot be empty".into());
+    }
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    if query.is_none() && image.is_none() {
+        return Err("query or image is required".into());
+    }
+    let root = project_root();
+    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
+        .ok_or("could not find a Python interpreter for chat turn command")?;
+    let mut command = ProcessCommand::new(&python);
+    command
+        .current_dir(&root)
+        .env("PYTHONPATH", root.display().to_string())
+        .arg("-m")
+        .arg("hermes_cli.main")
+        .arg("chat")
+        .arg("--resume")
+        .arg(session_id);
+    if let Some(query) = query {
+        command.arg("--query").arg(query);
+    }
+    if let Some(image) = image {
+        command.arg("--image").arg(image);
+    }
+    let status = command.status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!("chat turn command exited with status {status}").into())
+}
+
+fn build_slash_command_text(slash_name: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return format!("/{slash_name}");
+    }
+    format!("/{} {}", slash_name, args.join(" "))
+}
+
+fn build_resume_python_args(session_id: &str, original_argv: &[String]) -> Vec<String> {
+    let mut args = extract_inherited_relaunch_flags(original_argv);
+    args.push("--resume".to_string());
+    args.push(session_id.trim().to_string());
+    args
+}
+
+fn extract_inherited_relaunch_flags(argv: &[String]) -> Vec<String> {
+    let mut flags = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if let Some((key, _value)) = arg.split_once('=') {
+            if INHERITED_RELAUNCH_FLAGS
+                .iter()
+                .any(|(flag, _)| *flag == key)
+            {
+                flags.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((_, takes_value)) = INHERITED_RELAUNCH_FLAGS
+            .iter()
+            .find(|(flag, _)| *flag == arg)
+        {
+            flags.push(arg.clone());
+            if *takes_value && index + 1 < argv.len() && !argv[index + 1].starts_with('-') {
+                flags.push(argv[index + 1].clone());
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    flags
+}
+
+fn browse_sessions_with_io(
+    rows: &[hermes_core::SessionSearchRow],
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if rows.is_empty() {
+        writeln!(output, "No sessions found.")?;
+        return Ok(None);
+    }
+
+    let mut filter = String::new();
+    loop {
+        let visible = filter_session_rows(rows, &filter);
+        writeln!(output)?;
+        writeln!(output, "Hermes Session Browser")?;
+        writeln!(
+            output,
+            "  Enter a number to select, text to filter, or Enter/q to cancel."
+        )?;
+        if !filter.is_empty() {
+            writeln!(output, "  Filter: {filter}")?;
+        }
+        writeln!(output)?;
+
+        if visible.is_empty() {
+            writeln!(output, "  No sessions match that filter.")?;
+        } else {
+            for (index, row) in visible.iter().enumerate() {
+                writeln!(
+                    output,
+                    "  {}. {:<50} {:<10} {:<8} {}",
+                    index + 1,
+                    session_row_label(row),
+                    relative_time_label(row.last_active),
+                    row.source,
+                    row.id
+                )?;
+            }
+        }
+
+        let response = prompt_line(input, output, "Selection")?;
+        let trimmed = response.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") {
+            return Ok(None);
+        }
+        if let Ok(index) = trimmed.parse::<usize>() {
+            if (1..=visible.len()).contains(&index) {
+                return Ok(Some(visible[index - 1].id.clone()));
+            }
+            writeln!(output, "Selection must be between 1 and {}.", visible.len())?;
+            continue;
+        }
+        filter = trimmed.to_string();
+    }
+}
+
+fn filter_session_rows<'a>(
+    rows: &'a [hermes_core::SessionSearchRow],
+    filter: &str,
+) -> Vec<&'a hermes_core::SessionSearchRow> {
+    let needle = filter.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return rows.iter().collect();
+    }
+    rows.iter()
+        .filter(|row| {
+            let title = row
+                .title
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let preview = row.preview.to_ascii_lowercase();
+            let source = row.source.to_ascii_lowercase();
+            let id = row.id.to_ascii_lowercase();
+            title.contains(&needle)
+                || preview.contains(&needle)
+                || source.contains(&needle)
+                || id.contains(&needle)
+        })
+        .collect()
+}
+
+fn session_row_label(row: &hermes_core::SessionSearchRow) -> String {
+    let label = row
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if row.preview.trim().is_empty() {
+                row.id.as_str()
+            } else {
+                row.preview.as_str()
+            }
+        });
+    truncate_for_display(label, 50)
+}
+
+fn truncate_for_display(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    format!("{}...", chars.into_iter().take(keep).collect::<String>())
+}
+
+fn relative_time_label(timestamp: f64) -> String {
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(value) => value.as_secs_f64(),
+        Err(_) => return "unknown".to_string(),
+    };
+    let delta = (now - timestamp).max(0.0);
+    if delta < 60.0 {
+        return "just now".to_string();
+    }
+    if delta < 3600.0 {
+        return format!("{}m ago", (delta / 60.0).floor() as u64);
+    }
+    if delta < 86_400.0 {
+        return format!("{}h ago", (delta / 3600.0).floor() as u64);
+    }
+    format!("{}d ago", (delta / 86_400.0).floor() as u64)
+}
+
+fn prompt_line(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    label: &str,
+) -> Result<String, Box<dyn Error>> {
+    write!(output, "{label}: ")?;
+    output.flush()?;
+
+    let mut response = String::new();
+    let read = input.read_line(&mut response)?;
+    if read == 0 {
+        return Ok(String::new());
+    }
+    Ok(response)
 }
 
 fn confirm_prompt(prompt: &str) -> Result<bool, Box<dyn Error>> {
@@ -1473,6 +2342,39 @@ fn emit_warnings(env_report: &EnvLoadReport, config: &LoadedConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_core::{MessageAppend, SessionCreate};
+    use serde_json::Value;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn session_row(
+        id: &str,
+        title: Option<&str>,
+        preview: &str,
+        source: &str,
+        last_active: f64,
+    ) -> hermes_core::SessionSearchRow {
+        hermes_core::SessionSearchRow {
+            id: id.to_string(),
+            source: source.to_string(),
+            model: Some("test/model".to_string()),
+            title: title.map(ToOwned::to_owned),
+            started_at: last_active - 60.0,
+            ended_at: None,
+            end_reason: None,
+            message_count: 3,
+            tool_call_count: 0,
+            last_active,
+            preview: preview.to_string(),
+        }
+    }
+
+    fn now_ts() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs_f64())
+            .unwrap_or(0.0)
+    }
 
     #[test]
     fn cron_cli_parses_python_compatible_crud_commands() {
@@ -1555,6 +2457,1315 @@ mod tests {
         assert_eq!(
             listed["jobs"][0]["skills"][0],
             JsonValue::String(String::from("ops"))
+        );
+    }
+
+    #[test]
+    fn sessions_browse_subcommand_is_parseable() {
+        let cli = Cli::try_parse_from(["hermes", "sessions", "browse", "--limit", "42"]).unwrap();
+        match cli.command {
+            Some(Command::Sessions {
+                command: SessionsCommand::Browse { limit, source },
+            }) => {
+                assert_eq!(limit, 42);
+                assert!(source.is_none());
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_model_and_snapshot_aliases_are_parseable() {
+        let cli =
+            Cli::try_parse_from(["hermes", "provider", "set", "gpt-5", "--provider", "openai"])
+                .unwrap();
+        match cli.command {
+            Some(Command::Model {
+                command:
+                    Some(model_cmd::ModelCommand::Set {
+                        model, provider, ..
+                    }),
+            }) => {
+                assert_eq!(model, "gpt-5");
+                assert_eq!(provider.as_deref(), Some("openai"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "snap", "create", "before", "deploy"]).unwrap();
+        match cli.command {
+            Some(Command::Snapshot {
+                command: Some(snapshot_cmd::SnapshotCommand::Create { label }),
+            }) => assert_eq!(label, vec![String::from("before"), String::from("deploy")]),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "platforms", "status"]).unwrap();
+        match cli.command {
+            Some(Command::Gateway(gateway_cmd::GatewayArgs {
+                command: Some(gateway_cmd::GatewayCommand::Status(_)),
+                ..
+            })) => {}
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kanban_slash_style_subcommands_parse_into_compat_passthrough() {
+        let cli = Cli::try_parse_from(["hermes", "kanban", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Kanban {
+                command: KanbanCommand::Compat(args),
+            }) => assert_eq!(args, vec![String::from("list")]),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "kanban", "boards", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Kanban {
+                command: KanbanCommand::Compat(args),
+            }) => assert_eq!(args, vec![String::from("boards"), String::from("list")]),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_compat_commands_and_aliases_are_parseable() {
+        let cli = Cli::try_parse_from(["hermes", "reasoning", "high"]).unwrap();
+        match cli.command {
+            Some(Command::Reasoning(SlashCompatArgs { session, args })) => {
+                assert!(session.is_none());
+                assert_eq!(args, vec![String::from("high")]);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["hermes", "browser", "connect", "ws://127.0.0.1:9222"]).unwrap();
+        match cli.command {
+            Some(Command::Browser(SlashCompatArgs { args, .. })) => assert_eq!(
+                args,
+                vec![String::from("connect"), String::from("ws://127.0.0.1:9222")]
+            ),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "compress", "database", "schema"]).unwrap();
+        match cli.command {
+            Some(Command::Compress(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("database"), String::from("schema")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "clear"]).unwrap();
+        match cli.command {
+            Some(Command::Clear(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "reload_mcp"]).unwrap();
+        match cli.command {
+            Some(Command::ReloadMcp(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "tasks"]).unwrap();
+        match cli.command {
+            Some(Command::Agents(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "reset", "Sprint", "Branch"]).unwrap();
+        match cli.command {
+            Some(Command::New(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("Sprint"), String::from("Branch")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "gquota"]).unwrap();
+        match cli.command {
+            Some(Command::Gquota(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "goal", "pause"]).unwrap();
+        match cli.command {
+            Some(Command::Goal(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("pause")]);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "history"]).unwrap();
+        match cli.command {
+            Some(Command::History(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "image",
+            "/tmp/cat.png",
+            "what",
+            "do",
+            "you",
+            "see",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Image(SlashCompatArgs { args, .. })) => assert_eq!(
+                args,
+                vec![
+                    String::from("/tmp/cat.png"),
+                    String::from("what"),
+                    String::from("do"),
+                    String::from("you"),
+                    String::from("see")
+                ]
+            ),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "paste", "describe", "this"]).unwrap();
+        match cli.command {
+            Some(Command::Paste(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("describe"), String::from("this")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "redraw"]).unwrap();
+        match cli.command {
+            Some(Command::Redraw(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "q", "follow", "up"]).unwrap();
+        match cli.command {
+            Some(Command::Queue(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("follow"), String::from("up")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "retry"]).unwrap();
+        match cli.command {
+            Some(Command::Retry(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "undo"]).unwrap();
+        match cli.command {
+            Some(Command::Undo(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "steer", "after", "tool"]).unwrap();
+        match cli.command {
+            Some(Command::Steer(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("after"), String::from("tool")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "save"]).unwrap();
+        match cli.command {
+            Some(Command::Save(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "stop"]).unwrap();
+        match cli.command {
+            Some(Command::Stop(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "bg", "Summarize", "the", "logs"]).unwrap();
+        match cli.command {
+            Some(Command::Background(SlashCompatArgs { args, .. })) => assert_eq!(
+                args,
+                vec![
+                    String::from("Summarize"),
+                    String::from("the"),
+                    String::from("logs")
+                ]
+            ),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "fork", "new", "branch", "title"]).unwrap();
+        match cli.command {
+            Some(Command::Branch(SlashCompatArgs { args, .. })) => assert_eq!(
+                args,
+                vec![
+                    String::from("new"),
+                    String::from("branch"),
+                    String::from("title")
+                ]
+            ),
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "title", "--session", "sess-1", "My", "Session"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Title(SlashCompatArgs { session, args })) => {
+                assert_eq!(session.as_deref(), Some("sess-1"));
+                assert_eq!(args, vec![String::from("My"), String::from("Session")]);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restart_command_is_parseable_with_gateway_flags() {
+        let cli = Cli::try_parse_from(["hermes", "restart", "--system", "--all"]).unwrap();
+        match cli.command {
+            Some(Command::Restart(gateway_cmd::GatewayServiceArgs { system, all })) => {
+                assert!(system);
+                assert!(all);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_command_is_parseable_with_target_and_flags() {
+        let cli = Cli::try_parse_from([
+            "hermes", "resume", "--limit", "25", "--source", "cli", "Project", "Phoenix",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Resume(ResumeArgs {
+                limit,
+                source,
+                target,
+            })) => {
+                assert_eq!(limit, 25);
+                assert_eq!(source.as_deref(), Some("cli"));
+                assert_eq!(
+                    target,
+                    vec![String::from("Project"), String::from("Phoenix")]
+                );
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browse_sessions_with_io_selects_filtered_entry() {
+        let now = now_ts();
+        let rows = vec![
+            session_row("sess-1", Some("Alpha project"), "draft plan", "cli", now),
+            session_row(
+                "sess-2",
+                Some("Beta project"),
+                "review PR",
+                "telegram",
+                now - 7200.0,
+            ),
+        ];
+        let mut input = Cursor::new(b"beta\n1\n".to_vec());
+        let mut output = Vec::new();
+        let selected = browse_sessions_with_io(&rows, &mut input, &mut output).unwrap();
+        assert_eq!(selected.as_deref(), Some("sess-2"));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Hermes Session Browser"));
+        assert!(rendered.contains("Filter: beta"));
+        assert!(rendered.contains("2h ago"));
+    }
+
+    #[test]
+    fn browse_sessions_with_io_cancels_on_empty_input() {
+        let now = now_ts();
+        let rows = vec![session_row("sess-1", None, "hello world", "cli", now)];
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+        let selected = browse_sessions_with_io(&rows, &mut input, &mut output).unwrap();
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn browse_sessions_with_io_accepts_rows_from_store() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "20260525_000001_abc123";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(Value::String("hello".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let rows = store.search_sessions(Some("cli"), 10, 0).unwrap();
+        let mut input = Cursor::new(b"1\n".to_vec());
+        let mut output = Vec::new();
+        let selected = browse_sessions_with_io(&rows, &mut input, &mut output).unwrap();
+        assert_eq!(selected.as_deref(), Some(session_id));
+    }
+
+    #[test]
+    fn launch_python_resume_session_uses_python_override_and_resume_flag() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let log_path = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            log_path.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_resume_session("sess-123");
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+        let logged = fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("hermes_cli.main"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains("sess-123"));
+    }
+
+    #[test]
+    fn launch_python_kanban_command_uses_python_override_and_args() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let log_path = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            log_path.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_kanban_command(&[String::from("boards"), String::from("list")]);
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+        let logged = fs::read_to_string(&log_path).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("hermes_cli.main"));
+        assert!(logged.contains("kanban"));
+        assert!(logged.contains("boards"));
+        assert!(logged.contains("list"));
+    }
+
+    #[test]
+    fn launch_python_slash_command_uses_worker_module_and_json_payload() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat > \"{}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"compat ok\"}}'\n",
+            argv_log.display(),
+            stdin_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_slash_command(
+            "sess-compat",
+            "reasoning",
+            &[String::from("high"), String::from("show")],
+        );
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains("sess-compat"));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"id\":1"));
+        assert!(payload.contains("\"command\":\"/reasoning high show\""));
+    }
+
+    #[test]
+    fn print_no_arg_slash_compat_uses_worker_for_clear_and_redraw() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "clear-redraw";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\ncat >> \"{stdin}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"ok\"}}'\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        print_no_arg_slash_compat(
+            &store,
+            "clear",
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+        print_no_arg_slash_compat(
+            &store,
+            "redraw",
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert_eq!(logged.matches("CALL").count(), 2);
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains(session_id));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"command\":\"/clear\""));
+        assert!(payload.contains("\"command\":\"/redraw\""));
+    }
+
+    #[test]
+    fn launch_python_chat_query_uses_chat_resume_and_query() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            argv_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_chat_query("sess-chat", "Ship the fix");
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("hermes_cli.main"));
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains("sess-chat"));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("Ship the fix"));
+    }
+
+    #[test]
+    fn launch_python_chat_turn_uses_chat_resume_query_and_image() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            argv_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_chat_turn(
+            "sess-chat",
+            Some("Describe the attachment"),
+            Some(Path::new("/tmp/cat.png")),
+        );
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("hermes_cli.main"));
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains("sess-chat"));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("Describe the attachment"));
+        assert!(logged.contains("--image"));
+        assert!(logged.contains("/tmp/cat.png"));
+    }
+
+    #[test]
+    fn launch_python_session_bridge_compress_uses_bridge_module_and_focus_topic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{\"summary\":\"compressed ok\"}}}}'\n",
+            argv_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_session_bridge_compress("sess-compress", "database schema");
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        assert_eq!(
+            result.unwrap().get("summary").and_then(JsonValue::as_str),
+            Some("compressed ok")
+        );
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("tui_gateway.session_bridge"));
+        assert!(logged.contains("compress"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains("sess-compress"));
+        assert!(logged.contains("--focus-topic"));
+        assert!(logged.contains("database schema"));
+    }
+
+    #[test]
+    fn launch_python_session_bridge_clipboard_save_uses_bridge_module() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{\"path\":\"/tmp/fake.png\"}}}}'\n",
+            argv_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = launch_python_session_bridge_clipboard_save();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        assert_eq!(result.unwrap(), PathBuf::from("/tmp/fake.png"));
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("-m"));
+        assert!(logged.contains("tui_gateway.session_bridge"));
+        assert!(logged.contains("clipboard-save"));
+    }
+
+    #[test]
+    fn print_send_turn_compat_uses_chat_query_for_queue_and_steer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "send-turn-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\n",
+            argv = argv_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        print_send_turn_compat(
+            &store,
+            "queue",
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![String::from("queued"), String::from("prompt")],
+            },
+        )
+        .unwrap();
+        print_send_turn_compat(
+            &store,
+            "steer",
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![String::from("steered"), String::from("prompt")],
+            },
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert_eq!(logged.matches("CALL").count(), 2);
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains(session_id));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("queued prompt"));
+        assert!(logged.contains("steered prompt"));
+    }
+
+    #[test]
+    fn print_image_and_paste_compat_use_chat_turn_with_image_inputs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "image-paste-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\nif [ \"$2\" = \"tui_gateway.session_bridge\" ]; then\n  printf '%s\\n' '{{\"ok\":true,\"result\":{{\"path\":\"/tmp/from-clipboard.png\"}}}}'\nfi\n",
+            argv = argv_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        print_image_compat(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![
+                    String::from("/tmp/direct.png"),
+                    String::from("inspect"),
+                    String::from("this"),
+                ],
+            },
+        )
+        .unwrap();
+        print_paste_compat(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![String::from("describe"), String::from("clipboard")],
+            },
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert_eq!(logged.matches("CALL").count(), 3);
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains(session_id));
+        assert!(logged.contains("--image"));
+        assert!(logged.contains("/tmp/direct.png"));
+        assert!(logged.contains("/tmp/from-clipboard.png"));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("inspect this"));
+        assert!(logged.contains("describe clipboard"));
+        assert!(logged.contains("tui_gateway.session_bridge"));
+        assert!(logged.contains("clipboard-save"));
+    }
+
+    #[test]
+    fn print_retry_compat_replays_last_user_turn_via_chat_query() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "retry-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for message in [
+            hermes_core::MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("keep me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("keep answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("retry this exact prompt")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("drop answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message(session_id, &message).unwrap();
+        }
+
+        let argv_log = temp.path().join("argv.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            argv_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = print_retry_compat(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        );
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains(session_id));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("retry this exact prompt"));
+
+        let remaining = store.get_messages(session_id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].role, "user");
+        assert_eq!(remaining[1].role, "assistant");
+    }
+
+    #[test]
+    fn print_undo_compat_truncates_last_exchange() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "undo-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for message in [
+            hermes_core::MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("keep me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("keep answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("drop me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("drop answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message(session_id, &message).unwrap();
+        }
+
+        print_undo_compat(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let remaining = store.get_messages(session_id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].content, Some(json!("keep me")));
+        assert_eq!(remaining[1].content, Some(json!("keep answer")));
+    }
+
+    #[test]
+    fn print_goal_compat_kicks_off_non_control_goal_via_chat_query() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "goal-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\nif [ \"$2\" = \"tui_gateway.slash_worker\" ]; then\n  cat > \"{stdin}\"\n  printf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"goal ok\"}}'\nfi\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display()
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        let result = print_goal_compat(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![
+                    String::from("pause"),
+                    String::from("the"),
+                    String::from("rollout"),
+                ],
+            },
+        );
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+        result.unwrap();
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("hermes_cli.main"));
+        assert!(logged.contains("chat"));
+        assert!(logged.contains("--resume"));
+        assert!(logged.contains(session_id));
+        assert!(logged.contains("--query"));
+        assert!(logged.contains("pause the rollout"));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"command\":\"/goal pause the rollout\""));
+    }
+
+    #[test]
+    fn goal_control_command_detection_matches_python_semantics() {
+        assert!(is_goal_control_command(""));
+        assert!(is_goal_control_command("pause"));
+        assert!(is_goal_control_command(" done "));
+        assert!(!is_goal_control_command("pause the rollout"));
+        assert!(!is_goal_control_command("ship the fix"));
+    }
+
+    #[test]
+    fn resolve_slash_compat_session_id_prefers_requested_or_latest() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+
+        let requested_error = resolve_slash_compat_session_id(&store, Some("missing"));
+        assert!(requested_error.is_err());
+        assert_eq!(
+            resolve_slash_compat_session_id(&store, None).unwrap(),
+            "rust-cli-compat"
+        );
+
+        let session_id = "20260525_000002_latest";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_slash_compat_session_id(&store, None).unwrap(),
+            session_id
+        );
+        assert_eq!(
+            resolve_slash_compat_session_id(&store, Some(session_id)).unwrap(),
+            session_id
+        );
+    }
+
+    #[test]
+    fn resolve_resume_target_supports_title_lineage_and_prefixes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+
+        for session_id in ["abc123", "abc999", "other1"] {
+            store
+                .create_session(&SessionCreate {
+                    id: session_id.to_string(),
+                    source: "cli".to_string(),
+                    user_id: None,
+                    model: Some("test/model".to_string()),
+                    model_config: None,
+                    system_prompt: None,
+                    parent_session_id: None,
+                })
+                .unwrap();
+        }
+        store.set_session_title("abc123", "Project").unwrap();
+        store.set_session_title("abc999", "Project #2").unwrap();
+
+        assert_eq!(resolve_resume_target(&store, "other1").unwrap(), "other1");
+        assert_eq!(resolve_resume_target(&store, "other").unwrap(), "other1");
+        assert_eq!(resolve_resume_target(&store, "Project").unwrap(), "abc999");
+        assert!(resolve_resume_target(&store, "missing").is_err());
+    }
+
+    #[test]
+    fn extract_inherited_relaunch_flags_preserves_expected_flags() {
+        let argv = vec![
+            "--tui".to_string(),
+            "--dev".to_string(),
+            "--profile".to_string(),
+            "work".to_string(),
+            "-m".to_string(),
+            "gpt-5".to_string(),
+            "--provider=openrouter".to_string(),
+            "sessions".to_string(),
+            "browse".to_string(),
+        ];
+        assert_eq!(
+            extract_inherited_relaunch_flags(&argv),
+            vec![
+                "--tui".to_string(),
+                "--dev".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "-m".to_string(),
+                "gpt-5".to_string(),
+                "--provider=openrouter".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_inherited_relaunch_flags_skips_non_inherited_flags() {
+        let argv = vec![
+            "--worktree".to_string(),
+            "--quiet".to_string(),
+            "--tui".to_string(),
+            "--skills".to_string(),
+            "foo".to_string(),
+            "sessions".to_string(),
+            "browse".to_string(),
+        ];
+        assert_eq!(
+            extract_inherited_relaunch_flags(&argv),
+            vec![
+                "--tui".to_string(),
+                "--skills".to_string(),
+                "foo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_resume_python_args_appends_resume_after_inherited_flags() {
+        let argv = vec![
+            "--tui".to_string(),
+            "--profile".to_string(),
+            "work".to_string(),
+            "sessions".to_string(),
+            "browse".to_string(),
+        ];
+        assert_eq!(
+            build_resume_python_args("sess-42", &argv),
+            vec![
+                "--tui".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "--resume".to_string(),
+                "sess-42".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_slash_command_text_prefixes_and_joins_args() {
+        assert_eq!(build_slash_command_text("usage", &[]), "/usage");
+        assert_eq!(
+            build_slash_command_text("reasoning", &[String::from("high"), String::from("show")]),
+            "/reasoning high show"
+        );
+        assert_eq!(
+            build_slash_command_text(
+                "title",
+                &[
+                    String::from("Project"),
+                    String::from("Phoenix"),
+                    String::from("Plan")
+                ]
+            ),
+            "/title Project Phoenix Plan"
         );
     }
 }

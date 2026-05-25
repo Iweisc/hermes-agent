@@ -74,6 +74,7 @@ pub use providers::{
 pub use state::{
     ExportedSession, MessageAppend, MessageRecord, MessageSearchRow, SearchContextMessage,
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,
+    SessionTruncateResult,
 };
 pub use tools::{
     ToolDefinition, ToolRuntime, ToolsetInfo, coerce_tool_args, dispatch_tool, get_all_tool_names,

@@ -195,6 +195,13 @@ pub struct MessageRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTruncateResult {
+    pub removed_count: i64,
+    pub remaining_count: i64,
+    pub last_user_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchContextMessage {
     pub role: String,
     pub content: String,
@@ -741,6 +748,60 @@ impl SessionStore {
             .map_err(state_err("collecting messages"))
     }
 
+    pub fn truncate_last_user_turn(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionTruncateResult>, HermesError> {
+        let messages = self.get_messages(session_id)?;
+        let Some(last_user_idx) = messages.iter().rposition(|message| message.role == "user")
+        else {
+            return Ok(None);
+        };
+
+        let removed_messages = &messages[last_user_idx..];
+        let removed_count = removed_messages.len() as i64;
+        let last_user_text = extract_message_text(
+            removed_messages
+                .first()
+                .and_then(|message| message.content.as_ref()),
+        );
+        let removed_ids = removed_messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        let remaining_count = last_user_idx as i64;
+        let remaining_tool_call_count = messages[..last_user_idx]
+            .iter()
+            .map(|message| message.tool_calls.as_ref().map_or(0, count_tool_calls))
+            .sum::<i64>();
+
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(state_err("opening truncate messages transaction"))?;
+        let placeholders = std::iter::repeat_n("?", removed_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute(
+            &format!("DELETE FROM messages WHERE id IN ({placeholders})"),
+            params_from_iter(removed_ids.iter()),
+        )
+        .map_err(state_err("deleting truncated messages"))?;
+        tx.execute(
+            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+            params![remaining_count, remaining_tool_call_count, session_id],
+        )
+        .map_err(state_err("updating truncated message counters"))?;
+        tx.commit()
+            .map_err(state_err("committing truncate messages transaction"))?;
+
+        Ok(Some(SessionTruncateResult {
+            removed_count,
+            remaining_count,
+            last_user_text,
+        }))
+    }
+
     pub fn search_messages(
         &self,
         query: &str,
@@ -1157,6 +1218,34 @@ fn count_tool_calls(value: &Value) -> i64 {
         Value::Array(items) => items.len() as i64,
         Value::Null => 0,
         _ => 1,
+    }
+}
+
+fn extract_message_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(Value::Array(parts)) => {
+            let joined = parts
+                .iter()
+                .filter_map(|part| match part {
+                    Value::String(text) => Some(text.trim().to_string()),
+                    Value::Object(map) => map
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(ToOwned::to_owned),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
     }
 }
 
@@ -1582,6 +1671,168 @@ mod tests {
             .expect("session");
         assert_eq!(session.message_count, 0);
         assert_eq!(session.tool_call_count, 0);
+    }
+
+    #[test]
+    fn truncate_last_user_turn_removes_last_exchange_and_updates_counters() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-truncate"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!("keep me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("kept answer")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "search"}])),
+                tool_name: Some(String::from("search")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "retry this"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                ])),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("drop answer")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "todo"}, {"name": "search"}])),
+                tool_name: Some(String::from("todo")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(serde_json::json!("tool output")),
+                tool_call_id: Some(String::from("call-1")),
+                tool_calls: None,
+                tool_name: Some(String::from("todo")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store
+                .append_message("sess-truncate", &message)
+                .expect("append message");
+        }
+
+        let result = store
+            .truncate_last_user_turn("sess-truncate")
+            .expect("truncate")
+            .expect("truncate result");
+        assert_eq!(
+            result,
+            SessionTruncateResult {
+                removed_count: 3,
+                remaining_count: 2,
+                last_user_text: Some(String::from("retry this")),
+            }
+        );
+
+        let session = store
+            .get_session("sess-truncate")
+            .expect("get session")
+            .expect("session");
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.tool_call_count, 1);
+
+        let remaining = store.get_messages("sess-truncate").expect("messages");
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].role, "user");
+        assert_eq!(remaining[1].role, "assistant");
+    }
+
+    #[test]
+    fn truncate_last_user_turn_returns_none_without_user_message() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-no-user"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        store
+            .append_message(
+                "sess-no-user",
+                &MessageAppend {
+                    role: String::from("assistant"),
+                    content: Some(serde_json::json!("answer only")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .expect("append message");
+
+        assert_eq!(
+            store
+                .truncate_last_user_turn("sess-no-user")
+                .expect("truncate"),
+            None
+        );
     }
 
     #[test]
