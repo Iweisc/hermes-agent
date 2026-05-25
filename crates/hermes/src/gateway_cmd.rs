@@ -886,7 +886,11 @@ pub(crate) fn run_gateway_setup_with_io(
             break;
         }
         let platform = &platforms[choice];
-        if configure_native_gateway_plugin_platform_with_io(context, platform, input, output)? {
+        if configure_native_gateway_builtin_platform_with_io(context, platform, input, output)? {
+            continue;
+        } else if configure_native_gateway_plugin_platform_with_io(
+            context, platform, input, output,
+        )? {
             continue;
         } else if gateway_platform_uses_native_standard_setup(platform) {
             configure_standard_gateway_platform_with_io(context, platform, input, output)?;
@@ -1131,6 +1135,14 @@ const SLACK_SETUP_VARS: &[GatewaySetupVarSpec] = &[
         help: "Open the channel in Slack, copy its link, and use the C... channel ID.",
         is_allowlist: false,
     },
+];
+
+const MATRIX_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Works with any Matrix homeserver (self-hosted Synapse/Conduit/Dendrite or matrix.org)",
+    "2. Create a bot user on your homeserver, or use your own account",
+    "3. Get an access token from Element, or provide user ID + password",
+    "4. For E2EE: set MATRIX_ENCRYPTION=true or enable it below",
+    "5. Matrix user IDs look like @username:server and room IDs look like !abc123:server",
 ];
 
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
@@ -1437,8 +1449,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Matrix",
         emoji: "🔐",
         token_var: "MATRIX_ACCESS_TOKEN",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: MATRIX_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -1938,56 +1950,13 @@ fn configure_standard_gateway_platform_with_io(
         }
 
         if var.is_allowlist {
-            writeln!(output, "  The gateway denies all users by default.")?;
-            writeln!(
+            allowlist_value = configure_gateway_allowlist(
+                context,
+                input,
                 output,
-                "  Enter user IDs to create an allowlist, or leave empty to choose another access mode."
+                &var.name,
+                format!("  {}", var.prompt).as_str(),
             )?;
-            let value = prompt_gateway_line(input, output, format!("  {}", var.prompt).as_str())?;
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                let cleaned = normalize_gateway_allowlist(&var.name, trimmed);
-                save_env_value(context.env_path(), &var.name, &cleaned)?;
-                remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
-                writeln!(
-                    output,
-                    "  Saved — only these users can interact with the bot."
-                )?;
-                allowlist_value = Some(cleaned);
-            } else {
-                let access_choices = [
-                    "Enable open access (anyone can message the bot)",
-                    "Use DM pairing (unknown users request access, you approve later)",
-                    "Skip for now (bot will deny all users until configured)",
-                ];
-                let access_idx = prompt_gateway_menu_choice(
-                    input,
-                    output,
-                    "How should unauthorized users be handled?",
-                    &access_choices,
-                )?;
-                match access_idx {
-                    0 => {
-                        save_env_value(context.env_path(), "GATEWAY_ALLOW_ALL_USERS", "true")?;
-                        writeln!(output, "  Open access enabled.")?;
-                    }
-                    1 | 2 => {
-                        remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
-                        if access_idx == 1 {
-                            writeln!(
-                                output,
-                                "  DM pairing mode selected. Approve codes with `hermes pairing approve`."
-                            )?;
-                        } else {
-                            writeln!(
-                                output,
-                                "  Skipped — configure later with `hermes gateway setup`."
-                            )?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
             continue;
         }
 
@@ -2088,6 +2057,66 @@ fn configure_bluebubbles_advanced_settings(
     Ok(())
 }
 
+fn configure_gateway_allowlist(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    var_name: &str,
+    prompt: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    writeln!(output, "  The gateway denies all users by default.")?;
+    writeln!(
+        output,
+        "  Enter user IDs to create an allowlist, or leave empty to choose another access mode."
+    )?;
+    let value = prompt_gateway_line(input, output, prompt)?;
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        let cleaned = normalize_gateway_allowlist(var_name, trimmed);
+        save_env_value(context.env_path(), var_name, &cleaned)?;
+        remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+        writeln!(
+            output,
+            "  Saved — only these users can interact with the bot."
+        )?;
+        return Ok(Some(cleaned));
+    }
+
+    let access_choices = [
+        "Enable open access (anyone can message the bot)",
+        "Use DM pairing (unknown users request access, you approve later)",
+        "Skip for now (bot will deny all users until configured)",
+    ];
+    let access_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should unauthorized users be handled?",
+        &access_choices,
+    )?;
+    match access_idx {
+        0 => {
+            save_env_value(context.env_path(), "GATEWAY_ALLOW_ALL_USERS", "true")?;
+            writeln!(output, "  Open access enabled.")?;
+        }
+        1 | 2 => {
+            remove_env_key_if_present(&context.env_path(), "GATEWAY_ALLOW_ALL_USERS")?;
+            if access_idx == 1 {
+                writeln!(
+                    output,
+                    "  DM pairing mode selected. Approve codes with `hermes pairing approve`."
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "  Skipped — configure later with `hermes gateway setup`."
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
 fn write_slack_manifest_for_gateway_setup(
     context: &HermesContext,
     output: &mut dyn Write,
@@ -2160,6 +2189,178 @@ fn is_valid_telegram_bot_token(value: &str) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn configure_native_gateway_builtin_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<bool, Box<dyn Error>> {
+    match platform.key.as_str() {
+        "matrix" => {
+            configure_matrix_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn configure_matrix_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_auth = read_effective_env_value(context, "MATRIX_ACCESS_TOKEN")
+        .or_else(|| read_effective_env_value(context, "MATRIX_PASSWORD"));
+    if existing_auth.is_some() {
+        writeln!(output)?;
+        writeln!(output, "Matrix is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure Matrix?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    let homeserver = prompt_gateway_line(
+        input,
+        output,
+        "Homeserver URL (e.g. https://matrix.example.org)",
+    )?;
+    if !homeserver.trim().is_empty() {
+        let normalized = homeserver.trim().trim_end_matches('/').to_string();
+        save_env_value(context.env_path(), "MATRIX_HOMESERVER", &normalized)?;
+        writeln!(output, "  Saved MATRIX_HOMESERVER")?;
+    }
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Auth: provide an access token (recommended), or user ID + password."
+    )?;
+    let token = prompt_gateway_line(
+        input,
+        output,
+        "Access token (leave empty to use password login)",
+    )?;
+    if !token.trim().is_empty() {
+        save_env_value(context.env_path(), "MATRIX_ACCESS_TOKEN", token.trim())?;
+        let user_id = prompt_gateway_line(
+            input,
+            output,
+            "User ID (@bot:server — optional, will be auto-detected)",
+        )?;
+        if !user_id.trim().is_empty() {
+            save_env_value(context.env_path(), "MATRIX_USER_ID", user_id.trim())?;
+        }
+        writeln!(output, "  Matrix access token saved")?;
+    } else {
+        let user_id = prompt_gateway_line(input, output, "User ID (@bot:server)")?;
+        if !user_id.trim().is_empty() {
+            save_env_value(context.env_path(), "MATRIX_USER_ID", user_id.trim())?;
+        }
+        let password = prompt_gateway_line(input, output, "Password")?;
+        if !password.trim().is_empty() {
+            save_env_value(context.env_path(), "MATRIX_PASSWORD", password.trim())?;
+            writeln!(output, "  Matrix credentials saved")?;
+        }
+    }
+
+    let auth_configured =
+        !token.trim().is_empty() || read_effective_env_value(context, "MATRIX_PASSWORD").is_some();
+    if auth_configured {
+        writeln!(output)?;
+        let want_e2ee =
+            prompt_gateway_yes_no(input, output, "Enable end-to-end encryption (E2EE)?", false)?;
+        if want_e2ee {
+            save_env_value(context.env_path(), "MATRIX_ENCRYPTION", "true")?;
+            writeln!(output, "  E2EE enabled")?;
+        }
+
+        let matrix_pkg = if want_e2ee {
+            "mautrix[encryption]"
+        } else {
+            "mautrix"
+        };
+        if !gateway_python_module_installed("mautrix")? {
+            writeln!(output, "  Installing {matrix_pkg}...")?;
+            if gateway_install_python_package(matrix_pkg)? {
+                writeln!(output, "  {matrix_pkg} installed")?;
+            } else {
+                writeln!(
+                    output,
+                    "  Install failed — run manually: pip install '{matrix_pkg}'"
+                )?;
+            }
+        }
+
+        writeln!(output)?;
+        writeln!(output, "  Matrix user IDs look like @username:server.")?;
+        configure_gateway_allowlist(
+            context,
+            input,
+            output,
+            "MATRIX_ALLOWED_USERS",
+            "Allowed user IDs (comma-separated, e.g. @you:server)",
+        )?;
+
+        writeln!(output)?;
+        writeln!(
+            output,
+            "  Home Room: where Hermes delivers cron job results and notifications."
+        )?;
+        let home_room = prompt_gateway_line(
+            input,
+            output,
+            "Home room ID (leave empty to set later with /set-home)",
+        )?;
+        if !home_room.trim().is_empty() {
+            save_env_value(context.env_path(), "MATRIX_HOME_ROOM", home_room.trim())?;
+        }
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    Ok(())
+}
+
+fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
+    let root = project_root();
+    let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
+        return Ok(false);
+    };
+    let status = Command::new(python)
+        .arg("-c")
+        .arg(format!(
+            "import importlib.util; raise SystemExit(0 if importlib.util.find_spec({module:?}) else 1)"
+        ))
+        .status()?;
+    Ok(status.success())
+}
+
+fn gateway_install_python_package(package: &str) -> Result<bool, Box<dyn Error>> {
+    let root = project_root();
+    let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
+        return Ok(false);
+    };
+    let status = Command::new(python)
+        .args(["-m", "pip", "install", "-U", package])
+        .status()?;
+    Ok(status.success())
 }
 
 fn configure_native_gateway_plugin_platform_with_io(
@@ -4363,7 +4564,14 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "matrix")
             .unwrap();
-        assert!(matrix.has_builtin_setup);
+        assert!(!matrix.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(matrix));
+
+        let signal = metadata
+            .iter()
+            .find(|platform| platform.key == "signal")
+            .unwrap();
+        assert!(signal.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -4444,6 +4652,13 @@ exit 9\n",
             "TEAMS_TENANT_ID",
             "BLUEBUBBLES_SERVER_URL",
             "BLUEBUBBLES_PASSWORD",
+            "MATRIX_ACCESS_TOKEN",
+            "MATRIX_PASSWORD",
+            "MATRIX_HOMESERVER",
+            "MATRIX_USER_ID",
+            "MATRIX_ENCRYPTION",
+            "MATRIX_ALLOWED_USERS",
+            "MATRIX_HOME_ROOM",
         ] {
             remove_env_var(key);
         }
@@ -4520,12 +4735,85 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "matrix").unwrap();
+        run_gateway_platform_setup_bridge(true, "signal").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=matrix"));
+        assert!(log_text.contains("platform accept=1 key=signal"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_matrix_gateway_platform_uses_native_setup_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'argv=%s platform=%s\\n' \"$*\" \"$HERMES_GATEWAY_SETUP_PLATFORM\" >> '{}'\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  exit 0\n\
+fi\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+        remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "matrix")
+            .unwrap();
+        let mut input = Cursor::new(
+            "https://matrix.example.org/\n\n@bot:example.org\nmatrix-pass\ny\n@alice:example.org\n!home:example.org\n",
+        );
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("MATRIX_HOMESERVER=https://matrix.example.org"));
+        assert!(env_text.contains("MATRIX_USER_ID=@bot:example.org"));
+        assert!(env_text.contains("MATRIX_PASSWORD=matrix-pass"));
+        assert!(env_text.contains("MATRIX_ENCRYPTION=true"));
+        assert!(env_text.contains("MATRIX_ALLOWED_USERS=@alice:example.org"));
+        assert!(env_text.contains("MATRIX_HOME_ROOM=!home:example.org"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "matrix")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured + E2EE");
+
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("argv=-c"));
+        assert!(log_text.contains("platform="));
+        assert!(!log_text.contains("platform=matrix"));
+        assert!(!log_text.contains("-m pip"));
+
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+        remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
     }
 
     #[test]
