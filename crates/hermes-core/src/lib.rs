@@ -68,15 +68,17 @@ pub use logging::{
     LoggingMode, LoggingSetup, clear_session_context, enable_verbose_logging, set_session_context,
 };
 pub use plugin_runtime::{
-    DashboardSurface, DiscoveredPlugin, PlatformSurface, PluginCliCommand, PluginCliDispatchResult,
-    PluginKind, PluginSource, attach_python_plugin_callbacks, attach_python_plugin_runtime,
+    DashboardSurface, DiscoveredPlugin, ImageGenPluginProvider, ImageGenProviderEnvVar,
+    ImageGenProviderModel, PlatformSurface, PluginCliCommand, PluginCliDispatchResult, PluginKind,
+    PluginSource, attach_python_plugin_callbacks, attach_python_plugin_runtime,
     discover_context_engine_plugins, discover_dashboard_surfaces, discover_enabled_general_plugins,
     discover_enabled_plugin_cli_commands, discover_enabled_plugin_platforms,
     discover_general_plugins, discover_hook_registrations_from_source,
     discover_memory_provider_plugins, discover_platform_surfaces_from_source,
-    discover_plugin_cli_commands_from_source, discover_scanned_plugins,
-    discover_tool_definitions_from_source, dispatch_python_plugin_cli_command,
-    is_effectively_enabled, run_python_plugin_platform_setup,
+    discover_plugin_cli_commands_from_source, discover_plugin_image_gen_providers,
+    discover_scanned_plugins, discover_tool_definitions_from_source,
+    dispatch_python_plugin_cli_command, dispatch_python_plugin_image_generate,
+    is_effectively_enabled, python_plugin_image_gen_available, run_python_plugin_platform_setup,
 };
 pub use providers::{
     ProviderProfile, auto_provider_candidates, get_provider_profile, infer_api_mode_from_base_url,

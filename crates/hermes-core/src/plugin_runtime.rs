@@ -14,6 +14,8 @@ use serde_yaml::Value as YamlValue;
 
 use crate::{ToolDefinition, ToolRuntime, tool_error};
 
+const CREDENTIAL_SUFFIXES: [&str; 4] = ["_API_KEY", "_TOKEN", "_SECRET", "_KEY"];
+
 #[derive(Debug, Deserialize)]
 struct BridgeResponse<T> {
     ok: bool,
@@ -64,6 +66,48 @@ pub struct DashboardSurface {
     pub tab_hidden: bool,
     pub source: PluginSource,
     pub dashboard_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ImageGenProviderEnvVar {
+    pub key: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ImageGenProviderModel {
+    pub id: String,
+    #[serde(default)]
+    pub display: String,
+    #[serde(default)]
+    pub speed: String,
+    #[serde(default)]
+    pub strengths: String,
+    #[serde(default)]
+    pub price: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ImageGenPluginProvider {
+    pub plugin_name: String,
+    pub name: String,
+    #[serde(default)]
+    pub badge: String,
+    #[serde(default)]
+    pub tag: String,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub env_vars: Vec<ImageGenProviderEnvVar>,
+    #[serde(default)]
+    pub models: Vec<ImageGenProviderModel>,
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -300,7 +344,8 @@ impl PythonPluginBridge {
     }
 
     fn start_process(&self) -> Result<BridgeProcess, String> {
-        let mut child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .current_dir(&self.cwd)
             .env("HERMES_HOME", &self.hermes_home)
             .env("PYTHONPATH", pythonpath_with_root(&self.root))
@@ -309,7 +354,9 @@ impl PythonPluginBridge {
             .arg(PYTHON_PLUGIN_RUNTIME_BRIDGE)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_hermes_env_file(&mut command, &self.hermes_home);
+        let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start plugin runtime bridge: {error}"))?;
         let stdin = child
@@ -357,6 +404,29 @@ def _collect_cli_commands():
     except Exception:
         pass
     return commands
+
+def _resolve_image_gen_provider():
+    from agent.image_gen_registry import get_provider
+    from hermes_cli.config import load_config
+
+    configured = None
+    try:
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            value = section.get("provider")
+            if isinstance(value, str) and value.strip():
+                configured = value.strip()
+    except Exception:
+        configured = None
+    if not configured or configured == "fal":
+        return configured, None
+
+    provider = get_provider(configured)
+    if provider is None:
+        discover_plugins(force=True)
+        provider = get_provider(configured)
+    return configured, provider
 
 for raw in sys.stdin:
     text = raw.strip()
@@ -454,6 +524,154 @@ const PYTHON_PLUGIN_PLATFORM_SETUP: &str = concat!(
     "if entry.setup_fn is None:\n",
     "    raise SystemExit(f'plugin platform has no setup function: {target}')\n",
     "entry.setup_fn()\n",
+);
+
+const PYTHON_PLUGIN_IMAGE_GEN_PROBE: &str = concat!(
+    "import json\n",
+    "from agent.image_gen_registry import get_provider\n",
+    "from hermes_cli.config import load_config\n",
+    "from hermes_cli.plugins import discover_plugins\n",
+    "discover_plugins(force=True)\n",
+    "configured = None\n",
+    "cfg = load_config()\n",
+    "section = cfg.get('image_gen') if isinstance(cfg, dict) else None\n",
+    "if isinstance(section, dict):\n",
+    "    value = section.get('provider')\n",
+    "    if isinstance(value, str) and value.strip():\n",
+    "        configured = value.strip()\n",
+    "available = False\n",
+    "if configured and configured != 'fal':\n",
+    "    provider = get_provider(configured)\n",
+    "    if provider is not None:\n",
+    "        try:\n",
+    "            available = bool(provider.is_available())\n",
+    "        except Exception:\n",
+    "            available = False\n",
+    "print(json.dumps({'available': available}))\n",
+);
+
+const PYTHON_PLUGIN_IMAGE_GEN_GENERATE: &str = concat!(
+    "import json\n",
+    "import os\n",
+    "from agent.image_gen_registry import get_provider\n",
+    "from hermes_cli.config import load_config\n",
+    "from hermes_cli.plugins import discover_plugins\n",
+    "discover_plugins(force=True)\n",
+    "prompt = os.environ.get('HERMES_IMAGE_GEN_PROMPT', '')\n",
+    "aspect_ratio = os.environ.get('HERMES_IMAGE_GEN_ASPECT_RATIO', '')\n",
+    "configured = None\n",
+    "cfg = load_config()\n",
+    "section = cfg.get('image_gen') if isinstance(cfg, dict) else None\n",
+    "if isinstance(section, dict):\n",
+    "    value = section.get('provider')\n",
+    "    if isinstance(value, str) and value.strip():\n",
+    "        configured = value.strip()\n",
+    "if not configured or configured == 'fal':\n",
+    "    result = {\n",
+    "        'success': False,\n",
+    "        'image': None,\n",
+    "        'error': 'no plugin image generation provider is configured',\n",
+    "        'error_type': 'provider_not_registered',\n",
+    "    }\n",
+    "else:\n",
+    "    provider = get_provider(configured)\n",
+    "    if provider is None:\n",
+    "        result = {\n",
+    "            'success': False,\n",
+    "            'image': None,\n",
+    "            'error': (\n",
+    "                f\"image_gen.provider='{configured}' is set but no plugin registered \"\n",
+    "                f\"that name. Run `hermes plugins list` to see available image gen backends.\"\n",
+    "            ),\n",
+    "            'error_type': 'provider_not_registered',\n",
+    "        }\n",
+    "    else:\n",
+    "        try:\n",
+    "            result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio)\n",
+    "        except Exception as exc:\n",
+    "            result = {\n",
+    "                'success': False,\n",
+    "                'image': None,\n",
+    "                'error': f\"Provider '{getattr(provider, 'name', '?')}' error: {exc}\",\n",
+    "                'error_type': 'provider_exception',\n",
+    "            }\n",
+    "        if not isinstance(result, dict):\n",
+    "            result = {\n",
+    "                'success': False,\n",
+    "                'image': None,\n",
+    "                'error': 'Provider returned a non-dict result',\n",
+    "                'error_type': 'provider_contract',\n",
+    "            }\n",
+    "print(json.dumps(result, ensure_ascii=False, default=str))\n",
+);
+
+const PYTHON_PLUGIN_IMAGE_GEN_PROVIDERS: &str = concat!(
+    "import json\n",
+    "from agent.image_gen_registry import list_providers\n",
+    "from hermes_cli.plugins import discover_plugins\n",
+    "discover_plugins(force=True)\n",
+    "rows = []\n",
+    "for provider in list_providers():\n",
+    "    if getattr(provider, 'name', None) == 'fal':\n",
+    "        continue\n",
+    "    try:\n",
+    "        schema = provider.get_setup_schema() or {}\n",
+    "    except Exception:\n",
+    "        schema = {}\n",
+    "    if not isinstance(schema, dict):\n",
+    "        schema = {}\n",
+    "    try:\n",
+    "        models = provider.list_models() or []\n",
+    "    except Exception:\n",
+    "        models = []\n",
+    "    if not isinstance(models, list):\n",
+    "        models = []\n",
+    "    try:\n",
+    "        default_model = provider.default_model()\n",
+    "    except Exception:\n",
+    "        default_model = None\n",
+    "    try:\n",
+    "        available = bool(provider.is_available())\n",
+    "    except Exception:\n",
+    "        available = False\n",
+    "    env_vars = []\n",
+    "    for item in schema.get('env_vars', []) or []:\n",
+    "        if not isinstance(item, dict):\n",
+    "            continue\n",
+    "        key = str(item.get('key', '') or '').strip()\n",
+    "        if not key:\n",
+    "            continue\n",
+    "        env_vars.append({\n",
+    "            'key': key,\n",
+    "            'prompt': str(item.get('prompt', '') or ''),\n",
+    "            'url': item.get('url'),\n",
+    "            'default': item.get('default'),\n",
+    "        })\n",
+    "    model_rows = []\n",
+    "    for item in models:\n",
+    "        if not isinstance(item, dict):\n",
+    "            continue\n",
+    "        model_id = str(item.get('id', '') or '').strip()\n",
+    "        if not model_id:\n",
+    "            continue\n",
+    "        model_rows.append({\n",
+    "            'id': model_id,\n",
+    "            'display': str(item.get('display', '') or ''),\n",
+    "            'speed': str(item.get('speed', '') or ''),\n",
+    "            'strengths': str(item.get('strengths', '') or ''),\n",
+    "            'price': str(item.get('price', '') or ''),\n",
+    "        })\n",
+    "    rows.append({\n",
+    "        'plugin_name': str(getattr(provider, 'name', '') or ''),\n",
+    "        'name': str(schema.get('name', getattr(provider, 'display_name', getattr(provider, 'name', ''))) or ''),\n",
+    "        'badge': str(schema.get('badge', '') or ''),\n",
+    "        'tag': str(schema.get('tag', '') or ''),\n",
+    "        'available': available,\n",
+    "        'env_vars': env_vars,\n",
+    "        'models': model_rows,\n",
+    "        'default_model': default_model,\n",
+    "    })\n",
+    "print(json.dumps(rows, ensure_ascii=False, default=str))\n",
 );
 
 fn project_root() -> PathBuf {
@@ -586,6 +804,87 @@ pub fn dispatch_python_plugin_cli_command(
     argv: &[String],
 ) -> Result<PluginCliDispatchResult, String> {
     PythonPluginBridge::new(hermes_home, cwd)?.run_cli_command(argv)
+}
+
+pub fn python_plugin_image_gen_available(hermes_home: &Path, cwd: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct ProbeResult {
+        available: bool,
+    }
+
+    run_python_plugin_json(hermes_home, cwd, PYTHON_PLUGIN_IMAGE_GEN_PROBE, &[])
+        .map(|result: ProbeResult| result.available)
+}
+
+pub fn dispatch_python_plugin_image_generate(
+    hermes_home: &Path,
+    cwd: &Path,
+    prompt: &str,
+    aspect_ratio: &str,
+) -> Result<Value, String> {
+    run_python_plugin_json(
+        hermes_home,
+        cwd,
+        PYTHON_PLUGIN_IMAGE_GEN_GENERATE,
+        &[
+            ("HERMES_IMAGE_GEN_PROMPT", prompt),
+            ("HERMES_IMAGE_GEN_ASPECT_RATIO", aspect_ratio),
+        ],
+    )
+}
+
+pub fn discover_plugin_image_gen_providers(
+    hermes_home: &Path,
+    cwd: &Path,
+) -> Result<Vec<ImageGenPluginProvider>, String> {
+    run_python_plugin_json(hermes_home, cwd, PYTHON_PLUGIN_IMAGE_GEN_PROVIDERS, &[])
+}
+
+fn run_python_plugin_json<T: for<'de> Deserialize<'de>>(
+    hermes_home: &Path,
+    cwd: &Path,
+    script: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<T, String> {
+    let root = project_root();
+    let python =
+        resolve_repo_python(&root, Some("HERMES_PLUGIN_RUNTIME_PYTHON")).ok_or_else(|| {
+            "could not find a Python interpreter for plugin runtime dispatch".to_string()
+        })?;
+    let mut command = Command::new(&python);
+    command
+        .current_dir(cwd)
+        .env("HERMES_HOME", hermes_home)
+        .env("PYTHONPATH", pythonpath_with_root(&root))
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    apply_hermes_env_file(&mut command, hermes_home);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start plugin runtime helper: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            match output.status.code() {
+                Some(code) => format!("plugin runtime helper exited with status {code}"),
+                None => "plugin runtime helper terminated by signal".to_string(),
+            }
+        } else {
+            stderr
+        });
+    }
+    serde_json::from_slice::<T>(&output.stdout).map_err(|error| {
+        format!(
+            "failed to decode plugin runtime helper output: {error}; stdout={}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        )
+    })
 }
 
 pub fn discover_enabled_plugin_cli_commands(
@@ -742,6 +1041,7 @@ pub fn run_python_plugin_platform_setup(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    apply_hermes_env_file(&mut command, hermes_home);
     if accept_hooks {
         command.env("HERMES_ACCEPT_HOOKS", "1");
     }
@@ -758,6 +1058,80 @@ pub fn run_python_plugin_platform_setup(
         Some(code) => format!("plugin platform setup exited with status {code}"),
         None => "plugin platform setup terminated by signal".to_string(),
     })
+}
+
+fn apply_hermes_env_file(command: &mut Command, hermes_home: &Path) {
+    for (key, value) in hermes_env_entries(hermes_home) {
+        command.env(key, value);
+    }
+}
+
+fn hermes_env_entries(hermes_home: &Path) -> Vec<(String, String)> {
+    let path = hermes_home.join(".env");
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    let contents = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+    };
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        let Some((key, value)) = parse_env_line(line) else {
+            continue;
+        };
+        if !is_valid_env_var_name(&key) {
+            continue;
+        }
+        entries.push((key.clone(), sanitize_env_value(&key, &value)));
+    }
+    entries
+}
+
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let without_export = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, raw_value) = without_export.split_once('=')?;
+    Some((
+        key.trim().to_string(),
+        strip_matching_quotes(raw_value.trim()).to_string(),
+    ))
+}
+
+fn strip_matching_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn is_valid_env_var_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn sanitize_env_value(key: &str, value: &str) -> String {
+    if !CREDENTIAL_SUFFIXES
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
+    {
+        return value.to_string();
+    }
+    value.chars().filter(|ch| ch.is_ascii()).collect()
 }
 
 pub fn attach_python_plugin_callbacks(
@@ -2075,5 +2449,36 @@ def register(ctx):
         assert_eq!(failure.exit_code, 7);
         assert!(failure.stdout.trim().is_empty());
         assert_eq!(failure.stderr.trim(), "warn:bob");
+    }
+
+    #[test]
+    fn discover_plugin_image_gen_providers_lists_bundled_backends() {
+        let temp = TempDir::new().unwrap();
+        let providers = discover_plugin_image_gen_providers(temp.path(), temp.path()).unwrap();
+        let names = providers
+            .iter()
+            .map(|provider| provider.plugin_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"openai"));
+        assert!(names.contains(&"openai-codex"));
+        assert!(names.contains(&"xai"));
+
+        let openai = providers
+            .iter()
+            .find(|provider| provider.plugin_name == "openai")
+            .expect("openai image provider");
+        assert!(!openai.available);
+        assert!(
+            openai
+                .env_vars
+                .iter()
+                .any(|item| item.key == "OPENAI_API_KEY")
+        );
+        assert!(
+            openai
+                .models
+                .iter()
+                .any(|model| model.id == "gpt-image-2-medium")
+        );
     }
 }
