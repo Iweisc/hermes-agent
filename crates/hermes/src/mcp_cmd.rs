@@ -661,14 +661,26 @@ fn resolve_cached_oauth_access_token(context: &HermesContext, server_name: &str)
         .hermes_home()
         .join("mcp-tokens")
         .join(format!("{safe_name}.json"));
-    let raw = fs::read_to_string(path).ok()?;
+    let raw = fs::read_to_string(&path).ok()?;
     let payload = serde_json::from_str::<JsonValue>(&raw).ok()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
     if let Some(expires_at) = payload.get("expires_at").and_then(JsonValue::as_f64) {
-        let now = SystemTime::now()
+        if expires_at <= now + 30.0 {
+            return None;
+        }
+    } else if let Some(raw_expires_in) = payload.get("expires_in") {
+        let expires_in = json_number_or_string_as_i64(raw_expires_in)?;
+        let modified_at = path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()?
             .duration_since(UNIX_EPOCH)
             .ok()?
             .as_secs_f64();
-        if expires_at <= now + 30.0 {
+        if modified_at + expires_in as f64 <= now + 30.0 {
             return None;
         }
     }
@@ -678,6 +690,21 @@ fn resolve_cached_oauth_access_token(context: &HermesContext, server_name: &str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn json_number_or_string_as_i64(value: &JsonValue) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok();
+    }
+    if let Some(number) = value.as_f64().filter(|number| number.is_finite()) {
+        if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+            return Some(number.trunc() as i64);
+        }
+    }
+    value.as_str()?.trim().parse::<i64>().ok()
 }
 
 fn safe_oauth_server_filename(name: &str) -> String {
@@ -2199,6 +2226,41 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
         let logged = requests.lock().unwrap().clone();
         assert_eq!(logged.len(), 3);
         assert!(logged[2].contains("authorization"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cached_oauth_token_accepts_unexpired_legacy_expires_in() {
+        let home = temp_path("cached-oauth-legacy-live");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        fs::write(
+            home.join("mcp-tokens").join("alpha.json"),
+            r#"{"access_token":"secret-token","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_cached_oauth_access_token(&context, "alpha").as_deref(),
+            Some("secret-token")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cached_oauth_token_rejects_expired_legacy_expires_in() {
+        let home = temp_path("cached-oauth-legacy-expired");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        fs::write(
+            home.join("mcp-tokens").join("alpha.json"),
+            r#"{"access_token":"secret-token","token_type":"Bearer","expires_in":0}"#,
+        )
+        .unwrap();
+
+        assert!(resolve_cached_oauth_access_token(&context, "alpha").is_none());
 
         let _ = fs::remove_dir_all(home);
     }
