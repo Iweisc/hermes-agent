@@ -7,8 +7,11 @@ authors.workspace = true
 
 [dependencies]
 clap.workspace = true
+dirs.workspace = true
 hermes-core = { path = "../hermes-core" }
 log.workspace = true
+serde_json.workspace = true
+url.workspace = true
 
 [[bin]]
 name = "hermes-agent"

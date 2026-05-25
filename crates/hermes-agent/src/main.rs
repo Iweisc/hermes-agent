@@ -7,6 +7,8 @@ use hermes_core::{
     ToolRuntime,
 };
 
+mod tui_gateway;
+
 #[derive(Parser, Debug)]
 #[command(name = "hermes-agent", version, about = "Hermes agent Rust bootstrap")]
 struct Cli {
@@ -35,6 +37,7 @@ enum Command {
     },
     Env,
     Status,
+    TuiGateway,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -130,6 +133,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("terminal_backend={}", config.config.terminal.backend);
             println!("toolsets={}", config.config.toolsets.join(","));
             println!("note=Rust chat_completions loop available via `hermes-agent chat`");
+        }
+        Command::TuiGateway => {
+            tui_gateway::run(context)?;
         }
     }
 

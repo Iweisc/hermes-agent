@@ -38,6 +38,42 @@ const resolvePython = (root: string) => {
   return hit || (process.platform === 'win32' ? 'python' : 'python3')
 }
 
+interface GatewaySpawnSpec {
+  argv: string[]
+  cwd: string
+  label: string
+}
+
+const resolveGatewaySpawn = (root: string, sessionCwd: string): GatewaySpawnSpec => {
+  if ((process.env.HERMES_TUI_GATEWAY_BACKEND ?? '').trim().toLowerCase() === 'python') {
+    const python = resolvePython(root)
+
+    return {
+      argv: [python, '-m', 'tui_gateway.entry'],
+      cwd: sessionCwd,
+      label: `${python} -m tui_gateway.entry`
+    }
+  }
+
+  const compiled = [resolve(root, 'target/debug/hermes-agent'), resolve(root, 'target/release/hermes-agent')].find(
+    existsSync
+  )
+
+  if (compiled) {
+    return {
+      argv: [compiled, 'tui-gateway'],
+      cwd: root,
+      label: `${compiled} tui-gateway`
+    }
+  }
+
+  return {
+    argv: ['cargo', 'run', '-q', '-p', 'hermes-rs-agent', '--', 'tui-gateway'],
+    cwd: root,
+    label: 'cargo run -q -p hermes-rs-agent -- tui-gateway'
+  }
+}
+
 const asGatewayEvent = (value: unknown): GatewayEvent | null =>
   value && typeof value === 'object' && !Array.isArray(value) && typeof (value as { type?: unknown }).type === 'string'
     ? (value as GatewayEvent)
@@ -92,9 +128,14 @@ export class GatewayClient extends EventEmitter {
     const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
     const python = resolvePython(root)
     const cwd = process.env.HERMES_CWD || root
+    const gateway = resolveGatewaySpawn(root, cwd)
     const env = { ...process.env }
     const pyPath = env.PYTHONPATH?.trim()
+
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
+    env.HERMES_PYTHON = python
+    env.HERMES_PYTHON_SRC_ROOT = root
+    env.HERMES_CWD = cwd
 
     this.ready = false
     this.bufferedEvents.clear()
@@ -124,14 +165,18 @@ export class GatewayClient extends EventEmitter {
       // readable on slow boots.
       const stderrTail = this.getLogTail(20)
 
-      this.pushLog(`[startup] timed out waiting for gateway.ready (python=${python}, cwd=${cwd})`)
+      this.pushLog(`[startup] timed out waiting for gateway.ready (backend=${gateway.label}, cwd=${cwd})`)
       this.publish({
         type: 'gateway.start_timeout',
-        payload: { cwd, python, stderr_tail: stderrTail }
+        payload: { cwd, python: gateway.label, stderr_tail: stderrTail }
       })
     }, STARTUP_TIMEOUT_MS)
 
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.proc = spawn(gateway.argv[0]!, gateway.argv.slice(1), {
+      cwd: gateway.cwd,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })
     this.stdoutRl.on('line', raw => {

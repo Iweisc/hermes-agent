@@ -1227,8 +1227,11 @@ name = "hermes-rs-agent"
 version = "0.12.0"
 dependencies = [
  "clap",
+ "dirs",
  "hermes-core",
  "log",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
