@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use hermes_core::{
-    ApprovalRequest, DelegateExecutor, EnvLoadReport, GatewayEventBridge, HermesContext,
-    LoadedConfig, LoggingMode, ModelOverrides, StepUpdate, ToolProgressUpdate, ToolRuntime,
-    attach_gateway_event_callbacks,
+    ApprovalRequest, DelegateExecutor, EnvLoadReport, GatewayEventBridge, GatewaySessionPoll,
+    GatewayTurnSession, HermesContext, InteractiveTurnOptions, LoadedConfig, LoggingMode,
+    ModelOverrides, StepUpdate, ToolProgressUpdate, ToolRuntime, spawn_chat_turn_with_events,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -185,44 +185,81 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
             let structured_events = json_events || gateway_events;
             let event_emitter = structured_events.then(ChatEventEmitter::stdout);
-            let gateway_bridge =
-                gateway_events.then(|| Arc::new(Mutex::new(GatewayEventBridge::default())));
-            let mut runtime = ToolRuntime::default()
+            let runtime = ToolRuntime::default()
                 .with_hermes_home(context.hermes_home())
                 .with_delegate_callback(move |request| delegate.execute(request));
-            if let Some(emitter) = event_emitter.clone() {
-                if let Some(bridge) = gateway_bridge.clone() {
-                    emitter.emit(&bridge.lock().unwrap().gateway_ready());
-                    emitter.emit(&bridge.lock().unwrap().message_start());
-                    runtime = attach_gateway_event_callbacks(runtime, Arc::clone(&bridge), {
-                        let emitter = emitter.clone();
-                        move |event| emitter.emit(event)
-                    });
-                } else {
-                    runtime = runtime
-                        .with_tool_progress_callback({
-                            let emitter = emitter.clone();
-                            move |update| emit_tool_progress_event(&emitter, update)
-                        })
-                        .with_step_callback({
-                            let emitter = emitter.clone();
-                            move |update| emit_step_event(&emitter, update)
-                        })
-                        .with_clarify_request_callback({
-                            let emitter = emitter.clone();
-                            move |request| {
-                                emit_clarify_event(
-                                    &emitter,
+            if gateway_events {
+                let emitter = event_emitter.expect("gateway events require an emitter");
+                let rx = spawn_chat_turn_with_events(
+                    context.clone(),
+                    config.clone(),
+                    JsonValue::String(prompt.trim().to_string()),
+                    runtime,
+                    enabled_toolsets,
+                    overrides,
+                    session,
+                    InteractiveTurnOptions {
+                        enable_client_requests: true,
+                        ..InteractiveTurnOptions::default()
+                    },
+                );
+                let mut session = GatewayTurnSession::new(rx);
+                emitter.emit(&session.gateway_ready());
+                emitter.emit(&session.message_start());
+                loop {
+                    match session.poll_next()? {
+                        GatewaySessionPoll::Events {
+                            events,
+                            clarify_requests,
+                            approval_requests,
+                        } => {
+                            emit_gateway_events(&emitter, &events);
+                            for request in clarify_requests {
+                                let response = run_clarify_prompt_stderr(
                                     &request.question,
                                     request.choices.as_deref(),
-                                )
+                                );
+                                session.resolve_clarify(&request.request_id, response)?;
                             }
-                        })
-                        .with_approval_request_callback({
-                            let emitter = emitter.clone();
-                            move |request| emit_approval_event(&emitter, request)
-                        });
+                            for request in approval_requests {
+                                let response = run_approval_prompt_stderr(&request.request);
+                                session.resolve_approval(response)?;
+                            }
+                        }
+                        GatewaySessionPoll::Final { result, events } => {
+                            emit_gateway_events(&emitter, &events);
+                            result?;
+                            break;
+                        }
+                    }
                 }
+                return Ok(());
+            }
+            let mut runtime = runtime;
+            if let Some(emitter) = event_emitter.clone() {
+                runtime = runtime
+                    .with_tool_progress_callback({
+                        let emitter = emitter.clone();
+                        move |update| emit_tool_progress_event(&emitter, update)
+                    })
+                    .with_step_callback({
+                        let emitter = emitter.clone();
+                        move |update| emit_step_event(&emitter, update)
+                    })
+                    .with_clarify_request_callback({
+                        let emitter = emitter.clone();
+                        move |request| {
+                            emit_clarify_event(
+                                &emitter,
+                                &request.question,
+                                request.choices.as_deref(),
+                            )
+                        }
+                    })
+                    .with_approval_request_callback({
+                        let emitter = emitter.clone();
+                        move |request| emit_approval_event(&emitter, request)
+                    });
                 runtime = runtime
                     .with_clarify_callback(run_clarify_prompt_stderr)
                     .with_approval_callback(run_approval_prompt_stderr);
@@ -241,23 +278,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(&session_store),
             )?;
             if let Some(emitter) = event_emitter {
-                if let Some(bridge) = gateway_bridge {
-                    let event = bridge.lock().unwrap().on_final_response(&result);
-                    emitter.emit(&event);
-                } else {
-                    let event = json!({
-                        "event": "final_response",
-                        "text": result.final_response,
-                        "reasoning": result.reasoning,
-                        "api_calls": result.api_calls,
-                        "tool_calls": result.tool_calls,
-                        "model": result.model,
-                        "provider": result.provider,
-                        "base_url": result.base_url,
-                        "session_id": result.session_id,
-                    });
-                    emitter.emit(&event);
-                }
+                let event = json!({
+                    "event": "final_response",
+                    "text": result.final_response,
+                    "reasoning": result.reasoning,
+                    "api_calls": result.api_calls,
+                    "tool_calls": result.tool_calls,
+                    "model": result.model,
+                    "provider": result.provider,
+                    "base_url": result.base_url,
+                    "session_id": result.session_id,
+                });
+                emitter.emit(&event);
             } else {
                 println!("{}", result.final_response);
             }

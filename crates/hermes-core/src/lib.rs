@@ -38,6 +38,7 @@ pub mod state;
 mod terminal;
 pub mod tools;
 mod tts;
+mod turn_runner;
 mod video;
 mod vision;
 mod web;
@@ -67,7 +68,9 @@ pub use cronjob::{
 pub use delegate::DelegateExecutor;
 pub use env_loader::EnvLoadReport;
 pub use gateway_events::{
-    GatewayEventBridge, GatewayEventEnvelope, attach_gateway_event_callbacks,
+    GatewayApprovalPrompt, GatewayClarifyPrompt, GatewayEventBridge, GatewayEventEnvelope,
+    GatewaySessionPoll, GatewayTurnBridge, GatewayTurnOutcome, GatewayTurnSession,
+    attach_gateway_event_callbacks,
 };
 pub use kanban::{
     KanbanDispatchOptions, KanbanDispatchResult, KanbanRunResult, dispatch_kanban_once,
@@ -90,6 +93,10 @@ pub use tools::{
     ToolsetInfo, coerce_tool_args, dispatch_tool, get_all_tool_names, get_all_toolsets,
     get_tool_definitions, get_tool_definitions_for_runtime, get_toolset_for_tool, get_toolset_info,
     get_toolset_names, resolve_toolset, tool_error, tool_result, validate_toolset,
+};
+pub use turn_runner::{
+    InteractiveTurnEvent, InteractiveTurnOptions, InteractiveTurnRequest,
+    spawn_chat_turn_with_events,
 };
 
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";

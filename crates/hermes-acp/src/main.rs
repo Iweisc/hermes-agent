@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{LocalResult, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use hermes_core::{
-    AgentTurnResult, ClarifyRequest, EnvLoadReport, HermesContext, LoadedConfig, LoggingMode,
-    MessageAppend, MessageRecord, ModelOverrides, SessionCreate, SessionRecord, SessionStore,
-    StepUpdate, ToolProgressUpdate, ToolRuntime, get_provider_profile, get_tool_definitions,
-    normalize_provider_alias,
+    ClarifyRequest, EnvLoadReport, HermesContext, InteractiveTurnEvent, InteractiveTurnOptions,
+    InteractiveTurnRequest, LoadedConfig, LoggingMode, MessageAppend, MessageRecord,
+    ModelOverrides, SessionCreate, SessionRecord, SessionStore, StepUpdate, ToolProgressUpdate,
+    ToolRuntime, get_provider_profile, get_tool_definitions, normalize_provider_alias,
+    spawn_chat_turn_with_events,
 };
 use serde_json::{Value, json};
 
@@ -30,20 +31,15 @@ struct ActiveToolCall {
     args: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
-enum AcpRuntimeEvent {
-    ToolProgress(ToolProgressUpdate),
-    Step(StepUpdate),
-    ClientRequest(AcpClientRequest),
-    Final(Result<AgentTurnResult, String>),
-}
-
-#[derive(Debug, Clone)]
-struct AcpClientRequest {
-    id: String,
-    method: String,
-    params: Value,
-    response_tx: mpsc::Sender<Result<Value, String>>,
+#[derive(Debug)]
+enum PendingClientRequest {
+    Clarify {
+        request: ClarifyRequest,
+        response_tx: mpsc::Sender<Result<String, String>>,
+    },
+    Approval {
+        response_tx: mpsc::Sender<Result<String, String>>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -126,7 +122,7 @@ struct AcpServer<'a> {
     session_store: &'a SessionStore,
     sessions: HashMap<String, AcpSessionState>,
     input_rx: Option<mpsc::Receiver<Option<String>>>,
-    pending_client_requests: HashMap<String, mpsc::Sender<Result<Value, String>>>,
+    pending_client_requests: HashMap<String, PendingClientRequest>,
 }
 
 impl<'a> AcpServer<'a> {
@@ -299,7 +295,7 @@ impl<'a> AcpServer<'a> {
         let Some(key) = jsonrpc_id_key(&id) else {
             return;
         };
-        let Some(response_tx) = self.pending_client_requests.remove(&key) else {
+        let Some(request) = self.pending_client_requests.remove(&key) else {
             return;
         };
         if let Some(error) = message.get("error") {
@@ -307,10 +303,26 @@ impl<'a> AcpServer<'a> {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Client request failed");
-            let _ = response_tx.send(Err(detail.to_string()));
+            match request {
+                PendingClientRequest::Clarify { response_tx, .. }
+                | PendingClientRequest::Approval { response_tx } => {
+                    let _ = response_tx.send(Err(detail.to_string()));
+                }
+            }
             return;
         }
-        let _ = response_tx.send(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
+        let result = message.get("result").cloned().unwrap_or(Value::Null);
+        match request {
+            PendingClientRequest::Clarify {
+                request,
+                response_tx,
+            } => {
+                let _ = response_tx.send(map_input_response_to_clarify(&result, &request));
+            }
+            PendingClientRequest::Approval { response_tx } => {
+                let _ = response_tx.send(Ok(map_permission_response_to_approval(&result)));
+            }
+        }
     }
 
     fn handle_request<W: Write>(
@@ -715,121 +727,32 @@ impl<'a> AcpServer<'a> {
         }
 
         let enabled_toolsets = vec![String::from("hermes-acp")];
-        let (tx, rx) = mpsc::channel::<AcpRuntimeEvent>();
-        let worker_context = self.context.clone();
-        let worker_config = self.config.clone();
-        let worker_session_id = session_id.clone();
-        let worker_prompt = prompt_input.user_content;
-        let worker_toolsets = enabled_toolsets.clone();
-        let worker_overrides = state.overrides.clone();
-        let worker_cwd = state.cwd.clone();
-        let worker_home = self.context.hermes_home();
         let approval_timeout = approval_timeout_seconds(self.config);
         let clarify_timeout = clarify_timeout_seconds(self.config);
         let interactive_client = self.input_rx.is_some();
-        thread::spawn(move || {
-            let store = worker_context.open_session_store();
-            let mut runtime = ToolRuntime::new(&worker_cwd)
-                .with_hermes_home(worker_home)
-                .with_current_session_id(Some(worker_session_id.clone()))
-                .with_tool_progress_callback({
-                    let tx = tx.clone();
-                    move |update| {
-                        let _ = tx.send(AcpRuntimeEvent::ToolProgress(update.clone()));
-                    }
-                })
-                .with_step_callback({
-                    let tx = tx.clone();
-                    move |update| {
-                        let _ = tx.send(AcpRuntimeEvent::Step(update.clone()));
-                    }
-                });
-            if interactive_client {
-                runtime = runtime.with_clarify_callback({
-                    let tx = tx.clone();
-                    let clarify_session_id = worker_session_id.clone();
-                    move |question, choices| {
-                        let request = ClarifyRequest {
-                            question: question.to_string(),
-                            choices: choices.map(|items| items.to_vec()),
-                        };
-                        let request_id = next_acp_request_id();
-                        let params =
-                            build_input_request_params(&clarify_session_id, &request_id, &request);
-                        let (response_tx, response_rx) = mpsc::channel::<Result<Value, String>>();
-                        if tx
-                            .send(AcpRuntimeEvent::ClientRequest(AcpClientRequest {
-                                id: request_id,
-                                method: String::from("session/request_input"),
-                                params,
-                                response_tx,
-                            }))
-                            .is_err()
-                        {
-                            return Err(String::from(
-                                "ACP client disconnected before clarify input could be requested.",
-                            ));
-                        }
-                        match response_rx.recv_timeout(Duration::from_secs(clarify_timeout)) {
-                            Ok(Ok(response)) => map_input_response_to_clarify(&response, &request),
-                            Ok(Err(error)) => Err(error),
-                            Err(_) => Err(String::from(
-                                "Clarification timed out before the ACP client responded.",
-                            )),
-                        }
-                    }
-                });
-                runtime = runtime.with_approval_callback({
-                    let tx = tx.clone();
-                    let approval_session_id = worker_session_id.clone();
-                    move |request| {
-                        let request_id = next_acp_request_id();
-                        let params = build_permission_request_params(
-                            &approval_session_id,
-                            &request_id,
-                            request,
-                        );
-                        let (response_tx, response_rx) = mpsc::channel::<Result<Value, String>>();
-                        if tx
-                            .send(AcpRuntimeEvent::ClientRequest(AcpClientRequest {
-                                id: request_id.clone(),
-                                method: String::from("session/request_permission"),
-                                params,
-                                response_tx,
-                            }))
-                            .is_err()
-                        {
-                            return Ok(String::from("deny"));
-                        }
-                        match response_rx.recv_timeout(Duration::from_secs(approval_timeout)) {
-                            Ok(Ok(response)) => Ok(map_permission_response_to_approval(&response)),
-                            Ok(Err(_)) | Err(_) => Ok(String::from("deny")),
-                        }
-                    }
-                });
-            }
-            let result = match store {
-                Ok(store) => worker_context
-                    .run_chat_turn_with_user_content(
-                        &worker_config,
-                        worker_prompt,
-                        &runtime,
-                        Some(&worker_toolsets),
-                        &worker_overrides,
-                        Some(&worker_session_id),
-                        Some(&store),
-                    )
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = tx.send(AcpRuntimeEvent::Final(result));
-        });
+        let runtime = ToolRuntime::new(&state.cwd)
+            .with_hermes_home(self.context.hermes_home())
+            .with_current_session_id(Some(session_id.clone()));
+        let rx = spawn_chat_turn_with_events(
+            self.context.clone(),
+            self.config.clone(),
+            prompt_input.user_content,
+            runtime,
+            enabled_toolsets.clone(),
+            state.overrides.clone(),
+            Some(session_id.clone()),
+            InteractiveTurnOptions {
+                enable_client_requests: interactive_client,
+                clarify_timeout: Duration::from_secs(clarify_timeout),
+                approval_timeout: Duration::from_secs(approval_timeout),
+            },
+        );
 
         let mut active_tool_calls = HashMap::<String, Vec<ActiveToolCall>>::new();
         let final_response = loop {
             self.drain_input_lines(writer, true)?;
             match rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(AcpRuntimeEvent::ToolProgress(update)) => {
+                Ok(InteractiveTurnEvent::ToolProgress(update)) => {
                     if update.event_type == "tool.started" {
                         self.handle_tool_progress_update(
                             writer,
@@ -839,13 +762,16 @@ impl<'a> AcpServer<'a> {
                         )?;
                     }
                 }
-                Ok(AcpRuntimeEvent::Step(update)) => {
+                Ok(InteractiveTurnEvent::Step(update)) => {
                     self.handle_step_update(writer, &session_id, &mut active_tool_calls, &update)?;
                 }
-                Ok(AcpRuntimeEvent::ClientRequest(request)) => {
-                    self.send_client_request(writer, request)?;
+                Ok(InteractiveTurnEvent::ClarifyRequest(request)) => {
+                    self.send_clarify_request(writer, &session_id, request)?;
                 }
-                Ok(AcpRuntimeEvent::Final(result)) => match result {
+                Ok(InteractiveTurnEvent::ApprovalRequest(request)) => {
+                    self.send_approval_request(writer, &session_id, request)?;
+                }
+                Ok(InteractiveTurnEvent::Final(result)) => match result {
                     Ok(turn) => break turn.final_response,
                     Err(error) => break format!("Error: {error}"),
                 },
@@ -952,24 +878,55 @@ impl<'a> AcpServer<'a> {
         write_session_update(writer, session_id, payload).map_err(|error| error.to_string())
     }
 
-    fn send_client_request<W: Write>(
+    fn send_clarify_request<W: Write>(
         &mut self,
         writer: &mut W,
-        request: AcpClientRequest,
+        session_id: &str,
+        request: InteractiveTurnRequest<ClarifyRequest>,
     ) -> Result<(), String> {
-        let Some(key) = jsonrpc_id_key(&Value::String(request.id.clone())) else {
-            let _ = request
-                .response_tx
-                .send(Err(String::from("ACP client request id was invalid.")));
+        let (request, response_tx) = request.into_parts();
+        let request_id = next_acp_request_id();
+        let params = build_input_request_params(session_id, &request_id, &request);
+        let Some(key) = jsonrpc_id_key(&Value::String(request_id.clone())) else {
+            let _ = response_tx.send(Err(String::from("ACP client request id was invalid.")));
+            return Ok(());
+        };
+        self.pending_client_requests.insert(
+            key,
+            PendingClientRequest::Clarify {
+                request,
+                response_tx,
+            },
+        );
+        write_jsonrpc_request(
+            writer,
+            Value::String(request_id),
+            "session/request_input",
+            params,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn send_approval_request<W: Write>(
+        &mut self,
+        writer: &mut W,
+        session_id: &str,
+        request: InteractiveTurnRequest<hermes_core::ApprovalRequest>,
+    ) -> Result<(), String> {
+        let (request, response_tx) = request.into_parts();
+        let request_id = next_acp_request_id();
+        let params = build_permission_request_params(session_id, &request_id, &request);
+        let Some(key) = jsonrpc_id_key(&Value::String(request_id.clone())) else {
+            let _ = response_tx.send(Err(String::from("ACP client request id was invalid.")));
             return Ok(());
         };
         self.pending_client_requests
-            .insert(key, request.response_tx);
+            .insert(key, PendingClientRequest::Approval { response_tx });
         write_jsonrpc_request(
             writer,
-            Value::String(request.id),
-            &request.method,
-            request.params,
+            Value::String(request_id),
+            "session/request_permission",
+            params,
         )
         .map_err(|error| error.to_string())
     }

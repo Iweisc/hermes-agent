@@ -22,6 +22,7 @@ use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
+use crate::gateway_native::run_native_gateway_stdio;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -204,6 +205,7 @@ struct GatewaySetupVarSpec {
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
+            context,
             args.accept_hooks,
             GatewayRunArgs {
                 verbose: 0,
@@ -211,7 +213,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
                 replace: false,
             },
         ),
-        Some(GatewayCommand::Run(run)) => print_gateway_run(args.accept_hooks, run),
+        Some(GatewayCommand::Run(run)) => print_gateway_run(context, args.accept_hooks, run),
         Some(GatewayCommand::Start(service)) => {
             print_gateway_start(context, args.accept_hooks, service)
         }
@@ -471,6 +473,7 @@ fn print_gateway_restart(
             return Ok(());
         }
         return print_gateway_run(
+            context,
             accept_hooks,
             GatewayRunArgs {
                 verbose: 0,
@@ -495,6 +498,7 @@ fn print_gateway_restart(
     let _ = stop_manual_gateway(context)?;
     println!("Starting gateway...");
     print_gateway_run(
+        context,
         accept_hooks,
         GatewayRunArgs {
             verbose: 0,
@@ -761,7 +765,22 @@ fn print_gateway_status(
     Ok(())
 }
 
-fn print_gateway_run(accept_hooks: bool, args: GatewayRunArgs) -> Result<(), Box<dyn Error>> {
+fn print_gateway_run(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayRunArgs,
+) -> Result<(), Box<dyn Error>> {
+    if env::var("HERMES_NATIVE_TUI_GATEWAY")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        let config = context.load_config_document()?;
+        let store = context.open_session_store()?;
+        run_native_gateway_stdio(context, &config, &store)?;
+        return Ok(());
+    }
+
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
         .ok_or("could not find a Python interpreter for gateway launch")?;
@@ -6805,6 +6824,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
+        let (_ctx_temp, context) = test_context();
         let temp = TempDir::new().unwrap();
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
@@ -6829,6 +6849,7 @@ exit 9\n",
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
         print_gateway_run(
+            &context,
             true,
             GatewayRunArgs {
                 verbose: 2,
