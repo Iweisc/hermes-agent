@@ -6643,8 +6643,41 @@ mod tests {
         (temp, ctx)
     }
 
-    fn test_json_body_string(request: &[u8], key: &str) -> String {
-        let request = String::from_utf8_lossy(request);
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if header_end.is_none()
+                && let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let end = index + 4;
+                header_end = Some(end);
+                let headers = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+            }
+            if let Some(end) = header_end
+                && buffer.len() >= end + content_length
+            {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn test_json_body_string(request: &str, key: &str) -> String {
         let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
         let value: JsonValue = serde_json::from_str(body).unwrap();
         value
@@ -7434,8 +7467,7 @@ exit 9\n",
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut request = [0_u8; 1024];
-                let _ = stream.read(&mut request);
+                let _request = read_http_request(&mut stream);
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
             }
         });
@@ -7521,8 +7553,7 @@ exit 9\n",
             ];
             for body in responses {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut request = [0_u8; 2048];
-                    let _ = stream.read(&mut request);
+                    let _request = read_http_request(&mut stream);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -7629,8 +7660,7 @@ exit 9\n",
             while next < responses.len() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let _ = stream.read(&mut request);
+                        let _request = read_http_request(&mut stream);
                         let body = responses[next];
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7728,8 +7758,7 @@ exit 9\n",
             while next < responses.len() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let _ = stream.read(&mut request);
+                        let _request = read_http_request(&mut stream);
                         let body = responses[next];
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7838,8 +7867,7 @@ exit 9\n",
             while next < responses.len() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let _ = stream.read(&mut request);
+                        let _request = read_http_request(&mut stream);
                         let body = responses[next];
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -7980,10 +8008,9 @@ exit 9\n",
             while next < 2 && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let bytes = stream.read(&mut request).unwrap_or(0);
+                        let request = read_http_request(&mut stream);
                         let body = if next == 0 {
-                            bind_key = test_json_body_string(&request[..bytes], "key");
+                            bind_key = test_json_body_string(&request, "key");
                             String::from(r#"{"retcode":0,"data":{"task_id":"task-1"}}"#)
                         } else {
                             let encrypted = qqbot_encrypt_secret_for_test("qq-secret", &bind_key);
@@ -8154,8 +8181,7 @@ exit 9\n",
             while next < responses.len() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 2048];
-                        let _ = stream.read(&mut request);
+                        let _request = read_http_request(&mut stream);
                         let body = responses[next];
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -8522,7 +8548,7 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         let mut child = Command::new("bash")
-            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .args(["-c", "exec -a 'hermes gateway run' sleep 30"])
             .spawn()
             .unwrap();
         fs::create_dir_all(ctx.hermes_home()).unwrap();
@@ -8533,7 +8559,7 @@ exit 9\n",
         .unwrap();
 
         let mut unrelated = Command::new("bash")
-            .args(["-lc", "exec -a 'hermes gateway run' sleep 30"])
+            .args(["-c", "exec -a 'hermes gateway run' sleep 30"])
             .spawn()
             .unwrap();
 

@@ -5229,6 +5229,45 @@ mod tests {
         std::env::temp_dir().join(format!("hermes-rs-auth-{label}-{unique}"))
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+
+            if header_end.is_none()
+                && let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let end = pos + 4;
+                header_end = Some(end);
+                let headers = String::from_utf8_lossy(&buffer[..end]);
+                for line in headers.lines() {
+                    if let Some(value) = line
+                        .strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+
+            if let Some(end) = header_end
+                && buffer.len() >= end + content_length
+            {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&buffer).to_string()
+    }
+
     fn spawn_spotify_token_server(
         response: JsonValue,
     ) -> (String, Arc<Mutex<String>>, thread::JoinHandle<()>) {
@@ -5238,9 +5277,7 @@ mod tests {
         let request_body_clone = Arc::clone(&request_body);
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 8192];
-            let size = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+            let request = read_http_request(&mut stream);
             let body = request
                 .split("\r\n\r\n")
                 .nth(1)
@@ -5314,9 +5351,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 8192];
-                let size = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_http_request(&mut stream);
                 let first_line = request.lines().next().unwrap_or_default().to_string();
                 requests_clone.lock().unwrap().push(request.clone());
                 let (status_line, payload) = if first_line.starts_with("POST /token ") {
@@ -5374,9 +5409,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for idx in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 8192];
-                let size = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_http_request(&mut stream);
                 requests_clone.lock().unwrap().push(request.clone());
                 let payload = match idx {
                     0 => json!({
@@ -5421,9 +5454,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for idx in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 8192];
-                let size = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_http_request(&mut stream);
                 requests_clone.lock().unwrap().push(request.clone());
                 let (status_line, payload) = match idx {
                     0 => (
@@ -5477,9 +5508,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for idx in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 8192];
-                let size = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_http_request(&mut stream);
                 requests_clone.lock().unwrap().push(request.clone());
                 let payload = match idx {
                     0 => json!({
@@ -5533,9 +5562,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for idx in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 8192];
-                let size = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_http_request(&mut stream);
                 requests_clone.lock().unwrap().push(request.clone());
                 let payload = match idx {
                     0 => json!({

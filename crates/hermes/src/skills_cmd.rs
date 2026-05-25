@@ -6756,15 +6756,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     #[cfg(test)]
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     #[cfg(test)]
     fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::cli_test_env_lock()
     }
 
     #[cfg(test)]
