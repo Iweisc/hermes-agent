@@ -259,10 +259,7 @@ pub fn handle_send_message(args: &Value, runtime: &ToolRuntime) -> String {
 
 fn handle_list_targets(runtime: &ToolRuntime) -> String {
     let mut configs = load_configs();
-    if let Some(config) = configs.telegram.as_mut() {
-        config.disable_link_previews =
-            load_telegram_disable_link_previews(runtime.hermes_home()).unwrap_or(false);
-    }
+    apply_config_yaml_overrides(&mut configs, runtime.hermes_home());
     if !configs.has_any() {
         return tool_error(
             "No supported messaging platform is configured. Set TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, FEISHU_APP_ID/FEISHU_APP_SECRET, MATRIX_ACCESS_TOKEN/MATRIX_HOMESERVER, SIGNAL_HTTP_URL/SIGNAL_ACCOUNT, or YUANBAO_APP_ID/YUANBAO_APP_SECRET first.",
@@ -321,13 +318,7 @@ fn handle_send(args: &Value, runtime: &ToolRuntime) -> String {
     };
 
     let mut configs = load_configs();
-    if let Some(config) = configs.telegram.as_mut() {
-        config.disable_link_previews =
-            load_telegram_disable_link_previews(runtime.hermes_home()).unwrap_or(false);
-    }
-    if let Some(config) = configs.slack.as_mut() {
-        config.reply_broadcast = load_slack_reply_broadcast(runtime.hermes_home()).unwrap_or(false);
-    }
+    apply_config_yaml_overrides(&mut configs, runtime.hermes_home());
     if !configs.has_any() {
         return tool_error(
             "No supported messaging platform is configured. Set TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, FEISHU_APP_ID/FEISHU_APP_SECRET, MATRIX_ACCESS_TOKEN/MATRIX_HOMESERVER, SIGNAL_HTTP_URL/SIGNAL_ACCOUNT, or YUANBAO_APP_ID/YUANBAO_APP_SECRET first.",
@@ -472,6 +463,126 @@ fn load_configs() -> ConfigSet {
     }
 }
 
+fn apply_config_yaml_overrides(configs: &mut ConfigSet, hermes_home: &Path) {
+    match (
+        configs.telegram.as_mut(),
+        load_telegram_config_from_yaml(hermes_home),
+    ) {
+        (Some(config), _) => {
+            if env_trimmed("TELEGRAM_API_BASE_URL").is_none()
+                && let Some(base_url) = load_telegram_base_url(hermes_home)
+            {
+                config.base_url = base_url;
+            }
+            if config.home.is_none() {
+                config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
+            }
+        }
+        (None, Some(yaml)) => configs.telegram = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.telegram.as_mut() {
+        if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
+        }
+        config.disable_link_previews =
+            load_telegram_disable_link_previews(hermes_home).unwrap_or(false);
+    }
+
+    match (
+        configs.discord.as_mut(),
+        load_discord_config_from_yaml(hermes_home),
+    ) {
+        (Some(_config), _) => {}
+        (None, Some(yaml)) => configs.discord = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.discord.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("DISCORD_API_BASE_URL").as_deref(),
+            &config.base_url,
+        );
+        if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "discord", "Home");
+        }
+    }
+
+    match (
+        configs.slack.as_mut(),
+        load_slack_config_from_yaml(hermes_home),
+    ) {
+        (Some(_config), _) => {}
+        (None, Some(yaml)) => configs.slack = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.slack.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("SLACK_API_BASE_URL").as_deref(),
+            &config.base_url,
+        );
+        if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "slack", "");
+        }
+        config.reply_broadcast = load_slack_reply_broadcast(hermes_home).unwrap_or(false);
+    }
+
+    match (
+        configs.feishu.as_mut(),
+        load_feishu_config_from_yaml(hermes_home),
+    ) {
+        (Some(config), _) => {
+            if config.home.is_none() {
+                config.home = load_platform_home_target_from_yaml(hermes_home, "feishu", "Home");
+            }
+        }
+        (None, Some(yaml)) => configs.feishu = Some(yaml),
+        _ => {}
+    }
+
+    let matrix_yaml = load_matrix_config_from_yaml(hermes_home);
+    match (configs.matrix.as_mut(), matrix_yaml) {
+        (Some(config), Some(yaml)) => {
+            if config.token.is_none() {
+                config.token = yaml.token;
+            }
+            if config.homeserver.is_empty() {
+                config.homeserver = yaml.homeserver;
+            }
+            if config.user_id.is_none() {
+                config.user_id = yaml.user_id;
+            }
+            if config.password.is_none() {
+                config.password = yaml.password;
+            }
+            if config.device_id.is_none() {
+                config.device_id = yaml.device_id;
+            }
+            if config.home.is_none() {
+                config.home = yaml.home;
+            }
+        }
+        (None, Some(yaml)) => configs.matrix = Some(yaml),
+        _ => {}
+    }
+
+    let signal_yaml = load_signal_config_from_yaml(hermes_home);
+    match (configs.signal.as_mut(), signal_yaml) {
+        (Some(config), Some(yaml)) => {
+            if config.http_url.is_empty() {
+                config.http_url = yaml.http_url;
+            }
+            if config.account.is_empty() {
+                config.account = yaml.account;
+            }
+            if config.home.is_none() {
+                config.home = yaml.home;
+            }
+        }
+        (None, Some(yaml)) => configs.signal = Some(yaml),
+        _ => {}
+    }
+}
+
 fn load_telegram_config() -> Option<TelegramConfig> {
     let token = env_trimmed("TELEGRAM_BOT_TOKEN")?;
     Some(TelegramConfig {
@@ -489,6 +600,20 @@ fn load_telegram_config() -> Option<TelegramConfig> {
     })
 }
 
+fn load_telegram_config_from_yaml(hermes_home: &Path) -> Option<TelegramConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "telegram") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "telegram", "token"])?;
+    Some(TelegramConfig {
+        token,
+        base_url: load_telegram_base_url(hermes_home)
+            .unwrap_or_else(|| TELEGRAM_DEFAULT_BASE_URL.to_string()),
+        disable_link_previews: false,
+        home: load_platform_home_target_from_yaml(hermes_home, "telegram", "Home"),
+    })
+}
+
 fn load_discord_config() -> Option<DiscordConfig> {
     let token = env_trimmed("DISCORD_BOT_TOKEN")?;
     Some(DiscordConfig {
@@ -502,6 +627,18 @@ fn load_discord_config() -> Option<DiscordConfig> {
             "DISCORD_HOME_CHANNEL_THREAD_ID",
             "DISCORD_HOME_CHANNEL_NAME",
         ),
+    })
+}
+
+fn load_discord_config_from_yaml(hermes_home: &Path) -> Option<DiscordConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "discord") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "discord", "token"])?;
+    Some(DiscordConfig {
+        token,
+        base_url: DISCORD_DEFAULT_BASE_URL.to_string(),
+        home: load_platform_home_target_from_yaml(hermes_home, "discord", "Home"),
     })
 }
 
@@ -523,6 +660,19 @@ fn load_slack_config() -> Option<SlackConfig> {
     })
 }
 
+fn load_slack_config_from_yaml(hermes_home: &Path) -> Option<SlackConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "slack") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "slack", "token"])?;
+    Some(SlackConfig {
+        token,
+        base_url: SLACK_DEFAULT_BASE_URL.to_string(),
+        reply_broadcast: false,
+        home: load_platform_home_target_from_yaml(hermes_home, "slack", ""),
+    })
+}
+
 fn load_feishu_config() -> Option<FeishuConfig> {
     let app_id = env_trimmed("FEISHU_APP_ID")?;
     let app_secret = env_trimmed("FEISHU_APP_SECRET")?;
@@ -537,6 +687,24 @@ fn load_feishu_config() -> Option<FeishuConfig> {
             "FEISHU_HOME_CHANNEL_THREAD_ID",
             "FEISHU_HOME_CHANNEL_NAME",
         ),
+    })
+}
+
+fn load_feishu_config_from_yaml(hermes_home: &Path) -> Option<FeishuConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "feishu") != Some(true) {
+        return None;
+    }
+    let app_id = load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "app_id"])?;
+    let app_secret =
+        load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "app_secret"])?;
+    let domain = load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "domain"])
+        .unwrap_or_else(|| "feishu".to_string());
+    let base_url = normalize_feishu_base_url(&domain).ok()?;
+    Some(FeishuConfig {
+        app_id,
+        app_secret,
+        base_url,
+        home: load_platform_home_target_from_yaml(hermes_home, "feishu", "Home"),
     })
 }
 
@@ -1665,6 +1833,118 @@ fn load_config_yaml_bool(hermes_home: &Path, path: &[&str]) -> Option<bool> {
     }
 }
 
+fn load_config_yaml_string(hermes_home: &Path, path: &[&str]) -> Option<String> {
+    let contents = fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let mut value = &parsed;
+    for segment in path {
+        value = value
+            .as_mapping()?
+            .get(serde_yaml::Value::String((*segment).to_string()))?;
+    }
+    yaml_scalar_to_string(value)
+}
+
+fn load_platform_enabled_from_yaml(hermes_home: &Path, platform: &str) -> Option<bool> {
+    load_config_yaml_bool(hermes_home, &["platforms", platform, "enabled"])
+}
+
+fn load_telegram_base_url(hermes_home: &Path) -> Option<String> {
+    load_config_yaml_string(hermes_home, &["platforms", "telegram", "extra", "base_url"])
+        .map(|value| normalize_base_url(Some(value.as_str()), TELEGRAM_DEFAULT_BASE_URL))
+}
+
+fn load_matrix_config_from_yaml(hermes_home: &Path) -> Option<MatrixConfig> {
+    let homeserver =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "homeserver"])
+            .map(|value| normalize_base_url(Some(value.as_str()), MATRIX_DEFAULT_BASE_URL))
+            .unwrap_or_default();
+    if homeserver.is_empty() {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "matrix", "token"]);
+    let user_id =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "user_id"]);
+    let password =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "password"]);
+    if token.is_none() && (user_id.is_none() || password.is_none()) {
+        return None;
+    }
+    Some(MatrixConfig {
+        token,
+        homeserver,
+        user_id,
+        password,
+        device_id: load_config_yaml_string(
+            hermes_home,
+            &["platforms", "matrix", "extra", "device_id"],
+        ),
+        home: load_platform_home_target_from_yaml(hermes_home, "matrix", "Home"),
+    })
+}
+
+fn load_signal_config_from_yaml(hermes_home: &Path) -> Option<SignalConfig> {
+    let http_url =
+        load_config_yaml_string(hermes_home, &["platforms", "signal", "extra", "http_url"])
+            .map(|value| normalize_base_url(Some(value.as_str()), ""))
+            .unwrap_or_default();
+    let account =
+        load_config_yaml_string(hermes_home, &["platforms", "signal", "extra", "account"])
+            .unwrap_or_default();
+    if http_url.is_empty() || account.is_empty() {
+        return None;
+    }
+    Some(SignalConfig {
+        http_url,
+        account,
+        home: load_platform_home_target_from_yaml(hermes_home, "signal", "Home"),
+    })
+}
+
+fn load_platform_home_target_from_yaml(
+    hermes_home: &Path,
+    platform: &str,
+    default_name: &str,
+) -> Option<HomeTarget> {
+    let contents = fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let home = parsed
+        .as_mapping()?
+        .get(serde_yaml::Value::String("platforms".to_string()))?
+        .as_mapping()?
+        .get(serde_yaml::Value::String(platform.to_string()))?
+        .as_mapping()?
+        .get(serde_yaml::Value::String("home_channel".to_string()))?
+        .as_mapping()?;
+    let chat_id = home
+        .get(serde_yaml::Value::String("chat_id".to_string()))
+        .and_then(yaml_scalar_to_string)?;
+    let thread_id = home
+        .get(serde_yaml::Value::String("thread_id".to_string()))
+        .and_then(yaml_scalar_to_string);
+    let name = home
+        .get(serde_yaml::Value::String("name".to_string()))
+        .and_then(yaml_scalar_to_string)
+        .unwrap_or_else(|| default_name.to_string());
+    Some(HomeTarget {
+        chat_id,
+        thread_id,
+        name,
+    })
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn load_telegram_disable_link_previews(hermes_home: &Path) -> Option<bool> {
     load_config_yaml_bool(hermes_home, &["telegram", "disable_link_previews"]).or_else(|| {
         load_config_yaml_bool(
@@ -2016,7 +2296,6 @@ fn send_discord_forum_channel(
     message: &str,
     media: &[MediaAttachment],
 ) -> Result<SentMessage, SendError> {
-    let thread_name = derive_discord_forum_thread_name(message);
     let url = format!("{}/channels/{}/threads", config.base_url, target.chat_id);
     let mut warnings = Vec::new();
     let text_chunks = if message.is_empty() {
@@ -2053,6 +2332,15 @@ fn send_discord_forum_channel(
             }
         })
         .collect::<Vec<_>>();
+    let thread_name_hint = if message.trim().is_empty() {
+        valid_media
+            .first()
+            .map(|(file_name, _bytes)| file_name.as_str())
+            .unwrap_or("")
+    } else {
+        message
+    };
+    let thread_name = derive_discord_forum_thread_name(thread_name_hint);
 
     let body = if valid_media.is_empty() {
         if text_chunks.is_empty() {
@@ -2394,6 +2682,8 @@ fn send_slack(
 ) -> Result<SentMessage, SendError> {
     let client = http_client()?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
     let formatted_message = slack_format_message(message);
 
     if !formatted_message.is_empty() {
@@ -2429,6 +2719,7 @@ fn send_slack(
                 )));
             }
             last_message_id = body.get("ts").and_then(value_as_string);
+            delivered_any = true;
         }
     }
 
@@ -2439,15 +2730,33 @@ fn send_slack(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
-        last_message_id = Some(slack_upload_file(
-            &client, config, target, &file_name, &bytes,
-        )?);
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(format!(
+                    "Failed to send media {}: {error}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+        };
+        match slack_upload_file(&client, config, target, &file_name, &bytes) {
+            Ok(message_id) => {
+                last_message_id = Some(message_id);
+                delivered_any = true;
+            }
+            Err(error) => warnings.push(format!(
+                "Failed to send media {}: {}",
+                attachment.path.display(),
+                error.0
+            )),
+        }
+    }
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2458,7 +2767,7 @@ fn send_slack(
         note: target
             .used_home_channel
             .then(|| format!("Sent to slack home channel (chat_id: {})", target.chat_id)),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -2563,6 +2872,8 @@ fn send_feishu(
     let token = feishu_access_token(config)?;
     let client = http_client()?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
 
     if !message.is_empty() {
         for chunk in truncate_message(message, FEISHU_MAX_MESSAGE_LENGTH) {
@@ -2578,7 +2889,10 @@ fn send_feishu(
                 payload.clone(),
                 "Feishu send failed",
             ) {
-                Ok(message_id) => last_message_id = Some(message_id),
+                Ok(message_id) => {
+                    last_message_id = Some(message_id);
+                    delivered_any = true;
+                }
                 Err(error)
                     if msg_type == "post"
                         && feishu_is_invalid_post_error(error.to_string().as_str()) =>
@@ -2592,6 +2906,7 @@ fn send_feishu(
                         plain_text_payload,
                         "Feishu send failed",
                     )?);
+                    delivered_any = true;
                 }
                 Err(error) => return Err(error),
             }
@@ -2606,16 +2921,31 @@ fn send_feishu(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(format!(
+                    "Failed to send media {}: {error}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+        };
         let message_id = match route {
             FeishuMediaRoute::Image => {
-                let image_key = feishu_upload_image(&client, config, &token, &file_name, &bytes)?;
-                feishu_send_message(
+                let image_key =
+                    match feishu_upload_image(&client, config, &token, &file_name, &bytes) {
+                        Ok(image_key) => image_key,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                            continue;
+                        }
+                    };
+                match feishu_send_message(
                     &client,
                     config,
                     &token,
@@ -2623,15 +2953,41 @@ fn send_feishu(
                     "image",
                     json!({ "image_key": image_key }).to_string(),
                     "Feishu media send failed",
-                )?
+                ) {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "Failed to send media {}: {}",
+                            attachment.path.display(),
+                            error.0
+                        ));
+                        continue;
+                    }
+                }
             }
             FeishuMediaRoute::File {
                 upload_type,
                 msg_type,
             } => {
-                let file_key =
-                    feishu_upload_file(&client, config, &token, upload_type, &file_name, &bytes)?;
-                feishu_send_message(
+                let file_key = match feishu_upload_file(
+                    &client,
+                    config,
+                    &token,
+                    upload_type,
+                    &file_name,
+                    &bytes,
+                ) {
+                    Ok(file_key) => file_key,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "Failed to send media {}: {}",
+                            attachment.path.display(),
+                            error.0
+                        ));
+                        continue;
+                    }
+                };
+                match feishu_send_message(
                     &client,
                     config,
                     &token,
@@ -2639,10 +2995,27 @@ fn send_feishu(
                     msg_type,
                     json!({ "file_key": file_key }).to_string(),
                     "Feishu media send failed",
-                )?
+                ) {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "Failed to send media {}: {}",
+                            attachment.path.display(),
+                            error.0
+                        ));
+                        continue;
+                    }
+                }
             }
         };
         last_message_id = Some(message_id);
+        delivered_any = true;
+    }
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2653,7 +3026,7 @@ fn send_feishu(
         note: target
             .used_home_channel
             .then(|| format!("Sent to feishu home channel (chat_id: {})", target.chat_id)),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -2830,6 +3203,7 @@ fn send_matrix(
     let client = http_client()?;
     let token = matrix_access_token(&client, config)?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
     let mut warnings = Vec::new();
 
     if !message.is_empty() {
@@ -2842,6 +3216,7 @@ fn send_matrix(
                 matrix_text_payload(&chunk),
                 "Matrix send failed",
             )?);
+            delivered_any = true;
         }
     }
 
@@ -2856,32 +3231,52 @@ fn send_matrix(
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let fallback = format!("(file not found: {})", attachment.path.display());
-                let message_id = send_matrix_message(
+                match send_matrix_message(
                     &client,
                     &token,
                     &config.homeserver,
                     target,
                     matrix_text_payload(&fallback),
                     "Matrix send failed",
-                )?;
-                last_message_id = Some(message_id);
+                ) {
+                    Ok(message_id) => {
+                        last_message_id = Some(message_id);
+                        delivered_any = true;
+                        warnings.push(format!(
+                            "Matrix attachment missing, sent fallback text instead: {}",
+                            attachment.path.display()
+                        ));
+                    }
+                    Err(error) => warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    )),
+                }
+                continue;
+            }
+            Err(error) => {
                 warnings.push(format!(
-                    "Matrix attachment missing, sent fallback text instead: {}",
+                    "Failed to send media {}: {error}",
                     attachment.path.display()
                 ));
                 continue;
             }
-            Err(error) => {
-                return Err(SendError(format!(
-                    "Reading media {} failed: {error}",
-                    attachment.path.display()
-                )));
-            }
         };
         let mime_type = guess_matrix_mime_type(&attachment.path, &bytes);
         let content_uri =
-            matrix_upload_media(&client, &token, config, &file_name, &mime_type, &bytes)?;
-        let message_id = send_matrix_message(
+            match matrix_upload_media(&client, &token, config, &file_name, &mime_type, &bytes) {
+                Ok(content_uri) => content_uri,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    ));
+                    continue;
+                }
+            };
+        match send_matrix_message(
             &client,
             &token,
             &config.homeserver,
@@ -2895,8 +3290,23 @@ fn send_matrix(
                 &content_uri,
             ),
             "Matrix media send failed",
-        )?;
-        last_message_id = Some(message_id);
+        ) {
+            Ok(message_id) => {
+                last_message_id = Some(message_id);
+                delivered_any = true;
+            }
+            Err(error) => warnings.push(format!(
+                "Failed to send media {}: {}",
+                attachment.path.display(),
+                error.0
+            )),
+        }
+    }
+
+    if !delivered_any {
+        return Err(SendError(warnings.first().cloned().unwrap_or_else(|| {
+            "No deliverable text or media remained after processing MEDIA tags".to_string()
+        })));
     }
 
     Ok(SentMessage {
@@ -5365,6 +5775,66 @@ mod tests {
     }
 
     #[test]
+    fn sends_discord_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123456789",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123456789/messages "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bot discord-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["content"], json!("discord yaml hello"));
+            (200, json!({ "id": "msg-yaml-1" }).to_string())
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  discord:\n    enabled: true\n    token: discord-token\n    home_channel:\n      chat_id: '123456789'\n      name: Bot Home\n",
+        )
+        .unwrap();
+
+        with_env_var("DISCORD_BOT_TOKEN", None);
+        with_env_var("DISCORD_HOME_CHANNEL", None);
+        with_env_var("DISCORD_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("DISCORD_HOME_CHANNEL_NAME", None);
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord",
+                "message": "discord yaml hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("123456789"));
+        assert_eq!(parsed["message_id"], json!("msg-yaml-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn keeps_discord_text_success_when_media_upload_fails() {
         let _guard = acquire_test_lock();
         clear_discord_forum_cache();
@@ -5420,7 +5890,7 @@ mod tests {
             &runtime,
         );
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
         assert_eq!(parsed["platform"], json!("discord"));
         assert_eq!(parsed["message_id"], json!("msg-1"));
         let warnings = parsed["warnings"].as_array().unwrap();
@@ -5610,6 +6080,63 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("discord"));
         assert_eq!(parsed["chat_id"], json!("123"));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn names_media_only_discord_forum_post_from_attachment_filename() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("quarterly-results.pdf");
+        fs::write(&media_path, b"pdf-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/threads "));
+            assert!(body.contains("\"name\":\"quarterly-results.pdf\""));
+            assert!(body.contains("\"content\":\"\""));
+            assert!(body.contains("\"filename\":\"quarterly-results.pdf\""));
+            (
+                200,
+                json!({
+                    "id": "thread-1",
+                    "message": { "id": "starter-1" }
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["thread_id"], json!("thread-1"));
         assert_eq!(parsed["message_id"], json!("starter-1"));
         join.join().unwrap();
@@ -5860,6 +6387,81 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["message_id"], json!("55"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn telegram_send_honors_custom_base_url_from_config_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["text"], json!("hello"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 57 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!("platforms:\n  telegram:\n    extra:\n      base_url: {base_url}\n"),
+        )
+        .unwrap();
+        assert_eq!(load_telegram_base_url(temp.path()), Some(base_url.clone()));
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", None);
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": "hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("57"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["text"], json!("hello from yaml"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 58 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    extra:\n      base_url: {base_url}\n    home_channel:\n      chat_id: '98765'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_API_BASE_URL", None);
+        let result = handle_send(
+            &json!({
+                "target": "telegram",
+                "message": "hello from yaml",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("98765"));
+        assert_eq!(parsed["message_id"], json!("58"));
         join.join().unwrap();
     }
 
@@ -6484,6 +7086,69 @@ mod tests {
     }
 
     #[test]
+    fn sends_feishu_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_home"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hi from yaml"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_yaml_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: cli_test\n      app_secret: secret_test\n      domain: {base_url}\n    home_channel:\n      chat_id: oc_home\n      name: Home\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("FEISHU_APP_ID", None);
+        with_env_var("FEISHU_APP_SECRET", None);
+        with_env_var("FEISHU_DOMAIN", None);
+        let result = handle_send(
+            &json!({
+                "target": "feishu",
+                "message": "hi from yaml",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("oc_home"));
+        assert_eq!(parsed["message_id"], json!("om_yaml_1"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_feishu_thread_text_via_reply_endpoint() {
         let _guard = acquire_test_lock();
         clear_feishu_cache();
@@ -6790,6 +7455,132 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["message_id"], json!("om_media_1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn keeps_feishu_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hello feishu"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_text_1" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                (
+                    200,
+                    json!({ "code": 99991663, "msg": "upload disabled" }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("hello feishu\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_text_1"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: Feishu image upload failed: code=99991663 msg=upload disabled",
+                media_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn skips_missing_feishu_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hello feishu"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_text_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("hello feishu\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_text_1"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )])
+        );
         join.join().unwrap();
     }
 
@@ -7119,6 +7910,52 @@ mod tests {
     }
 
     #[test]
+    fn sends_matrix_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with(
+                "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+            ));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer matrix-config-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["msgtype"], json!("m.text"));
+            assert_eq!(payload["body"], json!("matrix config hello"));
+            (200, json!({ "event_id": "$event-config" }).to_string())
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  matrix:\n    token: matrix-config-token\n    extra:\n      homeserver: {base_url}\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        let result = handle_send(
+            &json!({
+                "target": "matrix",
+                "message": "matrix config hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("!roomid:example.org"));
+        assert_eq!(parsed["message_id"], json!("$event-config"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn matrix_media_routing_matches_python_adapter() {
         let image = MediaAttachment {
             path: PathBuf::from("proof.png"),
@@ -7248,6 +8085,49 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("matrix"));
         assert_eq!(parsed["message_id"], json!("$event-missing"));
+        assert_eq!(parsed["warnings"], json!([expected_warning]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn keeps_matrix_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let expected_warning = format!(
+            "Failed to send media {}: Matrix media upload failed: HTTP 500: upload exploded",
+            media_path.display()
+        );
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with(
+                    "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+                ));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.text"));
+                assert_eq!(payload["body"], json!("matrix hello"));
+                (200, json!({ "event_id": "$event-text" }).to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /_matrix/media/v3/upload?filename=proof.png "));
+                (500, "upload exploded".to_string())
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": format!("matrix hello\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("$event-text"));
         assert_eq!(parsed["warnings"], json!([expected_warning]));
         join.join().unwrap();
     }
@@ -7504,6 +8384,46 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("signal"));
         assert_eq!(parsed["chat_id"], json!("+15551234567"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_signal_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["params"]["account"], json!("+15550009999"));
+            assert_eq!(payload["params"]["message"], json!("signal config hello"));
+            assert_eq!(payload["params"]["groupId"], json!("group-123"));
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000099 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  signal:\n    enabled: true\n    extra:\n      http_url: {base_url}\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:group-123'\n      name: Alerts\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("SIGNAL_HTTP_URL", None);
+        with_env_var("SIGNAL_ACCOUNT", None);
+        let result = handle_send(
+            &json!({
+                "target": "signal",
+                "message": "signal config hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("group:group-123"));
         join.join().unwrap();
     }
 
@@ -8069,6 +8989,52 @@ mod tests {
     }
 
     #[test]
+    fn sends_slack_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer slack-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("C12345678"));
+            assert_eq!(payload["text"], json!("slack yaml hello"));
+            assert_eq!(payload["mrkdwn"], json!(true));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000201" }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  slack:\n    enabled: true\n    token: slack-token\n    home_channel:\n      chat_id: C12345678\n      name: Home\n",
+        )
+        .unwrap();
+
+        with_env_var("SLACK_BOT_TOKEN", None);
+        with_env_var("SLACK_HOME_CHANNEL", None);
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("SLACK_HOME_CHANNEL_NAME", None);
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack",
+                "message": "slack yaml hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("C12345678"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000201"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn slack_send_honors_reply_broadcast_from_config_yaml() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -8240,6 +9206,97 @@ mod tests {
         assert_eq!(parsed["message_id"], json!("F123"));
         join.join().unwrap();
         upload_join.join().unwrap();
+    }
+
+    #[test]
+    fn keeps_slack_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.txt");
+        fs::write(&media_path, b"slack-bytes").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /chat.postMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["channel"], json!("C12345678"));
+                assert_eq!(payload["text"], json!("hello slack"));
+                (
+                    200,
+                    json!({ "ok": true, "ts": "1710000000.000101" }).to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /files.getUploadURLExternal "));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "error": "upload_disabled"
+                    })
+                    .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("hello slack\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("1710000000.000101"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: Slack media upload init failed: upload_disabled",
+                media_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn skips_missing_slack_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.txt");
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("C12345678"));
+            assert_eq!(payload["text"], json!("hello slack"));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000101" }).to_string(),
+            )
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("hello slack\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("1710000000.000101"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )])
+        );
+        join.join().unwrap();
     }
 
     #[test]
