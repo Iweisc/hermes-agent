@@ -384,54 +384,13 @@ async fn handle_chat_completions(
             Err(response) => return response,
         };
     if request.stream.unwrap_or(false) {
-        return if let Some(session_id) = continued_session_id.clone() {
-            match run_chat_session_messages_async(
-                Arc::clone(&state),
-                request.model,
-                request.messages.clone(),
-                session_id.clone(),
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(result) => chat_completions_sse_response(
-                    &state.settings,
-                    headers.get(ORIGIN),
-                    &result.final_response,
-                    Some(session_id.as_str()),
-                ),
-                Err(error) => json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({ "error": { "message": error.to_string() } }),
-                    &state.settings,
-                    headers.get(ORIGIN),
-                ),
-            }
-        } else {
-            match run_agent_for_messages_async(
-                Arc::clone(&state),
-                request.model,
-                request.messages,
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(result) => chat_completions_sse_response(
-                    &state.settings,
-                    headers.get(ORIGIN),
-                    &result.final_response,
-                    None,
-                ),
-                Err(error) => json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({ "error": { "message": error.to_string() } }),
-                    &state.settings,
-                    headers.get(ORIGIN),
-                ),
-            }
-        };
+        return chat_completions_streaming_response(
+            Arc::clone(&state),
+            headers.get(ORIGIN),
+            request.model,
+            request.messages,
+            continued_session_id,
+        );
     }
     if request.messages.is_empty() {
         return json_response(
@@ -1538,12 +1497,239 @@ fn json_response(
     response
 }
 
-fn sse_response(
-    body: String,
-    settings: &NativeApiServerSettings,
+fn chat_completions_chunk(
+    completion_id: &str,
+    created: u64,
+    model_name: &str,
+    delta: Value,
+    finish_reason: Value,
+    include_usage: bool,
+) -> String {
+    let mut body = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    });
+    if include_usage {
+        body["usage"] = json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        });
+    }
+    format!("data: {body}\n\n")
+}
+
+fn chat_completions_tool_progress_event(
+    tool_name: &str,
+    tool_call_id: &str,
+    arguments: Option<&str>,
+    status: &str,
+) -> Option<String> {
+    if tool_name.trim().is_empty() || tool_name.starts_with('_') || tool_call_id.trim().is_empty() {
+        return None;
+    }
+    let mut payload = json!({
+        "tool": tool_name,
+        "toolCallId": tool_call_id,
+        "status": status,
+    });
+    if status == "running" {
+        payload["label"] = json!(tool_name);
+    }
+    if let Some(arguments) = arguments.map(str::trim).filter(|value| !value.is_empty()) {
+        payload["arguments"] = json!(arguments);
+    }
+    Some(format!("event: hermes.tool.progress\ndata: {payload}\n\n"))
+}
+
+fn chat_completions_streaming_response(
+    state: Arc<NativeApiServerState>,
     origin: Option<&HeaderValue>,
+    model: Option<String>,
+    messages: Vec<Value>,
+    session_id: Option<String>,
 ) -> Response {
-    let mut response = Response::new(Body::from(body));
+    let completion_id = format!("chatcmpl-rs-{:x}", unix_ts_nanos());
+    let created = unix_ts_secs();
+    let model_name = model
+        .clone()
+        .unwrap_or_else(|| state.settings.model_name.clone());
+    let origin = origin.cloned();
+    let interrupt_requested = Arc::new(AtomicBool::new(false));
+
+    let (body_tx, body_rx) = mpsc::channel::<String>(32);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LiveResponseEvent>();
+    let progress_callback: AgentProgressCallback = {
+        let event_tx = event_tx.clone();
+        Arc::new(move |event| {
+            let _ = event_tx.send(LiveResponseEvent::Progress(event));
+        })
+    };
+    let state_for_run = Arc::clone(&state);
+    let messages_for_run = messages.clone();
+    let session_id_for_run = session_id.clone();
+    let interrupt_for_run = Arc::clone(&interrupt_requested);
+    let model_name_for_run = model_name.clone();
+    tokio::spawn(async move {
+        let result = if let Some(session_id) = session_id_for_run {
+            run_chat_session_messages_async(
+                state_for_run,
+                Some(model_name_for_run.clone()),
+                messages_for_run,
+                session_id,
+                Some(interrupt_for_run),
+                Some(progress_callback),
+            )
+            .await
+        } else {
+            run_agent_for_messages_async(
+                state_for_run,
+                Some(model_name_for_run.clone()),
+                messages_for_run,
+                Some(interrupt_for_run),
+                Some(progress_callback),
+            )
+            .await
+        };
+        let terminal = match result {
+            Ok(result) => LiveResponseEvent::Completed(result),
+            Err(error) => LiveResponseEvent::Failed(error),
+        };
+        let _ = event_tx.send(terminal);
+    });
+
+    let model_name_for_stream = model_name.clone();
+    tokio::spawn(async move {
+        let role_chunk = chat_completions_chunk(
+            &completion_id,
+            created,
+            &model_name_for_stream,
+            json!({ "role": "assistant" }),
+            Value::Null,
+            false,
+        );
+        if !send_sse_chunk(&body_tx, &interrupt_requested, role_chunk).await {
+            return;
+        }
+
+        let mut emitted_text = false;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                LiveResponseEvent::Progress(AgentProgressEvent::MessageDelta { delta }) => {
+                    emitted_text = true;
+                    let chunk = chat_completions_chunk(
+                        &completion_id,
+                        created,
+                        &model_name_for_stream,
+                        json!({ "content": delta }),
+                        Value::Null,
+                        false,
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                        return;
+                    }
+                }
+                LiveResponseEvent::Progress(AgentProgressEvent::ToolStarted {
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                }) => {
+                    if let Some(chunk) = chat_completions_tool_progress_event(
+                        &tool_name,
+                        &tool_call_id,
+                        Some(&arguments),
+                        "running",
+                    ) {
+                        if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            return;
+                        }
+                    }
+                }
+                LiveResponseEvent::Progress(AgentProgressEvent::ToolCompleted {
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                    ..
+                }) => {
+                    if let Some(chunk) = chat_completions_tool_progress_event(
+                        &tool_name,
+                        &tool_call_id,
+                        Some(&arguments),
+                        "completed",
+                    ) {
+                        if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            return;
+                        }
+                    }
+                }
+                LiveResponseEvent::Progress(AgentProgressEvent::ReasoningAvailable { .. }) => {}
+                LiveResponseEvent::Completed(result) => {
+                    if !emitted_text && !result.final_response.trim().is_empty() {
+                        let chunk = chat_completions_chunk(
+                            &completion_id,
+                            created,
+                            &model_name_for_stream,
+                            json!({ "content": result.final_response }),
+                            Value::Null,
+                            false,
+                        );
+                        if !send_sse_chunk(&body_tx, &interrupt_requested, chunk).await {
+                            return;
+                        }
+                    }
+                    let finish_chunk = chat_completions_chunk(
+                        &completion_id,
+                        created,
+                        &model_name_for_stream,
+                        json!({}),
+                        json!("stop"),
+                        true,
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, finish_chunk).await {
+                        return;
+                    }
+                    let _ = send_sse_chunk(
+                        &body_tx,
+                        &interrupt_requested,
+                        "data: [DONE]\n\n".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                LiveResponseEvent::Failed(_) => {
+                    let error_chunk = chat_completions_chunk(
+                        &completion_id,
+                        created,
+                        &model_name_for_stream,
+                        json!({}),
+                        json!("error"),
+                        false,
+                    );
+                    if !send_sse_chunk(&body_tx, &interrupt_requested, error_chunk).await {
+                        return;
+                    }
+                    let _ = send_sse_chunk(
+                        &body_tx,
+                        &interrupt_requested,
+                        "data: [DONE]\n\n".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(
+        ReceiverStream::new(body_rx).map(Ok::<_, io::Error>),
+    ));
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
@@ -1555,75 +1741,12 @@ fn sse_response(
     response
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
-    apply_cors_headers(response.headers_mut(), settings, origin);
-    response
-}
-
-fn chat_completions_sse_response(
-    settings: &NativeApiServerSettings,
-    origin: Option<&HeaderValue>,
-    final_response: &str,
-    session_id: Option<&str>,
-) -> Response {
-    let completion_id = format!("chatcmpl-rs-{:x}", unix_ts_nanos());
-    let created = unix_ts_secs();
-    let body = [
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": settings.model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "role": "assistant" },
-                    "finish_reason": Value::Null,
-                }],
-            })
-        ),
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": settings.model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": final_response },
-                    "finish_reason": Value::Null,
-                }],
-            })
-        ),
-        format!(
-            "data: {}\n\n",
-            json!({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": settings.model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                }
-            })
-        ),
-        "data: [DONE]\n\n".to_string(),
-    ]
-    .concat();
-    let mut response = sse_response(body, settings, origin);
-    if let Some(session_id) = session_id
+    if let Some(session_id) = session_id.as_deref()
         && let Ok(value) = HeaderValue::from_str(session_id)
     {
         response.headers_mut().insert("X-Hermes-Session-Id", value);
     }
+    apply_cors_headers(response.headers_mut(), &state.settings, origin.as_ref());
     response
 }
 
@@ -3620,6 +3743,105 @@ mod tests {
         assert!(body.contains("\"chat.completion.chunk\""));
         assert!(body.contains("\"role\":\"assistant\""));
         assert!(body.contains("\"content\":\"streamed hello\""));
+        assert!(body.contains("data: [DONE]"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_chat_completions_streams_tool_progress() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_todo_chat_stream",
+                                "type": "function",
+                                "function": {
+                                    "name": "todo",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "chat tool stream hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |_| {},
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let body = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "say hi"
+                }],
+                "stream": true,
+            }))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(body.contains("event: hermes.tool.progress"));
+        assert!(body.contains("\"toolCallId\":\"call_todo_chat_stream\""));
+        assert!(body.contains("\"status\":\"running\""));
+        assert!(body.contains("\"status\":\"completed\""));
+        assert!(body.contains("\"content\":\"chat tool stream hello\""));
         assert!(body.contains("data: [DONE]"));
 
         let _ = shutdown_tx.send(());
