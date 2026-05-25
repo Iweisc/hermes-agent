@@ -175,6 +175,7 @@ fn compat_subcommands_for(name: &str) -> Vec<CommandInfo> {
             compat_command("resume", &[], Vec::new()),
             compat_command("clear", &[], Vec::new()),
         ],
+        "rollback" => vec![compat_command("diff", &[], Vec::new())],
         "indicator" => vec![
             compat_command("kaomoji", &[], Vec::new()),
             compat_command("emoji", &[], Vec::new()),
@@ -722,6 +723,7 @@ mod tests {
         assert!(bash.contains("paste"));
         assert!(bash.contains("queue"));
         assert!(bash.contains("redraw"));
+        assert!(bash.contains("rollback"));
         assert!(bash.contains("restart"));
         assert!(bash.contains("retry"));
         assert!(bash.contains("steer"));
@@ -746,6 +748,8 @@ mod tests {
         assert!(fish.contains(" -a xhigh "));
         assert!(fish.contains("__fish_seen_subcommand_from goal"));
         assert!(fish.contains(" -a pause "));
+        assert!(fish.contains("__fish_seen_subcommand_from rollback"));
+        assert!(fish.contains(" -a diff "));
         assert!(fish.contains("__fish_seen_subcommand_from browser"));
         assert!(fish.contains(" -a disconnect "));
 
@@ -760,6 +764,8 @@ mod tests {
         assert!(zsh.contains("'xhigh:"));
         assert!(zsh.contains("_describe 'goal command'"));
         assert!(zsh.contains("'pause:"));
+        assert!(zsh.contains("_describe 'rollback command'"));
+        assert!(zsh.contains("'diff:"));
         assert!(zsh.contains("_describe 'browser command'"));
     }
 }

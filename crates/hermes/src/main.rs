@@ -148,6 +148,7 @@ enum Command {
     ReloadMcp(SlashCompatArgs),
     #[command(alias = "reload_skills")]
     ReloadSkills(SlashCompatArgs),
+    Rollback(SlashCompatArgs),
     Restart(gateway_cmd::GatewayServiceArgs),
     Resume(ResumeArgs),
     Retry(SlashCompatArgs),
@@ -265,7 +266,7 @@ enum Command {
     Tools(tools_cmd::ToolsArgs),
     Update(update_cmd::UpdateArgs),
     Whatsapp,
-    Status,
+    Status(StatusArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -445,6 +446,12 @@ struct ResumeArgs {
     target: Vec<String>,
 }
 
+#[derive(Args, Debug, Clone, Default)]
+struct StatusArgs {
+    #[arg(long)]
+    session: Option<String>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let detected = HermesContext::detect();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -469,7 +476,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let argv = std::iter::once(String::from("hermes")).chain(profile_override.args);
     let cli = Cli::parse_from(argv);
 
-    match cli.command.unwrap_or(Command::Status) {
+    match cli
+        .command
+        .unwrap_or(Command::Status(StatusArgs::default()))
+    {
         Command::Paths => print_paths(&context, &config, &logging),
         Command::Version => dump::print_version(),
         Command::Dump(args) => dump::print_dump(&context, &config, args)?,
@@ -508,6 +518,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Reload(args) => print_slash_compat(&session_store, "reload", args)?,
         Command::ReloadMcp(args) => print_slash_compat(&session_store, "reload-mcp", args)?,
         Command::ReloadSkills(args) => print_slash_compat(&session_store, "reload-skills", args)?,
+        Command::Rollback(args) => print_slash_compat(&session_store, "rollback", args)?,
         Command::Restart(service) => gateway_cmd::print_gateway(
             &context,
             gateway_cmd::GatewayArgs {
@@ -584,7 +595,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
-        Command::Status => print_status(&context, &env_report, &config, &session_store),
+        Command::Status(args) => {
+            print_status(&context, &env_report, &config, &session_store, args)?
+        }
     }
 
     Ok(())
@@ -772,7 +785,12 @@ fn print_status(
     env_report: &EnvLoadReport,
     config: &LoadedConfig,
     session_store: &hermes_core::SessionStore,
-) {
+    args: StatusArgs,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(requested) = args.session.as_deref() {
+        let session_id = resolve_slash_compat_session_id(session_store, Some(requested))?;
+        return launch_python_slash_command(&session_id, "status", &[]);
+    }
     println!("app=hermes");
     println!("mode=rust-bootstrap");
     println!("current_profile={}", context.current_profile_name());
@@ -805,6 +823,7 @@ fn print_status(
         println!("warning={warning}");
     }
     println!("note=Rust one-shot chat is available via `hermes chat`");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2642,6 +2661,22 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
+        let cli = Cli::try_parse_from(["hermes", "rollback", "diff", "2"]).unwrap();
+        match cli.command {
+            Some(Command::Rollback(SlashCompatArgs { args, .. })) => {
+                assert_eq!(args, vec![String::from("diff"), String::from("2")])
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "status", "--session", "sess-1"]).unwrap();
+        match cli.command {
+            Some(Command::Status(StatusArgs { session })) => {
+                assert_eq!(session.as_deref(), Some("sess-1"));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
         let cli = Cli::try_parse_from(["hermes", "q", "follow", "up"]).unwrap();
         match cli.command {
             Some(Command::Queue(SlashCompatArgs { args, .. })) => {
@@ -3015,6 +3050,133 @@ mod tests {
         let payload = fs::read_to_string(&stdin_log).unwrap();
         assert!(payload.contains("\"command\":\"/clear\""));
         assert!(payload.contains("\"command\":\"/redraw\""));
+    }
+
+    #[test]
+    fn print_slash_compat_uses_worker_for_rollback_diff() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "rollback-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{argv}\"\ncat > \"{stdin}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"rollback ok\"}}'\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        print_slash_compat(
+            &store,
+            "rollback",
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![String::from("diff"), String::from("2")],
+            },
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains(session_id));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"command\":\"/rollback diff 2\""));
+    }
+
+    #[test]
+    fn print_status_uses_worker_when_session_is_requested() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let env_report = EnvLoadReport::default();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "status-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{argv}\"\ncat > \"{stdin}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"status ok\"}}'\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("HERMES_CLI_PYTHON", &python);
+        }
+        print_status(
+            &context,
+            &env_report,
+            &config,
+            &store,
+            StatusArgs {
+                session: Some(session_id.to_string()),
+            },
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains(session_id));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"command\":\"/status\""));
     }
 
     #[test]
