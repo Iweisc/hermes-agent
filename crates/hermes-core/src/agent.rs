@@ -32,7 +32,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     HermesContext, HermesError, LoadedConfig, MessageAppend, ModelOverrides, SessionCreate,
-    SessionStore, ToolRuntime, dispatch_tool, get_tool_definitions,
+    SessionStore, ToolRuntime, get_tool_definitions_for_runtime,
 };
 
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
@@ -55,6 +55,7 @@ const QWEN_CODE_VERSION: &str = "0.14.1";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnResult {
     pub final_response: String,
+    pub reasoning: Option<String>,
     pub api_calls: u64,
     pub tool_calls: u64,
     pub model: String,
@@ -307,12 +308,20 @@ impl HermesContext {
 
         let runtime_model = self.resolve_model_runtime(loaded, overrides)?;
         let mut tool_runtime = runtime.clone();
+        tool_runtime.load_approvals(loaded);
+        tool_runtime.load_context_engine(loaded);
+        tool_runtime.load_shell_hooks(self, loaded);
+        tool_runtime.load_checkpoints(loaded);
         if let Err(error) = tool_runtime.load_memory_store(&loaded.config.memory) {
             log::warn!(target: "run_agent", "memory bootstrap skipped: {error}");
         }
         let disabled_toolsets =
             (!loaded.config.memory.any_enabled()).then(|| vec![String::from("memory")]);
-        let tools = get_tool_definitions(enabled_toolsets, disabled_toolsets.as_deref());
+        let tools = get_tool_definitions_for_runtime(
+            &tool_runtime,
+            enabled_toolsets,
+            disabled_toolsets.as_deref(),
+        );
         tool_runtime = tool_runtime.with_available_tool_names(
             tools
                 .iter()
@@ -433,6 +442,14 @@ impl HermesContext {
                 resumed: resumed_session,
             },
         );
+        if let Some(active_session_id) = session_id.as_deref().or(tool_runtime.current_session_id())
+        {
+            tool_runtime.start_context_engine_session(
+                active_session_id,
+                &runtime_model.model,
+                &runtime_model.provider,
+            );
+        }
 
         let client = build_http_client()?;
         let mut api_calls = 0_u64;
@@ -463,6 +480,11 @@ impl HermesContext {
             {
                 let _ = store.increment_api_call_count(session_id, 1);
             }
+            tool_runtime.begin_tool_turn();
+            tool_runtime.emit_step(crate::StepUpdate {
+                iteration: api_calls,
+                prev_tools: extract_prev_tools(&messages),
+            });
             let response = send_model_request(
                 &client,
                 &runtime_model,
@@ -528,6 +550,7 @@ impl HermesContext {
                 );
                 return Ok(AgentTurnResult {
                     final_response,
+                    reasoning,
                     api_calls,
                     tool_calls,
                     model: runtime_model.model,
@@ -605,7 +628,13 @@ impl HermesContext {
                         arguments: tool_call.json.clone(),
                     },
                 );
-                let result = dispatch_tool(&tool_call.name, tool_call.json.clone(), &tool_runtime);
+                tool_runtime.maybe_checkpoint_before_tool(&tool_call.name, &tool_call.json);
+                let result = crate::tools::dispatch_tool_with_messages(
+                    &tool_call.name,
+                    tool_call.json.clone(),
+                    &tool_runtime,
+                    &messages,
+                );
                 tool_calls += 1;
                 emit_turn_event(
                     options.event_callback,
@@ -760,6 +789,7 @@ impl HermesContext {
             );
             return Ok(AgentTurnResult {
                 final_response,
+                reasoning: response.reasoning.clone(),
                 api_calls,
                 tool_calls,
                 model: runtime_model.model,
@@ -832,6 +862,7 @@ fn interrupt_with_phase(
     );
     Some(AgentTurnResult {
         final_response: String::new(),
+        reasoning: None,
         api_calls,
         tool_calls,
         model: runtime_model.model.clone(),
@@ -984,6 +1015,49 @@ fn build_system_prompt(
     Ok(sections.join("\n\n"))
 }
 
+fn extract_prev_tools(messages: &[Value]) -> Vec<crate::StepToolRecord> {
+    for (offset, message) in messages.iter().enumerate().rev() {
+        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        let start = offset + 1;
+        let mut results_by_id = HashMap::new();
+        for next in &messages[start..] {
+            if next.get("role").and_then(Value::as_str) != Some("tool") {
+                break;
+            }
+            if let Some(tool_call_id) = next.get("tool_call_id").and_then(Value::as_str) {
+                results_by_id.insert(
+                    tool_call_id.to_string(),
+                    next.get("content")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                );
+            }
+        }
+
+        return tool_calls
+            .iter()
+            .filter_map(|tool_call| {
+                let function = tool_call.get("function")?.as_object()?;
+                Some(crate::StepToolRecord {
+                    name: function.get("name")?.as_str()?.to_string(),
+                    result: tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|tool_call_id| results_by_id.get(tool_call_id).cloned())
+                        .flatten(),
+                    arguments: function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                })
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
 fn build_http_client() -> Result<Client, HermesError> {
     build_http_client_with_timeout(DEFAULT_AGENT_TIMEOUT_SECS)
 }
@@ -1099,10 +1173,11 @@ fn send_chat_completion(
             .get("finish_reason")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        reasoning: None,
-        reasoning_details: None,
-        codex_reasoning_items: None,
-        codex_message_items: None,
+        reasoning: extract_message_text(assistant_message.get("reasoning"))
+            .or_else(|| extract_message_text(assistant_message.get("reasoning_content"))),
+        reasoning_details: assistant_message.get("reasoning_details").cloned(),
+        codex_reasoning_items: assistant_message.get("codex_reasoning_items").cloned(),
+        codex_message_items: assistant_message.get("codex_message_items").cloned(),
     })
 }
 
@@ -4229,11 +4304,71 @@ mod tests {
 
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::path::Path;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct FakeContextEngine {
+        starts: Arc<Mutex<Vec<(String, crate::ContextEngineSessionStart)>>>,
+        calls: Arc<Mutex<Vec<(String, Value, usize)>>>,
+    }
+
+    impl crate::ContextEngine for FakeContextEngine {
+        fn name(&self) -> &str {
+            "lcm"
+        }
+
+        fn tool_definitions(&self) -> Vec<crate::ToolDefinition> {
+            vec![crate::ToolDefinition {
+                name: "lcm_expand".to_string(),
+                toolset: "context_engine".to_string(),
+                description: "Expand prior context.".to_string(),
+                emoji: "🧠".to_string(),
+                schema: json!({
+                    "name": "lcm_expand",
+                    "description": "Expand context for a query.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }
+                }),
+            }]
+        }
+
+        fn on_session_start(
+            &self,
+            session_id: &str,
+            event: &crate::ContextEngineSessionStart,
+        ) -> Result<(), String> {
+            self.starts
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), event.clone()));
+            Ok(())
+        }
+
+        fn handle_tool_call(&self, name: &str, args: &Value, messages: &[Value]) -> String {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args.clone(), messages.len()));
+            json!({
+                "success": true,
+                "engine": "lcm",
+                "query": args.get("query").cloned().unwrap_or(Value::Null),
+            })
+            .to_string()
+        }
+    }
 
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4279,6 +4414,70 @@ mod tests {
         });
 
         format!("http://{}", addr)
+    }
+
+    fn checkpoint_commit_count(hermes_home: &Path, workdir: &Path) -> usize {
+        git_checkpoint_output(
+            hermes_home,
+            workdir,
+            &[
+                "rev-list",
+                "--count",
+                &format!("refs/hermes/{}", checkpoint_project_hash(workdir)),
+            ],
+        )
+        .trim()
+        .parse::<usize>()
+        .unwrap()
+    }
+
+    fn checkpoint_latest_reason(hermes_home: &Path, workdir: &Path) -> String {
+        git_checkpoint_output(
+            hermes_home,
+            workdir,
+            &[
+                "log",
+                "--format=%s",
+                "-1",
+                &format!("refs/hermes/{}", checkpoint_project_hash(workdir)),
+            ],
+        )
+    }
+
+    fn git_checkpoint_output(hermes_home: &Path, workdir: &Path, args: &[&str]) -> String {
+        let store = hermes_home.join("checkpoints").join("store");
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .env("GIT_DIR", &store)
+            .env("GIT_WORK_TREE", workdir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn checkpoint_project_hash(workdir: &Path) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(
+            fs::canonicalize(workdir)
+                .unwrap()
+                .display()
+                .to_string()
+                .as_bytes(),
+        );
+        let digest = hasher.finalize();
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     }
 
     #[test]
@@ -4823,6 +5022,524 @@ for raw in sys.stdin:
         assert_eq!(
             fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
             "hello from tool"
+        );
+    }
+
+    #[test]
+    fn chat_completion_turn_returns_reasoning_in_result() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Finished directly.",
+                        "reasoning": "Plan first."
+                    },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Reply directly",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Finished directly.");
+        assert_eq!(result.reasoning.as_deref(), Some("Plan first."));
+        assert_eq!(result.api_calls, 1);
+        assert_eq!(result.tool_calls, 0);
+    }
+
+    #[test]
+    fn chat_completion_turn_auto_loads_shell_hooks_from_config() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let script = temp.path().join("block.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\ncat >/dev/null\nprintf '{\"decision\":\"block\",\"reason\":\"hook blocked write\"}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let mut loaded = context.load_config_document().unwrap();
+        loaded.raw = serde_yaml::from_str(&format!(
+            "hooks:\n  pre_tool_call:\n    - command: \"{}\"\n      matcher: \"^write_file$\"\n",
+            script.display()
+        ))
+        .unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"notes.txt\",\"content\":\"hello from tool\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hook blocked the write."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        unsafe { std::env::set_var("HERMES_ACCEPT_HOOKS", "1") };
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Create a file named notes.txt",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        unsafe { std::env::remove_var("HERMES_ACCEPT_HOOKS") };
+
+        assert_eq!(result.final_response, "Hook blocked the write.");
+        assert_eq!(result.api_calls, 2);
+        assert_eq!(result.tool_calls, 1);
+        assert!(!temp.path().join("notes.txt").exists());
+        assert!(temp.path().join("shell-hooks-allowlist.json").exists());
+    }
+
+    #[test]
+    fn chat_completion_turn_auto_loads_checkpoints_before_write_file() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(project.join("tracked.txt"), "before\n").unwrap();
+
+        let mut loaded = context.load_config_document().unwrap();
+        loaded.raw = serde_yaml::from_str(
+            "checkpoints:\n  enabled: true\n  max_snapshots: 20\n  max_total_size_mb: 500\n  max_file_size_mb: 10\n",
+        )
+        .unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"tracked.txt\",\"content\":\"after\\n\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Updated the tracked file."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(&project).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Update tracked.txt",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Updated the tracked file.");
+        assert_eq!(
+            fs::read_to_string(project.join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(checkpoint_commit_count(temp.path(), &project), 1);
+        assert_eq!(
+            checkpoint_latest_reason(temp.path(), &project),
+            "before write_file"
+        );
+    }
+
+    #[test]
+    fn chat_completion_turn_checkpoints_destructive_terminal_commands() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(project.join("tracked.txt"), "before\n").unwrap();
+
+        let mut loaded = context.load_config_document().unwrap();
+        loaded.raw = serde_yaml::from_str(
+            "checkpoints:\n  enabled: true\n  max_snapshots: 20\n  max_total_size_mb: 500\n  max_file_size_mb: 10\n",
+        )
+        .unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{\"command\":\"printf 'after\\\\n' > tracked.txt\",\"workdir\":\".\",\"timeout\":30}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Terminal command finished."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(&project).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Overwrite tracked.txt from the terminal.",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Terminal command finished.");
+        assert_eq!(
+            fs::read_to_string(project.join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(checkpoint_commit_count(temp.path(), &project), 1);
+        assert_eq!(
+            checkpoint_latest_reason(temp.path(), &project),
+            "before terminal: printf 'after\\n' > tracked.txt"
+        );
+    }
+
+    #[test]
+    fn chat_completion_turn_auto_loads_approvals_from_config() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let mut loaded = context.load_config_document().unwrap();
+        loaded.raw = serde_yaml::from_str("approvals:\n  mode: manual\n").unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{\"command\":\"bash -c \\\"printf approved\\\"\",\"timeout\":30}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Approval-gated command finished."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_approval_callback(|_| Ok("always".to_string()));
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Run the guarded command.",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Approval-gated command finished.");
+        let saved = fs::read_to_string(temp.path().join("config.yaml")).unwrap();
+        assert!(saved.contains("command_allowlist"));
+        assert!(saved.contains("shell command via -c/-lc flag"));
+    }
+
+    #[test]
+    fn chat_completion_turn_auto_loads_context_engine_from_config() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(temp.path().join("config.yaml"), "context:\n  engine: lcm\n").unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lcm_expand",
+                                "arguments": "{\"query\":\"alpha\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Context expansion finished."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let starts = Arc::new(Mutex::new(
+            Vec::<(String, crate::ContextEngineSessionStart)>::new(),
+        ));
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value, usize)>::new()));
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_context_engine(FakeContextEngine {
+                starts: Arc::clone(&starts),
+                calls: Arc::clone(&calls),
+            });
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Expand prior context for alpha.",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&store),
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Context expansion finished.");
+        let starts = starts.lock().unwrap().clone();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].1.model, "test-model");
+        assert_eq!(starts[0].1.provider, "custom");
+        assert_eq!(result.session_id.as_deref(), Some(starts[0].0.as_str()));
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "lcm_expand");
+        assert_eq!(calls[0].1["query"], json!("alpha"));
+        assert_eq!(calls[0].2, 3);
+    }
+
+    #[test]
+    fn chat_completion_turn_emits_step_and_tool_progress_callbacks() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"notes.txt\",\"content\":\"hello from tool\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Finished writing the file."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let progress = Arc::new(Mutex::new(Vec::<crate::ToolProgressUpdate>::new()));
+        let progress_capture = Arc::clone(&progress);
+        let steps = Arc::new(Mutex::new(Vec::<crate::StepUpdate>::new()));
+        let steps_capture = Arc::clone(&steps);
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_tool_progress_callback(move |update| {
+                progress_capture.lock().unwrap().push(update.clone())
+            })
+            .with_step_callback(move |update| steps_capture.lock().unwrap().push(update.clone()));
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Create a file named notes.txt",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "Finished writing the file.");
+        let progress = progress.lock().unwrap().clone();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].event_type, "tool.started");
+        assert_eq!(progress[0].function_name.as_deref(), Some("write_file"));
+        assert_eq!(progress[1].event_type, "tool.completed");
+        assert_eq!(progress[1].is_error, Some(false));
+
+        let steps = steps.lock().unwrap().clone();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].iteration, 1);
+        assert!(steps[0].prev_tools.is_empty());
+        assert_eq!(steps[1].iteration, 2);
+        assert_eq!(steps[1].prev_tools.len(), 1);
+        assert_eq!(steps[1].prev_tools[0].name, "write_file");
+        let step_result: Value =
+            serde_json::from_str(steps[1].prev_tools[0].result.as_deref().unwrap()).unwrap();
+        assert_eq!(step_result["success"], json!(true));
+        assert_eq!(
+            step_result["path"],
+            json!(temp.path().join("notes.txt").display().to_string())
+        );
+        assert_eq!(step_result["bytes_written"], json!(15));
+        assert_eq!(step_result["line_count"], json!(1));
+        assert_eq!(
+            steps[1].prev_tools[0].arguments.as_deref(),
+            Some("{\"path\":\"notes.txt\",\"content\":\"hello from tool\"}")
         );
     }
 

@@ -95,7 +95,12 @@ const VALID_TODO_STATUSES: &[&str] = &["pending", "in_progress", "completed", "c
 type ToolHandler = fn(&Value, &ToolRuntime) -> String;
 type ToolCheck = fn() -> bool;
 type ClarifyFn = dyn Fn(&str, Option<&[String]>) -> Result<String, String> + Send + Sync;
+type ClarifyRequestFn = dyn Fn(&ClarifyRequest) + Send + Sync;
 type DelegateFn = dyn Fn(DelegateTaskRequest) -> Result<Value, String> + Send + Sync;
+type ApprovalFn = dyn Fn(&crate::ApprovalRequest) -> Result<String, String> + Send + Sync;
+type ApprovalRequestFn = dyn Fn(&crate::ApprovalRequest) + Send + Sync;
+type ToolProgressFn = dyn Fn(&ToolProgressUpdate) + Send + Sync;
+type StepFn = dyn Fn(&StepUpdate) + Send + Sync;
 
 #[derive(Clone)]
 struct ClarifyCallback(Arc<ClarifyFn>);
@@ -107,12 +112,95 @@ impl std::fmt::Debug for ClarifyCallback {
 }
 
 #[derive(Clone)]
+struct ClarifyRequestCallback(Arc<ClarifyRequestFn>);
+
+impl std::fmt::Debug for ClarifyRequestCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClarifyRequestCallback(..)")
+    }
+}
+
+#[derive(Clone)]
 struct DelegateCallback(Arc<DelegateFn>);
 
 impl std::fmt::Debug for DelegateCallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DelegateCallback(..)")
     }
+}
+
+#[derive(Clone)]
+struct ApprovalCallback(Arc<ApprovalFn>);
+
+impl std::fmt::Debug for ApprovalCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalCallback(..)")
+    }
+}
+
+#[derive(Clone)]
+struct ApprovalRequestCallback(Arc<ApprovalRequestFn>);
+
+impl std::fmt::Debug for ApprovalRequestCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalRequestCallback(..)")
+    }
+}
+
+#[derive(Clone)]
+struct ContextEngineHandle(Arc<dyn crate::ContextEngine>);
+
+impl std::fmt::Debug for ContextEngineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContextEngineHandle(..)")
+    }
+}
+
+#[derive(Clone)]
+struct ToolProgressCallback(Arc<ToolProgressFn>);
+
+impl std::fmt::Debug for ToolProgressCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ToolProgressCallback(..)")
+    }
+}
+
+#[derive(Clone)]
+struct StepCallback(Arc<StepFn>);
+
+impl std::fmt::Debug for StepCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StepCallback(..)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolProgressUpdate {
+    pub event_type: String,
+    pub function_name: Option<String>,
+    pub preview: Option<String>,
+    pub function_args: Option<Value>,
+    pub duration_ms: Option<u64>,
+    pub is_error: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepToolRecord {
+    pub name: String,
+    pub result: Option<String>,
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepUpdate {
+    pub iteration: u64,
+    pub prev_tools: Vec<StepToolRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClarifyRequest {
+    pub question: String,
+    pub choices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -308,7 +396,18 @@ pub struct ToolRuntime {
     available_tool_names: Option<BTreeSet<String>>,
     system_prompt_additions: Vec<String>,
     clarify_callback: Option<ClarifyCallback>,
+    clarify_request_callback: Option<ClarifyRequestCallback>,
     delegate_callback: Option<DelegateCallback>,
+    approvals: Option<Arc<Mutex<crate::ApprovalManager>>>,
+    approval_callback: Option<ApprovalCallback>,
+    approval_request_callback: Option<ApprovalRequestCallback>,
+    context_engine: Option<ContextEngineHandle>,
+    context_engine_enabled: bool,
+    context_session_started: Arc<Mutex<Option<String>>>,
+    checkpoints: Option<Arc<Mutex<crate::checkpoints::CheckpointManager>>>,
+    shell_hooks: Option<Arc<crate::shell_hooks::ShellHookRunner>>,
+    tool_progress_callback: Option<ToolProgressCallback>,
+    step_callback: Option<StepCallback>,
 }
 
 impl ToolRuntime {
@@ -322,7 +421,18 @@ impl ToolRuntime {
             available_tool_names: None,
             system_prompt_additions: Vec::new(),
             clarify_callback: None,
+            clarify_request_callback: None,
             delegate_callback: None,
+            approvals: None,
+            approval_callback: None,
+            approval_request_callback: None,
+            context_engine: None,
+            context_engine_enabled: false,
+            context_session_started: Arc::new(Mutex::new(None)),
+            checkpoints: None,
+            shell_hooks: None,
+            tool_progress_callback: None,
+            step_callback: None,
         }
     }
 
@@ -392,10 +502,28 @@ impl ToolRuntime {
         self
     }
 
+    pub fn with_clarify_request_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&ClarifyRequest) + Send + Sync + 'static,
+    {
+        self.clarify_request_callback = Some(ClarifyRequestCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn emit_clarify_request(&self, request: &ClarifyRequest) {
+        if let Some(callback) = &self.clarify_request_callback {
+            (callback.0)(request);
+        }
+    }
+
     pub fn clarify(&self, question: &str, choices: Option<&[String]>) -> Result<String, String> {
         let Some(callback) = &self.clarify_callback else {
             return Err("Clarify tool is not available in this execution context.".to_string());
         };
+        self.emit_clarify_request(&ClarifyRequest {
+            question: question.to_string(),
+            choices: choices.map(|items| items.to_vec()),
+        });
         (callback.0)(question, choices)
     }
 
@@ -405,6 +533,238 @@ impl ToolRuntime {
     {
         self.delegate_callback = Some(DelegateCallback(Arc::new(callback)));
         self
+    }
+
+    pub fn with_approval_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&crate::ApprovalRequest) -> Result<String, String> + Send + Sync + 'static,
+    {
+        self.approval_callback = Some(ApprovalCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn with_approval_request_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&crate::ApprovalRequest) + Send + Sync + 'static,
+    {
+        self.approval_request_callback = Some(ApprovalRequestCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn emit_approval_request(&self, request: &crate::ApprovalRequest) {
+        if let Some(callback) = &self.approval_request_callback {
+            (callback.0)(request);
+        }
+    }
+
+    pub fn with_context_engine<E>(mut self, engine: E) -> Self
+    where
+        E: crate::ContextEngine + 'static,
+    {
+        self.context_engine = Some(ContextEngineHandle(Arc::new(engine)));
+        self.context_engine_enabled = false;
+        if let Ok(mut started) = self.context_session_started.lock() {
+            *started = None;
+        }
+        self
+    }
+
+    pub fn with_tool_progress_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&ToolProgressUpdate) + Send + Sync + 'static,
+    {
+        self.tool_progress_callback = Some(ToolProgressCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn emit_tool_progress(&self, update: ToolProgressUpdate) {
+        if let Some(callback) = &self.tool_progress_callback {
+            (callback.0)(&update);
+        }
+    }
+
+    pub fn with_step_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&StepUpdate) + Send + Sync + 'static,
+    {
+        self.step_callback = Some(StepCallback(Arc::new(callback)));
+        self
+    }
+
+    pub fn emit_step(&self, update: StepUpdate) {
+        if let Some(callback) = &self.step_callback {
+            (callback.0)(&update);
+        }
+    }
+
+    pub fn with_shell_hooks(mut self, value: Option<crate::shell_hooks::ShellHookRunner>) -> Self {
+        self.shell_hooks = value.map(Arc::new);
+        self
+    }
+
+    pub fn with_approvals(mut self, value: Option<crate::ApprovalManager>) -> Self {
+        self.approvals = value.map(|manager| Arc::new(Mutex::new(manager)));
+        self
+    }
+
+    pub fn load_approvals(&mut self, loaded: &crate::LoadedConfig) {
+        if self.approvals.is_none() {
+            self.approvals = Some(Arc::new(Mutex::new(
+                crate::ApprovalManager::load_for_runtime(&self.hermes_home, loaded),
+            )));
+        }
+    }
+
+    pub fn load_context_engine(&mut self, loaded: &crate::LoadedConfig) {
+        let configured = loaded
+            .cfg_get(&["context", "engine"])
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("compressor");
+
+        self.context_engine_enabled = false;
+        if configured.eq_ignore_ascii_case("compressor") {
+            if let Ok(mut started) = self.context_session_started.lock() {
+                *started = None;
+            }
+            return;
+        }
+
+        let Some(engine) = &self.context_engine else {
+            log::warn!(
+                "context engine '{configured}' requested but no Rust context engine is registered"
+            );
+            return;
+        };
+
+        if engine.0.name().eq_ignore_ascii_case(configured) {
+            self.context_engine_enabled = true;
+            return;
+        }
+
+        if let Ok(mut started) = self.context_session_started.lock() {
+            *started = None;
+        }
+        log::warn!(
+            "context engine '{configured}' requested but Rust runtime only has '{}'",
+            engine.0.name()
+        );
+    }
+
+    pub fn with_checkpoints(
+        mut self,
+        value: Option<crate::checkpoints::CheckpointManager>,
+    ) -> Self {
+        self.checkpoints = value.map(|manager| Arc::new(Mutex::new(manager)));
+        self
+    }
+
+    pub fn load_checkpoints(&mut self, loaded: &crate::LoadedConfig) {
+        if self.checkpoints.is_none() {
+            self.checkpoints =
+                crate::checkpoints::CheckpointManager::load_for_runtime(&self.hermes_home, loaded)
+                    .map(|manager| Arc::new(Mutex::new(manager)));
+        }
+    }
+
+    pub fn begin_tool_turn(&self) {
+        if let Some(checkpoints) = &self.checkpoints
+            && let Ok(mut manager) = checkpoints.lock()
+        {
+            manager.new_turn();
+        }
+    }
+
+    pub fn maybe_checkpoint_before_tool(&self, name: &str, args: &Value) {
+        let Some(checkpoints) = &self.checkpoints else {
+            return;
+        };
+
+        let checkpoint = match name {
+            "write_file" | "patch" => {
+                let Some(path) = args.get("path").and_then(Value::as_str).map(str::trim) else {
+                    return;
+                };
+                if path.is_empty() {
+                    return;
+                }
+                let Ok(resolved) = self.resolve_path(path) else {
+                    return;
+                };
+                (resolved, format!("before {name}"))
+            }
+            "terminal" => {
+                let Some(command) = args.get("command").and_then(Value::as_str).map(str::trim)
+                else {
+                    return;
+                };
+                if !crate::checkpoints::is_destructive_command(command) {
+                    return;
+                }
+                let workdir = args
+                    .get("workdir")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| self.resolve_path(value).ok())
+                    .unwrap_or_else(|| self.cwd().to_path_buf());
+                (
+                    workdir,
+                    format!(
+                        "before terminal: {}",
+                        command.chars().take(60).collect::<String>()
+                    ),
+                )
+            }
+            _ => return,
+        };
+
+        if let Ok(mut manager) = checkpoints.lock() {
+            let workdir = manager.get_working_dir_for_path(&checkpoint.0);
+            let _ = manager.ensure_checkpoint(&workdir, &checkpoint.1);
+        }
+    }
+
+    pub fn check_terminal_command_approval(&self, command: &str) -> crate::ApprovalCheckResult {
+        let Some(approvals) = &self.approvals else {
+            return crate::ApprovalCheckResult::Approved;
+        };
+        let callback = self.approval_callback.as_ref().cloned();
+        let request_callback = self.approval_request_callback.as_ref().cloned();
+        let Ok(mut manager) = approvals.lock() else {
+            return crate::ApprovalCheckResult::Blocked {
+                message: "BLOCKED: Approval manager is unavailable.".to_string(),
+            };
+        };
+        let wrapped_callback = callback.as_ref().map(|callback| {
+            let callback = callback.clone();
+            let request_callback = request_callback.clone();
+            move |request: &crate::ApprovalRequest| {
+                if let Some(observer) = &request_callback {
+                    (observer.0)(request);
+                }
+                (callback.0)(request)
+            }
+        });
+        manager.check_command(
+            command,
+            "local",
+            self.current_session_id(),
+            wrapped_callback.as_ref().map(|callback| callback as _),
+        )
+    }
+
+    pub fn load_shell_hooks(
+        &mut self,
+        context: &crate::HermesContext,
+        loaded: &crate::LoadedConfig,
+    ) {
+        if self.shell_hooks.is_none() {
+            self.shell_hooks =
+                crate::shell_hooks::ShellHookRunner::load_for_runtime(context, loaded)
+                    .map(Arc::new);
+        }
     }
 
     pub fn delegate(&self, request: DelegateTaskRequest) -> Result<Value, String> {
@@ -444,6 +804,89 @@ impl ToolRuntime {
 
     pub fn system_prompt_additions(&self) -> &[String] {
         &self.system_prompt_additions
+    }
+
+    pub fn context_tool_definitions(&self) -> Vec<ToolDefinition> {
+        if !self.context_engine_enabled {
+            return Vec::new();
+        }
+
+        self.context_engine
+            .as_ref()
+            .map(|engine| {
+                engine
+                    .0
+                    .tool_definitions()
+                    .into_iter()
+                    .filter(|definition| {
+                        !definition.name.trim().is_empty() && definition.schema.is_object()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn context_tool_schema(&self, name: &str) -> Option<Value> {
+        self.context_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.schema)
+    }
+
+    fn has_context_tool(&self, name: &str) -> bool {
+        self.context_tool_schema(name).is_some()
+    }
+
+    fn dispatch_context_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        messages: &[Value],
+    ) -> Option<String> {
+        if !self.context_engine_enabled || !self.has_context_tool(name) {
+            return None;
+        }
+        self.context_engine
+            .as_ref()
+            .map(|engine| engine.0.handle_tool_call(name, args, messages))
+    }
+
+    pub fn start_context_engine_session(&self, session_id: &str, model: &str, provider: &str) {
+        if !self.context_engine_enabled {
+            return;
+        }
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+
+        let Some(engine) = &self.context_engine else {
+            return;
+        };
+
+        let Ok(mut started) = self.context_session_started.lock() else {
+            return;
+        };
+        if started.as_deref() == Some(session_id) {
+            return;
+        }
+
+        let event = crate::ContextEngineSessionStart {
+            hermes_home: self.hermes_home.display().to_string(),
+            platform: std::env::var("HERMES_SESSION_PLATFORM")
+                .ok()
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .unwrap_or_else(|| "cli".to_string()),
+            model: model.to_string(),
+            provider: provider.to_string(),
+        };
+        match engine.0.on_session_start(session_id, &event) {
+            Ok(()) => *started = Some(session_id.to_string()),
+            Err(error) => log::warn!("context engine session start failed: {error}"),
+        }
     }
 
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf, String> {
@@ -1576,6 +2019,26 @@ pub fn get_tool_definitions(
         .collect()
 }
 
+pub fn get_tool_definitions_for_runtime(
+    runtime: &ToolRuntime,
+    enabled_toolsets: Option<&[String]>,
+    disabled_toolsets: Option<&[String]>,
+) -> Vec<ToolDefinition> {
+    let mut definitions = get_tool_definitions(enabled_toolsets, disabled_toolsets);
+    let mut seen = definitions
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    for definition in runtime.context_tool_definitions() {
+        if seen.insert(definition.name.clone()) {
+            definitions.push(definition);
+        }
+    }
+
+    definitions
+}
+
 pub fn get_all_tool_names() -> Vec<String> {
     TOOL_ENTRIES
         .iter()
@@ -1651,6 +2114,10 @@ pub fn coerce_tool_args(tool_name: &str, args: Value) -> Value {
     let Some(entry) = tool_entry(tool_name) else {
         return args;
     };
+    coerce_tool_args_against_schema(args, &(entry.schema_fn)())
+}
+
+fn coerce_tool_args_against_schema(args: Value, schema: &Value) -> Value {
     if !args.is_object() {
         return args;
     }
@@ -1659,7 +2126,6 @@ pub fn coerce_tool_args(tool_name: &str, args: Value) -> Value {
     let Some(object) = args.as_object_mut() else {
         return args;
     };
-    let schema = (entry.schema_fn)();
     let properties = schema
         .get("parameters")
         .and_then(|params| params.get("properties"))
@@ -1702,14 +2168,74 @@ pub fn coerce_tool_args(tool_name: &str, args: Value) -> Value {
 }
 
 pub fn dispatch_tool(name: &str, args: Value, runtime: &ToolRuntime) -> String {
-    let Some(entry) = tool_entry(name) else {
+    dispatch_tool_with_messages(name, args, runtime, &[])
+}
+
+pub(crate) fn dispatch_tool_with_messages(
+    name: &str,
+    args: Value,
+    runtime: &ToolRuntime,
+    messages: &[Value],
+) -> String {
+    let static_entry = tool_entry(name);
+    let context_schema = runtime.context_tool_schema(name);
+    let Some(schema) = static_entry
+        .map(|entry| (entry.schema_fn)())
+        .or(context_schema)
+    else {
         return tool_error(format!("unknown tool: {name}"));
     };
-    if !tool_is_available(entry) {
+    if let Some(entry) = static_entry
+        && !tool_is_available(entry)
+    {
         return tool_error(format!("tool unavailable: {name}"));
     }
-    let coerced = coerce_tool_args(name, args);
-    (entry.handler)(&coerced, runtime)
+    let coerced = coerce_tool_args_against_schema(args, &schema);
+    if let Some(shell_hooks) = runtime.shell_hooks.as_ref()
+        && let Some(message) =
+            shell_hooks.pre_tool_call(name, &coerced, runtime.current_session_id(), runtime.cwd())
+    {
+        return tool_error(message);
+    }
+
+    runtime.emit_tool_progress(ToolProgressUpdate {
+        event_type: "tool.started".to_string(),
+        function_name: Some(name.to_string()),
+        preview: build_tool_preview(name, &coerced),
+        function_args: Some(coerced.clone()),
+        duration_ms: None,
+        is_error: None,
+    });
+
+    let started = std::time::Instant::now();
+    let result = if let Some(entry) = static_entry {
+        (entry.handler)(&coerced, runtime)
+    } else if let Some(result) = runtime.dispatch_context_tool(name, &coerced, messages) {
+        result
+    } else {
+        tool_error(format!("unknown tool: {name}"))
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let is_error = tool_result_is_error(&result);
+    if let Some(shell_hooks) = runtime.shell_hooks.as_ref() {
+        shell_hooks.post_tool_call(
+            name,
+            &coerced,
+            runtime.current_session_id(),
+            runtime.cwd(),
+            &result,
+            duration_ms,
+        );
+    }
+    runtime.emit_tool_progress(ToolProgressUpdate {
+        event_type: "tool.completed".to_string(),
+        function_name: Some(name.to_string()),
+        preview: None,
+        function_args: None,
+        duration_ms: Some(duration_ms),
+        is_error: Some(is_error),
+    });
+    result
 }
 
 pub fn tool_error(message: impl Into<String>) -> String {
@@ -1747,6 +2273,46 @@ fn legacy_toolset(name: &str) -> Option<&'static [&'static str]> {
 
 fn tool_is_available(entry: &ToolEntry) -> bool {
     entry.check_fn.is_none_or(|check| check())
+}
+
+fn build_tool_preview(name: &str, args: &Value) -> Option<String> {
+    let object = args.as_object()?;
+    if let Some(command) = object.get("command").and_then(Value::as_str) {
+        let trimmed = command.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(path) = object.get("path").and_then(Value::as_str) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(pattern) = object.get("pattern").and_then(Value::as_str) {
+        let trimmed = pattern.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(query) = object
+        .get("query")
+        .or_else(|| object.get("q"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    (!name.is_empty()).then_some(name.to_string())
+}
+
+fn tool_result_is_error(result: &str) -> bool {
+    serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some_and(|value| !value.is_null())
 }
 
 fn resolve_toolset_inner(name: &str, visited: &mut HashSet<String>) -> Vec<String> {
@@ -3502,7 +4068,62 @@ fn default_hermes_home() -> PathBuf {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct FakeContextEngine {
+        calls: Arc<Mutex<Vec<(String, Value, usize)>>>,
+    }
+
+    impl crate::ContextEngine for FakeContextEngine {
+        fn name(&self) -> &str {
+            "lcm"
+        }
+
+        fn tool_definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "lcm_expand".to_string(),
+                toolset: "context_engine".to_string(),
+                description: "Expand prior context.".to_string(),
+                emoji: "🧠".to_string(),
+                schema: json!({
+                    "name": "lcm_expand",
+                    "description": "Expand context for a query.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }
+                }),
+            }]
+        }
+
+        fn handle_tool_call(&self, name: &str, args: &Value, messages: &[Value]) -> String {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), args.clone(), messages.len()));
+            json!({
+                "success": true,
+                "engine": "lcm",
+                "name": name,
+                "query": args.get("query").cloned().unwrap_or(Value::Null),
+            })
+            .to_string()
+        }
+    }
+
+    fn loaded_with_context_engine(name: &str) -> crate::LoadedConfig {
+        crate::LoadedConfig {
+            path: PathBuf::from("config.yaml"),
+            raw: serde_yaml::from_str(&format!("context:\n  engine: {name}\n")).unwrap(),
+            config: crate::HermesConfig::default(),
+            warnings: Vec::new(),
+        }
+    }
 
     #[test]
     fn resolves_hermes_cli_to_file_tools() {
@@ -3807,6 +4428,207 @@ mod tests {
             "one\nTWO\nthree\n"
         );
         assert!(!temp.path().join("remove.txt").exists());
+    }
+
+    #[test]
+    fn dispatch_tool_blocks_when_shell_hook_denies_call() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context =
+            crate::HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let script = temp.path().join("block.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\ncat >/dev/null\nprintf '{\"decision\":\"block\",\"reason\":\"blocked by rust hook\"}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let loaded = crate::LoadedConfig {
+            path: context.config_path(),
+            raw: serde_yaml::from_str(&format!(
+                "hooks:\n  pre_tool_call:\n    - command: \"{}\"\n      matcher: \"^read_file$\"\n",
+                script.display()
+            ))
+            .unwrap(),
+            config: crate::HermesConfig::default(),
+            warnings: Vec::new(),
+        };
+
+        unsafe { std::env::set_var("HERMES_ACCEPT_HOOKS", "1") };
+        let mut runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        runtime.load_shell_hooks(&context, &loaded);
+        let target = temp.path().join("notes.txt");
+        fs::write(&target, "hello\n").unwrap();
+
+        let result = dispatch_tool(
+            "read_file",
+            json!({ "path": target.display().to_string() }),
+            &runtime,
+        );
+        unsafe { std::env::remove_var("HERMES_ACCEPT_HOOKS") };
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error"], json!("blocked by rust hook"));
+    }
+
+    #[test]
+    fn dispatch_tool_emits_post_tool_shell_hook_payload() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let context =
+            crate::HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let capture = temp.path().join("payload.json");
+        let script = temp.path().join("capture.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\ncat - > {}\nprintf '{{}}\\n'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let loaded = crate::LoadedConfig {
+            path: context.config_path(),
+            raw: serde_yaml::from_str(&format!(
+                "hooks:\n  post_tool_call:\n    - command: \"{}\"\n      matcher: \"^read_file$\"\n",
+                script.display()
+            ))
+            .unwrap(),
+            config: crate::HermesConfig::default(),
+            warnings: Vec::new(),
+        };
+
+        unsafe { std::env::set_var("HERMES_ACCEPT_HOOKS", "1") };
+        let mut runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_current_session_id(Some("session_123".to_string()));
+        runtime.load_shell_hooks(&context, &loaded);
+        let target = temp.path().join("notes.txt");
+        fs::write(&target, "hello\n").unwrap();
+
+        let result = dispatch_tool(
+            "read_file",
+            json!({ "path": target.display().to_string() }),
+            &runtime,
+        );
+        unsafe { std::env::remove_var("HERMES_ACCEPT_HOOKS") };
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], Value::Bool(true));
+        let payload: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
+        assert_eq!(payload["hook_event_name"], json!("post_tool_call"));
+        assert_eq!(payload["tool_name"], json!("read_file"));
+        assert_eq!(payload["session_id"], json!("session_123"));
+        assert_eq!(
+            payload["tool_input"]["path"],
+            json!(target.display().to_string())
+        );
+        assert!(payload["extra"]["duration_ms"].as_u64().unwrap() <= 60_000);
+    }
+
+    #[test]
+    fn dispatch_tool_emits_progress_updates() {
+        let temp = TempDir::new().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<ToolProgressUpdate>::new()));
+        let capture = Arc::clone(&events);
+        let runtime = ToolRuntime::new(temp.path()).with_tool_progress_callback(move |update| {
+            capture.lock().unwrap().push(update.clone())
+        });
+        let target = temp.path().join("notes.txt");
+        fs::write(&target, "hello\n").unwrap();
+
+        let result = dispatch_tool(
+            "read_file",
+            json!({ "path": target.display().to_string() }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], Value::Bool(true));
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "tool.started");
+        assert_eq!(events[0].function_name.as_deref(), Some("read_file"));
+        assert_eq!(
+            events[0].function_args.as_ref().unwrap()["path"],
+            json!(target.display().to_string())
+        );
+        assert_eq!(events[0].preview, Some(target.display().to_string()));
+        assert_eq!(events[1].event_type, "tool.completed");
+        assert_eq!(events[1].function_name.as_deref(), Some("read_file"));
+        assert!(events[1].duration_ms.unwrap() <= 60_000);
+        assert_eq!(events[1].is_error, Some(false));
+    }
+
+    #[test]
+    fn context_engine_tools_are_injected_only_when_selected() {
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value, usize)>::new()));
+        let mut runtime = ToolRuntime::default().with_context_engine(FakeContextEngine {
+            calls: Arc::clone(&calls),
+        });
+        runtime.load_context_engine(&loaded_with_context_engine("lcm"));
+        let with_engine =
+            get_tool_definitions_for_runtime(&runtime, Some(&["hermes-cli".to_string()]), None);
+        assert!(with_engine.iter().any(|tool| tool.name == "lcm_expand"));
+
+        let mut without_runtime =
+            ToolRuntime::default().with_context_engine(FakeContextEngine { calls });
+        without_runtime.load_context_engine(&loaded_with_context_engine("compressor"));
+        let without_engine = get_tool_definitions_for_runtime(
+            &without_runtime,
+            Some(&["hermes-cli".to_string()]),
+            None,
+        );
+        assert!(!without_engine.iter().any(|tool| tool.name == "lcm_expand"));
+    }
+
+    #[test]
+    fn dispatch_tool_routes_context_engine_calls() {
+        let events = Arc::new(Mutex::new(Vec::<ToolProgressUpdate>::new()));
+        let events_capture = Arc::clone(&events);
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value, usize)>::new()));
+        let mut runtime = ToolRuntime::default()
+            .with_context_engine(FakeContextEngine {
+                calls: Arc::clone(&calls),
+            })
+            .with_tool_progress_callback(move |update| {
+                events_capture.lock().unwrap().push(update.clone())
+            });
+        runtime.load_context_engine(&loaded_with_context_engine("lcm"));
+
+        let result = dispatch_tool("lcm_expand", json!({ "query": "alpha" }), &runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["engine"], json!("lcm"));
+        assert_eq!(parsed["query"], json!("alpha"));
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "lcm_expand");
+        assert_eq!(calls[0].1["query"], json!("alpha"));
+        assert_eq!(calls[0].2, 0);
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "tool.started");
+        assert_eq!(events[0].function_name.as_deref(), Some("lcm_expand"));
+        assert_eq!(events[1].event_type, "tool.completed");
+        assert_eq!(events[1].is_error, Some(false));
     }
 
     #[test]
