@@ -1024,6 +1024,75 @@ pub(crate) fn run_gateway_setup_with_io(
 const NO_GATEWAY_SETUP_INSTRUCTIONS: &[&str] = &[];
 const NO_GATEWAY_SETUP_VARS: &[GatewaySetupVarSpec] = &[];
 
+const TELEGRAM_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Open Telegram and message @BotFather",
+    "2. Send /newbot and follow the prompts to create your bot",
+    "3. Copy the bot token BotFather gives you",
+    "4. To find your user ID: message @userinfobot — it replies with your numeric ID",
+];
+
+const TELEGRAM_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "TELEGRAM_BOT_TOKEN",
+        prompt: "Bot token",
+        password: true,
+        help: "Paste the token from @BotFather (step 3 above).",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "TELEGRAM_ALLOWED_USERS",
+        prompt: "Allowed user IDs (comma-separated)",
+        password: false,
+        help: "Paste your user ID from step 4 above.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "TELEGRAM_HOME_CHANNEL",
+        prompt: "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+        password: false,
+        help: "For DMs, this is your user ID. You can set it later by typing /set-home in chat.",
+        is_allowlist: false,
+    },
+];
+
+const DISCORD_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Go to https://discord.com/developers/applications → New Application",
+    "2. Go to Bot → Reset Token → copy the bot token",
+    "3. Enable: Bot → Privileged Gateway Intents → Message Content Intent",
+    "4. Invite the bot to your server:",
+    "   OAuth2 → URL Generator → check BOTH scopes:",
+    "     - bot",
+    "     - applications.commands  (required for slash commands!)",
+    "   Bot Permissions: Send Messages, Read Message History, Attach Files",
+    "   Copy the URL and open it in your browser to invite.",
+    "5. Get your user ID: enable Developer Mode in Discord settings,",
+    "   then right-click your name → Copy ID",
+];
+
+const DISCORD_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "DISCORD_BOT_TOKEN",
+        prompt: "Bot token",
+        password: true,
+        help: "Paste the token from step 2 above.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "DISCORD_ALLOWED_USERS",
+        prompt: "Allowed user IDs or usernames (comma-separated)",
+        password: false,
+        help: "Paste your user ID from step 5 above.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "DISCORD_HOME_CHANNEL",
+        prompt: "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+        password: false,
+        help: "Right-click a channel → Copy Channel ID (requires Developer Mode).",
+        is_allowlist: false,
+    },
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1113,6 +1182,55 @@ const SMS_SETUP_VARS: &[GatewaySetupVarSpec] = &[
         prompt: "Home channel phone number (for cron/notification delivery, or empty)",
         password: false,
         help: "Phone number to deliver cron job results and notifications to.",
+        is_allowlist: false,
+    },
+];
+
+const MATTERMOST_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. In Mattermost: Integrations → Bot Accounts → Add Bot Account",
+    "   (System Console → Integrations → Bot Accounts must be enabled)",
+    "2. Give it a username (e.g. hermes) and copy the bot token",
+    "3. Works with any self-hosted Mattermost instance — enter your server URL",
+    "4. To find your user ID: click your avatar (top-left) → Profile",
+    "   Your user ID is displayed there — click it to copy.",
+    "   ⚠ This is NOT your username — it's a 26-character alphanumeric ID.",
+    "5. To get a channel ID: click the channel name → View Info → copy the ID",
+];
+
+const MATTERMOST_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "MATTERMOST_URL",
+        prompt: "Server URL (e.g. https://mm.example.com)",
+        password: false,
+        help: "Your Mattermost server URL. Works with any self-hosted instance.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "MATTERMOST_TOKEN",
+        prompt: "Bot token",
+        password: true,
+        help: "Paste the bot token from step 2 above.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "MATTERMOST_ALLOWED_USERS",
+        prompt: "Allowed user IDs (comma-separated)",
+        password: false,
+        help: "Your Mattermost user ID from step 4 above.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "MATTERMOST_HOME_CHANNEL",
+        prompt: "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+        password: false,
+        help: "Channel ID where Hermes delivers cron results and notifications.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "MATTERMOST_REPLY_MODE",
+        prompt: "Reply mode — 'off' for flat messages, 'thread' for threaded replies (default: off)",
+        password: false,
+        help: "off = flat channel messages, thread = replies nest under your message.",
         is_allowlist: false,
     },
 ];
@@ -1211,18 +1329,18 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Telegram",
         emoji: "📱",
         token_var: "TELEGRAM_BOT_TOKEN",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
-        vars: NO_GATEWAY_SETUP_VARS,
+        has_builtin_setup: false,
+        setup_instructions: TELEGRAM_SETUP_INSTRUCTIONS,
+        vars: TELEGRAM_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
         key: "discord",
         label: "Discord",
         emoji: "💬",
         token_var: "DISCORD_BOT_TOKEN",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
-        vars: NO_GATEWAY_SETUP_VARS,
+        has_builtin_setup: false,
+        setup_instructions: DISCORD_SETUP_INSTRUCTIONS,
+        vars: DISCORD_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
         key: "slack",
@@ -1247,9 +1365,9 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Mattermost",
         emoji: "💬",
         token_var: "MATTERMOST_TOKEN",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
-        vars: NO_GATEWAY_SETUP_VARS,
+        has_builtin_setup: false,
+        setup_instructions: MATTERMOST_SETUP_INSTRUCTIONS,
+        vars: MATTERMOST_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
         key: "whatsapp",
@@ -1768,20 +1886,27 @@ fn configure_standard_gateway_platform_with_io(
             continue;
         }
 
-        let value = prompt_gateway_line(input, output, format!("  {}", var.prompt).as_str())?;
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            save_env_value(context.env_path(), &var.name, trimmed)?;
-            writeln!(output, "  Saved {}", var.name)?;
-        } else if var.name == platform.token_var {
-            writeln!(
-                output,
-                "  Skipped — {} won't work without this.",
-                platform.label
-            )?;
-            return Ok(());
-        } else {
-            writeln!(output, "  Skipped (can configure later)")?;
+        loop {
+            let value = prompt_gateway_line(input, output, format!("  {}", var.prompt).as_str())?;
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                if let Err(message) = validate_gateway_setup_value(platform, var, trimmed) {
+                    writeln!(output, "  {message}")?;
+                    continue;
+                }
+                save_env_value(context.env_path(), &var.name, trimmed)?;
+                writeln!(output, "  Saved {}", var.name)?;
+            } else if var.name == platform.token_var {
+                writeln!(
+                    output,
+                    "  Skipped — {} won't work without this.",
+                    platform.label
+                )?;
+                return Ok(());
+            } else {
+                writeln!(output, "  Skipped (can configure later)")?;
+            }
+            break;
         }
     }
 
@@ -1806,6 +1931,34 @@ fn configure_standard_gateway_platform_with_io(
     writeln!(output)?;
     writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
     Ok(())
+}
+
+fn validate_gateway_setup_value(
+    platform: &GatewaySetupPlatform,
+    var: &GatewaySetupVar,
+    value: &str,
+) -> Result<(), &'static str> {
+    if platform.key == "telegram"
+        && var.name == "TELEGRAM_BOT_TOKEN"
+        && !is_valid_telegram_bot_token(value)
+    {
+        return Err(
+            "Invalid token format. Expected: <numeric_id>:<alphanumeric_hash> (for example, 123456789:ABCdefGHI-jklMNOpqrSTUvwxYZ).",
+        );
+    }
+    Ok(())
+}
+
+fn is_valid_telegram_bot_token(value: &str) -> bool {
+    let Some((bot_id, token)) = value.split_once(':') else {
+        return false;
+    };
+    !bot_id.is_empty()
+        && bot_id.bytes().all(|byte| byte.is_ascii_digit())
+        && token.len() >= 30
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn configure_native_gateway_plugin_platform_with_io(
@@ -3937,7 +4090,7 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn gateway_setup_metadata_uses_native_builtins_and_plugin_bridge() {
+    fn gateway_setup_metadata_uses_native_standard_builtins_and_plugin_bridge() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = test_env_lock().lock().unwrap();
@@ -3979,7 +4132,25 @@ exit 9\n",
             .find(|platform| platform.key == "telegram")
             .unwrap();
         assert_eq!(telegram.label, "Telegram");
-        assert!(telegram.has_builtin_setup);
+        assert!(gateway_platform_uses_native_standard_setup(telegram));
+
+        let discord = metadata
+            .iter()
+            .find(|platform| platform.key == "discord")
+            .unwrap();
+        assert!(gateway_platform_uses_native_standard_setup(discord));
+
+        let mattermost = metadata
+            .iter()
+            .find(|platform| platform.key == "mattermost")
+            .unwrap();
+        assert!(gateway_platform_uses_native_standard_setup(mattermost));
+
+        let slack = metadata
+            .iter()
+            .find(|platform| platform.key == "slack")
+            .unwrap();
+        assert!(slack.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -4129,10 +4300,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "telegram").unwrap();
+        run_gateway_platform_setup_bridge(true, "slack").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=telegram"));
+        assert!(log_text.contains("platform accept=1 key=slack"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -4204,6 +4375,30 @@ exit 9\n",
         assert!(env_text.contains("EMAIL_IMAP_HOST=imap.example.com"));
         assert!(env_text.contains("EMAIL_SMTP_HOST=smtp.example.com"));
         assert!(env_text.contains("EMAIL_ALLOWED_USERS=me@example.com,ops@example.com"));
+    }
+
+    #[test]
+    fn configure_telegram_gateway_platform_validates_and_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "telegram")
+            .unwrap();
+
+        let mut input =
+            Cursor::new("bad-token\n123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd\n111, 222\n111\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Invalid token format"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("TELEGRAM_BOT_TOKEN=123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"));
+        assert!(env_text.contains("TELEGRAM_ALLOWED_USERS=111,222"));
+        assert!(env_text.contains("TELEGRAM_HOME_CHANNEL=111"));
     }
 
     #[test]
