@@ -22,6 +22,7 @@ mod discord;
 pub mod env_loader;
 mod feishu;
 mod gateway_events;
+pub mod gateway;
 mod homeassistant;
 mod image_gen;
 mod kanban;
