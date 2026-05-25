@@ -84,13 +84,20 @@ pub fn print_claw(command: Option<ClawCommand>) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
-    if let Some(path) = args.source.as_ref() {
-        validate_source(path)?;
-    }
+    let source_dir = resolve_migrate_source(&args)?;
     if let Some(path) = args.workspace_target.as_ref() {
         if !path.is_absolute() {
             return Err("workspace-target must be an absolute path".into());
         }
+    }
+
+    if !source_dir.is_dir() {
+        print_migration_banner();
+        println!();
+        println!("OpenClaw directory not found: {}", source_dir.display());
+        println!("Make sure your OpenClaw installation is at the expected path.");
+        println!("You can specify a custom path: hermes claw migrate --source /path/to/.openclaw");
+        return Ok(());
     }
 
     let root = project_root();
@@ -122,10 +129,11 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
             "HERMES_CLAW_MIGRATE_SKILL_CONFLICT",
             args.skill_conflict.as_str(),
         )
+        .env(
+            "HERMES_CLAW_MIGRATE_SOURCE",
+            source_dir.display().to_string(),
+        )
         .env("HERMES_CLAW_MIGRATE_YES", if args.yes { "1" } else { "0" });
-    if let Some(path) = args.source.as_ref() {
-        command.env("HERMES_CLAW_MIGRATE_SOURCE", path.display().to_string());
-    }
     if let Some(path) = args.workspace_target.as_ref() {
         command.env(
             "HERMES_CLAW_MIGRATE_WORKSPACE_TARGET",
@@ -139,6 +147,13 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     Err(exit_status_message("claw", status).into())
+}
+
+fn print_migration_banner() {
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│          ⚕ Hermes — OpenClaw Migration                 │");
+    println!("└─────────────────────────────────────────────────────────┘");
 }
 
 const CLAW_MIGRATE_BOOTSTRAP: &str = concat!(
@@ -298,6 +313,28 @@ fn validate_source(path: &Path) -> Result<(), Box<dyn Error>> {
         return Err(format!("source path is not a directory: {}", path.display()).into());
     }
     Ok(())
+}
+
+fn resolve_migrate_source(args: &MigrateArgs) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = args.source.as_ref() {
+        validate_source(path)?;
+        return Ok(path.clone());
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return Ok(PathBuf::from(".openclaw"));
+    };
+    let default = home.join(".openclaw");
+    if default.is_dir() {
+        return Ok(default);
+    }
+    for name in [".clawdbot", ".moltbot"] {
+        let candidate = home.join(name);
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+    Ok(default)
 }
 
 fn find_openclaw_dirs() -> Vec<PathBuf> {
@@ -610,6 +647,52 @@ mod tests {
                 .any(|(_, desc)| desc == "Workspace file: proj/todo.json")
         );
         assert_eq!(find_workspace_dirs(&source).len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_without_openclaw_source_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let old_home = env::var_os("HOME");
+        set_env_var("HOME", temp.path());
+        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
+        let result = print_migrate(MigrateArgs {
+            source: None,
+            dry_run: true,
+            preset: MigratePreset::Full,
+            overwrite: false,
+            migrate_secrets: false,
+            no_backup: false,
+            workspace_target: None,
+            skill_conflict: SkillConflict::Skip,
+            yes: false,
+        });
+        let python_called = log.exists();
+
+        match old_home {
+            Some(value) => set_env_var("HOME", value),
+            None => remove_env_var("HOME"),
+        }
+        remove_env_var("HERMES_CLAW_PYTHON");
+        result.unwrap();
+        assert!(!python_called);
     }
 
     #[test]
