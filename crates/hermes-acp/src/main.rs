@@ -1,15 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{LocalResult, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use hermes_core::{
-    EnvLoadReport, HermesContext, LoadedConfig, LoggingMode, MessageAppend, MessageRecord,
-    ModelOverrides, SessionCreate, SessionRecord, SessionStore, get_provider_profile,
-    get_tool_definitions, normalize_provider_alias,
+    AgentInterruptController, AgentInterruptPhase, AgentTurnEvent, AgentTurnOptions, EnvLoadReport,
+    HermesContext, LoadedConfig, LoggingMode, MessageAppend, MessageRecord, ModelOverrides,
+    SessionCreate, SessionRecord, SessionStore, get_provider_profile, get_tool_definitions,
+    normalize_provider_alias,
 };
 use serde_json::{Value, json};
 
@@ -97,6 +100,8 @@ struct AcpServer<'a> {
     config: &'a LoadedConfig,
     session_store: &'a SessionStore,
     sessions: HashMap<String, AcpSessionState>,
+    active_interrupts: HashMap<String, Arc<AgentInterruptController>>,
+    cancelled_sessions: HashSet<String>,
 }
 
 impl<'a> AcpServer<'a> {
@@ -110,6 +115,8 @@ impl<'a> AcpServer<'a> {
             config,
             session_store,
             sessions: HashMap::new(),
+            active_interrupts: HashMap::new(),
+            cancelled_sessions: HashSet::new(),
         }
     }
 
@@ -268,6 +275,10 @@ impl<'a> AcpServer<'a> {
             "session/cancel" => {
                 let session_id = required_string(&params, "sessionId")?;
                 log::info!(target: "acp_adapter", "cancel requested for session {}", session_id);
+                self.cancelled_sessions.insert(session_id.clone());
+                if let Some(controller) = self.active_interrupts.get(&session_id) {
+                    controller.request(Some("ACP session cancel requested."));
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -576,7 +587,18 @@ impl<'a> AcpServer<'a> {
             .with_hermes_home(self.context.hermes_home())
             .with_current_session_id(Some(session_id.clone()));
         let enabled_toolsets = vec![String::from("hermes-acp")];
-        let result = self.context.run_chat_turn_with_user_content(
+        let interrupt = Arc::new(AgentInterruptController::default());
+        if self.cancelled_sessions.remove(&session_id) {
+            interrupt.request(Some("ACP session cancel requested."));
+        }
+        self.active_interrupts
+            .insert(session_id.clone(), Arc::clone(&interrupt));
+        let writer_cell = RefCell::new(&mut *writer);
+        let event_callback = |event| {
+            let mut writer = writer_cell.borrow_mut();
+            let _ = send_agent_event_update(&mut **writer, &session_id, &event);
+        };
+        let result = self.context.run_chat_turn_with_user_content_and_options(
             self.config,
             prompt_input.user_content,
             &runtime,
@@ -584,15 +606,33 @@ impl<'a> AcpServer<'a> {
             &state.overrides,
             Some(&session_id),
             Some(self.session_store),
+            AgentTurnOptions {
+                event_callback: Some(&event_callback),
+                interrupt: Some(interrupt.as_ref()),
+                allow_grace_turn: true,
+            },
         );
-        let final_response = match result {
-            Ok(turn) => turn.final_response,
-            Err(error) => format!("Error: {error}"),
+        self.active_interrupts.remove(&session_id);
+        let (final_response, stop_reason) = match result {
+            Ok(turn) if turn.interrupted => {
+                let reason = match turn.turn_exit_reason.as_str() {
+                    "interrupted_before_grace_call" | "interrupted_before_model_call" => {
+                        "cancelled"
+                    }
+                    "interrupted_before_tool_call" => "cancelled",
+                    _ => "cancelled",
+                };
+                (turn.final_response, reason.to_string())
+            }
+            Ok(turn) => (turn.final_response, "end_turn".to_string()),
+            Err(error) => (format!("Error: {error}"), "refusal".to_string()),
         };
-        self.send_text_update(writer, &session_id, "agent_message_chunk", &final_response)?;
+        if !final_response.trim().is_empty() {
+            self.send_text_update(writer, &session_id, "agent_message_chunk", &final_response)?;
+        }
 
         let response = json!({
-            "stopReason": "end_turn",
+            "stopReason": stop_reason,
             "userMessageId": message_id,
         });
         write_jsonrpc_result(writer, id, response).map_err(|error| error.to_string())
@@ -1307,6 +1347,82 @@ fn write_session_update<W: Write>(
     write_json_line(writer, &payload)
 }
 
+fn send_agent_event_update<W: Write>(
+    writer: &mut W,
+    session_id: &str,
+    event: &AgentTurnEvent,
+) -> io::Result<()> {
+    let update = match event {
+        AgentTurnEvent::ToolCallStarted {
+            id,
+            name,
+            arguments,
+        } => Some(json!({
+            "sessionUpdate": "agent_event",
+            "event": {
+                "type": "tool_call_started",
+                "toolCallId": id,
+                "toolName": name,
+                "arguments": arguments,
+            }
+        })),
+        AgentTurnEvent::ToolCallCompleted { id, name, result } => Some(json!({
+            "sessionUpdate": "agent_event",
+            "event": {
+                "type": "tool_call_completed",
+                "toolCallId": id,
+                "toolName": name,
+                "resultPreview": truncate_for_event(result, 400),
+            }
+        })),
+        AgentTurnEvent::ApiCallStarted { index, grace } => Some(json!({
+            "sessionUpdate": "agent_event",
+            "event": {
+                "type": "api_call_started",
+                "index": index,
+                "grace": grace,
+            }
+        })),
+        AgentTurnEvent::GraceTurnStarted { index } => Some(json!({
+            "sessionUpdate": "agent_event",
+            "event": {
+                "type": "grace_turn_started",
+                "index": index,
+            }
+        })),
+        AgentTurnEvent::Interrupted { phase, message } => Some(json!({
+            "sessionUpdate": "agent_event",
+            "event": {
+                "type": "interrupted",
+                "phase": interrupt_phase_name(phase),
+                "message": message,
+            }
+        })),
+        _ => None,
+    };
+    if let Some(update) = update {
+        write_session_update(writer, session_id, update)?;
+    }
+    Ok(())
+}
+
+fn truncate_for_event(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let head = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{head}...")
+}
+
+fn interrupt_phase_name(phase: &AgentInterruptPhase) -> &'static str {
+    match phase {
+        AgentInterruptPhase::BeforeModelCall => "before_model_call",
+        AgentInterruptPhase::BeforeToolCall => "before_tool_call",
+        AgentInterruptPhase::BeforeGraceCall => "before_grace_call",
+    }
+}
+
 fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
@@ -1586,6 +1702,196 @@ mod tests {
         );
         assert!(message_display_text(&messages[1]).contains("ACP image prompt ok."));
         join.join().unwrap();
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn prompt_streams_agent_events_for_tool_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            for response in [
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": "{\"path\":\"event.txt\",\"content\":\"hello\"}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "Event stream complete."
+                        }
+                    }]
+                })
+                .to_string(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(http.as_bytes());
+            }
+        });
+
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            format!(
+                "model:\n  default: test-model\n  provider: custom\n  base_url: http://{}\n  api_key: test-key\n  api_mode: chat_completions\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = AcpServer::new(&context, &config, &store);
+
+        let created = server
+            .handle_new_session(&json!({"cwd": home.display().to_string()}))
+            .unwrap();
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let mut writer = Vec::new();
+        server
+            .handle_prompt(
+                json!(1),
+                &json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "Create a file"}],
+                }),
+                &mut writer,
+            )
+            .unwrap();
+        join.join().unwrap();
+
+        let frames = writer
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let update_types = frames
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .get("params")
+                    .and_then(|params| params.get("update"))
+                    .and_then(|update| update.get("event"))
+                    .and_then(|event| event.get("type"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert!(update_types.contains(&"api_call_started"));
+        assert!(update_types.contains(&"tool_call_started"));
+        assert!(update_types.contains(&"tool_call_completed"));
+        assert!(frames.iter().any(|frame| {
+            frame
+                .get("params")
+                .and_then(|params| params.get("update"))
+                .and_then(|update| update.get("sessionUpdate"))
+                == Some(&json!("agent_message_chunk"))
+                && frame
+                    .get("params")
+                    .and_then(|params| params.get("update"))
+                    .and_then(|update| update.get("content"))
+                    .and_then(|content| content.get("text"))
+                    == Some(&json!("Event stream complete."))
+        }));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cancelled_session_interrupts_prompt_before_model_call() {
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            "model:\n  default: test-model\n  provider: custom\n  base_url: http://127.0.0.1:9\n  api_key: test-key\n  api_mode: chat_completions\n",
+        )
+        .unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = AcpServer::new(&context, &config, &store);
+
+        let created = server
+            .handle_new_session(&json!({"cwd": home.display().to_string()}))
+            .unwrap();
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        server
+            .handle_notification("session/cancel", json!({"sessionId": session_id}))
+            .unwrap();
+
+        let mut writer = Vec::new();
+        server
+            .handle_prompt(
+                json!(1),
+                &json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "Do not run"}],
+                }),
+                &mut writer,
+            )
+            .unwrap();
+
+        let frames = writer
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let result = frames
+            .iter()
+            .find(|frame| frame.get("result").is_some())
+            .unwrap();
+        assert_eq!(result["result"]["stopReason"], json!("cancelled"));
+        assert!(frames.iter().any(|frame| {
+            frame
+                .get("params")
+                .and_then(|params| params.get("update"))
+                .and_then(|update| update.get("event"))
+                .and_then(|event| event.get("type"))
+                == Some(&json!("interrupted"))
+        }));
+
         let _ = fs::remove_dir_all(&home);
     }
 }

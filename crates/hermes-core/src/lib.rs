@@ -38,7 +38,10 @@ mod vision;
 mod web;
 mod yuanbao;
 
-pub use agent::AgentTurnResult;
+pub use agent::{
+    AgentInterruptController, AgentInterruptPhase, AgentTurnEvent, AgentTurnOptions,
+    AgentTurnResult,
+};
 pub use auth::{
     AuthStatusSummary, CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials,
     GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials,

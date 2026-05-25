@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,6 +61,110 @@ pub struct AgentTurnResult {
     pub provider: String,
     pub base_url: String,
     pub session_id: Option<String>,
+    pub completed: bool,
+    pub interrupted: bool,
+    pub turn_exit_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentInterruptPhase {
+    BeforeModelCall,
+    BeforeToolCall,
+    BeforeGraceCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AgentTurnEvent {
+    TurnStarted {
+        session_id: Option<String>,
+        resumed: bool,
+    },
+    SessionCreated {
+        session_id: String,
+    },
+    SessionResumed {
+        session_id: String,
+        prior_message_count: usize,
+    },
+    ApiCallStarted {
+        index: u64,
+        grace: bool,
+    },
+    AssistantResponse {
+        content: Option<String>,
+        tool_call_count: usize,
+        finish_reason: Option<String>,
+    },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolCallCompleted {
+        id: String,
+        name: String,
+        result: String,
+    },
+    GraceTurnStarted {
+        index: u64,
+    },
+    FinalResponse {
+        content: String,
+        grace: bool,
+    },
+    Interrupted {
+        phase: AgentInterruptPhase,
+        message: Option<String>,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct AgentInterruptController {
+    requested: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl AgentInterruptController {
+    pub fn request(&self, message: Option<&str>) {
+        self.requested.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.message.lock() {
+            *slot = message
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+    }
+
+    pub fn clear(&self) {
+        self.requested.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = self.message.lock() {
+            *slot = None;
+        }
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub fn message(&self) -> Option<String> {
+        self.message.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
+pub struct AgentTurnOptions<'a> {
+    pub event_callback: Option<&'a dyn Fn(AgentTurnEvent)>,
+    pub interrupt: Option<&'a AgentInterruptController>,
+    pub allow_grace_turn: bool,
+}
+
+impl Default for AgentTurnOptions<'_> {
+    fn default() -> Self {
+        Self {
+            event_callback: None,
+            interrupt: None,
+            allow_grace_turn: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +207,30 @@ impl HermesContext {
         session_hint: Option<&str>,
         session_store: Option<&SessionStore>,
     ) -> Result<AgentTurnResult, HermesError> {
-        self.run_chat_turn_with_user_content(
+        self.run_chat_completions_turn_with_options(
+            loaded,
+            prompt,
+            runtime,
+            enabled_toolsets,
+            overrides,
+            session_hint,
+            session_store,
+            AgentTurnOptions::default(),
+        )
+    }
+
+    pub fn run_chat_completions_turn_with_options(
+        &self,
+        loaded: &LoadedConfig,
+        prompt: &str,
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        session_hint: Option<&str>,
+        session_store: Option<&SessionStore>,
+        options: AgentTurnOptions<'_>,
+    ) -> Result<AgentTurnResult, HermesError> {
+        self.run_chat_turn_with_user_content_and_options(
             loaded,
             Value::String(prompt.trim().to_string()),
             runtime,
@@ -110,6 +238,7 @@ impl HermesContext {
             overrides,
             session_hint,
             session_store,
+            options,
         )
     }
 
@@ -122,6 +251,52 @@ impl HermesContext {
         overrides: &ModelOverrides,
         session_hint: Option<&str>,
         session_store: Option<&SessionStore>,
+    ) -> Result<AgentTurnResult, HermesError> {
+        self.run_chat_turn_with_user_content_and_options(
+            loaded,
+            user_content,
+            runtime,
+            enabled_toolsets,
+            overrides,
+            session_hint,
+            session_store,
+            AgentTurnOptions::default(),
+        )
+    }
+
+    pub fn run_chat_turn_with_user_content_and_options(
+        &self,
+        loaded: &LoadedConfig,
+        user_content: Value,
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        session_hint: Option<&str>,
+        session_store: Option<&SessionStore>,
+        options: AgentTurnOptions<'_>,
+    ) -> Result<AgentTurnResult, HermesError> {
+        self.run_chat_turn_with_user_content_impl(
+            loaded,
+            user_content,
+            runtime,
+            enabled_toolsets,
+            overrides,
+            session_hint,
+            session_store,
+            options,
+        )
+    }
+
+    fn run_chat_turn_with_user_content_impl(
+        &self,
+        loaded: &LoadedConfig,
+        user_content: Value,
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+        session_hint: Option<&str>,
+        session_store: Option<&SessionStore>,
+        options: AgentTurnOptions<'_>,
     ) -> Result<AgentTurnResult, HermesError> {
         if !content_has_meaningful_user_input(&user_content) {
             return Err(HermesError::State {
@@ -147,6 +322,7 @@ impl HermesContext {
         let mut system_prompt = build_system_prompt(&tool_runtime, &loaded.config.memory)?;
         let mut messages = Vec::new();
         let mut session_id = None;
+        let mut resumed_session = false;
 
         if let Some(store) = session_store {
             if let Some(session_hint) = session_hint.and_then(non_empty_trimmed) {
@@ -175,10 +351,19 @@ impl HermesContext {
                     "role": "system",
                     "content": system_prompt,
                 }));
+                let prior_message_count = prior_messages.len();
                 for prior in prior_messages {
                     messages.push(message_record_to_chat_message(prior)?);
                 }
+                emit_turn_event(
+                    options.event_callback,
+                    AgentTurnEvent::SessionResumed {
+                        session_id: resolved.clone(),
+                        prior_message_count,
+                    },
+                );
                 session_id = Some(resolved);
+                resumed_session = true;
             }
         }
 
@@ -213,6 +398,12 @@ impl HermesContext {
                     parent_session_id: None,
                 })?;
                 tool_runtime = tool_runtime.with_current_session_id(Some(new_session_id.clone()));
+                emit_turn_event(
+                    options.event_callback,
+                    AgentTurnEvent::SessionCreated {
+                        session_id: new_session_id.clone(),
+                    },
+                );
                 session_id = Some(new_session_id);
             }
             if let Some(session_id) = session_id.as_deref() {
@@ -235,13 +426,43 @@ impl HermesContext {
                 );
             }
         }
+        emit_turn_event(
+            options.event_callback,
+            AgentTurnEvent::TurnStarted {
+                session_id: session_id.clone(),
+                resumed: resumed_session,
+            },
+        );
 
         let client = build_http_client()?;
         let mut api_calls = 0_u64;
         let mut tool_calls = 0_u64;
 
         for _ in 0..loaded.config.agent.max_turns {
+            if let Some(result) = interrupt_before_model_call(
+                &runtime_model,
+                session_id.clone(),
+                api_calls,
+                tool_calls,
+                options.interrupt,
+                options.event_callback,
+            ) {
+                return Ok(result);
+            }
+
             api_calls += 1;
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::ApiCallStarted {
+                    index: api_calls,
+                    grace: false,
+                },
+            );
+            if let Some(store) = session_store
+                && let Some(session_id) = session_id.as_deref()
+            {
+                let _ = store.increment_api_call_count(session_id, 1);
+            }
             let response = send_model_request(
                 &client,
                 &runtime_model,
@@ -258,6 +479,14 @@ impl HermesContext {
                 codex_reasoning_items,
                 codex_message_items,
             } = response;
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::AssistantResponse {
+                    content: assistant_content.clone(),
+                    tool_call_count: pending_tool_calls.len(),
+                    finish_reason: finish_reason.clone(),
+                },
+            );
 
             if pending_tool_calls.is_empty() {
                 let final_response = assistant_content
@@ -290,6 +519,13 @@ impl HermesContext {
                         },
                     );
                 }
+                emit_turn_event(
+                    options.event_callback,
+                    AgentTurnEvent::FinalResponse {
+                        content: final_response.clone(),
+                        grace: false,
+                    },
+                );
                 return Ok(AgentTurnResult {
                     final_response,
                     api_calls,
@@ -298,6 +534,9 @@ impl HermesContext {
                     provider: runtime_model.provider,
                     base_url: runtime_model.base_url,
                     session_id,
+                    completed: true,
+                    interrupted: false,
+                    turn_exit_reason: "completed".to_string(),
                 });
             }
 
@@ -342,9 +581,40 @@ impl HermesContext {
                 );
             }
 
-            for tool_call in pending_tool_calls {
+            for index in 0..pending_tool_calls.len() {
+                if let Some(result) = interrupt_before_tool_call(
+                    &runtime_model,
+                    &mut messages,
+                    session_store,
+                    session_id.as_deref(),
+                    &pending_tool_calls[index..],
+                    api_calls,
+                    tool_calls,
+                    options.interrupt,
+                    options.event_callback,
+                ) {
+                    return Ok(result);
+                }
+
+                let tool_call = pending_tool_calls[index].clone();
+                emit_turn_event(
+                    options.event_callback,
+                    AgentTurnEvent::ToolCallStarted {
+                        id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        arguments: tool_call.json.clone(),
+                    },
+                );
+                let result = dispatch_tool(&tool_call.name, tool_call.json.clone(), &tool_runtime);
                 tool_calls += 1;
-                let result = dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                emit_turn_event(
+                    options.event_callback,
+                    AgentTurnEvent::ToolCallCompleted {
+                        id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        result: result.clone(),
+                    },
+                );
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -374,6 +644,134 @@ impl HermesContext {
             }
         }
 
+        if options.allow_grace_turn {
+            let summary_request = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
+            messages.push(json!({
+                "role": "user",
+                "content": summary_request,
+            }));
+            if let Some(store) = session_store
+                && let Some(session_id) = session_id.as_deref()
+            {
+                let _ = store.append_message(
+                    session_id,
+                    &MessageAppend {
+                        role: "user".to_string(),
+                        content: Some(Value::String(summary_request.to_string())),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: None,
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        codex_reasoning_items: None,
+                        codex_message_items: None,
+                    },
+                );
+            }
+
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::GraceTurnStarted {
+                    index: api_calls + 1,
+                },
+            );
+            if let Some(result) = interrupt_with_phase(
+                &runtime_model,
+                session_id.clone(),
+                api_calls,
+                tool_calls,
+                options.interrupt,
+                options.event_callback,
+                AgentInterruptPhase::BeforeGraceCall,
+                "interrupted_before_grace_call",
+            ) {
+                return Ok(result);
+            }
+
+            api_calls += 1;
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::ApiCallStarted {
+                    index: api_calls,
+                    grace: true,
+                },
+            );
+            if let Some(store) = session_store
+                && let Some(session_id) = session_id.as_deref()
+            {
+                let _ = store.increment_api_call_count(session_id, 1);
+            }
+            let response = send_model_request(
+                &client,
+                &runtime_model,
+                &messages,
+                &[],
+                session_id.as_deref(),
+            )?;
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::AssistantResponse {
+                    content: response.content.clone(),
+                    tool_call_count: response.tool_calls.len(),
+                    finish_reason: response.finish_reason.clone(),
+                },
+            );
+
+            let final_response = response
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| HermesError::State {
+                    action: "parsing assistant response",
+                    detail: "Grace turn did not produce a final text response.".to_string(),
+                })?
+                .to_string();
+            if let Some(store) = session_store
+                && let Some(session_id) = session_id.as_deref()
+            {
+                let _ = store.append_message(
+                    session_id,
+                    &MessageAppend {
+                        role: "assistant".to_string(),
+                        content: Some(Value::String(final_response.clone())),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        tool_name: None,
+                        token_count: None,
+                        finish_reason: response.finish_reason.clone(),
+                        reasoning: response.reasoning.clone(),
+                        reasoning_content: None,
+                        reasoning_details: response.reasoning_details.clone(),
+                        codex_reasoning_items: response.codex_reasoning_items.clone(),
+                        codex_message_items: response.codex_message_items.clone(),
+                    },
+                );
+            }
+            emit_turn_event(
+                options.event_callback,
+                AgentTurnEvent::FinalResponse {
+                    content: final_response.clone(),
+                    grace: true,
+                },
+            );
+            return Ok(AgentTurnResult {
+                final_response,
+                api_calls,
+                tool_calls,
+                model: runtime_model.model,
+                provider: runtime_model.provider,
+                base_url: runtime_model.base_url,
+                session_id,
+                completed: true,
+                interrupted: false,
+                turn_exit_reason: "grace_completed".to_string(),
+            });
+        }
+
         Err(HermesError::State {
             action: "running agent turn",
             detail: format!(
@@ -382,6 +780,129 @@ impl HermesContext {
             ),
         })
     }
+}
+
+fn emit_turn_event(callback: Option<&dyn Fn(AgentTurnEvent)>, event: AgentTurnEvent) {
+    if let Some(callback) = callback {
+        callback(event);
+    }
+}
+
+fn interrupt_before_model_call(
+    runtime_model: &crate::ModelRuntimeConfig,
+    session_id: Option<String>,
+    api_calls: u64,
+    tool_calls: u64,
+    interrupt: Option<&AgentInterruptController>,
+    event_callback: Option<&dyn Fn(AgentTurnEvent)>,
+) -> Option<AgentTurnResult> {
+    interrupt_with_phase(
+        runtime_model,
+        session_id,
+        api_calls,
+        tool_calls,
+        interrupt,
+        event_callback,
+        AgentInterruptPhase::BeforeModelCall,
+        "interrupted_before_model_call",
+    )
+}
+
+fn interrupt_with_phase(
+    runtime_model: &crate::ModelRuntimeConfig,
+    session_id: Option<String>,
+    api_calls: u64,
+    tool_calls: u64,
+    interrupt: Option<&AgentInterruptController>,
+    event_callback: Option<&dyn Fn(AgentTurnEvent)>,
+    phase: AgentInterruptPhase,
+    exit_reason: &str,
+) -> Option<AgentTurnResult> {
+    let interrupt = interrupt?;
+    if !interrupt.is_requested() {
+        return None;
+    }
+    let message = interrupt.message();
+    emit_turn_event(
+        event_callback,
+        AgentTurnEvent::Interrupted {
+            phase,
+            message: message.clone(),
+        },
+    );
+    Some(AgentTurnResult {
+        final_response: String::new(),
+        api_calls,
+        tool_calls,
+        model: runtime_model.model.clone(),
+        provider: runtime_model.provider.clone(),
+        base_url: runtime_model.base_url.clone(),
+        session_id,
+        completed: false,
+        interrupted: true,
+        turn_exit_reason: exit_reason.to_string(),
+    })
+}
+
+fn interrupt_before_tool_call(
+    runtime_model: &crate::ModelRuntimeConfig,
+    messages: &mut Vec<Value>,
+    session_store: Option<&SessionStore>,
+    session_id: Option<&str>,
+    remaining_tool_calls: &[PendingToolCall],
+    api_calls: u64,
+    tool_calls: u64,
+    interrupt: Option<&AgentInterruptController>,
+    event_callback: Option<&dyn Fn(AgentTurnEvent)>,
+) -> Option<AgentTurnResult> {
+    let interrupt = interrupt?;
+    if !interrupt.is_requested() {
+        return None;
+    }
+
+    for tool_call in remaining_tool_calls {
+        let content = format!(
+            "Interrupted before executing tool call '{}'.",
+            tool_call.name
+        );
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": content,
+        }));
+        if let Some(store) = session_store
+            && let Some(session_id) = session_id
+        {
+            let _ = store.append_message(
+                session_id,
+                &MessageAppend {
+                    role: "tool".to_string(),
+                    content: Some(Value::String(content)),
+                    tool_call_id: Some(tool_call.id.clone()),
+                    tool_calls: None,
+                    tool_name: Some(tool_call.name.clone()),
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            );
+        }
+    }
+
+    interrupt_with_phase(
+        runtime_model,
+        session_id.map(ToOwned::to_owned),
+        api_calls,
+        tool_calls,
+        Some(interrupt),
+        event_callback,
+        AgentInterruptPhase::BeforeToolCall,
+        "interrupted_before_tool_call",
+    )
 }
 
 fn content_has_meaningful_user_input(content: &Value) -> bool {
@@ -3708,8 +4229,8 @@ mod tests {
 
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use tempfile::TempDir;
@@ -5252,6 +5773,366 @@ for raw in sys.stdin:
         assert_eq!(todos[0]["id"], json!("1"));
         assert_eq!(todos[0]["content"], json!("draft plan"));
         assert_eq!(todos[0]["status"], json!("in_progress"));
+    }
+
+    #[test]
+    fn chat_turn_emits_lifecycle_events_and_updates_session_api_counts() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"one.txt\",\"content\":\"first\"}"
+                            }
+                        }, {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"two.txt\",\"content\":\"second\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Both files are written."
+                    },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::<AgentTurnEvent>::new()));
+        let event_callback = {
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event)
+        };
+        let result = context
+            .run_chat_completions_turn_with_options(
+                &loaded,
+                "Write two files",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&session_store),
+                AgentTurnOptions {
+                    event_callback: Some(&event_callback),
+                    ..AgentTurnOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(result.completed);
+        assert!(!result.interrupted);
+        assert_eq!(result.api_calls, 2);
+        let session = session_store
+            .get_session(result.session_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.api_call_count, 2);
+
+        let names = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| match event {
+                AgentTurnEvent::TurnStarted { .. } => "turn_started",
+                AgentTurnEvent::SessionCreated { .. } => "session_created",
+                AgentTurnEvent::SessionResumed { .. } => "session_resumed",
+                AgentTurnEvent::ApiCallStarted { grace, .. } => {
+                    if *grace {
+                        "api_call_grace"
+                    } else {
+                        "api_call"
+                    }
+                }
+                AgentTurnEvent::AssistantResponse { .. } => "assistant_response",
+                AgentTurnEvent::ToolCallStarted { name, .. } => {
+                    if name == "write_file" {
+                        "tool_started"
+                    } else {
+                        "tool_started_other"
+                    }
+                }
+                AgentTurnEvent::ToolCallCompleted { name, .. } => {
+                    if name == "write_file" {
+                        "tool_completed"
+                    } else {
+                        "tool_completed_other"
+                    }
+                }
+                AgentTurnEvent::GraceTurnStarted { .. } => "grace_started",
+                AgentTurnEvent::FinalResponse { grace, .. } => {
+                    if *grace {
+                        "final_grace"
+                    } else {
+                        "final"
+                    }
+                }
+                AgentTurnEvent::Interrupted { .. } => "interrupted",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "session_created",
+                "turn_started",
+                "api_call",
+                "assistant_response",
+                "tool_started",
+                "tool_completed",
+                "tool_started",
+                "tool_completed",
+                "api_call",
+                "assistant_response",
+                "final",
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_turn_interrupts_before_remaining_tool_calls_and_persists_skipped_results() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"first.txt\",\"content\":\"first\"}"
+                            }
+                        }, {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"second.txt\",\"content\":\"second\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        let interrupt = AgentInterruptController::default();
+        let interrupt_callback = |event| {
+            if matches!(
+                event,
+                AgentTurnEvent::ToolCallCompleted { ref id, .. } if id == "call_1"
+            ) {
+                interrupt.request(Some("stop now"));
+            }
+        };
+        let result = context
+            .run_chat_completions_turn_with_options(
+                &loaded,
+                "Write two files but interrupt after the first",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&session_store),
+                AgentTurnOptions {
+                    event_callback: Some(&interrupt_callback),
+                    interrupt: Some(&interrupt),
+                    allow_grace_turn: false,
+                },
+            )
+            .unwrap();
+
+        assert!(!result.completed);
+        assert!(result.interrupted);
+        assert_eq!(result.turn_exit_reason, "interrupted_before_tool_call");
+        assert_eq!(result.api_calls, 1);
+        assert_eq!(result.tool_calls, 1);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "first"
+        );
+        assert!(!temp.path().join("second.txt").exists());
+
+        let messages = session_store
+            .get_messages(result.session_id.as_deref().unwrap())
+            .unwrap();
+        let interrupted_tool = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call_2"))
+            .unwrap();
+        assert_eq!(
+            interrupted_tool.content.as_ref().unwrap(),
+            &json!("Interrupted before executing tool call 'write_file'.")
+        );
+    }
+
+    #[test]
+    fn chat_turn_uses_grace_summary_after_max_turns() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            "agent:\n  max_turns: 1\nmodel:\n  default: test-model\n  provider: custom\n  api_key: test-key\n  api_mode: chat_completions\n",
+        )
+        .unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for request_index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert!(request_line.starts_with("POST /chat/completions "));
+
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let payload = serde_json::from_slice::<Value>(&body).unwrap();
+
+                let response = if request_index == 0 {
+                    assert!(
+                        payload["tools"]
+                            .as_array()
+                            .is_some_and(|items| !items.is_empty())
+                    );
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": "{\"path\":\"grace.txt\",\"content\":\"done\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    })
+                    .to_string()
+                } else {
+                    let messages = payload["messages"].as_array().unwrap();
+                    assert!(payload.get("tools").is_none());
+                    assert_eq!(
+                        messages.last().unwrap()["content"],
+                        json!(
+                            "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools."
+                        )
+                    );
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Summary after grace turn."
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string()
+                };
+
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                stream.write_all(http.as_bytes()).unwrap();
+            }
+        });
+
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Need one tool and then a summary",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    base_url: Some(format!("http://{addr}")),
+                    ..ModelOverrides::default()
+                },
+                None,
+                Some(&session_store),
+            )
+            .unwrap();
+        server.join().unwrap();
+
+        assert!(result.completed);
+        assert_eq!(result.api_calls, 2);
+        assert_eq!(result.turn_exit_reason, "grace_completed");
+        assert_eq!(result.final_response, "Summary after grace turn.");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("grace.txt")).unwrap(),
+            "done"
+        );
+
+        let messages = session_store
+            .get_messages(result.session_id.as_deref().unwrap())
+            .unwrap();
+        assert!(messages.iter().any(|message| {
+            message.role == "user"
+                && message.content.as_ref()
+                    == Some(&json!("You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools."))
+        }));
     }
 
     #[test]
