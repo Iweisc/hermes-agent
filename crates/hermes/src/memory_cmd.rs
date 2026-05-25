@@ -155,6 +155,18 @@ struct MemoryPluginManifest {
     pip_dependencies: Vec<String>,
     #[serde(default)]
     external_dependencies: Vec<ExternalDependency>,
+    #[serde(default)]
+    setup: Option<MemoryPluginSetupManifest>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemoryPluginSetupManifest {
+    #[serde(default)]
+    schema: Vec<BridgedSchemaField>,
+    #[serde(default, alias = "has_post_setup")]
+    post_setup: bool,
+    #[serde(default, alias = "has_save_config")]
+    save_config: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -586,13 +598,18 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
         ),
         "honcho" => (SetupMode::NativeHoncho, Vec::new(), false),
         "hindsight" => (SetupMode::NativeHindsight, Vec::new(), false),
-        _ if schema_free_provider_has_no_setup_hooks(context, &provider.name) => {
-            (SetupMode::NativeGeneric, Vec::new(), false)
+        name => {
+            if let Ok(Some(manifest)) = load_manifest_provider_spec(context, name) {
+                (manifest.mode, manifest.fields, manifest.bridge_save_config)
+            } else if schema_free_provider_has_no_setup_hooks(context, name) {
+                (SetupMode::NativeGeneric, Vec::new(), false)
+            } else {
+                match load_bridged_provider_spec(context, name) {
+                    Ok(bridged) => (bridged.mode, bridged.fields, bridged.bridge_save_config),
+                    Err(_) => (SetupMode::PythonHook, Vec::new(), false),
+                }
+            }
         }
-        _ => match load_bridged_provider_spec(context, &provider.name) {
-            Ok(bridged) => (bridged.mode, bridged.fields, bridged.bridge_save_config),
-            Err(_) => (SetupMode::PythonHook, Vec::new(), false),
-        },
     };
 
     let hint = if mode == SetupMode::PythonHook {
@@ -623,6 +640,48 @@ fn render_setup_hint(fields: &[SetupField]) -> String {
     } else {
         String::from("local")
     }
+}
+
+fn load_manifest_provider_spec(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<Option<SetupProvider>, Box<dyn Error>> {
+    let Some(dir) = find_memory_provider_dir(context, provider_name) else {
+        return Ok(None);
+    };
+    let Some(manifest) = read_memory_plugin_manifest(&dir) else {
+        return Ok(None);
+    };
+    let Some(setup) = manifest.setup else {
+        return Ok(None);
+    };
+
+    if setup.post_setup {
+        return Ok(Some(SetupProvider {
+            name: provider_name.to_string(),
+            description: String::new(),
+            hint: String::from("custom setup"),
+            mode: SetupMode::PythonHook,
+            fields: Vec::new(),
+            bridge_save_config: false,
+        }));
+    }
+
+    let fields = setup
+        .schema
+        .into_iter()
+        .map(bridged_schema_field_to_setup_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    let hint = render_setup_hint(&fields);
+
+    Ok(Some(SetupProvider {
+        name: provider_name.to_string(),
+        description: String::new(),
+        hint,
+        mode: SetupMode::NativeGeneric,
+        fields,
+        bridge_save_config: setup.save_config,
+    }))
 }
 
 fn load_bridged_provider_spec(
@@ -3210,7 +3269,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("plugin.yaml"),
-            "pip_dependencies:\n  - mem0ai\nexternal_dependencies:\n  - name: brv\n    install: curl install\n    check: brv --version\n",
+            "pip_dependencies:\n  - mem0ai\nexternal_dependencies:\n  - name: brv\n    install: curl install\n    check: brv --version\nsetup:\n  save_config: true\n  schema:\n    - key: mode\n      description: Mode\n      default: cloud\n      choices: [cloud, local]\n",
         )
         .unwrap();
 
@@ -3218,6 +3277,10 @@ mod tests {
         assert_eq!(manifest.pip_dependencies, vec!["mem0ai"]);
         assert_eq!(manifest.external_dependencies.len(), 1);
         assert_eq!(manifest.external_dependencies[0].name, "brv");
+        let setup = manifest.setup.unwrap();
+        assert!(setup.save_config);
+        assert_eq!(setup.schema.len(), 1);
+        assert_eq!(setup.schema[0].key, "mode");
     }
 
     #[test]
@@ -3450,6 +3513,52 @@ exit 9\n",
         assert_eq!(provider.fields.len(), 2);
         assert_eq!(provider.fields[0].choices, vec!["cloud", "local"]);
         assert_eq!(provider.fields[1].env_var.as_deref(), Some("CUSTOM_TOKEN"));
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_provider_spec_uses_manifest_schema_without_python() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "manifested");
+        fs::write(
+            home.join("plugins").join("manifested").join("plugin.yaml"),
+            "description: Manifested provider\nsetup:\n  schema:\n    - key: mode\n      description: Mode\n      default: cloud\n      choices: [cloud, local]\n    - key: token\n      description: Access token\n      secret: true\n      env_var: CUSTOM_TOKEN\n",
+        )
+        .unwrap();
+
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        let provider = setup_provider_spec(
+            &context,
+            ProviderInfo {
+                name: String::from("manifested"),
+                description: String::from("Manifested provider"),
+            },
+        );
+
+        assert_eq!(provider.mode, SetupMode::NativeGeneric);
+        assert_eq!(provider.hint, "API key / local");
+        assert!(!provider.bridge_save_config);
+        assert_eq!(provider.fields.len(), 2);
+        assert_eq!(provider.fields[0].choices, vec!["cloud", "local"]);
+        assert_eq!(provider.fields[1].env_var.as_deref(), Some("CUSTOM_TOKEN"));
+        assert!(!log.exists());
 
         remove_env_var("HERMES_MEMORY_PYTHON");
     }
