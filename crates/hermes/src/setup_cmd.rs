@@ -5564,7 +5564,8 @@ exit 9\n",
             "platform_toolsets:\n  cli:\n    - file\n",
         )
         .unwrap();
-        let mut input = io::Cursor::new(b"1\n1,4\n3\n".to_vec());
+        let done_choice = crate::tools_cmd::interactive_tools_menu_choice_count(&context).unwrap();
+        let mut input = io::Cursor::new(format!("1\n1,4\n{done_choice}\n").into_bytes());
         let mut output = Vec::new();
 
         run_native_tools_setup_with_io(&context, &mut input, &mut output).unwrap();

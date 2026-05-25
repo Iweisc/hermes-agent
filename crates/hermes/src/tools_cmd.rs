@@ -1147,6 +1147,15 @@ fn build_interactive_tools_options(
     options
 }
 
+#[cfg(test)]
+pub(crate) fn interactive_tools_menu_choice_count(
+    context: &HermesContext,
+) -> Result<usize, Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let platforms = enabled_platforms();
+    Ok(build_interactive_tools_options(&root, &platforms).len())
+}
+
 fn prompt_menu_choice(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
