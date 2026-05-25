@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -401,9 +402,12 @@ struct SessionBinding {
     attached_images: Vec<String>,
     child_id: String,
     cols: u64,
+    info: Map<String, Value>,
     image_counter: u64,
+    running: bool,
     store_session_id: Option<String>,
     store_session_dirty: bool,
+    usage: Map<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +415,14 @@ struct PendingRequest {
     local_session_id: Option<String>,
     method: String,
     resume_target: Option<String>,
+    response_tx: Option<Sender<Value>>,
     suppress_output: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PromptRequestBinding {
+    child_request_id: String,
+    local_session_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -419,7 +430,9 @@ struct ProxyState {
     child_to_local: HashMap<String, String>,
     next_internal_request: u64,
     next_local_session: u64,
+    next_prompt_request: u64,
     pending: HashMap<String, PendingRequest>,
+    prompt_requests: HashMap<String, PromptRequestBinding>,
     sessions: HashMap<String, SessionBinding>,
 }
 
@@ -607,9 +620,39 @@ fn handle_native_request(
         "session.resume" => handle_session_resume(id, &params, store, state, helper)?,
         "session.close" => handle_session_close(id, &params, store, state, child_stdin)?,
         "session.title" => handle_session_title(id, &params, store, state)?,
+        "session.usage" => handle_session_usage(id, &params, state)?,
+        "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
         "session.interrupt" => handle_session_interrupt(id, &params, state, helper, child_stdin)?,
-        "session.steer" => handle_session_steer(id, &params, state)?,
+        "session.steer" => handle_session_steer(id, &params, state, child_stdin)?,
         "approval.respond" => handle_approval_respond(id, &params, state, helper)?,
+        "clarify.respond" => handle_text_respond(
+            id,
+            &params,
+            child_stdin,
+            state,
+            "clarify.respond",
+            "request_id",
+            "answer",
+        )?,
+        "sudo.respond" => handle_text_respond(
+            id,
+            &params,
+            child_stdin,
+            state,
+            "sudo.respond",
+            "request_id",
+            "password",
+        )?,
+        "secret.respond" => handle_text_respond(
+            id,
+            &params,
+            child_stdin,
+            state,
+            "secret.respond",
+            "request_id",
+            "value",
+        )?,
         "terminal.resize" => handle_terminal_resize(id, &params, state, child_stdin)?,
         "clipboard.paste" => handle_clipboard_paste(id, &params, state, helper)?,
         "image.attach" => handle_image_attach(id, &params, state, helper)?,
@@ -751,6 +794,12 @@ fn handle_session_create(
         parent_session_id: None,
     })?;
     let session_id = create_local_session(state, Some(store_session_id), cols)?;
+    if let Some(info_object) = info.as_object().cloned() {
+        update_session_info_cache(state, &session_id, info_object.clone())?;
+        if let Some(usage) = info_object.get("usage").and_then(Value::as_object) {
+            update_session_usage_cache(state, &session_id, usage.clone())?;
+        }
+    }
     Ok(Some(ok_response(
         id,
         json!({
@@ -787,6 +836,12 @@ fn handle_session_resume(
     let info = initial_session_info(helper, session.model.as_deref());
     let messages = resume_messages(store, &session.id)?;
     let session_id = create_local_session(state, Some(session.id.clone()), cols)?;
+    if let Some(info_object) = info.as_object().cloned() {
+        update_session_info_cache(state, &session_id, info_object.clone())?;
+        if let Some(usage) = info_object.get("usage").and_then(Value::as_object) {
+            update_session_usage_cache(state, &session_id, usage.clone())?;
+        }
+    }
     Ok(Some(ok_response(
         id,
         json!({
@@ -944,6 +999,108 @@ fn handle_session_title(
     }
 }
 
+fn handle_session_usage(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    Ok(Some(ok_response(
+        id,
+        Value::Object(usage_payload(&binding)),
+    )))
+}
+
+fn handle_session_status(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(binding) = get_session_binding(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+
+    let session_key = binding
+        .store_session_id
+        .clone()
+        .unwrap_or_else(|| local_id.to_string());
+    let record = binding
+        .store_session_id
+        .as_deref()
+        .map(|session_id| store.get_session(session_id))
+        .transpose()?
+        .flatten();
+    let usage = usage_payload(&binding);
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| record.as_ref().and_then(|row| row.model.clone()))
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let title = record
+        .as_ref()
+        .and_then(|row| row.title.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let created = record
+        .as_ref()
+        .map(|row| row.started_at)
+        .unwrap_or_else(current_timestamp_seconds);
+    let last_activity = if binding.running {
+        current_timestamp_seconds()
+    } else {
+        created
+    };
+
+    let mut lines = vec![
+        "Hermes TUI Status".to_string(),
+        String::new(),
+        format!("Session ID: {session_key}"),
+        format!("Path: {}", helper.hermes_home.display()),
+    ];
+    if let Some(title) = title {
+        lines.push(format!("Title: {title}"));
+    }
+    lines.extend([
+        format!("Model: {model} (unknown)"),
+        format!("Created: {}", format_timestamp(created)),
+        format!("Last Activity: {}", format_timestamp(last_activity)),
+        format!(
+            "Tokens: {}",
+            usage.get("total").and_then(Value::as_i64).unwrap_or(0)
+        ),
+        format!(
+            "Agent Running: {}",
+            if binding.running { "Yes" } else { "No" }
+        ),
+    ]);
+    Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
+}
+
 fn handle_session_interrupt(
     id: Value,
     params: &Map<String, Value>,
@@ -986,10 +1143,51 @@ fn handle_session_interrupt(
     Ok(Some(ok_response(id, json!({"status": "interrupted"}))))
 }
 
+fn handle_prompt_submit(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    if !session_exists(state, local_id)? {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    }
+
+    mark_store_session_dirty(state, local_id)?;
+    ensure_child_session(child_stdin, state, local_id)?;
+    sync_pending_images(child_stdin, state, local_id)?;
+    let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4001,
+            "child session not materialized",
+        )));
+    };
+
+    let mut forwarded_params = params.clone();
+    forwarded_params.insert("session_id".to_string(), json!(child_id));
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        "prompt.submit",
+        Value::Object(forwarded_params),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_session_steer(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1012,7 +1210,13 @@ fn handle_session_steer(
         return Ok(Some(error_response(id, 4002, "text is required")));
     }
     if !binding.child_id.is_empty() {
-        return Ok(None);
+        let response = send_blocking_child_request(
+            child_stdin,
+            state,
+            "session.steer",
+            json!({"session_id": binding.child_id, "text": text}),
+        )?;
+        return Ok(Some(rebind_response_id(response, id)));
     }
     Ok(Some(ok_response(
         id,
@@ -1063,6 +1267,48 @@ fn handle_approval_respond(
     )
     .map_err(|error| format!("approval resolve failed: {error}"))?;
     Ok(Some(ok_response(id, result)))
+}
+
+fn handle_text_respond(
+    id: Value,
+    params: &Map<String, Value>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+    state: &Arc<Mutex<ProxyState>>,
+    method: &str,
+    request_key: &str,
+    value_key: &str,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(request_id) = params
+        .get(request_key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(
+            id,
+            4009,
+            &format!("{request_key} required"),
+        )));
+    };
+    let Some(binding) = take_prompt_request(state, request_id)? else {
+        return Ok(Some(error_response(
+            id,
+            4009,
+            &format!("no pending {value_key} request"),
+        )));
+    };
+    let value = params
+        .get(value_key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let response = send_blocking_child_request(
+        child_stdin,
+        state,
+        method,
+        json!({request_key: binding.child_request_id, value_key: value}),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
 }
 
 fn handle_terminal_resize(
@@ -1367,6 +1613,13 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
+fn rebind_response_id(mut response: Value, id: Value) -> Value {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("id".to_string(), id);
+    }
+    response
+}
+
 fn rewrite_outbound_request(
     state: &Arc<Mutex<ProxyState>>,
     request: &Value,
@@ -1424,6 +1677,7 @@ fn rewrite_outbound_request(
                 local_session_id,
                 method,
                 resume_target,
+                response_tx: None,
                 suppress_output: false,
             },
         );
@@ -1465,10 +1719,105 @@ fn rewrite_child_event(
     let Some(child_sid) = params.get("session_id").and_then(Value::as_str) else {
         return Ok(());
     };
-    if let Some(local_sid) = lookup_local_session_id(state, child_sid)? {
+    let local_sid = if let Some(local_sid) = lookup_local_session_id(state, child_sid)? {
+        Some(local_sid)
+    } else {
+        claim_pending_resume_child_session(state, child_sid)?
+    };
+    if let Some(local_sid) = local_sid.clone() {
         params.insert("session_id".to_string(), Value::String(local_sid));
     }
+    if let Some(local_sid) = local_sid.clone() {
+        cache_child_event_state(state, &local_sid, params)?;
+    }
+    if let Some(event_type) = params.get("type").and_then(Value::as_str)
+        && matches!(
+            event_type,
+            "clarify.request" | "sudo.request" | "secret.request"
+        )
+        && let Some(payload) = params.get_mut("payload").and_then(Value::as_object_mut)
+        && let Some(child_request_id) = payload
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        && let Some(local_sid) = local_sid
+    {
+        let local_request_id = bind_prompt_request(state, &local_sid, &child_request_id)?;
+        payload.insert("request_id".to_string(), Value::String(local_request_id));
+    }
     Ok(())
+}
+
+fn cache_child_event_state(
+    state: &Arc<Mutex<ProxyState>>,
+    local_session_id: &str,
+    params: &Map<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    let event_type = params
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "session.info" => {
+            if let Some(payload) = params.get("payload").and_then(Value::as_object) {
+                update_session_info_cache(state, local_session_id, payload.clone())?;
+                if let Some(usage) = payload.get("usage").and_then(Value::as_object) {
+                    update_session_usage_cache(state, local_session_id, usage.clone())?;
+                }
+            }
+        }
+        "message.start" => set_session_running(state, local_session_id, true)?,
+        "message.complete" => {
+            set_session_running(state, local_session_id, false)?;
+            if let Some(usage) = params
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|payload| payload.get("usage"))
+                .and_then(Value::as_object)
+            {
+                update_session_usage_cache(state, local_session_id, usage.clone())?;
+            }
+        }
+        "error" => set_session_running(state, local_session_id, false)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn claim_pending_resume_child_session(
+    state: &Arc<Mutex<ProxyState>>,
+    child_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let candidate = {
+        let guard = state
+            .lock()
+            .map_err(|_| "proxy state lock poisoned while claiming pending resume child")?;
+        let mut candidates = guard
+            .pending
+            .values()
+            .filter(|pending| {
+                pending.method == "session.resume"
+                    && pending.suppress_output
+                    && pending.local_session_id.is_some()
+            })
+            .filter_map(|pending| {
+                pending
+                    .local_session_id
+                    .as_ref()
+                    .map(|local_id| (local_id.clone(), pending.resume_target.clone()))
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() == 1 {
+            candidates.pop()
+        } else {
+            None
+        }
+    };
+    let Some((local_id, resume_target)) = candidate else {
+        return Ok(None);
+    };
+    attach_child_to_local(state, &local_id, child_id, resume_target)?;
+    Ok(Some(local_id))
 }
 
 fn rewrite_child_response(
@@ -1486,6 +1835,9 @@ fn rewrite_child_response(
         return Ok(false);
     };
     let Some(result) = object.get_mut("result").and_then(Value::as_object_mut) else {
+        if let Some(response_tx) = pending.response_tx {
+            let _ = response_tx.send(Value::Object(object.clone()));
+        }
         if pending.method == "session.close" {
             if let Some(local_sid) = pending.local_session_id {
                 release_local_session(state, &local_sid)?;
@@ -1543,6 +1895,9 @@ fn rewrite_child_response(
         }
         _ => {}
     }
+    if let Some(response_tx) = pending.response_tx {
+        let _ = response_tx.send(Value::Object(object.clone()));
+    }
     Ok(pending.suppress_output)
 }
 
@@ -1574,9 +1929,12 @@ fn bind_child_session(
             attached_images: Vec::new(),
             child_id: child_id.to_string(),
             cols: 80,
+            info: Map::new(),
             image_counter: 0,
+            running: false,
             store_session_id,
             store_session_dirty: false,
+            usage: default_usage_payload(""),
         },
     );
     Ok(local_sid)
@@ -1598,9 +1956,12 @@ fn create_local_session(
             attached_images: Vec::new(),
             child_id: String::new(),
             cols,
+            info: Map::new(),
             image_counter: 0,
+            running: false,
             store_session_id,
             store_session_dirty: false,
+            usage: default_usage_payload(""),
         },
     );
     Ok(local_sid)
@@ -1639,6 +2000,9 @@ fn release_local_session(
     let mut guard = state
         .lock()
         .map_err(|_| "proxy state lock poisoned while releasing session")?;
+    guard
+        .prompt_requests
+        .retain(|_, binding| binding.local_session_id != local_id);
     if let Some(binding) = guard.sessions.remove(local_id) {
         if !binding.child_id.is_empty() {
             guard.child_to_local.remove(&binding.child_id);
@@ -1744,6 +2108,133 @@ fn get_session_binding(
         .lock()
         .map_err(|_| "proxy state lock poisoned while cloning session binding")?;
     Ok(guard.sessions.get(local_id).cloned())
+}
+
+fn bind_prompt_request(
+    state: &Arc<Mutex<ProxyState>>,
+    local_session_id: &str,
+    child_request_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while binding prompt request")?;
+    guard.next_prompt_request = guard.next_prompt_request.saturating_add(1);
+    let local_request_id = format!("rs_prompt_{:08x}", guard.next_prompt_request);
+    guard.prompt_requests.insert(
+        local_request_id.clone(),
+        PromptRequestBinding {
+            child_request_id: child_request_id.to_string(),
+            local_session_id: local_session_id.to_string(),
+        },
+    );
+    Ok(local_request_id)
+}
+
+fn take_prompt_request(
+    state: &Arc<Mutex<ProxyState>>,
+    local_request_id: &str,
+) -> Result<Option<PromptRequestBinding>, Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while taking prompt request")?;
+    Ok(guard.prompt_requests.remove(local_request_id))
+}
+
+fn update_session_info_cache(
+    state: &Arc<Mutex<ProxyState>>,
+    local_id: &str,
+    info: Map<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while updating session info cache")?;
+    if let Some(binding) = guard.sessions.get_mut(local_id) {
+        binding.info = info;
+    }
+    Ok(())
+}
+
+fn update_session_usage_cache(
+    state: &Arc<Mutex<ProxyState>>,
+    local_id: &str,
+    usage: Map<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while updating session usage cache")?;
+    if let Some(binding) = guard.sessions.get_mut(local_id) {
+        binding.usage = usage;
+    }
+    Ok(())
+}
+
+fn set_session_running(
+    state: &Arc<Mutex<ProxyState>>,
+    local_id: &str,
+    running: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while updating running state")?;
+    if let Some(binding) = guard.sessions.get_mut(local_id) {
+        binding.running = running;
+    }
+    Ok(())
+}
+
+fn default_usage_payload(model: &str) -> Map<String, Value> {
+    let mut usage = Map::new();
+    usage.insert("model".to_string(), json!(model));
+    usage.insert("calls".to_string(), json!(0));
+    usage.insert("input".to_string(), json!(0));
+    usage.insert("output".to_string(), json!(0));
+    usage.insert("total".to_string(), json!(0));
+    usage.insert("cache_read".to_string(), json!(0));
+    usage.insert("cache_write".to_string(), json!(0));
+    usage
+}
+
+fn usage_payload(binding: &SessionBinding) -> Map<String, Value> {
+    let model = binding
+        .info
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if binding.usage.is_empty() {
+        default_usage_payload(&model)
+    } else {
+        let mut usage = binding.usage.clone();
+        usage
+            .entry("model".to_string())
+            .or_insert_with(|| json!(model));
+        usage
+    }
+}
+
+fn current_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn format_timestamp(timestamp: f64) -> String {
+    run_python_datetime_format(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+}
+
+fn run_python_datetime_format(timestamp: f64) -> Result<String, Box<dyn Error>> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg("from datetime import datetime; import sys; print(datetime.fromtimestamp(float(sys.argv[1])).strftime('%Y-%m-%d %H:%M'))")
+        .arg(format!("{timestamp}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err("python3 timestamp formatting failed".into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 fn set_session_cols(
@@ -1889,6 +2380,7 @@ fn send_internal_child_request(
                 local_session_id,
                 method: method.to_string(),
                 resume_target,
+                response_tx: None,
                 suppress_output: true,
             },
         );
@@ -1907,6 +2399,60 @@ fn send_internal_child_request(
     stdin.write_all(b"\n")?;
     stdin.flush()?;
     Ok(())
+}
+
+fn send_blocking_child_request(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    state: &Arc<Mutex<ProxyState>>,
+    method: &str,
+    params: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let (response_tx, response_rx) = mpsc::channel();
+    let request_id = {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "proxy state lock poisoned while sending blocking request")?;
+        guard.next_internal_request = guard.next_internal_request.saturating_add(1);
+        let request_id = format!("rs_internal_{:08x}", guard.next_internal_request);
+        guard.pending.insert(
+            request_id.clone(),
+            PendingRequest {
+                local_session_id: None,
+                method: method.to_string(),
+                resume_target: None,
+                response_tx: Some(response_tx),
+                suppress_output: true,
+            },
+        );
+        request_id
+    };
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    });
+    {
+        let mut stdin = stdin
+            .lock()
+            .map_err(|_| "failed to lock child stdin for blocking request")?;
+        stdin.write_all(serde_json::to_string(&request)?.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+    }
+
+    match response_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            let mut guard = state
+                .lock()
+                .map_err(|_| "proxy state lock poisoned while clearing timed out request")?;
+            guard
+                .pending
+                .remove(request["id"].as_str().unwrap_or_default());
+            Err(format!("timed out waiting for child response to {method}").into())
+        }
+    }
 }
 
 fn resume_messages(store: &SessionStore, session_id: &str) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -2731,7 +3277,7 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStdout, Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use hermes_core::{MessageAppend, SessionCreate};
@@ -2754,9 +3300,12 @@ mod tests {
                     attached_images: Vec::new(),
                     child_id: "child-1".to_string(),
                     cols: 80,
+                    info: Map::new(),
                     image_counter: 0,
+                    running: false,
                     store_session_id: None,
                     store_session_dirty: false,
+                    usage: default_usage_payload(""),
                 },
             );
         }
@@ -2857,6 +3406,38 @@ mod tests {
                 .as_deref(),
             Some("stored-session")
         );
+    }
+
+    #[test]
+    fn early_child_event_during_internal_resume_claims_local_session_binding() {
+        let state = test_state();
+        let local_id = create_local_session(&state, Some("stored-early".to_string()), 80).unwrap();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.pending.insert(
+                "rs_internal_resume".to_string(),
+                PendingRequest {
+                    local_session_id: Some(local_id.clone()),
+                    method: "session.resume".to_string(),
+                    resume_target: Some("stored-early".to_string()),
+                    response_tx: None,
+                    suppress_output: true,
+                },
+            );
+        }
+
+        let rewritten = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"session.info","session_id":"child-early","payload":{"model":"demo"}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed["params"]["session_id"], json!(local_id));
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.child_to_local["child-early"], local_id);
+        assert_eq!(guard.sessions[&local_id].child_id, "child-early");
     }
 
     #[test]
@@ -3061,6 +3642,17 @@ mod tests {
         (child, Arc::new(Mutex::new(stdin)))
     }
 
+    fn dummy_child_echo() -> (Child, Arc<Mutex<ChildStdin>>, BufReader<ChildStdout>) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (child, Arc::new(Mutex::new(stdin)), BufReader::new(stdout))
+    }
+
     fn helper_context() -> HelperContext {
         HelperContext {
             hermes_home: std::env::temp_dir(),
@@ -3069,6 +3661,22 @@ mod tests {
             python_path: String::new(),
             work_root: project_root(),
         }
+    }
+
+    fn wait_for_pending_request_id(state: &Arc<Mutex<ProxyState>>, method: &str) -> String {
+        for _ in 0..100 {
+            if let Some(request_id) = state
+                .lock()
+                .unwrap()
+                .pending
+                .iter()
+                .find_map(|(id, pending)| (pending.method == method).then(|| id.clone()))
+            {
+                return request_id;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for pending {method} request");
     }
 
     #[test]
@@ -3190,9 +3798,48 @@ mod tests {
     }
 
     #[test]
+    fn prompt_submit_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-submit-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-submit", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "prompt.submit");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"streaming\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_prompt_submit(
+            json!("r-submit-child"),
+            json!({"session_id": local_id, "text": "hello"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("native prompt.submit response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-submit-child"));
+        assert_eq!(response["result"]["status"], json!("streaming"));
+        let guard = state.lock().unwrap();
+        assert!(guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
     fn session_steer_rejects_lazy_local_session_without_child() {
         let state = test_state();
         let local_id = create_local_session(&state, Some("stored-steer".to_string()), 80).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
 
         let response = handle_session_steer(
             json!("r-steer"),
@@ -3200,11 +3847,80 @@ mod tests {
                 .as_object()
                 .unwrap(),
             &state,
+            &child_stdin,
         )
         .unwrap()
         .expect("native session.steer response");
+        let _ = child.kill();
+        let _ = child.wait();
 
         assert_eq!(response["result"]["status"], json!("rejected"));
+        assert_eq!(response["result"]["text"], json!("keep going"));
+    }
+
+    #[test]
+    fn child_prompt_request_event_maps_request_id_to_local_id() {
+        let state = test_state();
+        bind_child_session(&state, "child-prompt", Some("stored-prompt".to_string())).unwrap();
+
+        let rewritten = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"clarify.request","session_id":"child-prompt","payload":{"question":"Continue?","choices":["yes","no"],"request_id":"child-req-1"}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
+        let request_id = parsed["params"]["payload"]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(request_id.starts_with("rs_prompt_"));
+        let binding = state
+            .lock()
+            .unwrap()
+            .prompt_requests
+            .get(&request_id)
+            .cloned()
+            .expect("prompt binding");
+        assert_eq!(binding.child_request_id, "child-req-1");
+        assert_eq!(binding.local_session_id, "rs_tui_00000001");
+    }
+
+    #[test]
+    fn session_steer_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-steer-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-steer", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "session.steer");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"queued\",\"text\":\"keep going\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_session_steer(
+            json!("r-steer-child"),
+            json!({"session_id": local_id, "text": "keep going"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("native session.steer response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-steer-child"));
+        assert_eq!(response["result"]["status"], json!("queued"));
         assert_eq!(response["result"]["text"], json!("keep going"));
     }
 
@@ -3229,6 +3945,85 @@ mod tests {
     }
 
     #[test]
+    fn session_usage_reads_cached_child_usage() {
+        let state = test_state();
+        bind_child_session(&state, "child-usage", Some("stored-usage".to_string())).unwrap();
+
+        let _ = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"session.info","session_id":"child-usage","payload":{"model":"gpt-test","usage":{"calls":2,"input":11,"output":7,"total":18}}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let response = handle_session_usage(
+            json!("r-usage"),
+            json!({"session_id": "rs_tui_00000001"})
+                .as_object()
+                .unwrap(),
+            &state,
+        )
+        .unwrap()
+        .expect("native session.usage response");
+
+        assert_eq!(response["result"]["model"], json!("gpt-test"));
+        assert_eq!(response["result"]["calls"], json!(2));
+        assert_eq!(response["result"]["total"], json!(18));
+    }
+
+    #[test]
+    fn session_status_uses_cached_runtime_state() {
+        let state = test_state();
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "stored-status".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-status".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .set_session_title("stored-status", "Status title")
+            .unwrap();
+        bind_child_session(&state, "child-status", Some("stored-status".to_string())).unwrap();
+        let _ = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"session.info","session_id":"child-status","payload":{"model":"gpt-live","usage":{"calls":1,"total":42}}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let _ = rewrite_child_line(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"message.start","session_id":"child-status"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let response = handle_session_status(
+            json!("r-status"),
+            json!({"session_id": "rs_tui_00000001"})
+                .as_object()
+                .unwrap(),
+            &store,
+            &state,
+            &helper_context(),
+        )
+        .unwrap()
+        .expect("native session.status response");
+        let output = response["result"]["output"].as_str().unwrap();
+
+        assert!(output.contains("Session ID: stored-status"));
+        assert!(output.contains("Title: Status title"));
+        assert!(output.contains("Model: gpt-live (unknown)"));
+        assert!(output.contains("Tokens: 42"));
+        assert!(output.contains("Agent Running: Yes"));
+    }
+
+    #[test]
     fn approval_respond_is_native_when_store_session_id_is_dirty() {
         let state = test_state();
         let local_id =
@@ -3247,6 +4042,49 @@ mod tests {
         .expect("native approval.respond response");
 
         assert_eq!(response["result"]["resolved"], json!(0));
+    }
+
+    #[test]
+    fn clarify_respond_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let prompt_request_id =
+            bind_prompt_request(&state, "rs_tui_00000001", "child-req-1").unwrap();
+        let (mut child, child_stdin, mut child_stdout) = dummy_child_echo();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "clarify.respond");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"ok\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_text_respond(
+            json!("r-clarify"),
+            json!({"request_id": prompt_request_id, "answer": "yes"})
+                .as_object()
+                .unwrap(),
+            &child_stdin,
+            &state,
+            "clarify.respond",
+            "request_id",
+            "answer",
+        )
+        .unwrap()
+        .expect("native clarify.respond response");
+        let mut outbound = String::new();
+        child_stdout.read_line(&mut outbound).unwrap();
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-clarify"));
+        assert_eq!(response["result"]["status"], json!("ok"));
+        let outbound: Value = serde_json::from_str(outbound.trim()).unwrap();
+        assert_eq!(outbound["params"]["request_id"], json!("child-req-1"));
+        assert_eq!(outbound["params"]["answer"], json!("yes"));
     }
 
     #[test]
