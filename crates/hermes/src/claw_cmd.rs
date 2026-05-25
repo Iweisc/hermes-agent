@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use clap::{Args, Subcommand, ValueEnum};
+use serde_json::Value as JsonValue;
 
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const OPENCLAW_DIR_NAMES: [&str; 3] = [".openclaw", ".clawdbot", ".moltbot"];
+const OPENCLAW_CONFIG_FILE_NAMES: [&str; 3] = ["openclaw.json", "clawdbot.json", "moltbot.json"];
 const OPENCLAW_MIGRATION_SCRIPT_REL: [&str; 4] = [
     "migration",
     "openclaw-migration",
@@ -114,7 +116,7 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if source_dir_is_empty(&source_dir) {
+    if source_dir_is_empty(&source_dir) || source_dir_contains_only_empty_configs(&source_dir) {
         print_migration_banner();
         println!();
         println!("Nothing to migrate from OpenClaw.");
@@ -402,6 +404,51 @@ fn detect_hermes_home() -> PathBuf {
 fn source_dir_is_empty(source_dir: &Path) -> bool {
     std::fs::read_dir(source_dir)
         .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
+fn source_dir_contains_only_empty_configs(source_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(source_dir) else {
+        return false;
+    };
+
+    let mut saw_config = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_file() {
+            return false;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if !OPENCLAW_CONFIG_FILE_NAMES.contains(&name) {
+            return false;
+        }
+        if !config_file_is_empty_object(&entry.path()) {
+            return false;
+        }
+        saw_config = true;
+    }
+    saw_config
+}
+
+fn config_file_is_empty_object(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    serde_json::from_str::<JsonValue>(trimmed)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| object.is_empty()))
         .unwrap_or(false)
 }
 
@@ -889,6 +936,72 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
+    fn migrate_with_config_only_source_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join(".openclaw");
+        let optional_skills = temp.path().join("optional-skills");
+        let script = optional_skills
+            .join("migration")
+            .join("openclaw-migration")
+            .join("scripts")
+            .join("openclaw_to_hermes.py");
+        let hermes_home = temp.path().join(".hermes");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("openclaw.json"), b"{}").unwrap();
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, b"# placeholder").unwrap();
+        fs::create_dir_all(&hermes_home).unwrap();
+
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let old_home = env::var_os("HERMES_HOME");
+        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
+        set_env_var("HERMES_HOME", &hermes_home);
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional_skills);
+        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
+        let result = print_migrate(MigrateArgs {
+            source: Some(source),
+            dry_run: true,
+            preset: MigratePreset::Full,
+            overwrite: false,
+            migrate_secrets: false,
+            no_backup: false,
+            workspace_target: None,
+            skill_conflict: SkillConflict::Skip,
+            yes: false,
+        });
+        let python_called = log.exists();
+
+        match old_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match old_optional {
+            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
+            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
+        }
+        remove_env_var("HERMES_CLAW_PYTHON");
+        result.unwrap();
+        assert!(!python_called);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn migrate_uses_python_override_and_env_flags() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -897,7 +1010,11 @@ exit 9\n",
         let source = temp.path().join(".openclaw");
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("openclaw.json"), b"{}").unwrap();
+        fs::write(
+            source.join("openclaw.json"),
+            br#"{"model":{"provider":"openrouter"}}"#,
+        )
+        .unwrap();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(
             &fake_python,
