@@ -91,6 +91,7 @@ const MAX_SEARCH_LIMIT: i64 = 500;
 const MAX_CONTEXT_LINES: i64 = 20;
 const MAX_PATCH_OPERATIONS: usize = 128;
 const VALID_TODO_STATUSES: &[&str] = &["pending", "in_progress", "completed", "cancelled"];
+pub const ALWAYS_DYNAMIC_TOOLSET: &str = "__always__";
 
 type ToolHandler = fn(&Value, &ToolRuntime) -> String;
 type ToolCheck = fn() -> bool;
@@ -322,6 +323,7 @@ impl TodoStore {
 pub struct ToolRuntime {
     cwd: PathBuf,
     hermes_home: PathBuf,
+    platform: String,
     current_session_id: Option<String>,
     todo_store: Arc<Mutex<TodoStore>>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
@@ -339,6 +341,7 @@ impl ToolRuntime {
         Self {
             cwd: cwd.into(),
             hermes_home: default_hermes_home(),
+            platform: String::new(),
             current_session_id: None,
             todo_store: Arc::new(Mutex::new(TodoStore::default())),
             memory_store: None,
@@ -362,6 +365,15 @@ impl ToolRuntime {
 
     pub fn with_hermes_home(mut self, value: impl Into<PathBuf>) -> Self {
         self.hermes_home = value.into();
+        self
+    }
+
+    pub fn platform(&self) -> &str {
+        self.platform.as_str()
+    }
+
+    pub fn with_platform(mut self, value: impl Into<String>) -> Self {
+        self.platform = value.into().trim().to_string();
         self
     }
 
@@ -558,6 +570,20 @@ impl ToolRuntime {
             .as_ref()
             .map(|callback| (callback.0)(hook_name, payload, self))
             .unwrap_or_default()
+    }
+
+    pub fn invoke_session_boundary_hook(&self, hook_name: &str, session_id: &str) -> Vec<Value> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        self.invoke_hook(
+            hook_name,
+            &json!({
+                "session_id": session_id,
+                "platform": self.platform(),
+            }),
+        )
     }
 }
 
@@ -1644,6 +1670,12 @@ pub fn get_tool_definitions_with_runtime(
     runtime: Option<&ToolRuntime>,
 ) -> Vec<ToolDefinition> {
     let mut selected = BTreeSet::new();
+
+    if let Some(runtime) = runtime {
+        for tool in runtime.resolve_dynamic_toolset(ALWAYS_DYNAMIC_TOOLSET) {
+            selected.insert(tool);
+        }
+    }
 
     if let Some(enabled) = enabled_toolsets {
         for name in enabled {
@@ -3867,6 +3899,37 @@ mod tests {
         assert_eq!(parsed.get("echo"), Some(&json!("hello")));
         let hook_results = child.invoke_hook("pre_llm_call", &json!({}));
         assert_eq!(hook_results, vec![json!({"context": "from parent"})]);
+    }
+
+    #[test]
+    fn session_boundary_hook_uses_runtime_platform() {
+        let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let runtime = ToolRuntime::new(".")
+            .with_platform("cli")
+            .with_hook_invoke_callback({
+                let seen = Arc::clone(&seen);
+                move |hook_name, payload, _runtime| {
+                    seen.lock()
+                        .unwrap()
+                        .push((hook_name.to_string(), payload.clone()));
+                    Vec::new()
+                }
+            });
+
+        runtime.invoke_session_boundary_hook("on_session_finalize", "  session-123  ");
+        runtime.invoke_session_boundary_hook("on_session_finalize", "   ");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "on_session_finalize");
+        assert_eq!(
+            seen[0].1.get("session_id").and_then(Value::as_str),
+            Some("session-123")
+        );
+        assert_eq!(
+            seen[0].1.get("platform").and_then(Value::as_str),
+            Some("cli")
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 
+use crate::tools::ALWAYS_DYNAMIC_TOOLSET;
 use crate::{ToolDefinition, ToolRuntime, tool_error};
 
 const CREDENTIAL_SUFFIXES: [&str; 4] = ["_API_KEY", "_TOKEN", "_SECRET", "_KEY"];
@@ -428,6 +429,64 @@ def _resolve_image_gen_provider():
         provider = get_provider(configured)
     return configured, provider
 
+_SELECTED_CONTEXT_ENGINE_LOADED = False
+_SELECTED_CONTEXT_ENGINE = None
+
+def _load_selected_context_engine():
+    global _SELECTED_CONTEXT_ENGINE_LOADED, _SELECTED_CONTEXT_ENGINE
+    if _SELECTED_CONTEXT_ENGINE_LOADED:
+        return _SELECTED_CONTEXT_ENGINE
+
+    engine_name = "compressor"
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        section = cfg.get("context") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            value = section.get("engine")
+            if isinstance(value, str) and value.strip():
+                engine_name = value.strip()
+    except Exception:
+        pass
+
+    if not engine_name or engine_name == "compressor":
+        return None
+
+    engine = None
+    try:
+        from plugins.context_engine import load_context_engine
+        engine = load_context_engine(engine_name)
+    except Exception:
+        engine = None
+
+    if engine is None:
+        try:
+            from hermes_cli.plugins import get_plugin_context_engine
+            candidate = get_plugin_context_engine()
+            if candidate is not None and getattr(candidate, "name", "") == engine_name:
+                engine = candidate
+        except Exception:
+            pass
+    _SELECTED_CONTEXT_ENGINE = engine
+    _SELECTED_CONTEXT_ENGINE_LOADED = True
+    return _SELECTED_CONTEXT_ENGINE
+
+def _dispatch_context_engine_tool(tool_name, args):
+    engine = _load_selected_context_engine()
+    if engine is None:
+        raise ValueError(f"unknown tool: {tool_name}")
+    names = {
+        str(schema.get("name", "") or "").strip()
+        for schema in (engine.get_tool_schemas() or [])
+        if isinstance(schema, dict)
+    }
+    if tool_name not in names:
+        raise ValueError(f"unknown tool: {tool_name}")
+    result = engine.handle_tool_call(tool_name, args or {}, messages=[])
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False, default=str)
+
 for raw in sys.stdin:
     text = raw.strip()
     if not text:
@@ -437,14 +496,19 @@ for raw in sys.stdin:
         action = str(request.get("action", "")).strip()
         payload = request.get("payload") or {}
         if action == "dispatch":
+            tool_name = payload.get("tool_name", "")
             emit({
                 "ok": True,
-                "result": registry.dispatch(
-                    payload.get("tool_name", ""),
-                    payload.get("args") or {},
-                    task_id=payload.get("task_id"),
-                    session_id=payload.get("session_id"),
-                    enabled_tools=payload.get("enabled_tools"),
+                "result": (
+                    registry.dispatch(
+                        tool_name,
+                        payload.get("args") or {},
+                        task_id=payload.get("task_id"),
+                        session_id=payload.get("session_id"),
+                        enabled_tools=payload.get("enabled_tools"),
+                    )
+                    if registry.get_entry(tool_name) is not None
+                    else _dispatch_context_engine_tool(tool_name, payload.get("args") or {})
                 )
             })
         elif action == "hook":
@@ -674,6 +738,66 @@ const PYTHON_PLUGIN_IMAGE_GEN_PROVIDERS: &str = concat!(
     "print(json.dumps(rows, ensure_ascii=False, default=str))\n",
 );
 
+const PYTHON_CONTEXT_ENGINE_TOOLS: &str = r#"
+import json
+
+from hermes_cli.plugins import discover_plugins
+
+discover_plugins()
+
+def _load_selected_context_engine():
+    engine_name = "compressor"
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        section = cfg.get("context") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            value = section.get("engine")
+            if isinstance(value, str) and value.strip():
+                engine_name = value.strip()
+    except Exception:
+        pass
+
+    if not engine_name or engine_name == "compressor":
+        return None
+
+    engine = None
+    try:
+        from plugins.context_engine import load_context_engine
+        engine = load_context_engine(engine_name)
+    except Exception:
+        engine = None
+
+    if engine is None:
+        try:
+            from hermes_cli.plugins import get_plugin_context_engine
+            candidate = get_plugin_context_engine()
+            if candidate is not None and getattr(candidate, "name", "") == engine_name:
+                engine = candidate
+        except Exception:
+            pass
+    return engine
+
+engine = _load_selected_context_engine()
+definitions = []
+if engine is not None:
+    for schema in engine.get_tool_schemas() or []:
+        if not isinstance(schema, dict):
+            continue
+        name = str(schema.get("name", "") or "").strip()
+        if not name:
+            continue
+        definitions.append({
+            "name": name,
+            "toolset": "__always__",
+            "description": str(schema.get("description", "") or ""),
+            "emoji": "",
+            "schema": schema,
+        })
+
+print(json.dumps(definitions, ensure_ascii=False))
+"#;
+
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -773,9 +897,6 @@ pub fn attach_python_plugin_runtime(
     runtime: ToolRuntime,
 ) -> Result<ToolRuntime, String> {
     let plugins = discover_enabled_general_plugins(hermes_home, runtime.cwd());
-    if plugins.is_empty() {
-        return Ok(runtime);
-    }
     let mut toolsets = BTreeMap::<String, Vec<String>>::new();
     let mut definitions = Vec::new();
     let mut dynamic_tool_names = BTreeSet::new();
@@ -793,6 +914,19 @@ pub fn attach_python_plugin_runtime(
                 definitions.push(definition);
             }
         }
+    }
+    for definition in discover_selected_context_engine_tool_definitions(hermes_home, runtime.cwd())?
+    {
+        if dynamic_tool_names.insert(definition.name.clone()) {
+            toolsets
+                .entry(definition.toolset.clone())
+                .or_default()
+                .push(definition.name.clone());
+            definitions.push(definition);
+        }
+    }
+    if definitions.is_empty() && active_hook_names.is_empty() {
+        return Ok(runtime);
     }
     let runtime = runtime.with_dynamic_tools(definitions, toolsets);
     attach_python_plugin_callbacks(hermes_home, runtime, dynamic_tool_names, active_hook_names)
@@ -838,6 +972,22 @@ pub fn discover_plugin_image_gen_providers(
     cwd: &Path,
 ) -> Result<Vec<ImageGenPluginProvider>, String> {
     run_python_plugin_json(hermes_home, cwd, PYTHON_PLUGIN_IMAGE_GEN_PROVIDERS, &[])
+}
+
+fn discover_selected_context_engine_tool_definitions(
+    hermes_home: &Path,
+    cwd: &Path,
+) -> Result<Vec<ToolDefinition>, String> {
+    let mut definitions = run_python_plugin_json::<Vec<ToolDefinition>>(
+        hermes_home,
+        cwd,
+        PYTHON_CONTEXT_ENGINE_TOOLS,
+        &[],
+    )?;
+    for definition in &mut definitions {
+        definition.toolset = ALWAYS_DYNAMIC_TOOLSET.to_string();
+    }
+    Ok(definitions)
 }
 
 fn run_python_plugin_json<T: for<'de> Deserialize<'de>>(
@@ -2259,7 +2409,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    use crate::get_tool_definitions_with_runtime;
+    use crate::{dispatch_tool, get_tool_definitions_with_runtime};
 
     #[test]
     fn attach_python_plugin_runtime_uses_static_tool_and_hook_discovery() {
@@ -2379,6 +2529,104 @@ def register(ctx):
         assert!(
             runtime
                 .invoke_hook("post_llm_call", &json!({"session_id": "session-1"}))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn attach_python_plugin_runtime_bridges_selected_context_engine_tools() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        let plugin_dir = home.join("plugins").join("demo-context");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: demo-context\ndescription: Demo context engine\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+import json
+
+from agent.context_engine import ContextEngine
+
+class DemoContextEngine(ContextEngine):
+    def __init__(self):
+        self.calls = 0
+
+    @property
+    def name(self):
+        return "demo-engine"
+
+    def update_from_response(self, usage):
+        return None
+
+    def should_compress(self, prompt_tokens=None):
+        return False
+
+    def compress(self, messages, current_tokens=None, focus_topic=None):
+        return messages
+
+    def get_tool_schemas(self):
+        return [{
+            "name": "demo_engine_lookup",
+            "description": "Demo context engine tool",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        }]
+
+    def handle_tool_call(self, name, args, **kwargs):
+        self.calls += 1
+        return json.dumps({
+            "success": True,
+            "query": (args or {}).get("query", ""),
+            "calls": self.calls,
+        })
+
+def register(ctx):
+    ctx.register_context_engine(DemoContextEngine())
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - demo-context\ncontext:\n  engine: demo-engine\n",
+        )
+        .unwrap();
+
+        let runtime = attach_python_plugin_runtime(
+            &home,
+            ToolRuntime::new(temp.path()).with_hermes_home(&home),
+        )
+        .unwrap();
+
+        let enabled_toolsets = vec![String::from("hermes-cli")];
+        let definitions =
+            get_tool_definitions_with_runtime(Some(&enabled_toolsets), None, Some(&runtime));
+        assert!(
+            definitions
+                .iter()
+                .any(|tool| tool.name == "demo_engine_lookup")
+        );
+
+        let result = dispatch_tool("demo_engine_lookup", json!({"query": "status"}), &runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["query"], json!("status"));
+        assert_eq!(parsed["calls"], json!(1));
+
+        let result = dispatch_tool("demo_engine_lookup", json!({"query": "again"}), &runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["query"], json!("again"));
+        assert_eq!(parsed["calls"], json!(2));
+        assert!(
+            runtime
+                .invoke_hook("pre_llm_call", &json!({"session_id": "s"}))
                 .is_empty()
         );
     }

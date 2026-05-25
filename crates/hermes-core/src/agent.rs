@@ -136,7 +136,7 @@ impl HermesContext {
             log::warn!(target: "run_agent", "memory bootstrap skipped: {error}");
         }
         let mut session_hook_guard =
-            SessionHookGuard::new(tool_runtime.clone(), runtime_model.model.clone(), "");
+            SessionHookGuard::new(tool_runtime.clone(), runtime_model.model.clone());
         let disabled_toolsets =
             (!loaded.config.memory.any_enabled()).then(|| vec![String::from("memory")]);
         let tools = get_tool_definitions_with_runtime(
@@ -203,7 +203,7 @@ impl HermesContext {
             "conversation_history": messages.clone(),
             "is_first_turn": session_hint.is_none(),
             "model": runtime_model.model.clone(),
-            "platform": "",
+            "platform": tool_runtime.platform(),
             "sender_id": "",
         });
         for hook_result in tool_runtime.invoke_hook("pre_llm_call", &pre_llm_payload) {
@@ -293,7 +293,7 @@ impl HermesContext {
                 &json!({
                     "task_id": tool_runtime.current_session_id().unwrap_or_default(),
                     "session_id": tool_runtime.current_session_id().unwrap_or_default(),
-                    "platform": "",
+                    "platform": tool_runtime.platform(),
                     "model": runtime_model.model.clone(),
                     "provider": runtime_model.provider.clone(),
                     "base_url": runtime_model.base_url.clone(),
@@ -328,7 +328,7 @@ impl HermesContext {
                 &json!({
                     "task_id": tool_runtime.current_session_id().unwrap_or_default(),
                     "session_id": tool_runtime.current_session_id().unwrap_or_default(),
-                    "platform": "",
+                    "platform": tool_runtime.platform(),
                     "model": runtime_model.model.clone(),
                     "provider": runtime_model.provider.clone(),
                     "base_url": runtime_model.base_url.clone(),
@@ -381,7 +381,7 @@ impl HermesContext {
                         "assistant_response": final_response.clone(),
                         "conversation_history": messages.clone(),
                         "model": runtime_model.model.clone(),
-                        "platform": "",
+                        "platform": tool_runtime.platform(),
                     }),
                 );
                 session_hook_guard.mark_completed();
@@ -3799,12 +3799,12 @@ struct SessionHookGuard {
 }
 
 impl SessionHookGuard {
-    fn new(runtime: ToolRuntime, model: String, platform: impl Into<String>) -> Self {
+    fn new(runtime: ToolRuntime, model: String) -> Self {
         Self {
             session_id: runtime.current_session_id().map(ToOwned::to_owned),
+            platform: runtime.platform().to_string(),
             runtime,
             model,
-            platform: platform.into(),
             completed: false,
             interrupted: false,
         }
@@ -5176,6 +5176,7 @@ for raw in sys.stdin:
         let events = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let runtime = ToolRuntime::new(temp.path())
             .with_hermes_home(temp.path())
+            .with_platform("cli")
             .with_hook_invoke_callback({
                 let events = Arc::clone(&events);
                 move |hook_name, payload, _runtime| {
@@ -5230,6 +5231,10 @@ for raw in sys.stdin:
             events[0].1.get("model").and_then(Value::as_str),
             Some("test-model")
         );
+        assert_eq!(
+            events[0].1.get("platform").and_then(Value::as_str),
+            Some("cli")
+        );
         assert_eq!(events[1].0, "on_session_end");
         assert_eq!(
             events[1].1.get("session_id").and_then(Value::as_str),
@@ -5242,6 +5247,10 @@ for raw in sys.stdin:
         assert_eq!(
             events[1].1.get("interrupted").and_then(Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            events[1].1.get("platform").and_then(Value::as_str),
+            Some("cli")
         );
     }
 
@@ -5286,6 +5295,7 @@ for raw in sys.stdin:
         let events = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let runtime = ToolRuntime::new(temp.path())
             .with_hermes_home(temp.path())
+            .with_platform("cli")
             .with_hook_invoke_callback({
                 let events = Arc::clone(&events);
                 move |hook_name, payload, _runtime| {
@@ -5335,6 +5345,10 @@ for raw in sys.stdin:
         assert_eq!(
             events[0].1.get("session_id").and_then(Value::as_str),
             Some(session_id.as_str())
+        );
+        assert_eq!(
+            events[0].1.get("platform").and_then(Value::as_str),
+            Some("cli")
         );
     }
 

@@ -745,6 +745,7 @@ fn run_chat(
         context,
         ToolRuntime::default()
             .with_hermes_home(context.hermes_home())
+            .with_platform("cli")
             .with_clarify_callback(run_clarify_prompt),
     )?;
     let delegate = delegate.with_runtime_template(runtime.clone());
@@ -761,6 +762,9 @@ fn run_chat(
         Some(session_store),
     )?;
     println!("{}", result.final_response);
+    if let Some(session_id) = result.session_id.as_deref() {
+        let _ = runtime.invoke_session_boundary_hook("on_session_finalize", session_id);
+    }
     Ok(())
 }
 
