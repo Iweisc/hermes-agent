@@ -146,11 +146,17 @@ fn merge_compat_subcommands(info: &mut CommandInfo) {
 
 fn compat_subcommands_for(name: &str) -> Vec<CommandInfo> {
     match name {
+        "approve" => vec![
+            compat_command("all", &[], Vec::new()),
+            compat_command("session", &[], Vec::new()),
+            compat_command("always", &[], Vec::new()),
+        ],
         "browser" => vec![
             compat_command("connect", &[], Vec::new()),
             compat_command("disconnect", &[], Vec::new()),
             compat_command("status", &[], Vec::new()),
         ],
+        "deny" => vec![compat_command("all", &[], Vec::new())],
         "busy" => vec![
             compat_command("queue", &[], Vec::new()),
             compat_command("steer", &[], Vec::new()),
@@ -175,6 +181,7 @@ fn compat_subcommands_for(name: &str) -> Vec<CommandInfo> {
             compat_command("resume", &[], Vec::new()),
             compat_command("clear", &[], Vec::new()),
         ],
+        "rollback" => vec![compat_command("diff", &[], Vec::new())],
         "indicator" => vec![
             compat_command("kaomoji", &[], Vec::new()),
             compat_command("emoji", &[], Vec::new()),
@@ -222,6 +229,10 @@ fn compat_subcommands_for(name: &str) -> Vec<CommandInfo> {
             compat_command("show", &[], Vec::new()),
             compat_command("hide", &[], Vec::new()),
             compat_command("on", &[], Vec::new()),
+            compat_command("off", &[], Vec::new()),
+        ],
+        "topic" => vec![
+            compat_command("help", &[], Vec::new()),
             compat_command("off", &[], Vec::new()),
         ],
         "voice" => vec![
@@ -722,6 +733,7 @@ mod tests {
         assert!(bash.contains("paste"));
         assert!(bash.contains("queue"));
         assert!(bash.contains("redraw"));
+        assert!(bash.contains("rollback"));
         assert!(bash.contains("restart"));
         assert!(bash.contains("retry"));
         assert!(bash.contains("steer"));
@@ -729,37 +741,58 @@ mod tests {
         assert!(bash.contains("title"));
         assert!(bash.contains("undo"));
         assert!(bash.contains("background"));
+        assert!(bash.contains("approve"));
+        assert!(bash.contains("deny"));
+        assert!(bash.contains("set-home"));
         assert!(bash.contains("show"));
         assert!(bash.contains("hide"));
         assert!(bash.contains("connect"));
         assert!(bash.contains("disconnect"));
         assert!(bash.contains("status"));
+        assert!(bash.contains("topic"));
 
         assert!(fish.contains("-a bg -d 'Alias for background'"));
         assert!(fish.contains("-a tasks -d 'Alias for agents'"));
         assert!(fish.contains("-a fork -d 'Alias for branch'"));
         assert!(fish.contains("-a q -d 'Alias for queue'"));
         assert!(fish.contains("-a reset -d 'Alias for new'"));
+        assert!(fish.contains("-a set-home -d 'Alias for sethome'"));
         assert!(fish.contains("-a gquota -d ''"));
         assert!(fish.contains("-a reload_mcp -d 'Alias for reload-mcp'"));
+        assert!(fish.contains("__fish_seen_subcommand_from approve"));
+        assert!(fish.contains(" -a always "));
+        assert!(fish.contains("__fish_seen_subcommand_from deny"));
+        assert!(fish.contains(" -a all "));
         assert!(fish.contains("__fish_seen_subcommand_from reasoning"));
         assert!(fish.contains(" -a xhigh "));
         assert!(fish.contains("__fish_seen_subcommand_from goal"));
         assert!(fish.contains(" -a pause "));
+        assert!(fish.contains("__fish_seen_subcommand_from rollback"));
+        assert!(fish.contains(" -a diff "));
         assert!(fish.contains("__fish_seen_subcommand_from browser"));
         assert!(fish.contains(" -a disconnect "));
+        assert!(fish.contains("__fish_seen_subcommand_from topic"));
+        assert!(fish.contains(" -a off "));
 
         assert!(zsh.contains("'bg:Alias for background'"));
         assert!(zsh.contains("'tasks:Alias for agents'"));
         assert!(zsh.contains("'fork:Alias for branch'"));
         assert!(zsh.contains("'q:Alias for queue'"));
         assert!(zsh.contains("'reset:Alias for new'"));
+        assert!(zsh.contains("'set-home:Alias for sethome'"));
         assert!(zsh.contains("'gquota:"));
         assert!(zsh.contains("'reload_mcp:Alias for reload-mcp'"));
+        assert!(zsh.contains("_describe 'approve command'"));
+        assert!(zsh.contains("'always:"));
+        assert!(zsh.contains("_describe 'deny command'"));
         assert!(zsh.contains("_describe 'reasoning command'"));
         assert!(zsh.contains("'xhigh:"));
         assert!(zsh.contains("_describe 'goal command'"));
         assert!(zsh.contains("'pause:"));
+        assert!(zsh.contains("_describe 'rollback command'"));
+        assert!(zsh.contains("'diff:"));
         assert!(zsh.contains("_describe 'browser command'"));
+        assert!(zsh.contains("_describe 'topic command'"));
+        assert!(zsh.contains("'off:"));
     }
 }
