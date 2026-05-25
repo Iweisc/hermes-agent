@@ -1145,6 +1145,13 @@ const MATRIX_SETUP_INSTRUCTIONS: &[&str] = &[
     "5. Matrix user IDs look like @username:server and room IDs look like !abc123:server",
 ];
 
+const SIGNAL_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Install signal-cli or run the bbernhard/signal-cli-rest-api container",
+    "2. Link your Signal account and start the HTTP daemon",
+    "3. Default local daemon URL: http://127.0.0.1:8080",
+    "4. Signal account numbers should use E.164 format, e.g. +15551234567",
+];
+
 const EMAIL_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Use a dedicated email account for your Hermes agent",
     "2. For Gmail: enable 2FA, then create an App Password at",
@@ -1476,8 +1483,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Signal",
         emoji: "📡",
         token_var: "SIGNAL_HTTP_URL",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: SIGNAL_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -2202,6 +2209,10 @@ fn configure_native_gateway_builtin_platform_with_io(
             configure_matrix_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
+        "signal" => {
+            configure_signal_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -2336,6 +2347,227 @@ fn configure_matrix_gateway_platform_with_io(
     writeln!(output)?;
     writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
     Ok(())
+}
+
+fn configure_signal_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_url = read_effective_env_value(context, "SIGNAL_HTTP_URL");
+    let existing_account = read_effective_env_value(context, "SIGNAL_ACCOUNT");
+    if existing_url.is_some() && existing_account.is_some() {
+        writeln!(output)?;
+        writeln!(output, "Signal is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure Signal?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    if which_on_path("signal-cli").is_some() {
+        writeln!(output, "  signal-cli found on PATH.")?;
+    } else {
+        writeln!(output, "  signal-cli not found on PATH.")?;
+        writeln!(
+            output,
+            "  Signal requires signal-cli running as an HTTP daemon."
+        )?;
+        writeln!(
+            output,
+            "  Install: https://github.com/AsamK/signal-cli/releases"
+        )?;
+        writeln!(output, "  macOS: brew install signal-cli")?;
+        writeln!(output, "  Docker: bbernhard/signal-cli-rest-api")?;
+        writeln!(
+            output,
+            "  Start daemon: signal-cli --account +YOURNUMBER daemon --http 127.0.0.1:8080"
+        )?;
+    }
+
+    let default_url = existing_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("http://127.0.0.1:8080");
+    let url = loop {
+        writeln!(output)?;
+        writeln!(
+            output,
+            "  Enter the URL where the signal-cli HTTP daemon is running."
+        )?;
+        let raw = prompt_gateway_line(
+            input,
+            output,
+            format!("  HTTP URL [{default_url}]").as_str(),
+        )?;
+        let candidate = if raw.trim().is_empty() {
+            default_url.to_string()
+        } else {
+            raw.trim().to_string()
+        };
+        match normalize_signal_http_url(&candidate) {
+            Some(url) => break url,
+            None => writeln!(output, "  Enter an http:// or https:// URL.")?,
+        }
+    };
+
+    writeln!(output, "  Testing connection...")?;
+    match probe_signal_http_daemon(&url) {
+        Ok(200) => writeln!(output, "  signal-cli daemon is reachable.")?,
+        Ok(status) => {
+            writeln!(output, "  signal-cli responded with status {status}.")?;
+            if !prompt_gateway_yes_no(input, output, "Continue anyway?", false)? {
+                return Ok(());
+            }
+        }
+        Err(error) => {
+            writeln!(output, "  Could not reach signal-cli at {url}: {error}")?;
+            if !prompt_gateway_yes_no(
+                input,
+                output,
+                "Save this URL anyway? (you can start signal-cli later)",
+                true,
+            )? {
+                return Ok(());
+            }
+        }
+    }
+    save_env_value(context.env_path(), "SIGNAL_HTTP_URL", &url)?;
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Enter your Signal account phone number in E.164 format."
+    )?;
+    let account = loop {
+        let prompt = if let Some(existing) = existing_account
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            format!("  Account number [{existing}]")
+        } else {
+            String::from("  Account number")
+        };
+        let raw = prompt_gateway_line(input, output, &prompt)?;
+        let candidate = if raw.trim().is_empty() {
+            existing_account.clone().unwrap_or_default()
+        } else {
+            raw.trim().to_string()
+        };
+        if is_valid_signal_account(&candidate) {
+            break candidate;
+        }
+        writeln!(
+            output,
+            "  Account number is required and should look like +15551234567."
+        )?;
+    };
+    save_env_value(context.env_path(), "SIGNAL_ACCOUNT", &account)?;
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Enter phone numbers or UUIDs of allowed users (comma-separated)."
+    )?;
+    let existing_allowed = read_effective_env_value(context, "SIGNAL_ALLOWED_USERS");
+    let default_allowed = existing_allowed
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&account);
+    let allowed = prompt_gateway_line(
+        input,
+        output,
+        format!("  Allowed users [{default_allowed}]").as_str(),
+    )?;
+    let allowed = if allowed.trim().is_empty() {
+        default_allowed.to_string()
+    } else {
+        normalize_gateway_allowlist("SIGNAL_ALLOWED_USERS", allowed.trim())
+    };
+    save_env_value(context.env_path(), "SIGNAL_ALLOWED_USERS", &allowed)?;
+
+    writeln!(output)?;
+    if prompt_gateway_yes_no(
+        input,
+        output,
+        "Enable group messaging? (disabled by default for security)",
+        false,
+    )? {
+        writeln!(output)?;
+        writeln!(output, "  Enter group IDs to allow, or * for all groups.")?;
+        let existing_groups = read_effective_env_value(context, "SIGNAL_GROUP_ALLOWED_USERS");
+        let default_groups = existing_groups
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("*");
+        let groups = prompt_gateway_line(
+            input,
+            output,
+            format!("  Group IDs [{default_groups}]").as_str(),
+        )?;
+        let groups = if groups.trim().is_empty() {
+            default_groups.to_string()
+        } else {
+            groups.replace(' ', "")
+        };
+        save_env_value(context.env_path(), "SIGNAL_GROUP_ALLOWED_USERS", &groups)?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    writeln!(output, "  URL: {url}")?;
+    writeln!(output, "  Account: {account}")?;
+    writeln!(output, "  DM auth: SIGNAL_ALLOWED_USERS + DM pairing")?;
+    let groups_enabled = read_effective_env_value(context, "SIGNAL_GROUP_ALLOWED_USERS").is_some();
+    writeln!(
+        output,
+        "  Groups: {}",
+        if groups_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )?;
+    Ok(())
+}
+
+fn normalize_signal_http_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => Some(trimmed.to_string()),
+        _ => None,
+    }
+}
+
+fn is_valid_signal_account(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits = trimmed.strip_prefix('+').unwrap_or_default();
+    (8..=16).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn probe_signal_http_daemon(url: &str) -> Result<u16, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()?;
+    let response = client
+        .get(format!("{}/api/v1/check", url.trim_end_matches('/')))
+        .send()?;
+    Ok(response.status().as_u16())
 }
 
 fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
@@ -4300,7 +4532,7 @@ fn remove_env_var(key: &str) {
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
     use tempfile::TempDir;
 
     #[derive(Parser, Debug)]
@@ -4571,7 +4803,14 @@ exit 9\n",
             .iter()
             .find(|platform| platform.key == "signal")
             .unwrap();
-        assert!(signal.has_builtin_setup);
+        assert!(!signal.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(signal));
+
+        let dingtalk = metadata
+            .iter()
+            .find(|platform| platform.key == "dingtalk")
+            .unwrap();
+        assert!(dingtalk.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -4659,6 +4898,10 @@ exit 9\n",
             "MATRIX_ENCRYPTION",
             "MATRIX_ALLOWED_USERS",
             "MATRIX_HOME_ROOM",
+            "SIGNAL_HTTP_URL",
+            "SIGNAL_ACCOUNT",
+            "SIGNAL_ALLOWED_USERS",
+            "SIGNAL_GROUP_ALLOWED_USERS",
         ] {
             remove_env_var(key);
         }
@@ -4706,6 +4949,11 @@ exit 9\n",
             .find(|platform| platform.key == "bluebubbles")
             .unwrap();
         assert_eq!(bluebubbles.status, "not configured");
+        let signal = metadata
+            .iter()
+            .find(|platform| platform.key == "signal")
+            .unwrap();
+        assert_eq!(signal.status, "not configured");
     }
 
     #[test]
@@ -4735,10 +4983,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "signal").unwrap();
+        run_gateway_platform_setup_bridge(true, "dingtalk").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=signal"));
+        assert!(log_text.contains("platform accept=1 key=dingtalk"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -4812,6 +5060,91 @@ exit 9\n",
         assert!(!log_text.contains("platform=matrix"));
         assert!(!log_text.contains("-m pip"));
 
+        remove_env_var("HERMES_GATEWAY_PYTHON");
+        remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_signal_gateway_platform_uses_native_setup_without_bridge() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "SIGNAL_HTTP_URL",
+            "SIGNAL_ACCOUNT",
+            "SIGNAL_ALLOWED_USERS",
+            "SIGNAL_GROUP_ALLOWED_USERS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_bin = temp.path().join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::write(fake_bin.join("signal-cli"), "#!/bin/sh\nexit 0\n").unwrap();
+        let original_path = env::var_os("PATH");
+        set_env_var("PATH", &fake_bin);
+
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "signal")
+            .unwrap();
+        let mut input = Cursor::new(format!(
+            "http://{addr}/\n+15551234567\n+15551234567, +15557654321\ny\ngroup-a, group-b\n"
+        ));
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains(&format!("SIGNAL_HTTP_URL=http://{addr}")));
+        assert!(env_text.contains("SIGNAL_ACCOUNT=+15551234567"));
+        assert!(env_text.contains("SIGNAL_ALLOWED_USERS=+15551234567,+15557654321"));
+        assert!(env_text.contains("SIGNAL_GROUP_ALLOWED_USERS=group-a,group-b"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "signal")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        if let Some(path) = original_path {
+            set_env_var("PATH", path);
+        } else {
+            remove_env_var("PATH");
+        }
         remove_env_var("HERMES_GATEWAY_PYTHON");
         remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
     }
