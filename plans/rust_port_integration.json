@@ -23,7 +23,7 @@
       "plans/rust_port_integration.json",
       "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "7c2875a24521"
+    "state_fingerprint": "71c9eaa7cde0"
   },
   "merge_order": [
     {
@@ -188,13 +188,10 @@
         "crates/hermes/src/completion.rs",
         "crates/hermes/src/curator_cmd.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/model_cmd.rs"
-      ],
-      "head": "8dd022743",
-      "subject": "test: harden rust setup parity checks"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "5577b13a6",
+      "subject": "test: stabilize rust model setup drift checks"
     },
     {
       "worktree": "agent-03",
@@ -255,12 +252,10 @@
         "crates/hermes-core/src/checkpoints.rs",
         "crates/hermes-core/src/context_engine.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-core/src/state.rs"
-      ],
-      "head": "cd1379cd6",
-      "subject": "Add native gateway branch and resize RPCs"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "5f5d0e4aa",
+      "subject": "Add Rust session usage accounting"
     },
     {
       "worktree": "agent-07",
@@ -314,8 +309,10 @@
         "ui-tui/package.json",
         "scripts/smoke_tui_rust_backend.py"
       ],
-      "status": "diverged",
-      "observed_dirty_files": [],
+      "status": "dirty",
+      "observed_dirty_files": [
+        "crates/hermes-agent/src/tui_gateway.rs"
+      ],
       "head": "6c27e0529",
       "subject": "WIP: move TUI ops RPCs into Rust gateway"
     },
@@ -368,8 +365,8 @@
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
-      "head": "795644078",
-      "subject": "WIP: add native gateway restart host actions"
+      "head": "01b9d35a0",
+      "subject": "WIP: port gateway approval command runtime"
     },
     {
       "worktree": "agent-13",
@@ -399,11 +396,10 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "crates/hermes-core/src/agent.rs",
         "crates/hermes/src/native_api_server.rs"
       ],
-      "head": "9f8ba0b70",
-      "subject": "WIP: extend native gateway runtime parity"
+      "head": "33c686c65",
+      "subject": "Fix native session-backed API streaming progress"
     },
     {
       "worktree": "agent-15",
@@ -457,6 +453,7 @@
         "crates/hermes-agent/src/main.rs",
         "crates/hermes-core/src/agent.rs",
         "crates/hermes-core/src/cronjob.rs",
+        "crates/hermes-core/src/plugin_runtime.rs",
         "crates/hermes-core/src/tools.rs",
         "crates/hermes/src/main.rs"
       ],
@@ -553,7 +550,7 @@
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 10 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 9 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -583,7 +580,7 @@
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=10, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=9, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -1221,8 +1218,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "10 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=10.",
+      "summary": "9 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=9.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1416,8 +1413,8 @@
       ]
     }
   ],
-  "last_synced_at": "2026-05-25T16:19:50+00:00",
-  "state_fingerprint": "7c2875a24521",
+  "last_synced_at": "2026-05-25T16:24:42+00:00",
+  "state_fingerprint": "71c9eaa7cde0",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
