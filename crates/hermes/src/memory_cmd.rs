@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 
 use clap::{Args, Subcommand, ValueEnum};
 use hermes_core::{HermesContext, LoadedConfig};
@@ -57,7 +57,6 @@ enum SetupMode {
     NativeGeneric,
     NativeHoncho,
     NativeHindsight,
-    PythonHook,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -90,7 +89,6 @@ struct SetupProvider {
     hint: String,
     mode: SetupMode,
     fields: Vec<SetupField>,
-    bridge_save_config: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,10 +107,6 @@ struct DefaultFrom {
 
 #[derive(Debug, Deserialize)]
 struct BridgedProviderMetadata {
-    #[serde(default)]
-    has_post_setup: bool,
-    #[serde(default)]
-    has_save_config: bool,
     #[serde(default)]
     is_available: bool,
     #[serde(default)]
@@ -151,6 +145,8 @@ struct BridgedDefaultFrom {
 
 #[derive(Debug, Default, Deserialize)]
 struct MemoryPluginManifest {
+    #[serde(default)]
+    requires_env: Vec<String>,
     #[serde(default)]
     pip_dependencies: Vec<String>,
     #[serde(default)]
@@ -310,13 +306,6 @@ fn print_memory_setup(
                 SetupMode::NativeGeneric => run_native_provider_setup(context, provider),
                 SetupMode::NativeHoncho => run_honcho_provider_setup(context, provider),
                 SetupMode::NativeHindsight => run_hindsight_provider_setup(context, provider),
-                SetupMode::PythonHook => {
-                    println!(
-                        "\n  Handing off to the provider-specific setup for {}.\n",
-                        provider.name
-                    );
-                    bridge_memory_setup_provider(&provider.name)
-                }
             }
         }
     }
@@ -331,7 +320,7 @@ fn discover_memory_setup_providers(context: &HermesContext) -> Vec<SetupProvider
 
 fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> SetupProvider {
     let display_home = context.display_hermes_home();
-    let (mode, fields, bridge_save_config) = match provider.name.as_str() {
+    let (mode, fields) = match provider.name.as_str() {
         "byterover" => (
             SetupMode::NativeGeneric,
             vec![SetupField {
@@ -347,7 +336,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                 when: BTreeMap::new(),
                 default_from: None,
             }],
-            false,
         ),
         "holographic" => (
             SetupMode::NativeGeneric,
@@ -405,7 +393,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                     default_from: None,
                 },
             ],
-            false,
         ),
         "mem0" => (
             SetupMode::NativeGeneric,
@@ -463,7 +450,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                     default_from: None,
                 },
             ],
-            false,
         ),
         "openviking" => (
             SetupMode::NativeGeneric,
@@ -536,7 +522,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                     default_from: None,
                 },
             ],
-            false,
         ),
         "retaindb" => (
             SetupMode::NativeGeneric,
@@ -581,7 +566,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                     default_from: None,
                 },
             ],
-            false,
         ),
         "supermemory" => (
             SetupMode::NativeGeneric,
@@ -598,29 +582,18 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
                 when: BTreeMap::new(),
                 default_from: None,
             }],
-            false,
         ),
-        "honcho" => (SetupMode::NativeHoncho, Vec::new(), false),
-        "hindsight" => (SetupMode::NativeHindsight, Vec::new(), false),
+        "honcho" => (SetupMode::NativeHoncho, Vec::new()),
+        "hindsight" => (SetupMode::NativeHindsight, Vec::new()),
         name => {
             if let Ok(Some(manifest)) = load_manifest_provider_spec(context, name) {
-                (manifest.mode, manifest.fields, manifest.bridge_save_config)
-            } else if schema_free_provider_has_no_setup_hooks(context, name) {
-                (SetupMode::NativeGeneric, Vec::new(), false)
+                (manifest.mode, manifest.fields)
             } else {
-                match load_bridged_provider_spec(context, name) {
-                    Ok(bridged) => (bridged.mode, bridged.fields, bridged.bridge_save_config),
-                    Err(_) => (SetupMode::PythonHook, Vec::new(), false),
-                }
+                (SetupMode::NativeGeneric, Vec::new())
             }
         }
     };
-
-    let hint = if mode == SetupMode::PythonHook {
-        String::from("custom setup")
-    } else {
-        render_setup_hint(&fields)
-    };
+    let hint = render_setup_hint(&fields);
 
     SetupProvider {
         name: provider.name,
@@ -628,7 +601,6 @@ fn setup_provider_spec(context: &HermesContext, provider: ProviderInfo) -> Setup
         hint,
         mode,
         fields,
-        bridge_save_config,
     }
 }
 
@@ -659,17 +631,7 @@ fn load_manifest_provider_spec(
     let Some(setup) = manifest.setup else {
         return Ok(None);
     };
-
-    if setup.post_setup {
-        return Ok(Some(SetupProvider {
-            name: provider_name.to_string(),
-            description: String::new(),
-            hint: String::from("custom setup"),
-            mode: SetupMode::PythonHook,
-            fields: Vec::new(),
-            bridge_save_config: false,
-        }));
-    }
+    let _legacy_post_setup = setup.post_setup;
 
     let fields = setup
         .schema
@@ -684,77 +646,7 @@ fn load_manifest_provider_spec(
         hint,
         mode: SetupMode::NativeGeneric,
         fields,
-        bridge_save_config: setup.save_config,
     }))
-}
-
-fn load_bridged_provider_spec(
-    context: &HermesContext,
-    provider_name: &str,
-) -> Result<SetupProvider, Box<dyn Error>> {
-    let metadata = load_bridged_provider_metadata(context, provider_name)?;
-    if metadata.has_post_setup {
-        return Ok(SetupProvider {
-            name: provider_name.to_string(),
-            description: String::new(),
-            hint: String::from("custom setup"),
-            mode: SetupMode::PythonHook,
-            fields: Vec::new(),
-            bridge_save_config: false,
-        });
-    }
-
-    let fields = metadata
-        .schema
-        .into_iter()
-        .map(bridged_schema_field_to_setup_field)
-        .collect::<Result<Vec<_>, _>>()?;
-    let hint = render_setup_hint(&fields);
-
-    Ok(SetupProvider {
-        name: provider_name.to_string(),
-        description: String::new(),
-        hint,
-        mode: SetupMode::NativeGeneric,
-        fields,
-        bridge_save_config: metadata.has_save_config,
-    })
-}
-
-fn schema_free_provider_has_no_setup_hooks(context: &HermesContext, provider_name: &str) -> bool {
-    let Some(dir) = find_memory_provider_dir(context, provider_name) else {
-        return false;
-    };
-    let Ok(source) = fs::read_to_string(dir.join("__init__.py")) else {
-        return false;
-    };
-    !["get_config_schema", "post_setup", "save_config"]
-        .iter()
-        .any(|needle| source.contains(needle))
-}
-
-fn load_bridged_provider_metadata(
-    _context: &HermesContext,
-    provider_name: &str,
-) -> Result<BridgedProviderMetadata, Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
-        .ok_or("could not find a Python interpreter for memory setup")?;
-
-    let output = Command::new(&python)
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_MEMORY_PROVIDER", provider_name)
-        .arg("-c")
-        .arg(MEMORY_SETUP_METADATA_BOOTSTRAP)
-        .output()?;
-    if !output.status.success() {
-        return Err(exit_status_message("memory metadata", output.status).into());
-    }
-    let stdout = String::from_utf8(output.stdout)?;
-    serde_json::from_str::<BridgedProviderMetadata>(stdout.trim()).map_err(|error| {
-        format!("invalid memory provider metadata for {provider_name}: {error}").into()
-    })
 }
 
 fn load_provider_status_metadata(
@@ -767,7 +659,10 @@ fn load_provider_status_metadata(
     if let Some(metadata) = manifest_provider_metadata(context, provider_name)? {
         return Ok(metadata);
     }
-    load_bridged_provider_metadata(context, provider_name)
+    Ok(BridgedProviderMetadata {
+        is_available: true,
+        schema: Vec::new(),
+    })
 }
 
 fn native_provider_metadata(
@@ -776,8 +671,6 @@ fn native_provider_metadata(
 ) -> Option<BridgedProviderMetadata> {
     let fields = native_status_fields(context, provider_name)?;
     Some(BridgedProviderMetadata {
-        has_post_setup: matches!(provider_name, "honcho" | "hindsight"),
-        has_save_config: matches!(provider_name, "holographic" | "mem0" | "supermemory"),
         is_available: native_provider_available(context, provider_name),
         schema: fields
             .into_iter()
@@ -796,22 +689,38 @@ fn manifest_provider_metadata(
     let Some(manifest) = read_memory_plugin_manifest(&dir) else {
         return Ok(None);
     };
-    let Some(setup) = manifest.setup else {
-        return Ok(None);
-    };
-    if setup.post_setup {
-        return Ok(None);
+    let setup = manifest.setup.unwrap_or_default();
+    let mut schema = setup.schema;
+    if schema.is_empty() && !manifest.requires_env.is_empty() {
+        schema = manifest
+            .requires_env
+            .iter()
+            .map(|env_var| BridgedSchemaField {
+                key: env_var.to_ascii_lowercase(),
+                description: Some(env_var.clone()),
+                default: None,
+                secret: true,
+                env_var: Some(env_var.clone()),
+                url: None,
+                required: true,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
+            })
+            .collect();
     }
 
     let is_available = setup.is_available.unwrap_or_else(|| {
-        manifest_required_fields_available(context, provider_name, setup.schema.as_slice())
+        manifest_required_fields_available(context, provider_name, schema.as_slice())
+            && manifest
+                .requires_env
+                .iter()
+                .all(|env_var| env_nonempty(env_var))
     });
 
     Ok(Some(BridgedProviderMetadata {
-        has_post_setup: false,
-        has_save_config: setup.save_config,
         is_available,
-        schema: setup.schema,
+        schema,
     }))
 }
 
@@ -2135,11 +2044,7 @@ fn persist_native_provider_setup_outputs(
     if provider_values.is_empty() {
         return Ok(());
     }
-
-    let manifest_saved = persist_manifest_provider_state(context, &provider.name, provider_values)?;
-    if provider.bridge_save_config && !manifest_saved {
-        bridge_memory_save_config(context, &provider.name, provider_values)?;
-    }
+    persist_manifest_provider_state(context, &provider.name, provider_values)?;
     Ok(())
 }
 
@@ -2645,117 +2550,6 @@ fn mask_secret(value: &str) -> String {
     }
     let suffix = chars[chars.len() - 4..].iter().collect::<String>();
     format!("...{suffix}")
-}
-
-fn bridge_memory_setup_provider(provider_name: &str) -> Result<(), Box<dyn Error>> {
-    let trimmed = provider_name.trim();
-    if trimmed.is_empty() {
-        return Err("memory provider name cannot be empty".into());
-    }
-
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
-        .ok_or("could not find a Python interpreter for memory setup")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_MEMORY_PROVIDER", trimmed)
-        .arg("-c")
-        .arg(MEMORY_SETUP_PROVIDER_BOOTSTRAP);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("memory", status).into())
-}
-
-fn bridge_memory_save_config(
-    context: &HermesContext,
-    provider_name: &str,
-    provider_values: &BTreeMap<String, SetupValue>,
-) -> Result<(), Box<dyn Error>> {
-    let trimmed = provider_name.trim();
-    if trimmed.is_empty() {
-        return Err("memory provider name cannot be empty".into());
-    }
-
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_MEMORY_PYTHON"))
-        .ok_or("could not find a Python interpreter for memory setup")?;
-    let values_json = serde_json::to_string(&setup_values_to_json_object(provider_values))?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_MEMORY_PROVIDER", trimmed)
-        .env("HERMES_MEMORY_PROVIDER_VALUES_JSON", values_json)
-        .env(
-            "HERMES_MEMORY_HOME",
-            context.hermes_home().display().to_string(),
-        )
-        .arg("-c")
-        .arg(MEMORY_SAVE_CONFIG_BOOTSTRAP);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message("memory save-config", status).into())
-}
-
-fn setup_values_to_json_object(values: &BTreeMap<String, SetupValue>) -> JsonValue {
-    let mut root = JsonMap::new();
-    for (key, value) in values {
-        root.insert(key.clone(), value.to_json());
-    }
-    JsonValue::Object(root)
-}
-
-const MEMORY_SETUP_METADATA_BOOTSTRAP: &str = concat!(
-    "import json\n",
-    "import os\n",
-    "from plugins.memory import load_memory_provider\n",
-    "provider = load_memory_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
-    "if provider is None:\n",
-    "    raise SystemExit(2)\n",
-    "payload = {\n",
-    "    'has_post_setup': hasattr(provider, 'post_setup'),\n",
-    "    'has_save_config': hasattr(provider, 'save_config'),\n",
-    "    'is_available': bool(provider.is_available()) if hasattr(provider, 'is_available') else True,\n",
-    "    'schema': provider.get_config_schema() if hasattr(provider, 'get_config_schema') else [],\n",
-    "}\n",
-    "print(json.dumps(payload, default=str))\n",
-);
-
-const MEMORY_SETUP_PROVIDER_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from hermes_cli.memory_setup import cmd_setup_provider\n",
-    "cmd_setup_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
-);
-
-const MEMORY_SAVE_CONFIG_BOOTSTRAP: &str = concat!(
-    "import json\n",
-    "import os\n",
-    "from plugins.memory import load_memory_provider\n",
-    "provider = load_memory_provider(os.environ['HERMES_MEMORY_PROVIDER'])\n",
-    "if provider is None:\n",
-    "    raise SystemExit(2)\n",
-    "if hasattr(provider, 'save_config'):\n",
-    "    provider.save_config(\n",
-    "        json.loads(os.environ['HERMES_MEMORY_PROVIDER_VALUES_JSON']),\n",
-    "        os.environ['HERMES_MEMORY_HOME'],\n",
-    "    )\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
 }
 
 fn render_status(context: &HermesContext, loaded: &LoadedConfig) -> String {
@@ -3447,7 +3241,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn manifest_save_config_file_writes_json_without_python_bridge() {
-        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
@@ -3458,17 +3251,6 @@ mod tests {
         )
         .unwrap();
 
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let provider = SetupProvider {
             name: String::from("custom"),
@@ -3476,7 +3258,6 @@ mod tests {
             hint: String::new(),
             mode: SetupMode::NativeGeneric,
             fields: Vec::new(),
-            bridge_save_config: true,
         };
         let mut values = BTreeMap::new();
         values.insert(
@@ -3485,15 +3266,11 @@ mod tests {
         );
         values.insert(String::from("enabled"), SetupValue::Bool(true));
 
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
         persist_native_provider_setup_outputs(&context, &provider, &values).unwrap();
 
         let json_text = fs::read_to_string(home.join("custom").join("config.json")).unwrap();
         assert!(json_text.contains("\"mode\": \"local\""));
         assert!(json_text.contains("\"enabled\": true"));
-        assert!(!log.exists());
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
@@ -3628,84 +3405,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn bridge_memory_setup_provider_uses_python_override() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'provider=%s\\n' \"$HERMES_MEMORY_PROVIDER\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
-        bridge_memory_setup_provider("hindsight").unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("provider=hindsight"));
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn setup_provider_spec_loads_dynamic_metadata_for_schema_only_provider() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        fs::write(
-            &fake_python,
-            "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  cat <<'EOF'\n\
-{\"has_post_setup\": false, \"has_save_config\": true, \"schema\": [{\"key\": \"mode\", \"description\": \"Mode\", \"default\": \"cloud\", \"choices\": [\"cloud\", \"local\"]}, {\"key\": \"token\", \"description\": \"Access token\", \"secret\": true, \"env_var\": \"CUSTOM_TOKEN\"}]}\n\
-EOF\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
-        let home = temp.path().join(".hermes");
-        fs::create_dir_all(&home).unwrap();
-        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
-        let provider = setup_provider_spec(
-            &context,
-            ProviderInfo {
-                name: String::from("custom"),
-                description: String::from("Custom"),
-            },
-        );
-
-        assert_eq!(provider.mode, SetupMode::NativeGeneric);
-        assert!(provider.bridge_save_config);
-        assert_eq!(provider.fields.len(), 2);
-        assert_eq!(provider.fields[0].choices, vec!["cloud", "local"]);
-        assert_eq!(provider.fields[1].env_var.as_deref(), Some("CUSTOM_TOKEN"));
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn setup_provider_spec_uses_manifest_schema_without_python() {
-        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
@@ -3716,19 +3416,7 @@ exit 9\n",
         )
         .unwrap();
 
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
         let provider = setup_provider_spec(
             &context,
             ProviderInfo {
@@ -3739,37 +3427,20 @@ exit 9\n",
 
         assert_eq!(provider.mode, SetupMode::NativeGeneric);
         assert_eq!(provider.hint, "API key / local");
-        assert!(!provider.bridge_save_config);
         assert_eq!(provider.fields.len(), 2);
         assert_eq!(provider.fields[0].choices, vec!["cloud", "local"]);
         assert_eq!(provider.fields[1].env_var.as_deref(), Some("CUSTOM_TOKEN"));
-        assert!(!log.exists());
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
     #[cfg(unix)]
     fn setup_schema_free_custom_provider_stays_native() {
-        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
         write_user_memory_plugin(&home, "simple");
 
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
 
         let provider = setup_provider_spec(
             &context,
@@ -3781,53 +3452,35 @@ exit 9\n",
         assert_eq!(provider.mode, SetupMode::NativeGeneric);
         assert_eq!(provider.hint, "no setup needed");
         assert!(provider.fields.is_empty());
-        assert!(!provider.bridge_save_config);
 
         run_native_provider_setup(&context, &provider).unwrap();
         let config = fs::read_to_string(home.join("config.yaml")).unwrap();
         assert!(config.contains("provider: simple"));
-        assert!(!log.exists());
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
-    #[cfg(unix)]
-    fn setup_provider_spec_keeps_post_setup_providers_on_python_hook() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn setup_provider_spec_treats_legacy_hook_provider_as_native_noop_setup() {
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        fs::write(
-            &fake_python,
-            "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf '%s\\n' '{\"has_post_setup\": true, \"has_save_config\": true, \"schema\": [{\"key\": \"token\"}]}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "legacy");
+        fs::write(
+            home.join("plugins").join("legacy").join("__init__.py"),
+            "class Legacy(MemoryProvider):\n    def get_config_schema(self):\n        return [{\"key\": \"token\"}]\n    def post_setup(self, hermes_home, config):\n        return None\n    def save_config(self, values, hermes_home):\n        return None\n",
+        )
+        .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
         let provider = setup_provider_spec(
             &context,
             ProviderInfo {
-                name: String::from("custom"),
-                description: String::from("Custom"),
+                name: String::from("legacy"),
+                description: String::from("Legacy"),
             },
         );
 
-        assert_eq!(provider.mode, SetupMode::PythonHook);
+        assert_eq!(provider.mode, SetupMode::NativeGeneric);
+        assert_eq!(provider.hint, "no setup needed");
         assert!(provider.fields.is_empty());
-        assert!(!provider.bridge_save_config);
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
     #[test]
@@ -3902,56 +3555,6 @@ exit 9\n",
             Some(value) => set_env_var("PATH", value),
             None => remove_env_var("PATH"),
         }
-        remove_env_var("HERMES_MEMORY_PYTHON");
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn bridge_memory_save_config_uses_python_override() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'provider=%s\\n' \"$HERMES_MEMORY_PROVIDER\" >> '{}'\n\
-  printf 'home=%s\\n' \"$HERMES_MEMORY_HOME\" >> '{}'\n\
-  printf 'values=%s\\n' \"$HERMES_MEMORY_PROVIDER_VALUES_JSON\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display(),
-                log.display(),
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let home = temp.path().join(".hermes");
-        fs::create_dir_all(&home).unwrap();
-        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
-        let mut values = BTreeMap::new();
-        values.insert(
-            String::from("workspace"),
-            SetupValue::String(String::from("alpha")),
-        );
-        values.insert(String::from("enabled"), SetupValue::Bool(true));
-
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
-        bridge_memory_save_config(&context, "custom", &values).unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("provider=custom"));
-        assert!(output.contains(format!("home={}", home.display()).as_str()));
-        assert!(output.contains("\"workspace\":\"alpha\""));
-        assert!(output.contains("\"enabled\":true"));
-
         remove_env_var("HERMES_MEMORY_PYTHON");
     }
 
@@ -4098,24 +3701,14 @@ exit 9\n",
     fn render_status_reports_unavailable_provider_requirements() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        fs::write(
-            &fake_python,
-            "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf '%s\\n' '{\"has_post_setup\": false, \"has_save_config\": false, \"is_available\": false, \"schema\": [{\"key\": \"api_key\", \"env_var\": \"CUSTOM_API_KEY\", \"url\": \"https://example.test\"}, {\"key\": \"endpoint\", \"env_var\": \"CUSTOM_ENDPOINT\"}]}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
         write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("plugin.yaml"),
+            "description: Custom provider\nrequires_env:\n  - CUSTOM_API_KEY\n  - CUSTOM_ENDPOINT\n",
+        )
+        .unwrap();
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let loaded = LoadedConfig {
             path: home.join("config.yaml"),
@@ -4130,7 +3723,6 @@ exit 9\n",
             warnings: Vec::new(),
         };
 
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
         set_env_var("CUSTOM_ENDPOINT", "https://api.test");
         remove_env_var("CUSTOM_API_KEY");
 
@@ -4138,33 +3730,15 @@ exit 9\n",
         assert!(output.contains("Plugin:    installed ✓"));
         assert!(output.contains("Status:    not available ✗"));
         assert!(output.contains("Missing:"));
-        assert!(output.contains("✗ CUSTOM_API_KEY  → https://example.test"));
+        assert!(output.contains("✗ CUSTOM_API_KEY"));
         assert!(output.contains("✓ CUSTOM_ENDPOINT"));
 
-        remove_env_var("HERMES_MEMORY_PYTHON");
         remove_env_var("CUSTOM_ENDPOINT");
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_status_reports_available_provider() {
-        let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        fs::write(
-            &fake_python,
-            "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf '%s\\n' '{\"has_post_setup\": false, \"has_save_config\": false, \"is_available\": true, \"schema\": []}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
         write_user_memory_plugin(&home, "custom");
@@ -4182,12 +3756,8 @@ exit 9\n",
             warnings: Vec::new(),
         };
 
-        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
-
         let output = render_status(&context, &loaded);
         assert!(output.contains("Status:    available ✓"));
         assert!(!output.contains("Missing:"));
-
-        remove_env_var("HERMES_MEMORY_PYTHON");
     }
 }
