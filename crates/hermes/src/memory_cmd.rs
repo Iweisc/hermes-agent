@@ -119,7 +119,7 @@ struct BridgedProviderMetadata {
     schema: Vec<BridgedSchemaField>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct BridgedSchemaField {
     key: String,
     #[serde(default)]
@@ -142,7 +142,7 @@ struct BridgedSchemaField {
     default_from: Option<BridgedDefaultFrom>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct BridgedDefaultFrom {
     field: String,
     #[serde(default)]
@@ -167,6 +167,8 @@ struct MemoryPluginSetupManifest {
     post_setup: bool,
     #[serde(default, alias = "has_save_config")]
     save_config: bool,
+    #[serde(default, alias = "available")]
+    is_available: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -757,9 +759,13 @@ fn load_provider_status_metadata(
     context: &HermesContext,
     provider_name: &str,
 ) -> Result<BridgedProviderMetadata, Box<dyn Error>> {
-    native_provider_metadata(context, provider_name)
-        .map(Ok)
-        .unwrap_or_else(|| load_bridged_provider_metadata(context, provider_name))
+    if let Some(metadata) = native_provider_metadata(context, provider_name) {
+        return Ok(metadata);
+    }
+    if let Some(metadata) = manifest_provider_metadata(context, provider_name)? {
+        return Ok(metadata);
+    }
+    load_bridged_provider_metadata(context, provider_name)
 }
 
 fn native_provider_metadata(
@@ -775,6 +781,56 @@ fn native_provider_metadata(
             .into_iter()
             .map(setup_field_to_bridged_schema)
             .collect(),
+    })
+}
+
+fn manifest_provider_metadata(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<Option<BridgedProviderMetadata>, Box<dyn Error>> {
+    let Some(dir) = find_memory_provider_dir(context, provider_name) else {
+        return Ok(None);
+    };
+    let Some(manifest) = read_memory_plugin_manifest(&dir) else {
+        return Ok(None);
+    };
+    let Some(setup) = manifest.setup else {
+        return Ok(None);
+    };
+    if setup.post_setup {
+        return Ok(None);
+    }
+
+    let is_available = setup.is_available.unwrap_or_else(|| {
+        manifest_required_fields_available(context, provider_name, setup.schema.as_slice())
+    });
+
+    Ok(Some(BridgedProviderMetadata {
+        has_post_setup: false,
+        has_save_config: setup.save_config,
+        is_available,
+        schema: setup.schema,
+    }))
+}
+
+fn manifest_required_fields_available(
+    context: &HermesContext,
+    provider_name: &str,
+    schema: &[BridgedSchemaField],
+) -> bool {
+    let mut required = schema.iter().filter(|field| field.required).peekable();
+    if required.peek().is_none() {
+        return true;
+    }
+
+    required.all(|field| {
+        field.env_var.as_deref().is_some_and(env_nonempty)
+            || provider_config_has_any(context, provider_name, &[field.key.as_str()])
+            || field
+                .default
+                .as_ref()
+                .and_then(json_scalar_string)
+                .is_some_and(|value| !value.trim().is_empty())
     })
 }
 
@@ -3852,6 +3908,60 @@ exit 9\n",
 
         remove_env_var("HERMES_MEMORY_PYTHON");
         remove_env_var("HONCHO_API_KEY");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn render_status_uses_manifest_metadata_without_python() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("plugin.yaml"),
+            "description: Custom manifest provider\nsetup:\n  schema:\n    - key: api_key\n      env_var: CUSTOM_API_KEY\n      url: https://example.test\n      required: true\n    - key: endpoint\n      env_var: CUSTOM_ENDPOINT\n",
+        )
+        .unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: custom\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("custom"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        set_env_var("CUSTOM_ENDPOINT", "https://api.test");
+        remove_env_var("CUSTOM_API_KEY");
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Plugin:    installed ✓"));
+        assert!(output.contains("Status:    not available ✗"));
+        assert!(output.contains("Missing:"));
+        assert!(output.contains("✗ CUSTOM_API_KEY  → https://example.test"));
+        assert!(output.contains("✓ CUSTOM_ENDPOINT"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+        remove_env_var("CUSTOM_ENDPOINT");
     }
 
     #[test]
