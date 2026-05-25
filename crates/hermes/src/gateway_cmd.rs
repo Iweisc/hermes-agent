@@ -1159,6 +1159,13 @@ const DINGTALK_SETUP_INSTRUCTIONS: &[&str] = &[
     "4. Add the bot to a group chat or message it directly",
 ];
 
+const FEISHU_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Create an app at https://open.feishu.cn/ or https://open.larksuite.com/",
+    "2. Enable the Bot capability and copy the App ID and App Secret, or use QR setup below",
+    "3. WebSocket mode is recommended because it does not require a public URL",
+    "4. Restrict access with DM pairing or FEISHU_ALLOWED_USERS for production use",
+];
+
 const WECOM_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Create a smart robot in WeCom Application → Workspace → Smart Robot",
     "2. Select API Mode and copy the Bot ID and Secret, or use QR setup below",
@@ -1533,8 +1540,8 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "Feishu / Lark",
         emoji: "🪽",
         token_var: "FEISHU_APP_ID",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
+        has_builtin_setup: false,
+        setup_instructions: FEISHU_SETUP_INSTRUCTIONS,
         vars: NO_GATEWAY_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
@@ -1706,6 +1713,16 @@ fn native_gateway_platform_status(
                     "configured".to_string()
                 }
             } else if val.is_some() || password.is_some() || homeserver.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "feishu" => {
+            let secret = read_effective_env_value(context, "FEISHU_APP_SECRET");
+            if val.is_some() && secret.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || secret.is_some() {
                 "partially configured".to_string()
             } else {
                 "not configured".to_string()
@@ -2239,6 +2256,10 @@ fn configure_native_gateway_builtin_platform_with_io(
         }
         "dingtalk" => {
             configure_dingtalk_gateway_platform_with_io(context, platform, input, output)?;
+            Ok(true)
+        }
+        "feishu" => {
+            configure_feishu_gateway_platform_with_io(context, platform, input, output)?;
             Ok(true)
         }
         "wecom" => {
@@ -2851,6 +2872,509 @@ fn dingtalk_json_string(value: &JsonValue, key: &str) -> Option<String> {
 
 fn dingtalk_json_u64(value: &JsonValue, key: &str) -> Option<u64> {
     value.get(key).and_then(JsonValue::as_u64)
+}
+
+#[derive(Debug, Clone)]
+struct FeishuSetupCredentials {
+    app_id: String,
+    app_secret: String,
+    domain: String,
+    open_id: Option<String>,
+    bot_name: Option<String>,
+}
+
+fn configure_feishu_gateway_platform_with_io(
+    context: &HermesContext,
+    platform: &GatewaySetupPlatform,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "─── {} {} Setup ───",
+        platform.emoji, platform.label
+    )?;
+    if !platform.setup_instructions.is_empty() {
+        writeln!(output)?;
+        for line in &platform.setup_instructions {
+            writeln!(output, "  {line}")?;
+        }
+    }
+
+    let existing_app_id = read_effective_env_value(context, "FEISHU_APP_ID");
+    let existing_secret = read_effective_env_value(context, "FEISHU_APP_SECRET");
+    if existing_app_id.is_some() && existing_secret.is_some() {
+        writeln!(output)?;
+        writeln!(output, "Feishu / Lark is already configured.")?;
+        if !prompt_gateway_yes_no(input, output, "Reconfigure Feishu / Lark?", false)? {
+            return Ok(());
+        }
+    }
+
+    writeln!(output)?;
+    let method = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How would you like to set up Feishu / Lark?",
+        &[
+            "Scan QR code to create a new bot automatically (recommended)",
+            "Enter existing App ID and App Secret manually",
+        ],
+    )?;
+
+    let mut used_qr = false;
+    let credentials = if method == 0 {
+        match feishu_qr_register_with_io(output) {
+            Ok(Some(credentials)) => {
+                used_qr = true;
+                Some(credentials)
+            }
+            Ok(None) => {
+                writeln!(
+                    output,
+                    "  QR setup did not complete. Continuing with manual input."
+                )?;
+                configure_feishu_manual_credentials(input, output)?
+            }
+            Err(error) => {
+                writeln!(output, "  QR registration failed: {error}")?;
+                writeln!(output, "  Continuing with manual input.")?;
+                configure_feishu_manual_credentials(input, output)?
+            }
+        }
+    } else {
+        configure_feishu_manual_credentials(input, output)?
+    };
+
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+
+    save_env_value(context.env_path(), "FEISHU_APP_ID", &credentials.app_id)?;
+    save_env_value(
+        context.env_path(),
+        "FEISHU_APP_SECRET",
+        &credentials.app_secret,
+    )?;
+    save_env_value(context.env_path(), "FEISHU_DOMAIN", &credentials.domain)?;
+
+    let connection_mode = if used_qr {
+        String::from("websocket")
+    } else {
+        writeln!(output)?;
+        let mode_idx = prompt_gateway_menu_choice(
+            input,
+            output,
+            "Connection mode",
+            &[
+                "WebSocket (recommended — no public URL needed)",
+                "Webhook (requires a reachable HTTP endpoint)",
+            ],
+        )?;
+        if mode_idx == 1 {
+            writeln!(output, "  Webhook defaults: 127.0.0.1:8765/feishu/webhook")?;
+            writeln!(
+                output,
+                "  Override with FEISHU_WEBHOOK_HOST / FEISHU_WEBHOOK_PORT / FEISHU_WEBHOOK_PATH"
+            )?;
+            writeln!(
+                output,
+                "  For signature verification, set FEISHU_ENCRYPT_KEY and FEISHU_VERIFICATION_TOKEN"
+            )?;
+            String::from("webhook")
+        } else {
+            String::from("websocket")
+        }
+    };
+    save_env_value(
+        context.env_path(),
+        "FEISHU_CONNECTION_MODE",
+        &connection_mode,
+    )?;
+
+    if let Some(bot_name) = credentials.bot_name.as_deref() {
+        writeln!(output)?;
+        writeln!(output, "  Bot: {bot_name}")?;
+    }
+
+    configure_feishu_dm_policy(context, input, output, credentials.open_id.as_deref())?;
+    configure_feishu_group_policy(context, input, output)?;
+
+    writeln!(output)?;
+    let home_channel = prompt_gateway_line(
+        input,
+        output,
+        "  Home chat ID (optional, for cron/notifications)",
+    )?;
+    if !home_channel.trim().is_empty() {
+        save_env_value(
+            context.env_path(),
+            "FEISHU_HOME_CHANNEL",
+            home_channel.trim(),
+        )?;
+        writeln!(output, "  Home channel set to {}", home_channel.trim())?;
+    }
+
+    writeln!(output)?;
+    writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    writeln!(output, "  App ID: {}", credentials.app_id)?;
+    writeln!(output, "  Domain: {}", credentials.domain)?;
+    Ok(())
+}
+
+fn configure_feishu_manual_credentials(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<Option<FeishuSetupCredentials>, Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Go to https://open.feishu.cn/ or https://open.larksuite.com/ for Lark."
+    )?;
+    writeln!(
+        output,
+        "  Create an app, enable the Bot capability, and copy the credentials."
+    )?;
+
+    let Some(app_id) = prompt_gateway_required_line(
+        input,
+        output,
+        "  App ID",
+        "Skipped — Feishu / Lark won't work without an App ID.",
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(app_secret) = prompt_gateway_required_line(
+        input,
+        output,
+        "  App Secret",
+        "Skipped — Feishu / Lark won't work without an App Secret.",
+    )?
+    else {
+        return Ok(None);
+    };
+    writeln!(output)?;
+    let domain_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "Domain",
+        &["feishu (China)", "lark (International)"],
+    )?;
+    let domain = if domain_idx == 1 { "lark" } else { "feishu" }.to_string();
+
+    let bot_info = match feishu_probe_bot_raw(&app_id, &app_secret, &domain) {
+        Ok(info) => {
+            if let Some(name) = info.bot_name.as_deref() {
+                writeln!(output, "  Credentials verified — bot: {name}")?;
+            } else {
+                writeln!(output, "  Credentials verified.")?;
+            }
+            Some(info)
+        }
+        Err(error) => {
+            writeln!(output, "  Credential verification skipped: {error}")?;
+            None
+        }
+    };
+
+    Ok(Some(FeishuSetupCredentials {
+        app_id,
+        app_secret,
+        domain,
+        open_id: None,
+        bot_name: bot_info.and_then(|info| info.bot_name),
+    }))
+}
+
+fn configure_feishu_dm_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    default_open_id: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    let access_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should direct messages be authorized?",
+        &[
+            "Use DM pairing approval (recommended)",
+            "Allow all direct messages",
+            "Only allow listed user IDs",
+        ],
+    )?;
+    match access_idx {
+        0 => {
+            save_env_value(context.env_path(), "FEISHU_ALLOW_ALL_USERS", "false")?;
+            save_env_value(context.env_path(), "FEISHU_ALLOWED_USERS", "")?;
+            writeln!(output, "  DM pairing enabled.")?;
+        }
+        1 => {
+            save_env_value(context.env_path(), "FEISHU_ALLOW_ALL_USERS", "true")?;
+            save_env_value(context.env_path(), "FEISHU_ALLOWED_USERS", "")?;
+            writeln!(output, "  Open DM access enabled for Feishu / Lark.")?;
+        }
+        2 => {
+            save_env_value(context.env_path(), "FEISHU_ALLOW_ALL_USERS", "false")?;
+            let prompt =
+                if let Some(open_id) = default_open_id.filter(|value| !value.trim().is_empty()) {
+                    format!("  Allowed user IDs (comma-separated) [{open_id}]")
+                } else {
+                    String::from("  Allowed user IDs (comma-separated)")
+                };
+            let raw = prompt_gateway_line(input, output, &prompt)?;
+            let allowed = if raw.trim().is_empty() {
+                default_open_id.unwrap_or("").to_string()
+            } else {
+                normalize_gateway_allowlist("FEISHU_ALLOWED_USERS", raw.trim())
+            };
+            save_env_value(context.env_path(), "FEISHU_ALLOWED_USERS", &allowed)?;
+            writeln!(output, "  Allowlist saved.")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn configure_feishu_group_policy(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    let group_idx = prompt_gateway_menu_choice(
+        input,
+        output,
+        "How should group chats be handled?",
+        &[
+            "Respond only when @mentioned in groups (recommended)",
+            "Disable group chats",
+        ],
+    )?;
+    if group_idx == 0 {
+        save_env_value(context.env_path(), "FEISHU_GROUP_POLICY", "open")?;
+        writeln!(output, "  Group chats enabled (bot must be @mentioned).")?;
+    } else {
+        save_env_value(context.env_path(), "FEISHU_GROUP_POLICY", "disabled")?;
+        writeln!(output, "  Group chats disabled.")?;
+    }
+    Ok(())
+}
+
+fn feishu_qr_register_with_io(
+    output: &mut dyn Write,
+) -> Result<Option<FeishuSetupCredentials>, Box<dyn Error>> {
+    writeln!(output, "  Connecting to Feishu / Lark...")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let initial_domain = env::var("FEISHU_REGISTRATION_DOMAIN")
+        .ok()
+        .filter(|value| value.trim() == "lark")
+        .unwrap_or_else(|| String::from("feishu"));
+
+    let init = feishu_registration_post(&client, &initial_domain, &[("action", "init")])?;
+    let supports_client_secret = init
+        .get("supported_auth_methods")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|methods| {
+            methods
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .any(|method| method == "client_secret")
+        });
+    if !supports_client_secret {
+        return Err("Feishu / Lark registration does not support client_secret auth".into());
+    }
+
+    let begin = feishu_registration_post(
+        &client,
+        &initial_domain,
+        &[
+            ("action", "begin"),
+            ("archetype", "PersonalAgent"),
+            ("auth_method", "client_secret"),
+            ("request_user_info", "open_id"),
+        ],
+    )?;
+    let device_code = feishu_json_string(&begin, "device_code")
+        .ok_or("Feishu / Lark registration did not return a device_code")?;
+    let mut qr_url = feishu_json_string(&begin, "verification_uri_complete").unwrap_or_default();
+    if !qr_url.trim().is_empty() {
+        qr_url = append_url_query_param(
+            &append_url_query_param(&qr_url, "from", "hermes"),
+            "tp",
+            "hermes",
+        );
+    }
+    let interval = feishu_json_u64(&begin, "interval").unwrap_or(5).max(1);
+    let expire_in = feishu_json_u64(&begin, "expire_in").unwrap_or(600).max(1);
+    let timeout_ms = feishu_env_u64("FEISHU_REGISTRATION_TIMEOUT_MS", expire_in * 1000).max(1);
+    let poll_interval = Duration::from_millis(
+        feishu_env_u64("FEISHU_REGISTRATION_POLL_INTERVAL_MS", interval * 1000).max(1),
+    );
+
+    if !qr_url.trim().is_empty() {
+        writeln!(output)?;
+        writeln!(output, "  Open this URL in Feishu / Lark on your phone:")?;
+        writeln!(output, "  {qr_url}")?;
+    }
+    writeln!(output)?;
+    writeln!(output, "  Waiting for QR scan confirmation...")?;
+
+    let mut current_domain = initial_domain;
+    let mut domain_switched = false;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        let poll = feishu_registration_post(
+            &client,
+            &current_domain,
+            &[
+                ("action", "poll"),
+                ("device_code", device_code.as_str()),
+                ("tp", "ob_app"),
+            ],
+        )?;
+        if feishu_nested_json_string(&poll, &["user_info", "tenant_brand"]).as_deref()
+            == Some("lark")
+            && !domain_switched
+        {
+            current_domain = String::from("lark");
+            domain_switched = true;
+        }
+        if let (Some(app_id), Some(app_secret)) = (
+            feishu_json_string(&poll, "client_id"),
+            feishu_json_string(&poll, "client_secret"),
+        ) {
+            let open_id = feishu_nested_json_string(&poll, &["user_info", "open_id"]);
+            let bot_info = feishu_probe_bot_raw(&app_id, &app_secret, &current_domain).ok();
+            return Ok(Some(FeishuSetupCredentials {
+                app_id,
+                app_secret,
+                domain: current_domain,
+                open_id,
+                bot_name: bot_info.and_then(|info| info.bot_name),
+            }));
+        }
+        match feishu_json_string(&poll, "error").as_deref() {
+            Some("access_denied" | "expired_token") => return Ok(None),
+            _ => sleep(poll_interval),
+        }
+    }
+    Ok(None)
+}
+
+fn feishu_registration_post(
+    client: &reqwest::blocking::Client,
+    domain: &str,
+    params: &[(&str, &str)],
+) -> Result<JsonValue, Box<dyn Error>> {
+    let base = feishu_registration_base_url(domain);
+    let response = client
+        .post(format!("{base}/oauth/v1/app/registration"))
+        .form(&params)
+        .send()?;
+    let text = response.text()?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn feishu_registration_base_url(domain: &str) -> String {
+    if let Ok(value) = env::var("FEISHU_REGISTRATION_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        return value.trim().trim_end_matches('/').to_string();
+    }
+    match domain {
+        "lark" => String::from("https://accounts.larksuite.com"),
+        _ => String::from("https://accounts.feishu.cn"),
+    }
+}
+
+fn feishu_open_base_url(domain: &str) -> String {
+    if let Ok(value) = env::var("FEISHU_OPEN_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        return value.trim().trim_end_matches('/').to_string();
+    }
+    match domain {
+        "lark" => String::from("https://open.larksuite.com"),
+        _ => String::from("https://open.feishu.cn"),
+    }
+}
+
+fn feishu_probe_bot_raw(
+    app_id: &str,
+    app_secret: &str,
+    domain: &str,
+) -> Result<FeishuSetupCredentials, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let base = feishu_open_base_url(domain);
+    let token = client
+        .post(format!(
+            "{base}/open-apis/auth/v3/tenant_access_token/internal"
+        ))
+        .json(&serde_json::json!({
+            "app_id": app_id,
+            "app_secret": app_secret,
+        }))
+        .send()?
+        .json::<JsonValue>()?;
+    let access_token = feishu_json_string(&token, "tenant_access_token")
+        .ok_or("tenant access token not returned")?;
+    let bot = client
+        .get(format!("{base}/open-apis/bot/v3/info"))
+        .bearer_auth(access_token)
+        .send()?
+        .json::<JsonValue>()?;
+    if bot.get("code").and_then(JsonValue::as_i64) != Some(0) {
+        return Err("bot info probe failed".into());
+    }
+    Ok(FeishuSetupCredentials {
+        app_id: app_id.to_string(),
+        app_secret: app_secret.to_string(),
+        domain: domain.to_string(),
+        open_id: None,
+        bot_name: feishu_nested_json_string(&bot, &["bot", "app_name"])
+            .or_else(|| feishu_nested_json_string(&bot, &["bot", "bot_name"]))
+            .or_else(|| feishu_nested_json_string(&bot, &["data", "bot", "app_name"]))
+            .or_else(|| feishu_nested_json_string(&bot, &["data", "bot", "bot_name"])),
+    })
+}
+
+fn feishu_json_string(value: &JsonValue, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn feishu_json_u64(value: &JsonValue, key: &str) -> Option<u64> {
+    value.get(key).and_then(JsonValue::as_u64)
+}
+
+fn feishu_env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn feishu_nested_json_string(value: &JsonValue, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn configure_wecom_gateway_platform_with_io(
@@ -5449,6 +5973,13 @@ exit 9\n",
         assert!(!dingtalk.has_builtin_setup);
         assert!(!gateway_platform_uses_native_standard_setup(dingtalk));
 
+        let feishu = metadata
+            .iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap();
+        assert!(!feishu.has_builtin_setup);
+        assert!(!gateway_platform_uses_native_standard_setup(feishu));
+
         let wecom = metadata
             .iter()
             .find(|platform| platform.key == "wecom")
@@ -5456,11 +5987,11 @@ exit 9\n",
         assert!(!wecom.has_builtin_setup);
         assert!(!gateway_platform_uses_native_standard_setup(wecom));
 
-        let feishu = metadata
+        let weixin = metadata
             .iter()
-            .find(|platform| platform.key == "feishu")
+            .find(|platform| platform.key == "weixin")
             .unwrap();
-        assert!(feishu.has_builtin_setup);
+        assert!(weixin.has_builtin_setup);
 
         let email = metadata
             .iter()
@@ -5555,6 +6086,14 @@ exit 9\n",
             "DINGTALK_CLIENT_ID",
             "DINGTALK_CLIENT_SECRET",
             "DINGTALK_ALLOW_ALL_USERS",
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_DOMAIN",
+            "FEISHU_CONNECTION_MODE",
+            "FEISHU_ALLOW_ALL_USERS",
+            "FEISHU_ALLOWED_USERS",
+            "FEISHU_GROUP_POLICY",
+            "FEISHU_HOME_CHANNEL",
             "WECOM_BOT_ID",
             "WECOM_SECRET",
             "WECOM_ALLOWED_USERS",
@@ -5617,6 +6156,11 @@ exit 9\n",
             .find(|platform| platform.key == "dingtalk")
             .unwrap();
         assert_eq!(dingtalk.status, "not configured");
+        let feishu = metadata
+            .iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap();
+        assert_eq!(feishu.status, "not configured");
         let wecom = metadata
             .iter()
             .find(|platform| platform.key == "wecom")
@@ -5651,10 +6195,10 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        run_gateway_platform_setup_bridge(true, "feishu").unwrap();
+        run_gateway_platform_setup_bridge(true, "weixin").unwrap();
 
         let log_text = fs::read_to_string(&log).unwrap();
-        assert!(log_text.contains("platform accept=1 key=feishu"));
+        assert!(log_text.contains("platform accept=1 key=weixin"));
 
         remove_env_var("HERMES_GATEWAY_PYTHON");
     }
@@ -5902,6 +6446,215 @@ exit 9\n",
         remove_env_var("DINGTALK_REGISTRATION_SOURCE");
         remove_env_var("HERMES_GATEWAY_PYTHON");
         remove_env_var("HERMES_GATEWAY_SETUP_PLATFORM");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configure_feishu_gateway_platform_uses_native_qr_flow_without_bridge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_DOMAIN",
+            "FEISHU_CONNECTION_MODE",
+            "FEISHU_ALLOW_ALL_USERS",
+            "FEISHU_ALLOWED_USERS",
+            "FEISHU_GROUP_POLICY",
+            "FEISHU_HOME_CHANNEL",
+            "FEISHU_REGISTRATION_BASE_URL",
+            "FEISHU_OPEN_BASE_URL",
+            "FEISHU_REGISTRATION_POLL_INTERVAL_MS",
+            "FEISHU_REGISTRATION_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+        set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("FEISHU_REGISTRATION_BASE_URL", format!("http://{addr}"));
+        set_env_var("FEISHU_OPEN_BASE_URL", format!("http://{addr}"));
+        set_env_var("FEISHU_REGISTRATION_POLL_INTERVAL_MS", "1");
+        set_env_var("FEISHU_REGISTRATION_TIMEOUT_MS", "1000");
+        let server = std::thread::spawn(move || {
+            let responses = [
+                r#"{"supported_auth_methods":["client_secret"]}"#,
+                r#"{"device_code":"device-1","verification_uri_complete":"https://example.com/verify","user_code":"USER","interval":1,"expire_in":5}"#,
+                r#"{"client_id":"feishu-app","client_secret":"feishu-secret","user_info":{"tenant_brand":"feishu","open_id":"ou-user"}}"#,
+                r#"{"code":0,"tenant_access_token":"tenant-token"}"#,
+                r#"{"code":0,"bot":{"app_name":"HermesBot","open_id":"ou-bot"}}"#,
+            ];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut next = 0;
+            while next < responses.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = responses[next];
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        next += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap();
+        let mut input = Cursor::new("1\n3\nou-user, ou-other\n1\nhome-chat\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("FEISHU_APP_ID=feishu-app"));
+        assert!(env_text.contains("FEISHU_APP_SECRET=feishu-secret"));
+        assert!(env_text.contains("FEISHU_DOMAIN=feishu"));
+        assert!(env_text.contains("FEISHU_CONNECTION_MODE=websocket"));
+        assert!(env_text.contains("FEISHU_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("FEISHU_ALLOWED_USERS=ou-user,ou-other"));
+        assert!(env_text.contains("FEISHU_GROUP_POLICY=open"));
+        assert!(env_text.contains("FEISHU_HOME_CHANNEL=home-chat"));
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
+        assert!(!log.exists());
+
+        for key in [
+            "FEISHU_REGISTRATION_BASE_URL",
+            "FEISHU_OPEN_BASE_URL",
+            "FEISHU_REGISTRATION_POLL_INTERVAL_MS",
+            "FEISHU_REGISTRATION_TIMEOUT_MS",
+            "HERMES_GATEWAY_PYTHON",
+            "HERMES_GATEWAY_SETUP_PLATFORM",
+        ] {
+            remove_env_var(key);
+        }
+    }
+
+    #[test]
+    fn configure_feishu_gateway_platform_writes_manual_credentials_and_policies() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        for key in [
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_DOMAIN",
+            "FEISHU_CONNECTION_MODE",
+            "FEISHU_ALLOW_ALL_USERS",
+            "FEISHU_ALLOWED_USERS",
+            "FEISHU_GROUP_POLICY",
+            "FEISHU_HOME_CHANNEL",
+            "FEISHU_OPEN_BASE_URL",
+        ] {
+            remove_env_var(key);
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        set_env_var("FEISHU_OPEN_BASE_URL", format!("http://{addr}"));
+        let server = std::thread::spawn(move || {
+            let responses = [
+                r#"{"code":0,"tenant_access_token":"tenant-token"}"#,
+                r#"{"code":0,"bot":{"app_name":"ManualBot","open_id":"ou-bot"}}"#,
+            ];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut next = 0;
+            while next < responses.len() && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = responses[next];
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        next += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "feishu")
+            .unwrap();
+        let mut input = Cursor::new("2\nmanual-app\nmanual-secret\n2\n2\n1\n2\nhome-chat\n");
+        let mut output = Vec::new();
+
+        assert!(
+            configure_native_gateway_builtin_platform_with_io(
+                &context,
+                &platform,
+                &mut input,
+                &mut output,
+            )
+            .unwrap()
+        );
+        server.join().unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("FEISHU_APP_ID=manual-app"));
+        assert!(env_text.contains("FEISHU_APP_SECRET=manual-secret"));
+        assert!(env_text.contains("FEISHU_DOMAIN=lark"));
+        assert!(env_text.contains("FEISHU_CONNECTION_MODE=webhook"));
+        assert!(env_text.contains("FEISHU_ALLOW_ALL_USERS=false"));
+        assert!(env_text.contains("FEISHU_ALLOWED_USERS="));
+        assert!(env_text.contains("FEISHU_GROUP_POLICY=disabled"));
+        assert!(env_text.contains("FEISHU_HOME_CHANNEL=home-chat"));
+
+        remove_env_var("FEISHU_OPEN_BASE_URL");
     }
 
     #[test]
