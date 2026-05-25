@@ -1,3 +1,4 @@
+use std::env;
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const OPENCLAW_DIR_NAMES: [&str; 3] = [".openclaw", ".clawdbot", ".moltbot"];
+const OPENCLAW_MIGRATION_SCRIPT_REL: [&str; 4] = [
+    "migration",
+    "openclaw-migration",
+    "scripts",
+    "openclaw_to_hermes.py",
+];
 
 #[derive(Subcommand, Debug)]
 pub enum ClawCommand {
@@ -101,6 +108,12 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
     }
 
     let root = project_root();
+    let script_candidates = migration_script_candidates(&root, &detect_hermes_home());
+    if !script_candidates.iter().any(|path| path.exists()) {
+        print_migration_script_missing(&script_candidates);
+        return Ok(());
+    }
+
     let python = resolve_repo_python(&root, Some("HERMES_CLAW_PYTHON"))
         .ok_or("could not find a Python interpreter for claw migrate")?;
 
@@ -154,6 +167,17 @@ fn print_migration_banner() {
     println!("┌─────────────────────────────────────────────────────────┐");
     println!("│          ⚕ Hermes — OpenClaw Migration                 │");
     println!("└─────────────────────────────────────────────────────────┘");
+}
+
+fn print_migration_script_missing(candidates: &[PathBuf]) {
+    print_migration_banner();
+    println!();
+    println!("Migration script not found.");
+    println!("Expected at one of:");
+    for candidate in candidates {
+        println!("  {}", candidate.display());
+    }
+    println!("Make sure the openclaw-migration skill is installed.");
 }
 
 const CLAW_MIGRATE_BOOTSTRAP: &str = concat!(
@@ -335,6 +359,37 @@ fn resolve_migrate_source(args: &MigrateArgs) -> Result<PathBuf, Box<dyn Error>>
         }
     }
     Ok(default)
+}
+
+fn migration_script_candidates(project_root: &Path, hermes_home: &Path) -> Vec<PathBuf> {
+    vec![
+        optional_skills_root(project_root)
+            .join(OPENCLAW_MIGRATION_SCRIPT_REL.iter().collect::<PathBuf>()),
+        hermes_home.join(
+            ["skills"]
+                .iter()
+                .chain(OPENCLAW_MIGRATION_SCRIPT_REL.iter())
+                .collect::<PathBuf>(),
+        ),
+    ]
+}
+
+fn optional_skills_root(project_root: &Path) -> PathBuf {
+    env::var_os("HERMES_OPTIONAL_SKILLS")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root.join("optional-skills"))
+}
+
+fn detect_hermes_home() -> PathBuf {
+    env::var_os("HERMES_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".hermes")
+        })
 }
 
 fn find_openclaw_dirs() -> Vec<PathBuf> {
@@ -689,6 +744,65 @@ exit 9\n",
         match old_home {
             Some(value) => set_env_var("HOME", value),
             None => remove_env_var("HOME"),
+        }
+        remove_env_var("HERMES_CLAW_PYTHON");
+        result.unwrap();
+        assert!(!python_called);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migrate_with_missing_script_stays_native() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join(".openclaw");
+        let optional_skills = temp.path().join("optional-skills");
+        let hermes_home = temp.path().join(".hermes");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&optional_skills).unwrap();
+        fs::create_dir_all(&hermes_home).unwrap();
+
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!(
+                "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let old_home = env::var_os("HERMES_HOME");
+        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
+        set_env_var("HERMES_HOME", &hermes_home);
+        set_env_var("HERMES_OPTIONAL_SKILLS", &optional_skills);
+        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
+        let result = print_migrate(MigrateArgs {
+            source: Some(source),
+            dry_run: true,
+            preset: MigratePreset::Full,
+            overwrite: false,
+            migrate_secrets: false,
+            no_backup: false,
+            workspace_target: None,
+            skill_conflict: SkillConflict::Skip,
+            yes: false,
+        });
+        let python_called = log.exists();
+
+        match old_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match old_optional {
+            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
+            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
         }
         remove_env_var("HERMES_CLAW_PYTHON");
         result.unwrap();
