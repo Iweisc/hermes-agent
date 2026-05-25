@@ -1538,6 +1538,7 @@ impl GatewayToolApprovalChoice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayToolApprovalPromptPlan {
+    pub approval_id: String,
     pub session_key: String,
     pub command: String,
     pub description: String,
@@ -1546,6 +1547,9 @@ pub struct GatewayToolApprovalPromptPlan {
 
 impl GatewayToolApprovalPromptPlan {
     pub fn validate(&self) -> Result<(), String> {
+        if self.approval_id.trim().is_empty() {
+            return Err("tool approval prompt approval_id must not be empty".to_string());
+        }
         if self.session_key.trim().is_empty() {
             return Err("tool approval prompt session_key must not be empty".to_string());
         }
@@ -1588,6 +1592,45 @@ impl GatewayToolApprovalCallbackPresentation {
 pub struct GatewayToolApprovalCallbackExecution {
     pub presentation: GatewayToolApprovalCallbackPresentation,
     pub result: GatewayToolApprovalCommandExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayToolApprovalCallbackRef {
+    pub choice: GatewayToolApprovalChoice,
+    pub approval_id: String,
+}
+
+impl GatewayToolApprovalCallbackRef {
+    pub fn from_callback_data(data: &str) -> Result<Option<Self>, String> {
+        let data = data.trim();
+        if data.is_empty() {
+            return Err("tool approval callback data must not be empty".to_string());
+        }
+        let Some(rest) = data.strip_prefix("ea:") else {
+            return Ok(None);
+        };
+        let mut parts = rest.splitn(2, ':');
+        let choice = parts
+            .next()
+            .ok_or_else(|| "tool approval callback choice is missing".to_string())?;
+        let approval_id = parts
+            .next()
+            .ok_or_else(|| "tool approval callback approval_id is missing".to_string())?
+            .trim();
+        if approval_id.is_empty() {
+            return Err("tool approval callback approval_id must not be empty".to_string());
+        }
+        Ok(Some(Self {
+            choice: GatewayToolApprovalChoice::from_token(choice)?,
+            approval_id: approval_id.to_string(),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayToolApprovalCallbackOutcome {
+    NoPending { message: String },
+    Resolved { execution: GatewayToolApprovalCallbackExecution },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2930,6 +2973,8 @@ pub struct GatewayRuntime {
     queued_events: HashMap<String, VecDeque<MessageEvent>>,
     busy_ack_timestamps: HashMap<String, f64>,
     pending_tool_approval_sessions: HashSet<String>,
+    tool_approval_callbacks: HashMap<String, String>,
+    next_tool_approval_id: u64,
     slash_confirms: GatewaySlashConfirmState,
     next_slash_confirm_id: u64,
     update_watcher: GatewayUpdateWatcherState,
@@ -2957,6 +3002,8 @@ impl GatewayRuntime {
             queued_events: HashMap::new(),
             busy_ack_timestamps: HashMap::new(),
             pending_tool_approval_sessions: HashSet::new(),
+            tool_approval_callbacks: HashMap::new(),
+            next_tool_approval_id: 1,
             slash_confirms: GatewaySlashConfirmState::default(),
             next_slash_confirm_id: 1,
             update_watcher: GatewayUpdateWatcherState::default(),
@@ -3002,6 +3049,8 @@ impl GatewayRuntime {
         if session_key.is_empty() {
             return false;
         }
+        self.tool_approval_callbacks
+            .retain(|_, stored_session_key| stored_session_key != session_key);
         self.pending_tool_approval_sessions.remove(session_key)
     }
 
@@ -3034,7 +3083,12 @@ impl GatewayRuntime {
 
         self.pending_tool_approval_sessions
             .insert(session_key.to_string());
+        let approval_id = self.next_tool_approval_id.to_string();
+        self.next_tool_approval_id = self.next_tool_approval_id.saturating_add(1);
+        self.tool_approval_callbacks
+            .insert(approval_id.clone(), session_key.to_string());
         let plan = GatewayToolApprovalPromptPlan {
+            approval_id,
             session_key: session_key.to_string(),
             command: command.to_string(),
             description: description.to_string(),
@@ -3192,6 +3246,32 @@ impl GatewayRuntime {
         Ok(GatewayToolApprovalCallbackExecution {
             presentation,
             result,
+        })
+    }
+
+    pub fn complete_tool_approval_callback_by_id(
+        &mut self,
+        approval_id: &str,
+        choice: GatewayToolApprovalChoice,
+        actor_display: &str,
+        resolved_count: usize,
+    ) -> Result<GatewayToolApprovalCallbackOutcome, String> {
+        let approval_id = approval_id.trim();
+        if approval_id.is_empty() {
+            return Err("tool approval callback approval_id must not be empty".to_string());
+        }
+        let Some(session_key) = self.tool_approval_callbacks.remove(approval_id) else {
+            return Ok(GatewayToolApprovalCallbackOutcome::NoPending {
+                message: "This approval has already been resolved.".to_string(),
+            });
+        };
+        Ok(GatewayToolApprovalCallbackOutcome::Resolved {
+            execution: self.complete_tool_approval_callback(
+                &session_key,
+                choice,
+                actor_display,
+                resolved_count,
+            )?,
         })
     }
 
@@ -9570,6 +9650,7 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(plan.approval_id, "1");
         assert_eq!(plan.session_key, "session-1");
         assert!(runtime.has_pending_tool_approval("session-1"));
         assert!(
@@ -9578,6 +9659,25 @@ mod tests {
         );
         assert!(plan.fallback_message.contains("python -c"));
         assert!(plan.fallback_message.contains("Reply `/approve`"));
+    }
+
+    #[test]
+    fn tool_approval_callback_ref_parses_exec_approval_callback_data() {
+        assert_eq!(
+            GatewayToolApprovalCallbackRef::from_callback_data("ea:always:42").unwrap(),
+            Some(GatewayToolApprovalCallbackRef {
+                choice: GatewayToolApprovalChoice::Always,
+                approval_id: "42".to_string(),
+            })
+        );
+        assert_eq!(
+            GatewayToolApprovalCallbackRef::from_callback_data("noop").unwrap(),
+            None
+        );
+        assert_eq!(
+            GatewayToolApprovalCallbackRef::from_callback_data("ea:bad:42").unwrap_err(),
+            "tool approval choice must be once, session, always, or deny"
+        );
     }
 
     #[test]
@@ -9781,6 +9881,62 @@ mod tests {
                             .to_string(),
                     resume_typing: true,
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_complete_tool_approval_callback_by_id_resolves_and_clears_registration() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let plan = runtime
+            .begin_tool_approval_prompt("session-1", "rm -rf /tmp/x", "recursive delete")
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &plan.approval_id,
+                    GatewayToolApprovalChoice::Once,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::Resolved {
+                execution: GatewayToolApprovalCallbackExecution {
+                    presentation: GatewayToolApprovalCallbackPresentation {
+                        acknowledgement_label: "✅ Approved once".to_string(),
+                        decision_text: "✅ Approved once by Kai".to_string(),
+                    },
+                    result: GatewayToolApprovalCommandExecution::Resolved {
+                        request: GatewayToolApprovalRequest {
+                            session_key: "session-1".to_string(),
+                            choice: GatewayToolApprovalChoice::Once,
+                            resolve_all: false,
+                        },
+                        resolved_count: 1,
+                        message: "✅ Command approved. The agent is resuming...".to_string(),
+                        resume_typing: true,
+                    },
+                },
+            }
+        );
+        assert_eq!(
+            runtime
+                .complete_tool_approval_callback_by_id(
+                    &plan.approval_id,
+                    GatewayToolApprovalChoice::Once,
+                    "Kai",
+                    1,
+                )
+                .unwrap(),
+            GatewayToolApprovalCallbackOutcome::NoPending {
+                message: "This approval has already been resolved.".to_string(),
             }
         );
     }
