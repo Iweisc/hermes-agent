@@ -342,7 +342,17 @@ impl HermesContext {
     pub fn load_config_document(&self) -> Result<LoadedConfig, HermesError> {
         self.ensure_hermes_home()?;
 
-        let path = self.config_path();
+        let ignore_user_config = env::var("HERMES_IGNORE_USER_CONFIG")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| value.trim() == "1");
+        let user_path = self.config_path();
+        let project_path = project_cli_config_path();
+        let path = if user_path.exists() && !ignore_user_config {
+            user_path
+        } else {
+            project_path
+        };
         let mut warnings = Vec::new();
         let mut merged =
             serde_yaml::to_value(HermesConfig::default()).expect("default config serialization");
@@ -737,6 +747,19 @@ fn create_dir_all(path: &Path) -> Result<(), HermesError> {
     })
 }
 
+fn project_cli_config_path() -> PathBuf {
+    if let Some(path) = env::var("HERMES_PROJECT_CLI_CONFIG")
+        .ok()
+        .and_then(non_empty_string)
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("cli-config.yaml")
+}
+
 fn normalize_user_config(value: Value) -> Value {
     let mut mapping = match value {
         Value::Mapping(mapping) => mapping,
@@ -891,7 +914,10 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_context() -> (TempDir, HermesContext) {
         let temp = TempDir::new().expect("tempdir");
@@ -965,6 +991,58 @@ mod tests {
                 .expect("agent.max_turns"),
             &Value::Number(42.into())
         );
+    }
+
+    #[test]
+    fn load_config_document_ignores_user_config_when_requested() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let (_temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(ctx.config_path(), "logging:\n  level: DEBUG\n").expect("write config");
+        unsafe { env::set_var("HERMES_IGNORE_USER_CONFIG", "1") };
+
+        let loaded = ctx.load_config_document().expect("load config");
+        assert_eq!(loaded.config.logging.level, "INFO");
+
+        unsafe { env::remove_var("HERMES_IGNORE_USER_CONFIG") };
+    }
+
+    #[test]
+    fn load_config_document_falls_back_to_project_cli_config() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let (temp, ctx) = test_context();
+        let project_config = temp.path().join("cli-config.yaml");
+        fs::write(&project_config, "logging:\n  level: DEBUG\n").expect("write project config");
+        unsafe { env::set_var("HERMES_PROJECT_CLI_CONFIG", &project_config) };
+
+        let loaded = ctx.load_config_document().expect("load config");
+        assert_eq!(loaded.path, project_config);
+        assert_eq!(loaded.config.logging.level, "DEBUG");
+
+        unsafe { env::remove_var("HERMES_PROJECT_CLI_CONFIG") };
+    }
+
+    #[test]
+    fn load_config_document_ignore_user_config_uses_project_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let (temp, ctx) = test_context();
+        ctx.ensure_hermes_home().expect("ensure home");
+        fs::write(ctx.config_path(), "logging:\n  level: ERROR\n").expect("write user config");
+        let project_config = temp.path().join("cli-config.yaml");
+        fs::write(&project_config, "logging:\n  level: DEBUG\n").expect("write project config");
+        unsafe {
+            env::set_var("HERMES_PROJECT_CLI_CONFIG", &project_config);
+            env::set_var("HERMES_IGNORE_USER_CONFIG", "1");
+        }
+
+        let loaded = ctx.load_config_document().expect("load config");
+        assert_eq!(loaded.path, project_config);
+        assert_eq!(loaded.config.logging.level, "DEBUG");
+
+        unsafe {
+            env::remove_var("HERMES_PROJECT_CLI_CONFIG");
+            env::remove_var("HERMES_IGNORE_USER_CONFIG");
+        };
     }
 
     #[test]

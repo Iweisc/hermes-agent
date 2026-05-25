@@ -37,8 +37,9 @@ mod whatsapp_cmd;
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -46,16 +47,19 @@ use std::sync::{
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, KanbanDispatchOptions, LoadedConfig,
     LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once,
-    get_tool_definitions, handle_cronjob, is_container, is_wsl, kanban_has_spawnable_ready,
-    run_cron_job_now, run_due_cron_jobs, run_kanban_task,
+    get_active_auth_provider, get_auth_status_summary, get_tool_definitions, handle_cronjob,
+    is_container, is_wsl, kanban_has_spawnable_ready, list_provider_profiles,
+    load_skill_prompt_content, run_cron_job_now, run_due_cron_jobs, run_kanban_task,
 };
 use serde_json::{Value as JsonValue, json};
+
+const CONTINUE_LATEST_SENTINEL: &str = "__hermes_continue_latest__";
 
 #[cfg(test)]
 pub(crate) fn cli_test_env_lock() -> &'static Mutex<()> {
@@ -63,11 +67,60 @@ pub(crate) fn cli_test_env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[derive(Args, Debug, Clone, Default)]
+struct ChatArgs {
+    #[arg(long = "query", global = true)]
+    query: Option<String>,
+    #[arg(short = 'r', long = "resume", global = true)]
+    resume: Option<String>,
+    #[arg(
+        short = 'c',
+        long = "continue",
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = CONTINUE_LATEST_SENTINEL
+    )]
+    continue_last: Option<String>,
+    #[arg(short = 'm', long = "model", global = true)]
+    model: Option<String>,
+    #[arg(long = "provider", global = true)]
+    provider: Option<String>,
+    #[arg(long = "base-url", global = true)]
+    base_url: Option<String>,
+    #[arg(long = "api-key", global = true)]
+    api_key: Option<String>,
+    #[arg(long = "api-mode", global = true)]
+    api_mode: Option<String>,
+    #[arg(
+        short = 's',
+        long = "skills",
+        global = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    skills: Vec<String>,
+    #[arg(
+        long = "toolsets",
+        global = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    toolsets: Vec<String>,
+    #[arg(short = 'w', long = "worktree", global = true, default_value_t = false)]
+    worktree: bool,
+    #[arg(long = "yolo", global = true, default_value_t = false)]
+    yolo: bool,
+    #[arg(long = "ignore-user-config", global = true, default_value_t = false)]
+    ignore_user_config: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hermes", version, about = "Hermes Rust bootstrap")]
 struct Cli {
     #[arg(short = 'p', long = "profile", global = true)]
     _profile: Option<String>,
+    #[command(flatten)]
+    chat: ChatArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -162,21 +215,7 @@ enum Command {
         command: Option<profile_cmd::ProfileCommand>,
     },
     Chat {
-        prompt: String,
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        provider: Option<String>,
-        #[arg(long)]
-        base_url: Option<String>,
-        #[arg(long)]
-        api_key: Option<String>,
-        #[arg(long)]
-        api_mode: Option<String>,
-        #[arg(long = "toolset")]
-        toolsets: Vec<String>,
+        prompt: Vec<String>,
     },
     Sessions {
         #[command(subcommand)]
@@ -353,6 +392,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let detected = HermesContext::detect();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let profile_override = detected.apply_profile_override(&raw_args)?;
+    let processed_args = coalesce_session_name_args(profile_override.args, known_subcommands());
     let context = match profile_override.hermes_home.clone() {
         Some(home) => detected.with_hermes_home_env(Some(home)),
         None => detected,
@@ -360,6 +400,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe { std::env::set_var("HERMES_HOME", context.hermes_home()) };
     context.ensure_hermes_home()?;
     let env_report = context.load_hermes_dotenv(None)?;
+    if argv_contains_flag(&processed_args, "--ignore-user-config") {
+        unsafe { std::env::set_var("HERMES_IGNORE_USER_CONFIG", "1") };
+    }
     let config = context.load_config_document()?;
     let logging = context.setup_logging(&config, LoggingMode::Cli)?;
     let session_store = context.open_session_store()?;
@@ -370,10 +413,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         context.current_profile_name(),
         context.hermes_home().display()
     );
-    let argv = std::iter::once(String::from("hermes")).chain(profile_override.args);
+    apply_cli_runtime_env(
+        &config,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
+    let argv = std::iter::once(String::from("hermes")).chain(processed_args);
     let cli = Cli::parse_from(argv);
 
-    match cli.command.unwrap_or(Command::Status) {
+    if cli.chat.yolo {
+        unsafe { std::env::set_var("HERMES_YOLO_MODE", "1") };
+    }
+
+    let default_chat = cli.command.is_none();
+    match cli.command.unwrap_or(Command::Chat { prompt: Vec::new() }) {
         Command::Paths => print_paths(&context, &config, &logging),
         Command::Version => dump::print_version(),
         Command::Dump(args) => dump::print_dump(&context, &config, args)?,
@@ -413,27 +465,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => profile_cmd::print_profile(&context, command)?,
-        Command::Chat {
-            prompt,
-            session,
-            model,
-            provider,
-            base_url,
-            api_key,
-            api_mode,
-            toolsets,
-        } => run_chat(
+        Command::Chat { prompt } => run_chat(
             &context,
             &config,
             &session_store,
+            cli.chat.clone(),
             prompt,
-            session,
-            model,
-            provider,
-            base_url,
-            api_key,
-            api_mode,
-            toolsets,
+            default_chat,
         )?,
         Command::Sessions { command } => print_sessions(&context, &session_store, command)?,
         Command::Cron { command } => print_cron(&context, &config, &session_store, command)?,
@@ -644,37 +682,204 @@ fn print_status(
     if let Some(warning) = context.profile_fallback_warning() {
         println!("warning={warning}");
     }
-    println!("note=Rust one-shot chat is available via `hermes chat`");
+    println!("note=Rust interactive chat is the default; use `hermes chat -q ...` for one-shot");
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_chat(
     context: &HermesContext,
     config: &LoadedConfig,
     session_store: &hermes_core::SessionStore,
-    prompt: String,
-    session: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    api_mode: Option<String>,
-    toolsets: Vec<String>,
+    chat: ChatArgs,
+    prompt_parts: Vec<String>,
+    default_chat: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let enabled_toolsets = if toolsets.is_empty() {
+    unsafe { std::env::set_var("HERMES_SESSION_SOURCE", "cli") };
+    let mut worktree_guard = if chat.worktree {
+        Some(WorktreeGuard::create()?)
+    } else {
+        None
+    };
+    let active_cwd = worktree_guard
+        .as_ref()
+        .map(|guard| guard.path().to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    apply_cli_runtime_env(config, &active_cwd);
+
+    let enabled_toolsets = if chat.toolsets.is_empty() {
         config.config.toolsets.clone()
     } else {
-        toolsets
+        unique_cli_strings(&chat.toolsets)
     };
     let overrides = ModelOverrides {
-        model,
-        provider,
-        base_url,
-        api_key,
-        api_mode,
+        model: chat.model.clone(),
+        provider: chat.provider.clone(),
+        base_url: chat.base_url.clone(),
+        api_key: chat.api_key.clone(),
+        api_mode: chat.api_mode.clone(),
     };
+
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let prompt = resolve_initial_prompt(chat.query.as_deref(), &prompt_parts)?;
+    let stdin_prompt = read_prompt_from_stdin()?;
+    let initial_prompt = prompt.or(stdin_prompt);
+
+    if !has_any_chat_provider_configured(context, config, &overrides)? {
+        print_chat_setup_required();
+        if !stdin_is_terminal || !stdout_is_terminal {
+            print_noninteractive_chat_setup_guidance();
+            return Err("Hermes is not configured yet.".into());
+        }
+        let reply = prompt_user_input("Run setup now? [Y/n] ")?
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(reply.as_str(), "" | "y" | "yes") {
+            setup_cmd::print_setup(
+                context,
+                setup_cmd::SetupArgs {
+                    section: None,
+                    non_interactive: false,
+                    reset: false,
+                    reconfigure: false,
+                    quick: false,
+                },
+            )?;
+            return Ok(());
+        }
+        println!();
+        println!("You can run 'hermes setup' at any time to configure.");
+        return Err("Hermes is not configured yet.".into());
+    }
+
+    let _ = skills_cmd::sync_bundled_skills(context, true);
+
+    let mut session_hint = resolve_chat_session_hint(session_store, &chat)?;
+    let runtime = build_chat_runtime(
+        context,
+        config,
+        &enabled_toolsets,
+        &overrides,
+        &active_cwd,
+        &chat.skills,
+        worktree_guard.as_ref().map(WorktreeGuard::metadata),
+    )?;
+
+    if let Some(prompt) = initial_prompt {
+        let result = execute_chat_turn(
+            context,
+            config,
+            session_store,
+            &runtime,
+            &enabled_toolsets,
+            &overrides,
+            &prompt,
+            session_hint.as_deref(),
+        )?;
+        println!("{}", result.final_response);
+        return Ok(());
+    }
+
+    if !stdin_is_terminal || !stdout_is_terminal {
+        return Err(
+            "interactive chat requires a tty; pass -q/--query or pipe a prompt on stdin".into(),
+        );
+    }
+
+    let runtime_model = context.resolve_model_runtime(config, &overrides)?;
+    if default_chat {
+        println!(
+            "Hermes Rust CLI  model={}  provider={}",
+            runtime_model.model, runtime_model.provider
+        );
+    }
+    if let Some(resumed) = session_hint.as_deref() {
+        println!("Resumed session: {resumed}");
+    }
+    if !chat.skills.is_empty() {
+        println!(
+            "Activated skills: {}",
+            unique_cli_strings(&chat.skills).join(", ")
+        );
+    }
+    if worktree_guard.is_some() {
+        println!("Worktree: {}", active_cwd.display());
+    }
+    println!("Type /exit to quit.");
+
+    loop {
+        let Some(user_input) = prompt_user_input("> ")? else {
+            println!();
+            break;
+        };
+        let trimmed = user_input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed, "/exit" | "/quit" | "exit" | "quit") {
+            break;
+        }
+        if trimmed == "/help" {
+            println!("Use /exit to quit, /help to show this message, or type a prompt.");
+            continue;
+        }
+
+        let result = execute_chat_turn(
+            context,
+            config,
+            session_store,
+            &runtime,
+            &enabled_toolsets,
+            &overrides,
+            trimmed,
+            session_hint.as_deref(),
+        )?;
+        if let Some(next_session) = result.session_id.clone() {
+            session_hint = Some(next_session);
+        }
+        println!();
+        println!("{}", result.final_response);
+        println!();
+    }
+
+    worktree_guard.take();
+    Ok(())
+}
+
+fn execute_chat_turn(
+    context: &HermesContext,
+    config: &LoadedConfig,
+    session_store: &hermes_core::SessionStore,
+    runtime: &ToolRuntime,
+    enabled_toolsets: &[String],
+    overrides: &ModelOverrides,
+    prompt: &str,
+    session_hint: Option<&str>,
+) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
+    context
+        .run_chat_completions_turn(
+            config,
+            prompt,
+            runtime,
+            Some(enabled_toolsets),
+            overrides,
+            session_hint,
+            Some(session_store),
+        )
+        .map_err(Into::into)
+}
+
+fn build_chat_runtime(
+    context: &HermesContext,
+    config: &LoadedConfig,
+    enabled_toolsets: &[String],
+    overrides: &ModelOverrides,
+    cwd: &Path,
+    skills: &[String],
+    worktree: Option<&WorktreeMetadata>,
+) -> Result<ToolRuntime, Box<dyn Error>> {
     let disabled = disabled_memory_toolsets(&config.config.memory);
-    let tool_names = get_tool_definitions(Some(&enabled_toolsets), disabled.as_deref())
+    let tool_names = get_tool_definitions(Some(enabled_toolsets), disabled.as_deref())
         .into_iter()
         .map(|tool| tool.name)
         .collect::<Vec<_>>();
@@ -682,26 +887,530 @@ fn run_chat(
         context.clone(),
         config.clone(),
         "rust-delegate",
-        enabled_toolsets.clone(),
+        enabled_toolsets.to_vec(),
         overrides.clone(),
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cwd.to_path_buf(),
     );
-    let mut runtime = ToolRuntime::default()
+    let mut runtime = ToolRuntime::new(cwd)
         .with_hermes_home(context.hermes_home())
         .with_available_tool_names(tool_names)
         .with_clarify_callback(run_clarify_prompt)
         .with_delegate_callback(move |request| delegate.execute(request));
+
+    let mut missing_skills = Vec::new();
+    for skill in unique_cli_strings(skills) {
+        match load_skill_prompt_content(&context.hermes_home(), &skill) {
+            Ok(content) => {
+                runtime =
+                    runtime.with_system_prompt_addition(format!("Activated skill:\n{content}"));
+            }
+            Err(_) => missing_skills.push(skill),
+        }
+    }
+    if !missing_skills.is_empty() {
+        return Err(format!("Unknown skill(s): {}", missing_skills.join(", ")).into());
+    }
+    if let Some(worktree) = worktree {
+        runtime = runtime.with_system_prompt_addition(format!(
+            "[System note: You are working in an isolated git worktree at {}. Your branch is `{}`. Changes here do not affect the main working tree or other agents. The original repo is at {}.]",
+            worktree.path.display(),
+            worktree.branch,
+            worktree.repo_root.display(),
+        ));
+    }
     let _ = runtime.load_memory_store(&config.config.memory);
-    let result = context.run_chat_completions_turn(
-        config,
-        &prompt,
-        &runtime,
-        Some(&enabled_toolsets),
-        &overrides,
-        session.as_deref(),
-        Some(session_store),
-    )?;
-    println!("{}", result.final_response);
+    Ok(runtime)
+}
+
+fn resolve_initial_prompt(
+    query: Option<&str>,
+    prompt_parts: &[String],
+) -> Result<Option<String>, Box<dyn Error>> {
+    let query = query.and_then(non_empty_trimmed);
+    let prompt = (!prompt_parts.is_empty()).then(|| prompt_parts.join(" "));
+    let prompt = prompt.as_deref().and_then(non_empty_trimmed);
+    match (query, prompt) {
+        (Some(_), Some(_)) => Err("pass either --query or a chat prompt, not both".into()),
+        (Some(query), None) => Ok(Some(query.to_string())),
+        (None, Some(prompt)) => Ok(Some(prompt.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_chat_session_hint(
+    session_store: &hermes_core::SessionStore,
+    chat: &ChatArgs,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(resume) = chat.resume.as_deref() {
+        let resolved = resolve_session_name_or_id(session_store, resume)?;
+        return resolved
+            .map(Some)
+            .ok_or_else(|| format!("No session matched '{resume}'.").into());
+    }
+    let Some(continue_value) = chat.continue_last.as_deref() else {
+        return Ok(None);
+    };
+    if continue_value == CONTINUE_LATEST_SENTINEL {
+        let resolved = resolve_last_session_id(session_store, "cli")?;
+        return resolved
+            .map(Some)
+            .ok_or_else(|| "No previous CLI session found to continue.".into());
+    }
+    let resolved = resolve_session_name_or_id(session_store, continue_value)?;
+    resolved
+        .map(Some)
+        .ok_or_else(|| format!("No session matched '{continue_value}'.").into())
+}
+
+fn resolve_session_name_or_id(
+    session_store: &hermes_core::SessionStore,
+    value: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Some(resolved) = session_store.resolve_session_id(trimmed)? {
+        return Ok(Some(resolved));
+    }
+    if let Some(resolved) = session_store.resolve_session_by_title(trimmed)? {
+        return Ok(Some(resolved));
+    }
+    Ok(None)
+}
+
+fn resolve_last_session_id(
+    session_store: &hermes_core::SessionStore,
+    source: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    Ok(session_store
+        .search_sessions(Some(source), 1, 0)?
+        .into_iter()
+        .next()
+        .map(|row| row.id))
+}
+
+fn has_any_chat_provider_configured(
+    context: &HermesContext,
+    config: &LoadedConfig,
+    overrides: &ModelOverrides,
+) -> Result<bool, Box<dyn Error>> {
+    if overrides
+        .api_key
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .is_some()
+        || overrides
+            .base_url
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .is_some()
+        || config.configured_model_api_key().is_some()
+        || config.configured_model_base_url().is_some()
+    {
+        return Ok(true);
+    }
+
+    for key in provider_env_keys() {
+        if env_value_for_context(context, key).is_some() {
+            return Ok(true);
+        }
+    }
+
+    if get_active_auth_provider(context.hermes_home().as_path())?
+        .as_deref()
+        .is_some_and(inference_auth_provider)
+    {
+        return Ok(true);
+    }
+
+    for profile in list_provider_profiles() {
+        if profile.auth_type == "api_key" {
+            continue;
+        }
+        let status = get_auth_status_summary(context.hermes_home().as_path(), profile.name)?;
+        if status.configured || status.logged_in {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn provider_env_keys() -> Vec<&'static str> {
+    let mut keys = vec![
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+        "OPENAI_BASE_URL",
+    ];
+    for profile in list_provider_profiles() {
+        for key in profile.env_vars {
+            if !keys.contains(key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn inference_auth_provider(provider: &str) -> bool {
+    let provider = provider.trim();
+    !provider.is_empty()
+        && list_provider_profiles()
+            .iter()
+            .any(|profile| profile.name == provider)
+}
+
+fn env_value_for_context(context: &HermesContext, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_env_file_value(context.env_path().as_path(), key))
+}
+
+fn read_env_file_value(path: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((entry_key, entry_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if entry_key.trim() != key {
+            continue;
+        }
+        let value = entry_value.trim().trim_matches(['"', '\'']);
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn print_chat_setup_required() {
+    println!();
+    println!("It looks like Hermes isn't configured yet -- no API keys or providers found.");
+    println!();
+    println!("  Run:  hermes setup");
+    println!();
+}
+
+fn print_noninteractive_chat_setup_guidance() {
+    println!("⚕ Hermes Setup — Non-interactive mode");
+    println!();
+    println!("  Running in a non-interactive environment (no TTY detected).");
+    println!("  The interactive wizard cannot be used here.");
+    println!();
+    println!("  Configure Hermes using environment variables or config commands:");
+    println!("    hermes config set model.provider custom");
+    println!("    hermes config set model.base_url http://localhost:8080/v1");
+    println!("    hermes config set model.default your-model-name");
+    println!();
+    println!("  Or set OPENROUTER_API_KEY / OPENAI_API_KEY in your environment.");
+    println!("  Run 'hermes setup' in an interactive terminal to use the full wizard.");
+    println!();
+}
+
+fn prompt_user_input(prompt: &str) -> Result<Option<String>, Box<dyn Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+fn read_prompt_from_stdin() -> Result<Option<String>, Box<dyn Error>> {
+    if io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buffer = String::new();
+    io::stdin().read_to_string(&mut buffer)?;
+    Ok(non_empty_trimmed(&buffer).map(ToOwned::to_owned))
+}
+
+fn unique_cli_strings(values: &[String]) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !output.iter().any(|existing| existing == trimmed) {
+            output.push(trimmed.to_string());
+        }
+    }
+    output
+}
+
+fn known_subcommands() -> &'static [&'static str] {
+    &[
+        "paths",
+        "version",
+        "dump",
+        "doctor",
+        "debug",
+        "hooks",
+        "login",
+        "fallback",
+        "model",
+        "slack",
+        "webhook",
+        "completion",
+        "dashboard",
+        "gateway",
+        "skills",
+        "checkpoints",
+        "snapshot",
+        "plugins",
+        "curator",
+        "memory",
+        "mcp",
+        "insights",
+        "claw",
+        "acp",
+        "logout",
+        "auth",
+        "setup",
+        "config",
+        "pairing",
+        "uninstall",
+        "backup",
+        "import",
+        "profile",
+        "chat",
+        "sessions",
+        "cron",
+        "logs",
+        "kanban",
+        "tools",
+        "update",
+        "whatsapp",
+        "status",
+    ]
+}
+
+fn coalesce_session_name_args(args: Vec<String>, commands: &[&str]) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = &args[index];
+        output.push(token.clone());
+        if matches!(token.as_str(), "-c" | "--continue" | "-r" | "--resume") {
+            index += 1;
+            let mut pieces = Vec::new();
+            while index < args.len() {
+                let next = &args[index];
+                if next.starts_with('-') {
+                    break;
+                }
+                if commands.iter().any(|command| *command == next) {
+                    break;
+                }
+                pieces.push(next.clone());
+                index += 1;
+            }
+            if !pieces.is_empty() {
+                output.push(pieces.join(" "));
+            }
+            continue;
+        }
+        index += 1;
+    }
+    output
+}
+
+fn argv_contains_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn apply_cli_runtime_env(config: &LoadedConfig, cwd: &Path) {
+    unsafe { std::env::set_var("TERMINAL_ENV", config.config.terminal.backend.trim()) };
+    let backend = config.config.terminal.backend.trim().to_ascii_lowercase();
+    let configured_cwd = config.config.terminal.cwd.trim();
+    let effective_cwd = if backend == "local" {
+        cwd.to_path_buf()
+    } else if matches!(configured_cwd, "" | "." | "auto" | "cwd") {
+        cwd.to_path_buf()
+    } else {
+        PathBuf::from(configured_cwd)
+    };
+    unsafe { std::env::set_var("TERMINAL_CWD", effective_cwd) };
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeMetadata {
+    path: PathBuf,
+    branch: String,
+    repo_root: PathBuf,
+}
+
+struct WorktreeGuard {
+    metadata: WorktreeMetadata,
+    original_cwd: PathBuf,
+}
+
+impl WorktreeGuard {
+    fn create() -> Result<Self, Box<dyn Error>> {
+        let repo_root =
+            git_repo_root()?.ok_or("--worktree requires being inside a git repository")?;
+        let original_cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
+        let metadata = setup_worktree(&repo_root)?;
+        std::env::set_current_dir(&metadata.path)?;
+        unsafe { std::env::set_var("TERMINAL_CWD", &metadata.path) };
+        Ok(Self {
+            metadata,
+            original_cwd,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.metadata.path
+    }
+
+    fn metadata(&self) -> &WorktreeMetadata {
+        &self.metadata
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original_cwd);
+        let _ = cleanup_worktree(&self.metadata);
+    }
+}
+
+fn git_repo_root() -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(non_empty_trimmed(&value).map(PathBuf::from))
+}
+
+fn setup_worktree(repo_root: &Path) -> Result<WorktreeMetadata, Box<dyn Error>> {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    let worktree_name = format!("hermes-{:08x}", (suffix & 0xffff_ffff) as u64);
+    let branch = format!("hermes/{worktree_name}");
+    let worktrees_dir = repo_root.join(".worktrees");
+    fs::create_dir_all(&worktrees_dir)?;
+    ensure_worktrees_gitignore(repo_root)?;
+    let path = worktrees_dir.join(&worktree_name);
+    let output = ProcessCommand::new("git")
+        .current_dir(repo_root)
+        .args([
+            "worktree",
+            "add",
+            path.to_string_lossy().as_ref(),
+            "-b",
+            branch.as_str(),
+            "HEAD",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("failed to create worktree: {stderr}").into());
+    }
+    copy_worktreeinclude_entries(repo_root, &path)?;
+    Ok(WorktreeMetadata {
+        path,
+        branch,
+        repo_root: repo_root.to_path_buf(),
+    })
+}
+
+fn ensure_worktrees_gitignore(repo_root: &Path) -> Result<(), Box<dyn Error>> {
+    let path = repo_root.join(".gitignore");
+    let entry = ".worktrees/";
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(());
+    }
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(entry);
+    contents.push('\n');
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn copy_worktreeinclude_entries(
+    repo_root: &Path,
+    worktree_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let include_path = repo_root.join(".worktreeinclude");
+    if !include_path.is_file() {
+        return Ok(());
+    }
+    for line in fs::read_to_string(include_path)?.lines() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let source = repo_root.join(entry);
+        let destination = worktree_path.join(entry);
+        if source.is_file() {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_worktree(worktree: &WorktreeMetadata) -> Result<(), Box<dyn Error>> {
+    if !worktree.path.exists() {
+        return Ok(());
+    }
+    let has_unpushed = ProcessCommand::new("git")
+        .current_dir(&worktree.path)
+        .args(["log", "--oneline", "HEAD", "--not", "--remotes"])
+        .output()
+        .ok()
+        .is_some_and(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    if has_unpushed {
+        eprintln!(
+            "Keeping worktree with unpushed commits: {}",
+            worktree.path.display()
+        );
+        return Ok(());
+    }
+    let _ = ProcessCommand::new("git")
+        .current_dir(&worktree.repo_root)
+        .args([
+            "worktree",
+            "remove",
+            worktree.path.to_string_lossy().as_ref(),
+            "--force",
+        ])
+        .output();
+    let _ = ProcessCommand::new("git")
+        .current_dir(&worktree.repo_root)
+        .args(["branch", "-D", worktree.branch.as_str()])
+        .output();
     Ok(())
 }
 
@@ -1473,6 +2182,7 @@ fn emit_warnings(env_report: &EnvLoadReport, config: &LoadedConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermes_core::SessionCreate;
 
     #[test]
     fn cron_cli_parses_python_compatible_crud_commands() {
@@ -1556,5 +2266,171 @@ mod tests {
             listed["jobs"][0]["skills"][0],
             JsonValue::String(String::from("ops"))
         );
+    }
+
+    #[test]
+    fn top_level_chat_flags_parse_without_subcommand() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "--resume",
+            "Alpha Session",
+            "--skills",
+            "ops,git",
+            "--toolsets",
+            "web,terminal",
+            "--yolo",
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.chat.resume.as_deref(), Some("Alpha Session"));
+        assert_eq!(
+            cli.chat.skills,
+            vec![String::from("ops"), String::from("git")]
+        );
+        assert_eq!(
+            cli.chat.toolsets,
+            vec![String::from("web"), String::from("terminal")]
+        );
+        assert!(cli.chat.yolo);
+    }
+
+    #[test]
+    fn coalesces_multiword_continue_before_subcommand() {
+        let args = coalesce_session_name_args(
+            vec![
+                String::from("-c"),
+                String::from("Project"),
+                String::from("Alpha"),
+                String::from("chat"),
+                String::from("hello"),
+            ],
+            known_subcommands(),
+        );
+        assert_eq!(
+            args,
+            vec![
+                String::from("-c"),
+                String::from("Project Alpha"),
+                String::from("chat"),
+                String::from("hello"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_chat_session_hint_supports_titles_and_continue_latest() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-1"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store.set_session_title("sess-1", "Project Alpha").unwrap();
+
+        let resumed = resolve_chat_session_hint(
+            &store,
+            &ChatArgs {
+                resume: Some(String::from("Project Alpha")),
+                ..ChatArgs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.as_deref(), Some("sess-1"));
+
+        let continued = resolve_chat_session_hint(
+            &store,
+            &ChatArgs {
+                continue_last: Some(CONTINUE_LATEST_SENTINEL.to_string()),
+                ..ChatArgs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(continued.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn build_chat_runtime_rejects_unknown_skills() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+
+        let error = build_chat_runtime(
+            &context,
+            &config,
+            &config.config.toolsets,
+            &ModelOverrides::default(),
+            temp.path(),
+            &[String::from("missing-skill")],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown skill(s): missing-skill")
+        );
+    }
+
+    #[test]
+    fn chat_provider_detection_reads_env_file_and_auth_state() {
+        let _guard = cli_test_env_lock().lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+
+        fs::write(context.env_path(), "OPENROUTER_API_KEY=sk-test\n").unwrap();
+        assert!(
+            has_any_chat_provider_configured(&context, &config, &ModelOverrides::default())
+                .unwrap()
+        );
+
+        fs::write(context.env_path(), "").unwrap();
+        fs::write(
+            context.hermes_home().join("auth.json"),
+            r#"{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token":"token"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            has_any_chat_provider_configured(&context, &config, &ModelOverrides::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn read_env_file_value_trims_quotes_and_missing_values() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(".env");
+        fs::write(&path, "OPENAI_API_KEY=\"sk-test\"\nEMPTY=\n").unwrap();
+
+        assert_eq!(
+            read_env_file_value(&path, "OPENAI_API_KEY").as_deref(),
+            Some("sk-test")
+        );
+        assert_eq!(read_env_file_value(&path, "EMPTY"), None);
+        assert_eq!(read_env_file_value(&path, "MISSING"), None);
+    }
+
+    #[test]
+    fn inference_auth_provider_filters_non_inference_entries() {
+        assert!(inference_auth_provider("openai-codex"));
+        assert!(!inference_auth_provider("spotify"));
+        assert!(!inference_auth_provider(""));
     }
 }

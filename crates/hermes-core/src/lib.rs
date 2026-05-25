@@ -71,6 +71,7 @@ pub use providers::{
     infer_provider_from_base_url, list_provider_profiles, normalize_model_for_provider,
     normalize_provider_alias, resolve_provider_api_mode,
 };
+pub use skills::load_skill_prompt_content;
 pub use state::{
     ExportedSession, MessageAppend, MessageRecord, MessageSearchRow, SearchContextMessage,
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,
