@@ -233,6 +233,7 @@ impl<'a> NativeGatewayServer<'a> {
             "session.list" => self.handle_session_list(),
             "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
+            "session.undo" => self.handle_session_undo(params),
             "session.delete" => self.handle_session_delete(params),
             "session.title" => self.handle_session_title(params),
             "session.status" => self.handle_session_status(params),
@@ -398,6 +399,32 @@ impl<'a> NativeGatewayServer<'a> {
             return Err((4007, String::from("session not found"), None));
         }
         Ok(json!({ "deleted": session_id }))
+    }
+
+    fn handle_session_undo(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        if !self.sessions.contains_key(&session_id) {
+            return Err((4007, String::from("session not found"), None));
+        }
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.session_id == session_id)
+        {
+            return Err((
+                4009,
+                String::from("session busy — /interrupt the current turn before /undo"),
+                None,
+            ));
+        }
+        let removed = self
+            .session_store
+            .trim_last_exchange(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?;
+        Ok(json!({ "removed": removed }))
     }
 
     fn handle_session_title(
@@ -1933,6 +1960,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    use hermes_core::MessageAppend;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2546,6 +2574,115 @@ mod tests {
             delete_closed_frame["result"]["deleted"],
             json!("session-rpc-test")
         );
+    }
+
+    #[test]
+    fn native_gateway_session_undo_removes_last_exchange() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("undo-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("keep")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("keep answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("remove")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("remove answer")),
+                tool_call_id: None,
+                tool_calls: Some(json!([{"name":"search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message("undo-session", &message).unwrap();
+        }
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("undo-session"),
+            NativeGatewaySessionState {
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                overrides: ModelOverrides::default(),
+            },
+        );
+
+        let mut undo = Vec::new();
+        server
+            .handle_request(
+                "session.undo",
+                json!(1),
+                json!({"session_id":"undo-session"}),
+                &mut undo,
+                false,
+            )
+            .unwrap();
+        let undo_frame = serde_json::from_slice::<Value>(&undo).unwrap();
+        assert_eq!(undo_frame["result"]["removed"], json!(2));
+
+        let messages = store.get_messages("undo-session").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, Some(json!("keep")));
+        assert_eq!(messages[1].content, Some(json!("keep answer")));
     }
 
     #[test]

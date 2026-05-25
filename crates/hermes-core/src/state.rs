@@ -994,6 +994,70 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn trim_last_exchange(&self, session_id: &str) -> Result<usize, HermesError> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(state_err("opening undo transaction"))?;
+        let mut statement = tx
+            .prepare(
+                "SELECT id, role, tool_calls
+                 FROM messages
+                 WHERE session_id = ?
+                 ORDER BY timestamp DESC, id DESC",
+            )
+            .map_err(state_err("preparing undo message query"))?;
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(state_err("querying undo messages"))?;
+
+        let mut removed_ids = Vec::new();
+        let mut removed_tool_calls = 0_i64;
+        for row in rows {
+            let (message_id, role, tool_calls) = row.map_err(state_err("collecting undo rows"))?;
+            if matches!(role.as_str(), "assistant" | "tool") {
+                removed_ids.push(message_id);
+                removed_tool_calls += parse_tool_call_count(tool_calls.as_deref())?;
+                continue;
+            }
+            if role == "user" {
+                removed_ids.push(message_id);
+                removed_tool_calls += parse_tool_call_count(tool_calls.as_deref())?;
+            }
+            break;
+        }
+
+        drop(statement);
+
+        if removed_ids.is_empty() {
+            tx.rollback()
+                .map_err(state_err("rolling back empty undo transaction"))?;
+            return Ok(0);
+        }
+
+        for message_id in &removed_ids {
+            tx.execute("DELETE FROM messages WHERE id = ?", [message_id])
+                .map_err(state_err("deleting undone messages"))?;
+        }
+        tx.execute(
+            "UPDATE sessions
+             SET message_count = MAX(message_count - ?, 0),
+                 tool_call_count = MAX(tool_call_count - ?, 0)
+             WHERE id = ?",
+            params![removed_ids.len() as i64, removed_tool_calls, session_id],
+        )
+        .map_err(state_err("updating undo counters"))?;
+        tx.commit()
+            .map_err(state_err("committing undo transaction"))?;
+        Ok(removed_ids.len())
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<bool, HermesError> {
         let tx = self
             .connection
@@ -1158,6 +1222,17 @@ fn count_tool_calls(value: &Value) -> i64 {
         Value::Null => 0,
         _ => 1,
     }
+}
+
+fn parse_tool_call_count(raw: Option<&str>) -> Result<i64, HermesError> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let parsed = serde_json::from_str::<Value>(raw).map_err(|source| HermesError::State {
+        action: "parsing stored tool_calls",
+        detail: source.to_string(),
+    })?;
+    Ok(count_tool_calls(&parsed))
 }
 
 fn escape_like(value: &str) -> String {
@@ -1582,6 +1657,161 @@ mod tests {
             .expect("session");
         assert_eq!(session.message_count, 0);
         assert_eq!(session.tool_call_count, 0);
+    }
+
+    #[test]
+    fn trim_last_exchange_removes_trailing_assistant_tool_and_user_messages() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-undo"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!("keep me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("prior answer")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!("remove me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("thinking")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "plan"}, {"name": "search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(serde_json::json!("tool output")),
+                tool_call_id: Some(String::from("call-1")),
+                tool_calls: None,
+                tool_name: Some(String::from("search")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store
+                .append_message("sess-undo", &message)
+                .expect("append message");
+        }
+
+        let removed = store
+            .trim_last_exchange("sess-undo")
+            .expect("trim last exchange");
+        assert_eq!(removed, 3);
+
+        let messages = store.get_messages("sess-undo").expect("get messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, Some(serde_json::json!("keep me")));
+        assert_eq!(messages[1].content, Some(serde_json::json!("prior answer")));
+
+        let session = store
+            .get_session("sess-undo")
+            .expect("get session")
+            .expect("session");
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.tool_call_count, 1);
+    }
+
+    #[test]
+    fn trim_last_exchange_removes_single_trailing_user_message() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-undo-user"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        store
+            .append_message(
+                "sess-undo-user",
+                &MessageAppend {
+                    role: String::from("user"),
+                    content: Some(serde_json::json!("question")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .expect("append message");
+
+        let removed = store
+            .trim_last_exchange("sess-undo-user")
+            .expect("trim last exchange");
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .get_messages("sess-undo-user")
+                .expect("get messages")
+                .is_empty()
+        );
     }
 
     #[test]
