@@ -1275,6 +1275,47 @@ const MATTERMOST_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
+const BLUEBUBBLES_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Install BlueBubbles on a Mac that will act as your iMessage server:",
+    "   https://bluebubbles.app/",
+    "2. Complete the BlueBubbles setup wizard and sign in with your Apple ID",
+    "3. In BlueBubbles Settings → API, note the Server URL and password",
+    "4. The server URL is typically http://<your-mac-ip>:1234",
+    "5. Hermes connects via the BlueBubbles REST API and receives incoming messages via a local webhook",
+    "6. To authorize users, use DM pairing: hermes pairing generate bluebubbles",
+];
+
+const BLUEBUBBLES_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "BLUEBUBBLES_SERVER_URL",
+        prompt: "BlueBubbles server URL (e.g. http://192.168.1.10:1234)",
+        password: false,
+        help: "The URL shown in BlueBubbles Settings → API.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "BLUEBUBBLES_PASSWORD",
+        prompt: "BlueBubbles server password",
+        password: true,
+        help: "The password shown in BlueBubbles Settings → API.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "BLUEBUBBLES_ALLOWED_USERS",
+        prompt: "Pre-authorized phone numbers or iMessage IDs (comma-separated, or leave empty for DM pairing)",
+        password: false,
+        help: "Optional — pre-authorize specific users. Leave empty to use DM pairing instead.",
+        is_allowlist: true,
+    },
+    GatewaySetupVarSpec {
+        name: "BLUEBUBBLES_HOME_CHANNEL",
+        prompt: "Home channel (phone number or iMessage ID for cron/notifications, or empty)",
+        password: false,
+        help: "Phone number or Apple ID to deliver cron results and notifications to.",
+        is_allowlist: false,
+    },
+];
+
 const WECOM_CALLBACK_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Go to WeCom Admin Console → Applications → Create Self-Built App",
     "2. Note the Corp ID (top of admin console) and create a Corp Secret",
@@ -1495,9 +1536,9 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         label: "BlueBubbles (iMessage)",
         emoji: "💬",
         token_var: "BLUEBUBBLES_SERVER_URL",
-        has_builtin_setup: true,
-        setup_instructions: NO_GATEWAY_SETUP_INSTRUCTIONS,
-        vars: NO_GATEWAY_SETUP_VARS,
+        has_builtin_setup: false,
+        setup_instructions: BLUEBUBBLES_SETUP_INSTRUCTIONS,
+        vars: BLUEBUBBLES_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
         key: "qqbot",
@@ -1632,6 +1673,16 @@ fn native_gateway_platform_status(
                     "configured".to_string()
                 }
             } else if val.is_some() || password.is_some() || homeserver.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "bluebubbles" => {
+            let password = read_effective_env_value(context, "BLUEBUBBLES_PASSWORD");
+            if val.is_some() && password.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || password.is_some() {
                 "partially configured".to_string()
             } else {
                 "not configured".to_string()
@@ -1948,9 +1999,10 @@ fn configure_standard_gateway_platform_with_io(
                     writeln!(output, "  {message}")?;
                     continue;
                 }
-                save_env_value(context.env_path(), &var.name, trimmed)?;
+                let normalized = normalize_gateway_setup_value(platform, var, trimmed);
+                save_env_value(context.env_path(), &var.name, &normalized)?;
                 writeln!(output, "  Saved {}", var.name)?;
-            } else if var.name == platform.token_var {
+            } else if gateway_setup_var_is_required(platform, var) {
                 writeln!(
                     output,
                     "  Skipped — {} won't work without this.",
@@ -1982,8 +2034,57 @@ fn configure_standard_gateway_platform_with_io(
         writeln!(output, "  Home channel set to {first_id}")?;
     }
 
+    if platform.key == "bluebubbles" {
+        configure_bluebubbles_advanced_settings(context, input, output)?;
+    }
+
     writeln!(output)?;
     writeln!(output, "{} {} configured!", platform.emoji, platform.label)?;
+    Ok(())
+}
+
+fn gateway_setup_var_is_required(platform: &GatewaySetupPlatform, var: &GatewaySetupVar) -> bool {
+    var.name == platform.token_var
+        || (platform.key == "bluebubbles" && var.name == "BLUEBUBBLES_PASSWORD")
+}
+
+fn configure_bluebubbles_advanced_settings(
+    context: &HermesContext,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  Advanced settings (defaults are fine for most setups):"
+    )?;
+    if prompt_gateway_yes_no(input, output, "Configure webhook listener settings?", false)? {
+        let value = prompt_gateway_line(input, output, "  Webhook listener port (default: 8645)")?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            match trimmed.parse::<u16>() {
+                Ok(port) if port > 0 => {
+                    save_env_value(
+                        context.env_path(),
+                        "BLUEBUBBLES_WEBHOOK_PORT",
+                        &port.to_string(),
+                    )?;
+                    writeln!(output, "  Webhook port set to {port}")?;
+                }
+                Ok(_) | Err(_) => {
+                    writeln!(output, "  Invalid port number, using default 8645")?;
+                }
+            }
+        }
+    }
+    writeln!(
+        output,
+        "  Requires the BlueBubbles Private API helper for typing indicators, read receipts, and tapback reactions."
+    )?;
+    writeln!(
+        output,
+        "  Install: https://docs.bluebubbles.app/helper-bundle/installation"
+    )?;
     Ok(())
 }
 
@@ -2030,6 +2131,23 @@ fn validate_gateway_setup_value(
         );
     }
     Ok(())
+}
+
+fn normalize_gateway_setup_value(
+    platform: &GatewaySetupPlatform,
+    var: &GatewaySetupVar,
+    value: &str,
+) -> String {
+    if matches!(
+        platform.key.as_str(),
+        "bluebubbles" | "mattermost" | "matrix"
+    ) && matches!(
+        var.name.as_str(),
+        "BLUEBUBBLES_SERVER_URL" | "MATTERMOST_URL" | "MATRIX_HOMESERVER"
+    ) {
+        return value.trim_end_matches('/').to_string();
+    }
+    value.to_string()
 }
 
 fn is_valid_telegram_bot_token(value: &str) -> bool {
@@ -4235,6 +4353,12 @@ exit 9\n",
             .unwrap();
         assert!(gateway_platform_uses_native_standard_setup(slack));
 
+        let bluebubbles = metadata
+            .iter()
+            .find(|platform| platform.key == "bluebubbles")
+            .unwrap();
+        assert!(gateway_platform_uses_native_standard_setup(bluebubbles));
+
         let matrix = metadata
             .iter()
             .find(|platform| platform.key == "matrix")
@@ -4318,6 +4442,8 @@ exit 9\n",
             "TEAMS_CLIENT_ID",
             "TEAMS_CLIENT_SECRET",
             "TEAMS_TENANT_ID",
+            "BLUEBUBBLES_SERVER_URL",
+            "BLUEBUBBLES_PASSWORD",
         ] {
             remove_env_var(key);
         }
@@ -4360,6 +4486,11 @@ exit 9\n",
             .find(|platform| platform.key == "teams")
             .unwrap();
         assert_eq!(teams.status, "partially configured");
+        let bluebubbles = metadata
+            .iter()
+            .find(|platform| platform.key == "bluebubbles")
+            .unwrap();
+        assert_eq!(bluebubbles.status, "not configured");
     }
 
     #[test]
@@ -4538,6 +4669,41 @@ exit 9\n",
         let env_text = fs::read_to_string(context.env_path()).unwrap();
         assert!(env_text.contains("SLACK_BOT_TOKEN=xoxb-existing"));
         assert!(!env_text.contains("SLACK_APP_TOKEN="));
+    }
+
+    #[test]
+    fn configure_bluebubbles_gateway_platform_writes_env_values_and_webhook_port() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "bluebubbles")
+            .unwrap();
+
+        let mut input = Cursor::new(
+            "http://192.168.1.10:1234/\nsecret\n+15551234567, user@icloud.com\n+15551234567\ny\n8765\n",
+        );
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Webhook port set to 8765"));
+        assert!(rendered.contains("BlueBubbles Private API helper"));
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("BLUEBUBBLES_SERVER_URL=http://192.168.1.10:1234"));
+        assert!(env_text.contains("BLUEBUBBLES_PASSWORD=secret"));
+        assert!(env_text.contains("BLUEBUBBLES_ALLOWED_USERS=+15551234567,user@icloud.com"));
+        assert!(env_text.contains("BLUEBUBBLES_HOME_CHANNEL=+15551234567"));
+        assert!(env_text.contains("BLUEBUBBLES_WEBHOOK_PORT=8765"));
+
+        let status = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "bluebubbles")
+            .unwrap()
+            .status;
+        assert_eq!(status, "configured");
     }
 
     #[test]
