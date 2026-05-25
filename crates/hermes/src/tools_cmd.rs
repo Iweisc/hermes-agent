@@ -1156,6 +1156,50 @@ pub(crate) fn interactive_tools_menu_choice_count(
     Ok(build_interactive_tools_options(&root, &platforms).len())
 }
 
+#[cfg(test)]
+pub(crate) fn interactive_tools_platform_choice(
+    context: &HermesContext,
+    platform_name: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let root = read_raw_yaml_mapping(&context.config_path())?;
+    let platforms = enabled_platforms();
+    let options = build_interactive_tools_options(&root, &platforms);
+    for (index, choice) in options.iter().enumerate() {
+        if let InteractiveToolsChoice::Platform(platform_index) = choice.0 {
+            if platforms
+                .get(platform_index)
+                .is_some_and(|platform| platform.name == platform_name)
+            {
+                return Ok(index + 1);
+            }
+        }
+    }
+    Err(format!("platform choice '{platform_name}' is not available").into())
+}
+
+#[cfg(test)]
+pub(crate) fn interactive_toolset_selection_for_names(
+    platform: &str,
+    names: &[&str],
+) -> Result<String, Box<dyn Error>> {
+    let available = CONFIGURABLE_TOOLSETS
+        .iter()
+        .filter(|toolset| toolset_allowed_for_platform(toolset.name, platform))
+        .collect::<Vec<_>>();
+    let mut selections = BTreeSet::new();
+    for name in names {
+        let Some(index) = available.iter().position(|toolset| toolset.name == *name) else {
+            return Err(format!("toolset '{name}' is not available for {platform}").into());
+        };
+        selections.insert(index + 1);
+    }
+    Ok(selections
+        .into_iter()
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 fn prompt_menu_choice(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
@@ -2293,7 +2337,11 @@ printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"alpha\"
             &context.config_path(),
             "platform_toolsets:\n  cli:\n    - file\n",
         );
-        let mut input = Cursor::new(b"1\n1,4\n3\n".to_vec());
+        let cli_choice = interactive_tools_platform_choice(&context, "cli").unwrap();
+        let selection = interactive_toolset_selection_for_names("cli", &["file", "web"]).unwrap();
+        let done_choice = interactive_tools_menu_choice_count(&context).unwrap();
+        let mut input =
+            Cursor::new(format!("{cli_choice}\n{selection}\n{done_choice}\n").into_bytes());
         let mut output = Vec::new();
 
         run_native_tools_interactive_with_io(&context, &mut input, &mut output).unwrap();
