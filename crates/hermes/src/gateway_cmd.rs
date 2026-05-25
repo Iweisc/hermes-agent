@@ -857,7 +857,7 @@ fn print_gateway_run(
     Err(exit_status_message("gateway", status).into())
 }
 
-const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
+pub(crate) const GATEWAY_RUN_BOOTSTRAP: &str = concat!(
     "import os\n",
     "from hermes_cli.gateway import run_gateway\n",
     "run_gateway(\n",

@@ -297,6 +297,7 @@ from dotenv import load_dotenv  # backward-compat for tests that monkeypatch thi
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+_gateway_config_override = os.environ.get("HERMES_GATEWAY_CONFIG_PATH", "").strip()
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -304,7 +305,7 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
+_config_path = Path(_gateway_config_override) if _gateway_config_override else (_hermes_home / 'config.yaml')
 if _config_path.exists():
     try:
         import yaml as _yaml
@@ -814,7 +815,7 @@ def _load_gateway_config() -> dict:
     still see their fixture) and shares the mtime-keyed raw-yaml cache
     from ``hermes_cli.config.read_raw_config`` when the paths match.
     """
-    config_path = _hermes_home / 'config.yaml'
+    config_path = Path(_gateway_config_override) if _gateway_config_override else (_hermes_home / 'config.yaml')
     try:
         from hermes_cli.config import get_config_path, read_raw_config
         # Fast path: if _hermes_home agrees with the canonical config

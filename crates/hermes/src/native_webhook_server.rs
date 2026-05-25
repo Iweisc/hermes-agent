@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermes_core::{
     DelegateExecutor, HermesContext, LoadedConfig, ModelOverrides, ToolRuntime, dispatch_tool,
-    get_tool_definitions,
+    get_tool_definitions, load_skill_prompt_content,
 };
 use hmac::{Hmac, Mac};
 use regex::Regex;
@@ -260,7 +260,11 @@ async fn handle_webhook(
         return response;
     }
 
-    let prompt = render_prompt(&route.prompt, &payload, &event_type, &route_name);
+    let prompt = apply_route_skills(
+        &state.context,
+        &route.skills,
+        &render_prompt(&route.prompt, &payload, &event_type, &route_name),
+    );
     let rendered_extra = render_delivery_extra(&route.deliver_extra, &payload);
 
     if route.deliver_only {
@@ -664,11 +668,41 @@ pub(crate) fn routes_support_native<'a>(
     mut routes: impl Iterator<Item = &'a NativeWebhookRoute>,
 ) -> bool {
     routes.all(|route| {
-        route.skills.is_empty()
-            && (route.deliver == "log"
-                || route.deliver == "github_comment"
-                || send_message_supported_platform(&route.deliver))
+        route.deliver == "log"
+            || route.deliver == "github_comment"
+            || send_message_supported_platform(&route.deliver)
     })
+}
+
+fn apply_route_skills(context: &HermesContext, skills: &[String], prompt: &str) -> String {
+    if skills.is_empty() {
+        return prompt.to_string();
+    }
+
+    let mut parts = Vec::new();
+    let mut skipped = Vec::new();
+    for skill_name in skills {
+        match load_skill_prompt_content(context.hermes_home().as_path(), skill_name) {
+            Ok(content) => {
+                parts.push(format!(
+                    "[IMPORTANT: The user has invoked the \"{}\" skill. Follow its instructions.]\n\n{}",
+                    skill_name, content
+                ));
+            }
+            Err(_) => skipped.push(skill_name.clone()),
+        }
+    }
+    if !skipped.is_empty() {
+        parts.push(format!(
+            "[IMPORTANT: The following skill(s) were listed for this webhook route but could not be found and were skipped: {}.]",
+            skipped.join(", ")
+        ));
+    }
+    parts.push(format!(
+        "The user has provided the following instruction alongside the skill invocation: {}",
+        prompt
+    ));
+    parts.join("\n\n")
 }
 
 fn validate_signature(headers: &HeaderMap, body: &[u8], secret: &str) -> bool {
@@ -1120,6 +1154,30 @@ mod tests {
                     break;
                 }
             }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|value| value + 4)
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
             handler(String::from_utf8_lossy(&request).to_string());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1240,6 +1298,125 @@ mod tests {
         let (_temp, context, loaded) = temp_context(&config_text);
         let settings = load_webhook_settings(&loaded).unwrap();
         let static_routes = load_static_routes(&loaded, &settings.global_secret).unwrap();
+        let state = NativeWebhookState {
+            context: context.clone(),
+            loaded,
+            settings: settings.clone(),
+            static_routes,
+            dynamic_routes_path: context.hermes_home().join(DYNAMIC_ROUTES_FILENAME),
+            runtime_state: Arc::new(Mutex::new(WebhookRuntimeState::default())),
+        };
+        set_env_var("DINGTALK_WEBHOOK_URL", &webhook_url);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                let app = Router::new()
+                    .route("/health", get(handle_health))
+                    .route("/webhooks/{route_name}", post(handle_webhook))
+                    .with_state(Arc::new(state));
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let payload = br#"{"message":"ping"}"#;
+        let response: JsonValue = client
+            .post(format!("http://{addr}/webhooks/review"))
+            .header("Content-Type", "application/json")
+            .header(
+                "X-Hub-Signature-256",
+                compute_signature("topsecret", payload),
+            )
+            .header("X-GitHub-Event", "test")
+            .body(payload.to_vec())
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(response["status"], json!("accepted"));
+        model_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        dingtalk_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(client);
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        dingtalk_join.join().unwrap();
+        model_join.join().unwrap();
+        remove_env_var("DINGTALK_WEBHOOK_URL");
+    }
+
+    #[test]
+    fn native_webhook_routes_support_skills() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (dingtalk_tx, dingtalk_rx) = mpsc::channel();
+        let (dingtalk_base_url, dingtalk_join) = mock_http_server(move |_headers, body| {
+            let payload: JsonValue = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["text"]["content"], json!("handled with skill"));
+            dingtalk_tx.send(()).unwrap();
+        });
+        let (model_tx, model_rx) = mpsc::channel();
+        let (model_base_url, model_join) = mock_model_server(
+            json!({
+                "id": "chatcmpl-skill",
+                "choices": [{
+                    "message": {
+                        "content": "handled with skill"
+                    }
+                }]
+            })
+            .to_string(),
+            move |request| {
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let payload: JsonValue = serde_json::from_str(body).unwrap();
+                let messages = payload["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["role"] == json!("user")
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("demo-skill"))
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("Skill body"))
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("Summarize: ping"))
+                }));
+                model_tx.send(()).unwrap();
+            },
+        );
+        let webhook_url = format!("{dingtalk_base_url}/robot/send?access_token=test-token");
+        let config_text = format!(
+            "model:\n  default: test-model\n  provider: custom\n  base_url: {model_base_url}\n  api_key: test-key\n  api_mode: chat_completions\nplatforms:\n  webhook:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 8644\n      routes:\n        review:\n          secret: topsecret\n          prompt: 'Summarize: {{message}}'\n          deliver: dingtalk\n          deliver_extra:\n            chat_id: cidding==\n          skills:\n            - demo-skill\n"
+        );
+        let (temp, context, loaded) = temp_context(&config_text);
+        fs::create_dir_all(temp.path().join("skills").join("demo-skill")).unwrap();
+        fs::write(
+            temp.path()
+                .join("skills")
+                .join("demo-skill")
+                .join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nSkill body\n",
+        )
+        .unwrap();
+        let settings = load_webhook_settings(&loaded).unwrap();
+        let static_routes = load_static_routes(&loaded, &settings.global_secret).unwrap();
+        assert!(routes_support_native(static_routes.values()));
         let state = NativeWebhookState {
             context: context.clone(),
             loaded,

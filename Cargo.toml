@@ -46,6 +46,7 @@ serde_yaml = "0.9.34"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 tokio = { version = "1.52.2", features = ["full"] }
+tokio-stream = "0.1.17"
 tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots"] }
 unicode-normalization = "0.1.24"
 url = "2.5.7"
