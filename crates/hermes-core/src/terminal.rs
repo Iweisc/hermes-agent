@@ -132,7 +132,7 @@ pub fn handle_terminal(args: &Value, runtime: &ToolRuntime) -> String {
     if background {
         return spawn_background_command(&command, &cwd, runtime);
     }
-    run_foreground_command(&command, &cwd, timeout)
+    run_foreground_command(&command, &cwd, timeout, runtime)
 }
 
 pub fn handle_process(args: &Value, runtime: &ToolRuntime) -> String {
@@ -382,7 +382,12 @@ fn spawn_background_command(command: &str, cwd: &Path, runtime: &ToolRuntime) ->
     }))
 }
 
-fn run_foreground_command(command: &str, cwd: &Path, timeout: u64) -> String {
+fn run_foreground_command(
+    command: &str,
+    cwd: &Path,
+    timeout: u64,
+    runtime: &ToolRuntime,
+) -> String {
     let child = match shell_command(command, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -431,12 +436,39 @@ fn run_foreground_command(command: &str, cwd: &Path, timeout: u64) -> String {
     };
 
     let combined = combine_output(&output);
+    let transformed = transform_terminal_output(
+        runtime,
+        command,
+        &combined,
+        output.status.code().unwrap_or_default(),
+    );
     json_result(json!({
-        "output": combined.trim(),
+        "output": transformed.trim(),
         "exit_code": output.status.code().unwrap_or_default(),
         "error": Value::Null,
         "status": if output.status.success() { "completed" } else { "failed" },
     }))
+}
+
+fn transform_terminal_output(
+    runtime: &ToolRuntime,
+    command: &str,
+    output: &str,
+    returncode: i32,
+) -> String {
+    let payload = json!({
+        "command": command,
+        "output": output,
+        "returncode": returncode,
+        "task_id": runtime.current_session_id().unwrap_or_default(),
+        "env_type": "local",
+    });
+    for hook_result in runtime.invoke_hook("transform_terminal_output", &payload) {
+        if let Some(text) = hook_result.as_str() {
+            return text.to_string();
+        }
+    }
+    output.to_string()
 }
 
 fn shell_command(command: &str, cwd: &Path) -> Command {
@@ -671,6 +703,32 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["exit_code"], json!(0));
         assert_eq!(parsed["output"], json!("hi from shell"));
+    }
+
+    #[test]
+    fn foreground_terminal_applies_transform_output_hook() {
+        let temp = TempDir::new().unwrap();
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_hook_invoke_callback(|hook_name, payload, _runtime| {
+                if hook_name != "transform_terminal_output" {
+                    return Vec::new();
+                }
+                assert_eq!(payload["command"], json!("printf 'hi from shell\\n'"));
+                assert_eq!(payload["output"], json!("hi from shell\n"));
+                assert_eq!(payload["returncode"], json!(0));
+                assert_eq!(payload["env_type"], json!("local"));
+                vec![json!("normalized shell output")]
+            });
+        let result = handle_terminal(
+            &json!({
+                "command": "printf 'hi from shell\\n'",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exit_code"], json!(0));
+        assert_eq!(parsed["output"], json!("normalized shell output"));
     }
 
     #[test]

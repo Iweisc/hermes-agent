@@ -661,6 +661,44 @@ pub fn discover_memory_provider_plugins(hermes_home: &Path) -> Vec<DiscoveredPlu
     plugins
 }
 
+pub fn discover_general_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
+    let mut plugins = discover_scanned_plugins(hermes_home, cwd)
+        .into_iter()
+        .filter(|plugin| {
+            !matches!(
+                plugin.kind,
+                PluginKind::Exclusive | PluginKind::ModelProvider | PluginKind::ContextEngine
+            )
+        })
+        .collect::<Vec<_>>();
+    plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.key.cmp(&right.key)));
+    plugins
+}
+
+pub fn discover_context_engine_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
+    let mut plugins = BTreeMap::<String, DiscoveredPlugin>::new();
+    for plugin in discover_scanned_plugins(hermes_home, cwd) {
+        if plugin.kind == PluginKind::ContextEngine {
+            plugins.entry(plugin.name.clone()).or_insert(plugin);
+        }
+    }
+    plugins.into_values().collect()
+}
+
+pub fn is_effectively_enabled(
+    plugin: &DiscoveredPlugin,
+    enabled: &BTreeSet<String>,
+    disabled: &BTreeSet<String>,
+) -> bool {
+    if disabled.contains(&plugin.name) || disabled.contains(&plugin.key) {
+        return false;
+    }
+    if plugin.kind.is_auto_enabled(plugin.source) {
+        return true;
+    }
+    enabled.contains(&plugin.name) || enabled.contains(&plugin.key)
+}
+
 pub fn discover_dashboard_surfaces(hermes_home: &Path, cwd: &Path) -> Vec<DashboardSurface> {
     let mut dashboards = BTreeMap::<String, DashboardSurface>::new();
     for (root, source) in [
@@ -817,26 +855,12 @@ pub struct DiscoveredPlugin {
     pub platforms: Vec<PlatformSurface>,
 }
 
-fn discover_enabled_general_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
+pub fn discover_enabled_general_plugins(hermes_home: &Path, cwd: &Path) -> Vec<DiscoveredPlugin> {
     let enabled = load_plugin_set(hermes_home, "enabled");
     let disabled = load_plugin_set(hermes_home, "disabled");
-    discover_scanned_plugins(hermes_home, cwd)
+    discover_general_plugins(hermes_home, cwd)
         .into_iter()
-        .filter(|plugin| {
-            !matches!(
-                plugin.kind,
-                PluginKind::Exclusive | PluginKind::ModelProvider | PluginKind::ContextEngine
-            )
-        })
-        .filter(|plugin| {
-            if disabled.contains(&plugin.name) || disabled.contains(&plugin.key) {
-                return false;
-            }
-            if plugin.kind.is_auto_enabled(plugin.source) {
-                return true;
-            }
-            enabled.contains(&plugin.name) || enabled.contains(&plugin.key)
-        })
+        .filter(|plugin| is_effectively_enabled(plugin, &enabled, &disabled))
         .collect()
 }
 

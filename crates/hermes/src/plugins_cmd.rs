@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Args, Subcommand};
-use hermes_core::HermesContext;
+use hermes_core::{HermesContext, is_effectively_enabled};
 use serde_yaml::{Mapping, Value};
 use tempfile::TempDir;
 
@@ -14,7 +14,6 @@ use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mappin
 use crate::plugin_runtime::{
     PluginSource, discover_context_engines as discover_context_engine_plugins,
     discover_general_plugins, discover_memory_providers as discover_memory_provider_plugins,
-    is_effectively_enabled,
 };
 use crate::python_bridge::project_root;
 

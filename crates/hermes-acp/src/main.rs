@@ -8,8 +8,9 @@ use chrono::{LocalResult, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use hermes_core::{
     EnvLoadReport, HermesContext, LoadedConfig, LoggingMode, MessageAppend, MessageRecord,
-    ModelOverrides, SessionCreate, SessionRecord, SessionStore, attach_python_plugin_runtime,
-    get_provider_profile, get_tool_definitions, normalize_provider_alias,
+    ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
+    attach_python_plugin_runtime, get_provider_profile, get_tool_definitions,
+    normalize_provider_alias,
 };
 use serde_json::{Value, json};
 
@@ -310,6 +311,7 @@ impl<'a> AcpServer<'a> {
         let state = AcpSessionState::new(cwd.clone());
         self.create_or_update_persisted_session(&session_id, &state, None)?;
         self.sessions.insert(session_id.clone(), state.clone());
+        self.emit_session_start_hook(&session_id, &state);
         Ok(json!({
             "sessionId": session_id,
             "models": self.model_state_json(&state),
@@ -340,6 +342,7 @@ impl<'a> AcpServer<'a> {
                 let state = AcpSessionState::new(cwd);
                 self.create_or_update_persisted_session(&session_id, &state, None)?;
                 self.sessions.insert(session_id.clone(), state.clone());
+                self.emit_session_start_hook(&session_id, &state);
                 state
             }
         };
@@ -374,6 +377,7 @@ impl<'a> AcpServer<'a> {
                 .map_err(|error| error.to_string())?;
         }
         self.sessions.insert(fork_id.clone(), source_state.clone());
+        self.emit_session_start_hook(&fork_id, &source_state);
         Ok(json!({
             "sessionId": fork_id,
             "models": self.model_state_json(&source_state),
@@ -451,6 +455,18 @@ impl<'a> AcpServer<'a> {
 
     fn handle_close_session(&mut self, params: &Value) -> Result<Value, String> {
         let session_id = required_string(params, "sessionId")?;
+        let session_state = match self.load_session_state(&session_id, None) {
+            Ok(state) => state,
+            Err(error) => {
+                log::warn!(
+                    target: "acp_adapter",
+                    "failed to load ACP session state for finalize hook {}: {}",
+                    session_id,
+                    error
+                );
+                None
+            }
+        };
         let existed = self
             .session_store
             .get_session(&session_id)
@@ -462,8 +478,75 @@ impl<'a> AcpServer<'a> {
         self.session_store
             .end_session(&session_id, "closed")
             .map_err(|error| error.to_string())?;
+        if let Some(state) = session_state {
+            self.emit_session_finalize_hook(&session_id, &state);
+        }
         self.sessions.remove(&session_id);
         Ok(json!({}))
+    }
+
+    fn emit_session_start_hook(&self, session_id: &str, state: &AcpSessionState) {
+        self.invoke_session_hook(
+            session_id,
+            state,
+            "on_session_start",
+            json!({
+                "session_id": session_id,
+                "model": self.resolve_session_model_name(state),
+                "platform": "acp",
+            }),
+        );
+    }
+
+    fn emit_session_finalize_hook(&self, session_id: &str, state: &AcpSessionState) {
+        self.invoke_session_hook(
+            session_id,
+            state,
+            "on_session_finalize",
+            json!({
+                "session_id": session_id,
+                "platform": "acp",
+            }),
+        );
+    }
+
+    fn invoke_session_hook(
+        &self,
+        session_id: &str,
+        state: &AcpSessionState,
+        hook_name: &str,
+        payload: Value,
+    ) {
+        let runtime = attach_python_plugin_runtime(
+            &self.context.hermes_home(),
+            ToolRuntime::new(&state.cwd)
+                .with_hermes_home(self.context.hermes_home())
+                .with_current_session_id(Some(session_id.to_string())),
+        );
+        match runtime {
+            Ok(runtime) => {
+                let _ = runtime.invoke_hook(hook_name, &payload);
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "acp_adapter",
+                    "failed to attach ACP plugin runtime for {} hook {}: {}",
+                    hook_name,
+                    session_id,
+                    error
+                );
+            }
+        }
+    }
+
+    fn resolve_session_model_name(&self, state: &AcpSessionState) -> String {
+        self.context
+            .resolve_model_runtime(self.config, &state.overrides)
+            .ok()
+            .map(|runtime| runtime.model)
+            .or_else(|| state.overrides.model.clone())
+            .or_else(|| self.config.configured_model_name())
+            .unwrap_or_default()
     }
 
     fn handle_set_session_model(&mut self, params: &Value) -> Result<Value, String> {
@@ -1434,6 +1517,147 @@ mod tests {
             state.overrides.base_url.as_deref(),
             Some("https://api.example.com/v1")
         );
+    }
+
+    #[test]
+    fn close_session_emits_finalize_hook_for_plugins() {
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        let plugin_dir = home.join("plugins").join("finalizer");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: finalizer\ndescription: ACP finalize observer\nkind: standalone\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+import os
+from pathlib import Path
+
+
+def register(ctx):
+    def on_session_finalize(**kwargs):
+        Path(os.environ["HERMES_HOME"]).joinpath("finalize.log").write_text(
+            kwargs.get("session_id", ""),
+            encoding="utf-8",
+        )
+
+    ctx.register_hook("on_session_finalize", on_session_finalize)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - finalizer\n",
+        )
+        .unwrap();
+
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = AcpServer::new(&context, &config, &store);
+
+        let created = server
+            .handle_new_session(&json!({"cwd": home.display().to_string()}))
+            .unwrap();
+        let session_id = created
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        server
+            .handle_close_session(&json!({"sessionId": session_id.clone()}))
+            .unwrap();
+
+        let finalized = fs::read_to_string(home.join("finalize.log")).unwrap();
+        assert_eq!(finalized, session_id);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn acp_session_creation_paths_emit_start_hook_for_plugins() {
+        let home = std::env::temp_dir().join(format!("hermes-acp-test-{}", unix_ts_nanos()));
+        let plugin_dir = home.join("plugins").join("starter");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: starter\ndescription: ACP start observer\nkind: standalone\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+import os
+from pathlib import Path
+
+
+def register(ctx):
+    def on_session_start(**kwargs):
+        path = Path(os.environ["HERMES_HOME"]).joinpath("start.log")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{kwargs.get('session_id', '')}|{kwargs.get('platform', '')}\n"
+            )
+
+    ctx.register_hook("on_session_start", on_session_start)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - starter\n",
+        )
+        .unwrap();
+
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = AcpServer::new(&context, &config, &store);
+
+        let created = server
+            .handle_new_session(&json!({"cwd": home.display().to_string()}))
+            .unwrap();
+        let created_session_id = created
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let resumed_session_id = format!("acp_resume_{:x}", unix_ts_nanos());
+        server
+            .handle_resume_session(&json!({
+                "sessionId": resumed_session_id,
+                "cwd": home.display().to_string()
+            }))
+            .unwrap();
+
+        let forked = server
+            .handle_fork_session(&json!({
+                "sessionId": created_session_id,
+                "cwd": home.display().to_string()
+            }))
+            .unwrap();
+        let forked_session_id = forked
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let lines = fs::read_to_string(home.join("start.log"))
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert!(lines.contains(&format!("{created_session_id}|acp")));
+        assert!(lines.contains(&format!("{resumed_session_id}|acp")));
+        assert!(lines.contains(&format!("{forked_session_id}|acp")));
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
