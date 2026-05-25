@@ -23,7 +23,7 @@
       "plans/rust_port_integration.json",
       "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "777277357d83"
+    "state_fingerprint": "cfc77f771cbd"
   },
   "merge_order": [
     {
@@ -188,8 +188,21 @@
         "crates/hermes/src/completion.rs",
         "crates/hermes/src/curator_cmd.rs"
       ],
-      "status": "diverged",
-      "observed_dirty_files": [],
+      "status": "dirty",
+      "observed_dirty_files": [
+        "crates/hermes-core/src/config.rs",
+        "crates/hermes-core/src/tts.rs",
+        "plugins/model-providers/ai-gateway/__init__.py",
+        "plugins/model-providers/anthropic/__init__.py",
+        "plugins/model-providers/bedrock/__init__.py",
+        "plugins/model-providers/copilot/__init__.py",
+        "plugins/model-providers/deepseek/__init__.py",
+        "plugins/model-providers/gemini/__init__.py",
+        "plugins/model-providers/minimax/__init__.py",
+        "plugins/model-providers/opencode-zen/__init__.py",
+        "plugins/model-providers/xai/__init__.py",
+        "plugins/model-providers/zai/__init__.py"
+      ],
       "head": "c01d3df83",
       "subject": "test: stabilize skills cmd github mock server"
     },
@@ -234,18 +247,11 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "Cargo.lock",
-        "Cargo.toml",
-        "crates/hermes-core/Cargo.toml",
         "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/auth.rs",
-        "crates/hermes-core/src/config.rs",
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes/src/backup.rs",
-        "crates/hermes/src/webhook.rs"
+        "crates/hermes-core/src/lib.rs"
       ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "head": "632289b32",
+      "subject": "WIP: extend Rust auth and config runtime parity"
     },
     {
       "worktree": "agent-06",
@@ -262,8 +268,8 @@
       "observed_dirty_files": [
         "crates/hermes/src/gateway_native.rs"
       ],
-      "head": "20bd6299f",
-      "subject": "Add native gateway startup RPCs"
+      "head": "75aee9d7c",
+      "subject": "Add native gateway shell exec support"
     },
     {
       "worktree": "agent-07",
@@ -294,6 +300,8 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/lib.rs",
+        "crates/hermes-core/src/state.rs",
         "crates/hermes/src/completion.rs",
         "crates/hermes/src/gateway_cmd.rs",
         "crates/hermes/src/main.rs",
@@ -319,8 +327,8 @@
       "observed_dirty_files": [
         "crates/hermes-agent/src/tui_gateway.rs"
       ],
-      "head": "f2f235f0d",
-      "subject": "WIP: move TUI session branching into Rust"
+      "head": "64948db2c",
+      "subject": "WIP: move TUI background prompts into Rust"
     },
     {
       "worktree": "agent-10",
@@ -338,19 +346,10 @@
         "tui_gateway/server.py",
         "crates/hermes/src/native_gateway_runtime.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/tui_cmd.rs",
-        "scripts/smoke_tui_rust_backend.py",
-        "ui-tui/package.json",
-        "ui-tui/src/__tests__/gatewayClient.test.ts",
-        "ui-tui/src/app/createGatewayEventHandler.ts",
-        "ui-tui/src/gatewayClient.ts",
-        "ui-tui/src/gatewayTypes.ts"
-      ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "29fac95c6",
+      "subject": "WIP: add Rust TUI gateway backend launcher"
     },
     {
       "worktree": "agent-11",
@@ -377,6 +376,7 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/gateway.rs",
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
@@ -391,8 +391,10 @@
       "allowed_paths": [
         "crates/hermes/src/acp_cmd.rs"
       ],
-      "status": "diverged",
-      "observed_dirty_files": [],
+      "status": "dirty",
+      "observed_dirty_files": [
+        "crates/hermes-core/src/send_message.rs"
+      ],
       "head": "8f2ad0a9d",
       "subject": "WIP: extend gateway send_message parity"
     },
@@ -409,6 +411,9 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/agent.rs",
+        "crates/hermes-core/src/lib.rs",
+        "crates/hermes-core/src/skills.rs",
         "crates/hermes/src/native_api_server.rs"
       ],
       "head": "3e5283934",
@@ -464,7 +469,8 @@
       "observed_dirty_files": [
         "crates/hermes-core/src/image_gen.rs",
         "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/plugin_runtime.rs"
+        "crates/hermes-core/src/plugin_runtime.rs",
+        "crates/hermes/src/tools_cmd.rs"
       ],
       "head": "2ee21c3a1",
       "subject": "WIP: tighten Rust plugin runtime parity"
@@ -493,19 +499,10 @@
         "crates/hermes/src/mcp_cmd.rs",
         "crates/hermes/src/mcp_server.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes/src/backup.rs",
-        "crates/hermes/src/claw_cmd.rs",
-        "crates/hermes/src/claw_cmd/native_migration.rs",
-        "crates/hermes/src/curator_cmd.rs",
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/mcp_cmd.rs",
-        "crates/hermes/src/update_cmd.rs",
-        "crates/hermes/src/webhook.rs"
-      ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "981e75ea5",
+      "subject": "WIP: extend Rust MCP and Claw migration flows"
     },
     {
       "worktree": "agent-20",
@@ -558,34 +555,17 @@
         "hermes_cli/skills_config.py",
         "hermes_cli/nous_subscription.py"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "gateway/delivery.py",
-        "hermes_cli/nous_subscription.py",
-        "hermes_cli/skills_config.py",
-        "hermes_cli/tools_config.py",
-        "tests/cron/test_scheduler.py",
-        "tests/gateway/test_delivery.py",
-        "tests/hermes_cli/test_nous_subscription.py",
-        "tests/hermes_cli/test_skills_config.py",
-        "tests/hermes_cli/test_tools_config.py",
-        "tests/hermes_cli/test_tools_disable_enable.py",
-        "tests/test_toolsets.py",
-        "tests/tools/test_delegate.py",
-        "tests/tools/test_send_message_tool.py",
-        "tools/delegate_tool.py",
-        "tools/send_message_tool.py",
-        "toolsets.py"
-      ],
-      "head": "554243ac5",
-      "subject": "Port memory manifest save config to Rust"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "03056dd62",
+      "subject": "WIP: harden Python delivery and toolset parity"
     }
   ],
   "checklist": [
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 12 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 11 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -595,7 +575,7 @@
     {
       "item": "Prevent shared-file conflicts",
       "status": "in_progress",
-      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=31; critical_overlap_count=4; ownership_decision_count=4; lane_proposal_count=1; tracker_edit_action_count=2; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=4; allowed_path_additions=0."
+      "evidence": "The validator emits conflict_runbook, owner_runbook, branch_batches, merge_gates, and execution_queue; paths_with_overlaps=33; critical_overlap_count=4; ownership_decision_count=14; lane_proposal_count=1; tracker_edit_action_count=3; release_only=4; retask_or_stop=1; retire_after_release=1; unowned_path_count=14; allowed_path_additions=0."
     },
     {
       "item": "Keep an integration checklist",
@@ -605,7 +585,7 @@
     {
       "item": "Continuously identify blockers",
       "status": "in_progress",
-      "evidence": "tracker_validation.summary reports violation_count=71 and execution_queue.summary reports operation_count=41."
+      "evidence": "tracker_validation.summary reports violation_count=73 and execution_queue.summary reports operation_count=41."
     },
     {
       "item": "Rebase the integration stack onto main",
@@ -615,7 +595,7 @@
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=12, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=11, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -951,6 +931,7 @@
     {
       "path": "crates/hermes-core/src/config.rs",
       "workers": [
+        "agent-02",
         "agent-05",
         "agent-07",
         "agent-21"
@@ -1004,6 +985,15 @@
       "reason": "Peripheral platform lane should own outbound delivery semantics."
     },
     {
+      "path": "crates/hermes-core/src/skills.rs",
+      "workers": [
+        "agent-07",
+        "agent-14"
+      ],
+      "owner": "agent-07",
+      "reason": "Only agent-07 claims this path in allowed_paths."
+    },
+    {
       "path": "crates/hermes-core/src/state.rs",
       "workers": [
         "agent-04",
@@ -1034,6 +1024,15 @@
       ],
       "owner": "agent-15",
       "reason": "Runtime lane should own tool execution semantics during integration."
+    },
+    {
+      "path": "crates/hermes-core/src/tts.rs",
+      "workers": [
+        "agent-02",
+        "agent-21"
+      ],
+      "owner": "agent-21",
+      "reason": "Only agent-21 claims this path in allowed_paths."
     },
     {
       "path": "crates/hermes/Cargo.toml",
@@ -1213,8 +1212,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "12 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=12.",
+      "summary": "11 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=11.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1236,15 +1235,15 @@
       "next_action": "Use live_conflict_clusters owners as the first serialization pass."
     },
     {
-      "severity": "high",
-      "summary": "Some worker branches still exist only as dirty local worktrees with no committed branch delta.",
-      "evidence": "Unmergeable local-only branches: agent-05@554243ac5 (9 dirty files), agent-10@554243ac5 (8 dirty files), agent-19@554243ac5 (8 dirty files), agent-22@554243ac5 (16 dirty files).",
-      "next_action": "Commit and push those local-only branches, or explicitly discard them, before treating their lanes as merge candidates."
+      "severity": "medium",
+      "summary": "Some worker branches still lack upstreams.",
+      "evidence": "workers_with_upstream=9 in the status script summary.",
+      "next_action": "Push the surviving branches after scopes are corrected so integration state is externally visible."
     },
     {
       "severity": "medium",
       "summary": "The validator still reports many scope violations because the live edits do not match the planned lanes.",
-      "evidence": "tracker_validation.summary reports violation_count=71 with high_severity_count=50.",
+      "evidence": "tracker_validation.summary reports violation_count=73 with high_severity_count=50.",
       "next_action": "Either retask the branches to their current files or move the files to the designated owners."
     },
     {
@@ -1408,8 +1407,8 @@
       ]
     }
   ],
-  "last_synced_at": "2026-05-25T15:37:22+00:00",
-  "state_fingerprint": "777277357d83",
+  "last_synced_at": "2026-05-25T15:50:10+00:00",
+  "state_fingerprint": "cfc77f771cbd",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
