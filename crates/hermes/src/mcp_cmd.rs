@@ -1,23 +1,26 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::TcpListener;
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
+use getrandom::fill as fill_random;
 use hermes_core::HermesContext;
 use regex::Regex;
 use serde_json::{Value as JsonValue, json};
 use serde_yaml::{Mapping, Value};
+use sha2::{Digest, Sha256};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value, write_yaml_mapping};
 use crate::mcp_server::run_mcp_stdio;
-use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[cfg(test)]
 use clap::Parser;
@@ -143,10 +146,8 @@ fn test_server(context: &HermesContext, args: TestArgs) -> Result<(), Box<dyn Er
     if is_oauth_configured(&entry.config)
         && resolve_cached_oauth_access_token(context, name).is_none()
     {
-        println!(
-            "  OAuth-configured server has no cached access token; using compatibility probe."
-        );
-        return print_python_mcp_test(name);
+        println!("  OAuth-configured server has no cached access token; starting login...");
+        native_oauth_login(context, name, &entry.config, false)?;
     }
 
     let start = Instant::now();
@@ -229,7 +230,14 @@ fn login_server(context: &HermesContext, args: LoginArgs) -> Result<(), Box<dyn 
         println!("  No cached OAuth tokens found for '{name}'.");
     }
     println!("  Starting OAuth flow for '{name}'...");
-    print_python_mcp_login(name)
+    native_oauth_login(context, name, &entry.config, true)?;
+    let tools = probe_server_tools(context, name, &entry.config)?;
+    if tools.is_empty() {
+        println!("  Authenticated (server reported no tools)");
+    } else {
+        println!("  Authenticated — {} tool(s) available", tools.len());
+    }
+    Ok(())
 }
 
 fn print_mcp_serve(context: &HermesContext, args: ServeArgs) -> Result<(), Box<dyn Error>> {
@@ -263,7 +271,13 @@ fn configure_server_io<R: BufRead, W: Write>(
     if is_oauth_configured(&entry.config)
         && resolve_cached_oauth_access_token(context, name).is_none()
     {
-        return print_python_mcp_configure(name);
+        writeln!(output)?;
+        writeln!(
+            output,
+            "  OAuth login required for '{name}' — starting flow..."
+        )?;
+        output.flush()?;
+        native_oauth_login(context, name, &entry.config, false)?;
     }
 
     writeln!(output)?;
@@ -702,6 +716,817 @@ fn safe_oauth_server_filename(name: &str) -> String {
     } else {
         limited.to_string()
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct McpOauthConfig {
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    scope: Option<String>,
+    redirect_port: Option<u16>,
+    client_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProtectedResourceMetadata {
+    #[serde(default)]
+    resource: Option<String>,
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OAuthAuthorizationServerMetadata {
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint: Option<String>,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+    #[serde(default)]
+    scopes_supported: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OAuthClientInfo {
+    #[serde(default)]
+    redirect_uris: Option<Vec<String>>,
+    #[serde(default)]
+    token_endpoint_auth_method: String,
+    #[serde(default)]
+    grant_types: Option<Vec<String>>,
+    #[serde(default)]
+    response_types: Option<Vec<String>>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    client_name: Option<String>,
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    client_id_issued_at: Option<i64>,
+    #[serde(default)]
+    client_secret_expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct OAuthClientMetadataPayload {
+    redirect_uris: Vec<String>,
+    token_endpoint_auth_method: String,
+    grant_types: Vec<String>,
+    response_types: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct OAuthTokenPayload {
+    access_token: String,
+    token_type: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct OAuthCallbackResult {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn native_oauth_login(
+    context: &HermesContext,
+    server_name: &str,
+    config: &Mapping,
+    force_reauth: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !force_reauth && resolve_cached_oauth_access_token(context, server_name).is_some() {
+        return Ok(());
+    }
+    let url = config_string(config, "url")
+        .ok_or_else(|| format!("Server '{server_name}' has no URL configured"))?;
+    let oauth_cfg = load_oauth_config(config)?;
+    let timeout = config_timeout(config);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?;
+
+    let prm = discover_protected_resource_metadata(&client, &url)?;
+    let asm = discover_authorization_server_metadata(&client, &url, prm.as_ref())?;
+    let client_info = load_or_register_client(
+        &client,
+        context,
+        server_name,
+        &url,
+        &oauth_cfg,
+        asm.as_ref(),
+    )?;
+    let token = run_oauth_authorization_flow(
+        &client,
+        &url,
+        prm.as_ref(),
+        asm.as_ref(),
+        &oauth_cfg,
+        &client_info,
+    )?;
+    persist_oauth_state(context, server_name, &client_info, &token)?;
+    Ok(())
+}
+
+fn load_oauth_config(config: &Mapping) -> Result<McpOauthConfig, Box<dyn Error>> {
+    let Some(mapping) = config.get(yaml_key("oauth")).and_then(Value::as_mapping) else {
+        return Ok(McpOauthConfig::default());
+    };
+    let mut oauth = McpOauthConfig::default();
+    oauth.client_id = mapping
+        .get(yaml_key("client_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    oauth.client_secret = mapping
+        .get(yaml_key("client_secret"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    oauth.scope = mapping
+        .get(yaml_key("scope"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    oauth.client_name = mapping
+        .get(yaml_key("client_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(raw_port) = mapping.get(yaml_key("redirect_port")) {
+        let port = value_as_u64(raw_port).ok_or("oauth.redirect_port must be numeric")?;
+        oauth.redirect_port = Some(
+            u16::try_from(port).map_err(|_| "oauth.redirect_port must be between 0 and 65535")?,
+        );
+    }
+    Ok(oauth)
+}
+
+fn discover_protected_resource_metadata(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+) -> Result<Option<ProtectedResourceMetadata>, Box<dyn Error>> {
+    for url in build_protected_resource_metadata_discovery_urls(server_url)? {
+        let response = client
+            .get(url.clone())
+            .header("mcp-protocol-version", DEFAULT_MCP_PROTOCOL_VERSION)
+            .send()?;
+        if response.status() != reqwest::StatusCode::OK {
+            continue;
+        }
+        if let Ok(metadata) = response.json::<ProtectedResourceMetadata>() {
+            if !metadata.authorization_servers.is_empty() {
+                return Ok(Some(metadata));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn build_protected_resource_metadata_discovery_urls(
+    server_url: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let parsed = reqwest::Url::parse(server_url)?;
+    let base = oauth_url_origin(&parsed)?;
+    let mut urls = Vec::new();
+    if !parsed.path().is_empty() && parsed.path() != "/" {
+        urls.push(format!(
+            "{base}/.well-known/oauth-protected-resource{}",
+            parsed.path()
+        ));
+    }
+    urls.push(format!("{base}/.well-known/oauth-protected-resource"));
+    Ok(urls)
+}
+
+fn discover_authorization_server_metadata(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    prm: Option<&ProtectedResourceMetadata>,
+) -> Result<Option<OAuthAuthorizationServerMetadata>, Box<dyn Error>> {
+    let auth_server_url = prm
+        .and_then(|metadata| metadata.authorization_servers.first())
+        .map(String::as_str);
+    for url in build_authorization_server_metadata_discovery_urls(auth_server_url, server_url)? {
+        let response = client
+            .get(url)
+            .header("mcp-protocol-version", DEFAULT_MCP_PROTOCOL_VERSION)
+            .send()?;
+        let status = response.status();
+        if status == reqwest::StatusCode::OK {
+            if let Ok(metadata) = response.json::<OAuthAuthorizationServerMetadata>() {
+                return Ok(Some(metadata));
+            }
+            return Ok(None);
+        }
+        if status.is_server_error() || status.is_informational() || status.is_redirection() {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn build_authorization_server_metadata_discovery_urls(
+    auth_server_url: Option<&str>,
+    server_url: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    if let Some(url) = auth_server_url.filter(|value| !value.trim().is_empty()) {
+        let parsed = reqwest::Url::parse(url)?;
+        let base = oauth_url_origin(&parsed)?;
+        if !parsed.path().is_empty() && parsed.path() != "/" {
+            let path = parsed.path().trim_end_matches('/');
+            return Ok(vec![
+                format!("{base}/.well-known/oauth-authorization-server{path}"),
+                format!("{base}/.well-known/openid-configuration{path}"),
+                format!("{base}{path}/.well-known/openid-configuration"),
+            ]);
+        }
+        return Ok(vec![
+            format!("{base}/.well-known/oauth-authorization-server"),
+            format!("{base}/.well-known/openid-configuration"),
+        ]);
+    }
+
+    let parsed = reqwest::Url::parse(server_url)?;
+    Ok(vec![format!(
+        "{}/.well-known/oauth-authorization-server",
+        oauth_url_origin(&parsed)?
+    )])
+}
+
+fn load_or_register_client(
+    client: &reqwest::blocking::Client,
+    context: &HermesContext,
+    server_name: &str,
+    server_url: &str,
+    oauth_cfg: &McpOauthConfig,
+    asm: Option<&OAuthAuthorizationServerMetadata>,
+) -> Result<OAuthClientInfo, Box<dyn Error>> {
+    if let Some(client_id) = oauth_cfg.client_id.as_deref() {
+        let redirect_uri = build_redirect_uri(oauth_cfg.redirect_port)?;
+        return Ok(OAuthClientInfo {
+            redirect_uris: Some(vec![redirect_uri]),
+            token_endpoint_auth_method: if oauth_cfg.client_secret.is_some() {
+                String::from("client_secret_post")
+            } else {
+                String::from("none")
+            },
+            grant_types: Some(vec![
+                String::from("authorization_code"),
+                String::from("refresh_token"),
+            ]),
+            response_types: Some(vec![String::from("code")]),
+            scope: oauth_cfg.scope.clone(),
+            client_name: oauth_cfg
+                .client_name
+                .clone()
+                .or(Some(String::from("Hermes Agent"))),
+            client_id: client_id.to_string(),
+            client_secret: oauth_cfg.client_secret.clone(),
+            client_id_issued_at: None,
+            client_secret_expires_at: None,
+        });
+    }
+
+    let safe_name = safe_oauth_server_filename(server_name);
+    let client_path = context
+        .hermes_home()
+        .join("mcp-tokens")
+        .join(format!("{safe_name}.client.json"));
+    if client_path.exists()
+        && let Ok(raw) = fs::read_to_string(&client_path)
+        && let Ok(client_info) = serde_json::from_str::<OAuthClientInfo>(&raw)
+        && !client_info.client_id.trim().is_empty()
+    {
+        return Ok(client_info);
+    }
+
+    let redirect_uri = build_redirect_uri(oauth_cfg.redirect_port)?;
+    let metadata = OAuthClientMetadataPayload {
+        redirect_uris: vec![redirect_uri],
+        token_endpoint_auth_method: if oauth_cfg.client_secret.is_some() {
+            String::from("client_secret_post")
+        } else {
+            String::from("none")
+        },
+        grant_types: vec![
+            String::from("authorization_code"),
+            String::from("refresh_token"),
+        ],
+        response_types: vec![String::from("code")],
+        scope: oauth_cfg.scope.clone(),
+        client_name: oauth_cfg
+            .client_name
+            .clone()
+            .or(Some(String::from("Hermes Agent"))),
+    };
+    let registration_url = if let Some(url) = asm
+        .and_then(|metadata| metadata.registration_endpoint.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        url.to_string()
+    } else {
+        let parsed = reqwest::Url::parse(server_url)?;
+        format!("{}/register", oauth_url_origin(&parsed)?)
+    };
+    let response = client
+        .post(registration_url)
+        .header("content-type", "application/json")
+        .json(&metadata)
+        .send()?;
+    if response.status() != reqwest::StatusCode::OK
+        && response.status() != reqwest::StatusCode::CREATED
+    {
+        return Err(format!("OAuth client registration failed: {}", response.status()).into());
+    }
+    let client_info = response.json::<OAuthClientInfo>()?;
+    if client_info.client_id.trim().is_empty() {
+        return Err("OAuth client registration did not return client_id".into());
+    }
+    Ok(client_info)
+}
+
+fn run_oauth_authorization_flow(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    prm: Option<&ProtectedResourceMetadata>,
+    asm: Option<&OAuthAuthorizationServerMetadata>,
+    oauth_cfg: &McpOauthConfig,
+    client_info: &OAuthClientInfo,
+) -> Result<OAuthTokenPayload, Box<dyn Error>> {
+    let redirect_uri = client_info
+        .redirect_uris
+        .as_ref()
+        .and_then(|uris| uris.first())
+        .cloned()
+        .ok_or("OAuth client has no redirect_uri configured")?;
+    let authorize_url =
+        build_mcp_authorize_url(server_url, prm, asm, oauth_cfg, client_info, &redirect_uri)?;
+    let callback = if is_remote_session_local() || !can_open_browser_local() {
+        if !io::stdin().is_terminal() {
+            return Err(
+                "OAuth login requires an interactive terminal when no browser callback is available."
+                    .into(),
+            );
+        }
+        println!();
+        println!("  MCP OAuth: authorization required.");
+        println!("  Open this URL in your browser:\n");
+        println!("    {authorize_url}\n");
+        println!("  Paste the full callback URL or just the authorization code below.");
+        let pasted = prompt_for_callback()?;
+        parse_oauth_callback_input(&pasted)?
+    } else {
+        println!();
+        println!("  MCP OAuth: authorization required.");
+        println!("  Open this URL in your browser:\n");
+        println!("    {authorize_url}\n");
+        if try_open_browser_local(&authorize_url)? {
+            println!("  (Browser opened automatically.)");
+        } else {
+            println!("  (Could not open browser automatically — open the URL manually.)");
+        }
+        wait_for_oauth_callback(&redirect_uri)?
+    };
+
+    if let Some(error) = callback.error {
+        let detail = callback.error_description.unwrap_or(error);
+        return Err(format!("OAuth authorization failed: {detail}").into());
+    }
+    let expected_state = authorize_url
+        .split("state=")
+        .nth(1)
+        .and_then(|value| value.split('&').next())
+        .unwrap_or_default()
+        .to_string();
+    let returned_state = callback
+        .state
+        .as_deref()
+        .ok_or("OAuth callback was missing state")?;
+    if returned_state != expected_state {
+        return Err("OAuth authorization failed: state mismatch".into());
+    }
+    let code = callback
+        .code
+        .as_deref()
+        .ok_or("OAuth callback was missing authorization code")?;
+
+    exchange_oauth_code_for_tokens(
+        client,
+        server_url,
+        prm,
+        asm,
+        client_info,
+        &redirect_uri,
+        code,
+        oauth_cfg,
+    )
+}
+
+fn build_mcp_authorize_url(
+    server_url: &str,
+    prm: Option<&ProtectedResourceMetadata>,
+    asm: Option<&OAuthAuthorizationServerMetadata>,
+    oauth_cfg: &McpOauthConfig,
+    client_info: &OAuthClientInfo,
+    redirect_uri: &str,
+) -> Result<String, Box<dyn Error>> {
+    let auth_endpoint = if let Some(endpoint) = asm
+        .and_then(|metadata| metadata.authorization_endpoint.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        endpoint.to_string()
+    } else {
+        let parsed = reqwest::Url::parse(server_url)?;
+        format!("{}/authorize", oauth_url_origin(&parsed)?)
+    };
+    let verifier = oauth_test_override("HERMES_MCP_OAUTH_TEST_VERIFIER")
+        .unwrap_or_else(|| oauth_random_token(64).expect("random verifier"));
+    let challenge = oauth_code_challenge(&verifier);
+    let state = oauth_test_override("HERMES_MCP_OAUTH_TEST_STATE")
+        .unwrap_or_else(|| oauth_random_token(16).expect("random state"));
+
+    let mut url = reqwest::Url::parse(&auth_endpoint)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("response_type", "code");
+        query.append_pair("client_id", &client_info.client_id);
+        query.append_pair("redirect_uri", redirect_uri);
+        query.append_pair("state", &state);
+        query.append_pair("code_challenge", &challenge);
+        query.append_pair("code_challenge_method", "S256");
+        if let Some(scope) = resolve_oauth_scope(oauth_cfg, prm, asm) {
+            query.append_pair("scope", &scope);
+        }
+        if let Some(resource) = prm.and_then(|metadata| metadata.resource.as_deref()) {
+            query.append_pair("resource", resource);
+        }
+    }
+
+    save_pending_oauth_pkce(&verifier, &state)?;
+    Ok(url.to_string())
+}
+
+fn resolve_oauth_scope(
+    oauth_cfg: &McpOauthConfig,
+    prm: Option<&ProtectedResourceMetadata>,
+    asm: Option<&OAuthAuthorizationServerMetadata>,
+) -> Option<String> {
+    oauth_cfg
+        .scope
+        .clone()
+        .or_else(|| {
+            prm.and_then(|metadata| metadata.scopes_supported.as_ref())
+                .map(|values| values.join(" "))
+        })
+        .or_else(|| {
+            asm.and_then(|metadata| metadata.scopes_supported.as_ref())
+                .map(|values| values.join(" "))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn exchange_oauth_code_for_tokens(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+    prm: Option<&ProtectedResourceMetadata>,
+    asm: Option<&OAuthAuthorizationServerMetadata>,
+    client_info: &OAuthClientInfo,
+    redirect_uri: &str,
+    code: &str,
+    oauth_cfg: &McpOauthConfig,
+) -> Result<OAuthTokenPayload, Box<dyn Error>> {
+    let token_endpoint = if let Some(endpoint) = asm
+        .and_then(|metadata| metadata.token_endpoint.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        endpoint.to_string()
+    } else {
+        let parsed = reqwest::Url::parse(server_url)?;
+        format!("{}/token", oauth_url_origin(&parsed)?)
+    };
+    let (verifier, _) = load_pending_oauth_pkce()?;
+    let mut form = vec![
+        ("grant_type", String::from("authorization_code")),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("client_id", client_info.client_id.clone()),
+        ("code_verifier", verifier),
+    ];
+    if let Some(resource) = prm.and_then(|metadata| metadata.resource.as_deref()) {
+        form.push(("resource", resource.to_string()));
+    }
+    let mut request = client
+        .post(token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded");
+    match client_info.token_endpoint_auth_method.as_str() {
+        "client_secret_basic" => {
+            let secret = client_info
+                .client_secret
+                .as_deref()
+                .or(oauth_cfg.client_secret.as_deref())
+                .ok_or("OAuth client_secret_basic requires client_secret")?;
+            request = request.basic_auth(client_info.client_id.clone(), Some(secret.to_string()));
+        }
+        "client_secret_post" => {
+            let secret = client_info
+                .client_secret
+                .as_deref()
+                .or(oauth_cfg.client_secret.as_deref())
+                .ok_or("OAuth client_secret_post requires client_secret")?;
+            form.push(("client_secret", secret.to_string()));
+        }
+        _ => {}
+    }
+    let response = request.form(&form).send()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("OAuth token exchange failed: {}", response.status()).into());
+    }
+    let mut token = response.json::<OAuthTokenPayload>()?;
+    if token.access_token.trim().is_empty() {
+        return Err("OAuth token exchange did not return access_token".into());
+    }
+    if token.token_type.trim().is_empty() {
+        token.token_type = String::from("Bearer");
+    }
+    token.expires_at = token.expires_in.map(|seconds| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_secs_f64() + seconds as f64)
+            .unwrap_or(seconds as f64)
+    });
+    clear_pending_oauth_pkce();
+    Ok(token)
+}
+
+fn persist_oauth_state(
+    context: &HermesContext,
+    server_name: &str,
+    client_info: &OAuthClientInfo,
+    token: &OAuthTokenPayload,
+) -> Result<(), Box<dyn Error>> {
+    let safe_name = safe_oauth_server_filename(server_name);
+    let token_dir = context.hermes_home().join("mcp-tokens");
+    fs::create_dir_all(&token_dir)?;
+    let token_path = token_dir.join(format!("{safe_name}.json"));
+    let client_path = token_dir.join(format!("{safe_name}.client.json"));
+    write_secure_json(&token_path, token)?;
+    write_secure_json(&client_path, client_info)?;
+    Ok(())
+}
+
+fn build_redirect_uri(redirect_port: Option<u16>) -> Result<String, Box<dyn Error>> {
+    let requested = redirect_port.unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", requested))
+        .map_err(|error| format!("failed to reserve OAuth callback port: {error}"))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(format!("http://127.0.0.1:{port}/callback"))
+}
+
+fn wait_for_oauth_callback(redirect_uri: &str) -> Result<OAuthCallbackResult, Box<dyn Error>> {
+    let parsed = reqwest::Url::parse(redirect_uri)?;
+    let host = parsed
+        .host_str()
+        .ok_or("invalid OAuth redirect_uri host")?
+        .to_string();
+    let port = parsed
+        .port()
+        .ok_or("OAuth redirect_uri must include an explicit port")?;
+    let expected_path = if parsed.path().is_empty() {
+        "/".to_string()
+    } else {
+        parsed.path().to_string()
+    };
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
+        format!("Could not bind OAuth callback server on {host}:{port}: {error}")
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure OAuth callback server: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut buffer = [0u8; 8192];
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let size = stream.read(&mut buffer)?;
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let first_line = request.lines().next().unwrap_or_default();
+                let mut result = OAuthCallbackResult::default();
+                if let Some(target) = first_line
+                    .strip_prefix("GET ")
+                    .and_then(|value| value.split_whitespace().next())
+                {
+                    let callback_url = reqwest::Url::parse(&format!("http://localhost{target}"))?;
+                    if callback_url.path() == expected_path {
+                        for (key, value) in callback_url.query_pairs() {
+                            match key.as_ref() {
+                                "code" => result.code = Some(value.into_owned()),
+                                "state" => result.state = Some(value.into_owned()),
+                                "error" => result.error = Some(value.into_owned()),
+                                "error_description" => {
+                                    result.error_description = Some(value.into_owned())
+                                }
+                                _ => {}
+                            }
+                        }
+                        let body = if result.error.is_some() {
+                            "Authorization failed. You can close this tab."
+                        } else {
+                            "Authorization received. You can close this tab."
+                        };
+                        let html = format!("<html><body><h1>{body}</h1></body></html>");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        return Ok(result);
+                    }
+                }
+                let response =
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 10\r\n\r\nNot found.";
+                let _ = stream.write_all(response);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "OAuth callback timed out waiting for the browser authorization.".into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("OAuth callback server failed: {error}").into()),
+        }
+    }
+}
+
+fn prompt_for_callback() -> Result<String, Box<dyn Error>> {
+    print!("Authorization code or callback URL: ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        return Err("interactive input closed".into());
+    }
+    Ok(line.trim().to_string())
+}
+
+fn parse_oauth_callback_input(raw: &str) -> Result<OAuthCallbackResult, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("OAuth setup cancelled: empty authorization code".into());
+    }
+    let mut result = OAuthCallbackResult::default();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let parsed = reqwest::Url::parse(trimmed)?;
+        for (key, value) in parsed.query_pairs() {
+            match key.as_ref() {
+                "code" => result.code = Some(value.into_owned()),
+                "state" => result.state = Some(value.into_owned()),
+                "error" => result.error = Some(value.into_owned()),
+                "error_description" => result.error_description = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        return Ok(result);
+    }
+    result.code = Some(trimmed.to_string());
+    result.state = load_pending_oauth_pkce()?.1.into();
+    Ok(result)
+}
+
+fn oauth_random_token(byte_len: usize) -> Result<String, Box<dyn Error>> {
+    let mut bytes = vec![0u8; byte_len];
+    fill_random(&mut bytes).map_err(|error| format!("failed to generate random bytes: {error}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn oauth_code_challenge(verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn oauth_test_override(env_name: &str) -> Option<String> {
+    std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn pending_oauth_pkce_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("hermes-mcp-oauth-pkce.json")
+}
+
+fn save_pending_oauth_pkce(verifier: &str, state: &str) -> Result<(), Box<dyn Error>> {
+    let payload = json!({ "verifier": verifier, "state": state });
+    fs::write(pending_oauth_pkce_path(), serde_json::to_vec(&payload)?)?;
+    Ok(())
+}
+
+fn load_pending_oauth_pkce() -> Result<(String, String), Box<dyn Error>> {
+    let raw = fs::read_to_string(pending_oauth_pkce_path())?;
+    let payload = serde_json::from_str::<JsonValue>(&raw)?;
+    let verifier = payload
+        .get("verifier")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("pending OAuth verifier was missing")?;
+    let state = payload
+        .get("state")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("pending OAuth state was missing")?;
+    Ok((verifier.to_string(), state.to_string()))
+}
+
+fn clear_pending_oauth_pkce() {
+    let _ = fs::remove_file(pending_oauth_pkce_path());
+}
+
+fn write_secure_json<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+) -> Result<(), Box<dyn Error>> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&tmp, perms)?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn is_remote_session_local() -> bool {
+    std::env::var_os("SSH_CLIENT").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+fn can_open_browser_local() -> bool {
+    if is_remote_session_local() {
+        return false;
+    }
+    if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        return true;
+    }
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+fn oauth_url_origin(parsed: &reqwest::Url) -> Result<String, Box<dyn Error>> {
+    let host = parsed.host_str().ok_or("invalid OAuth server host")?;
+    let mut base = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        base.push(':');
+        base.push_str(&port.to_string());
+    }
+    Ok(base)
+}
+
+fn try_open_browser_local(url: &str) -> Result<bool, Box<dyn Error>> {
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("open", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("cmd", &["/C", "start", ""])]
+    } else {
+        &[("xdg-open", &[])]
+    };
+    for (program, args) in commands {
+        let mut command = Command::new(program);
+        command.args(*args).arg(url);
+        match command.status() {
+            Ok(status) if status.success() => return Ok(true),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to open browser: {error}").into()),
+        }
+    }
+    Ok(false)
 }
 
 fn print_auth_info(config: &Mapping) -> Result<(), Box<dyn Error>> {
@@ -1197,70 +2022,6 @@ fn stdin_is_terminal() -> bool {
     #[cfg(not(windows))]
     {
         unsafe { libc::isatty(io::stdin().as_raw_fd()) == 1 }
-    }
-}
-
-fn print_python_mcp_name_command(
-    name: &str,
-    command_name: &str,
-    bootstrap: &str,
-) -> Result<(), Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_MCP_PYTHON"))
-        .ok_or("could not find a Python interpreter for mcp")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env("HERMES_MCP_NAME", name)
-        .arg("-c")
-        .arg(bootstrap);
-
-    let status = command.status()?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(exit_status_message(command_name, status).into())
-}
-
-fn print_python_mcp_test(name: &str) -> Result<(), Box<dyn Error>> {
-    print_python_mcp_name_command(name, "mcp test", MCP_TEST_BOOTSTRAP)
-}
-
-fn print_python_mcp_configure(name: &str) -> Result<(), Box<dyn Error>> {
-    print_python_mcp_name_command(name, "mcp configure", MCP_CONFIGURE_BOOTSTRAP)
-}
-
-fn print_python_mcp_login(name: &str) -> Result<(), Box<dyn Error>> {
-    print_python_mcp_name_command(name, "mcp login", MCP_LOGIN_BOOTSTRAP)
-}
-
-const MCP_TEST_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from argparse import Namespace\n",
-    "from hermes_cli.mcp_config import cmd_mcp_test\n",
-    "cmd_mcp_test(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
-);
-
-const MCP_CONFIGURE_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from argparse import Namespace\n",
-    "from hermes_cli.mcp_config import cmd_mcp_configure\n",
-    "cmd_mcp_configure(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
-);
-
-const MCP_LOGIN_BOOTSTRAP: &str = concat!(
-    "import os\n",
-    "from argparse import Namespace\n",
-    "from hermes_cli.mcp_config import cmd_mcp_login\n",
-    "cmd_mcp_login(Namespace(name=os.environ['HERMES_MCP_NAME']))\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
     }
 }
 
@@ -1926,6 +2687,163 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
         (format!("http://{addr}/mcp"), handle)
     }
 
+    fn spawn_http_oauth_server(
+        requests: Arc<Mutex<Vec<String>>>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut stage = 0usize;
+            while stage < 7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (request_line, headers, body) = read_http_request(&mut stream);
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("{request_line}\n{:?}\n{body}", headers));
+                match stage {
+                    0 => {
+                        assert!(
+                            request_line
+                                .starts_with("GET /.well-known/oauth-protected-resource/mcp ")
+                        );
+                        let response_body = format!(
+                            r#"{{"resource":"http://{addr}","authorization_servers":["http://{addr}/auth"],"scopes_supported":["tools:read"]}}"#
+                        );
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    1 => {
+                        assert!(
+                            request_line
+                                .starts_with("GET /.well-known/oauth-authorization-server/auth ")
+                        );
+                        let response_body = format!(
+                            r#"{{"authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token","registration_endpoint":"http://{addr}/register","scopes_supported":["tools:read"]}}"#
+                        );
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    2 => {
+                        assert!(request_line.starts_with("POST /register "));
+                        assert!(body.contains(
+                            "\"grant_types\":[\"authorization_code\",\"refresh_token\"]"
+                        ));
+                        let response_body = format!(
+                            r#"{{"client_id":"registered-client","client_secret":"registered-secret","token_endpoint_auth_method":"client_secret_post","redirect_uris":["http://127.0.0.1:48123/callback"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"scope":"tools:read","client_name":"Hermes Agent"}}"#
+                        );
+                        write!(
+                            stream,
+                            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    3 => {
+                        if !request_line.starts_with("POST /token ") {
+                            let response_body = "<html><body>authorize</body></html>";
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                                response_body.len(),
+                                response_body
+                            )
+                            .unwrap();
+                            continue;
+                        }
+                        assert!(body.contains("grant_type=authorization_code"));
+                        assert!(body.contains("code=auth-code-123"));
+                        assert!(body.contains("code_verifier=fixed-verifier"));
+                        assert!(body.contains("client_secret=registered-secret"));
+                        let response_body = r#"{"access_token":"fresh-token","refresh_token":"refresh-token","token_type":"Bearer","expires_in":3600,"scope":"tools:read"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    4 => {
+                        assert!(body.contains("\"method\":\"initialize\""));
+                        let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"serverInfo\":{\"name\":\"oauth-demo\",\"version\":\"1.0\"},\"capabilities\":{}}}";
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: session-123\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    5 => {
+                        assert!(body.contains("\"method\":\"notifications/initialized\""));
+                        write!(
+                            stream,
+                            "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    6 => {
+                        assert_eq!(
+                            headers.get("authorization").map(String::as_str),
+                            Some("Bearer fresh-token")
+                        );
+                        assert!(body.contains("\"method\":\"tools/list\""));
+                        let response_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"oauth-tool\",\"description\":\"OAuth tool\"}]}}";
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .unwrap();
+                        stage += 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+        (format!("http://{addr}/mcp"), handle)
+    }
+
+    fn spawn_oauth_callback_sender(port: u16, state: &'static str) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(mut stream) => {
+                        write!(
+                            stream,
+                            "GET /callback?code=auth-code-123&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                            state
+                        )
+                        .unwrap();
+                        return;
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            panic!("timed out waiting for oauth callback listener");
+        })
+    }
+
     #[derive(Parser, Debug)]
     struct McpHarness {
         #[command(subcommand)]
@@ -2205,37 +3123,24 @@ printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\
 
     #[test]
     #[cfg(unix)]
-    fn oauth_http_test_uses_python_override_without_cached_token() {
+    fn oauth_http_test_runs_native_login_without_cached_token() {
         let _guard = test_env_lock().lock().unwrap();
-        let home = temp_path("oauth-http-test-bridge");
+        let home = temp_path("oauth-http-test-native");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         fs::create_dir_all(&home).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, handle) = spawn_http_oauth_server(requests.clone());
         fs::write(
             context.config_path(),
-            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
-        )
-        .unwrap();
-
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
             format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
+                "mcp_servers:\n  alpha:\n    url: {url}\n    auth: oauth\n    oauth:\n      redirect_port: 48123\n"
             ),
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+        set_env_var("DISPLAY", "1");
+        set_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER", "fixed-verifier");
+        set_env_var("HERMES_MCP_OAUTH_TEST_STATE", "fixed-state");
+        let callback = spawn_oauth_callback_sender(48123, "fixed-state");
 
         print_mcp(
             &context,
@@ -2245,10 +3150,14 @@ exit 9\n",
         )
         .unwrap();
 
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("name=alpha"));
-
-        remove_env_var("HERMES_MCP_PYTHON");
+        callback.join().unwrap();
+        handle.join().unwrap();
+        let token_path = home.join("mcp-tokens").join("alpha.json");
+        let token_text = fs::read_to_string(token_path).unwrap();
+        assert!(token_text.contains("fresh-token"));
+        remove_env_var("DISPLAY");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_STATE");
         let _ = fs::remove_dir_all(home);
     }
 
@@ -2345,39 +3254,26 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
-    fn oauth_http_configure_uses_python_override_without_cached_token() {
+    fn oauth_http_configure_runs_native_login_without_cached_token() {
         let _guard = test_env_lock().lock().unwrap();
-        let home = temp_path("oauth-http-configure-bridge");
+        let home = temp_path("oauth-http-configure-native");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         fs::create_dir_all(&home).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, handle) = spawn_http_oauth_server(requests.clone());
         fs::write(
             context.config_path(),
-            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
-        )
-        .unwrap();
-
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
             format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
+                "mcp_servers:\n  alpha:\n    url: {url}\n    auth: oauth\n    oauth:\n      redirect_port: 48123\n"
             ),
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+        set_env_var("DISPLAY", "1");
+        set_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER", "fixed-verifier");
+        set_env_var("HERMES_MCP_OAUTH_TEST_STATE", "fixed-state");
+        let callback = spawn_oauth_callback_sender(48123, "fixed-state");
 
-        let input = std::io::Cursor::new("");
+        let input = std::io::Cursor::new("none\n");
         let mut output = Vec::new();
         configure_server_io(
             &context,
@@ -2389,48 +3285,38 @@ exit 9\n",
         )
         .unwrap();
 
-        let logged = fs::read_to_string(&log).unwrap();
-        assert!(logged.contains("name=alpha"));
-
-        remove_env_var("HERMES_MCP_PYTHON");
+        callback.join().unwrap();
+        handle.join().unwrap();
+        let saved = fs::read_to_string(context.config_path()).unwrap();
+        assert!(saved.contains("include: []"));
+        remove_env_var("DISPLAY");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_STATE");
         let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     #[cfg(unix)]
-    fn native_login_clears_tokens_and_uses_python_override_for_oauth_probe() {
+    fn native_login_clears_tokens_and_runs_native_oauth_flow() {
         let _guard = test_env_lock().lock().unwrap();
         let home = temp_path("native-login");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
         fs::create_dir_all(home.join("mcp-tokens")).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (url, handle) = spawn_http_oauth_server(requests.clone());
         fs::write(
             context.config_path(),
-            "mcp_servers:\n  alpha:\n    url: https://example.com/mcp\n    auth: oauth\n",
+            format!(
+                "mcp_servers:\n  alpha:\n    url: {url}\n    auth: oauth\n    oauth:\n      redirect_port: 48123\n"
+            ),
         )
         .unwrap();
         fs::write(home.join("mcp-tokens").join("alpha.json"), "{}").unwrap();
         fs::write(home.join("mcp-tokens").join("alpha.client.json"), "{}").unwrap();
-
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-        set_env_var("HERMES_MCP_PYTHON", &fake_python);
+        set_env_var("DISPLAY", "1");
+        set_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER", "fixed-verifier");
+        set_env_var("HERMES_MCP_OAUTH_TEST_STATE", "fixed-state");
+        let callback = spawn_oauth_callback_sender(48123, "fixed-state");
 
         print_mcp(
             &context,
@@ -2440,46 +3326,17 @@ exit 9\n",
         )
         .unwrap();
 
-        assert!(!home.join("mcp-tokens").join("alpha.json").exists());
-        assert!(!home.join("mcp-tokens").join("alpha.client.json").exists());
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("name=alpha"));
-
-        remove_env_var("HERMES_MCP_PYTHON");
+        callback.join().unwrap();
+        handle.join().unwrap();
+        let token_text = fs::read_to_string(home.join("mcp-tokens").join("alpha.json")).unwrap();
+        let client_text =
+            fs::read_to_string(home.join("mcp-tokens").join("alpha.client.json")).unwrap();
+        assert!(token_text.contains("fresh-token"));
+        assert!(client_text.contains("registered-client"));
+        remove_env_var("DISPLAY");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_VERIFIER");
+        remove_env_var("HERMES_MCP_OAUTH_TEST_STATE");
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn python_login_helper_uses_python_override_and_passes_name() {
-        let _guard = test_env_lock().lock().unwrap();
-        let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'name=%s\\n' \"$HERMES_MCP_NAME\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        set_env_var("HERMES_MCP_PYTHON", &fake_python);
-        print_python_mcp_login("alpha").unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains("name=alpha"));
-
-        remove_env_var("HERMES_MCP_PYTHON");
     }
 
     #[test]

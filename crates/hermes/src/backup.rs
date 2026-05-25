@@ -44,6 +44,7 @@ const QUICK_SNAPSHOTS_DIR: &str = "state-snapshots";
 pub(crate) const QUICK_DEFAULT_KEEP: usize = 20;
 const PRE_UPDATE_BACKUPS_DIR: &str = "backups";
 const PRE_UPDATE_PREFIX: &str = "pre-update-";
+const PRE_MIGRATION_PREFIX: &str = "pre-migration-";
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
@@ -131,6 +132,26 @@ pub(crate) fn create_pre_update_backup(
     fs::create_dir_all(&backup_dir)?;
     let stamp = Local::now().format("%Y-%m-%d-%H%M%S").to_string();
     let out_path = backup_dir.join(format!("{PRE_UPDATE_PREFIX}{stamp}.zip"));
+    if write_full_zip_backup(&root, &out_path, false)?.is_none() {
+        return Ok(None);
+    }
+    let _ = prune_pre_update_backups(&backup_dir, keep.max(1));
+    Ok(Some(out_path))
+}
+
+pub(crate) fn create_pre_migration_backup(
+    context: &HermesContext,
+    keep: usize,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let root = context.default_hermes_root();
+    if !root.is_dir() {
+        return Ok(None);
+    }
+
+    let backup_dir = root.join(PRE_UPDATE_BACKUPS_DIR);
+    fs::create_dir_all(&backup_dir)?;
+    let stamp = Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    let out_path = backup_dir.join(format!("{PRE_MIGRATION_PREFIX}{stamp}.zip"));
     if write_full_zip_backup(&root, &out_path, false)?.is_none() {
         return Ok(None);
     }
@@ -1084,16 +1105,20 @@ mod tests {
         .unwrap();
 
         assert!(!target_home.path().join("evil.txt").exists());
-        assert!(!target_home
-            .path()
-            .join(".hermes")
-            .join("..")
-            .join("evil.txt")
-            .exists());
-        assert!(target_home
-            .path()
-            .join(".hermes")
-            .join("config.yaml")
-            .exists());
+        assert!(
+            !target_home
+                .path()
+                .join(".hermes")
+                .join("..")
+                .join("evil.txt")
+                .exists()
+        );
+        assert!(
+            target_home
+                .path()
+                .join(".hermes")
+                .join("config.yaml")
+                .exists()
+        );
     }
 }

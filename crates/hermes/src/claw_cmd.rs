@@ -1,22 +1,19 @@
-use std::env;
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 
 use clap::{Args, Subcommand, ValueEnum};
+use hermes_core::HermesContext;
 use serde_json::Value as JsonValue;
 
-use crate::python_bridge::{project_root, resolve_repo_python};
+use crate::backup::create_pre_migration_backup;
+
+mod native_migration;
+use native_migration::{MigrationItem, MigrationReport, run_native_apply, run_native_preview};
 
 const OPENCLAW_DIR_NAMES: [&str; 3] = [".openclaw", ".clawdbot", ".moltbot"];
 const OPENCLAW_CONFIG_FILE_NAMES: [&str; 3] = ["openclaw.json", "clawdbot.json", "moltbot.json"];
-const OPENCLAW_MIGRATION_SCRIPT_REL: [&str; 4] = [
-    "migration",
-    "openclaw-migration",
-    "scripts",
-    "openclaw_to_hermes.py",
-];
 
 #[derive(Subcommand, Debug)]
 pub enum ClawCommand {
@@ -75,9 +72,12 @@ pub enum SkillConflict {
     Rename,
 }
 
-pub fn print_claw(command: Option<ClawCommand>) -> Result<(), Box<dyn Error>> {
+pub fn print_claw(
+    context: &HermesContext,
+    command: Option<ClawCommand>,
+) -> Result<(), Box<dyn Error>> {
     match command {
-        Some(ClawCommand::Migrate(args)) => print_migrate(args),
+        Some(ClawCommand::Migrate(args)) => print_migrate(context, args),
         Some(ClawCommand::Cleanup(args)) => print_cleanup(args),
         None => {
             println!("Usage: hermes claw <command> [options]");
@@ -92,7 +92,7 @@ pub fn print_claw(command: Option<ClawCommand>) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
+fn print_migrate(context: &HermesContext, args: MigrateArgs) -> Result<(), Box<dyn Error>> {
     let source_dir = resolve_migrate_source(&args)?;
     if let Some(path) = args.workspace_target.as_ref() {
         if !path.is_absolute() {
@@ -109,13 +109,6 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let root = project_root();
-    let script_candidates = migration_script_candidates(&root, &detect_hermes_home());
-    if !script_candidates.iter().any(|path| path.exists()) {
-        print_migration_script_missing(&script_candidates);
-        return Ok(());
-    }
-
     if source_dir_is_empty(&source_dir) || source_dir_contains_only_empty_configs(&source_dir) {
         print_migration_banner();
         println!();
@@ -123,52 +116,119 @@ fn print_migrate(args: MigrateArgs) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let python = resolve_repo_python(&root, Some("HERMES_CLAW_PYTHON"))
-        .ok_or("could not find a Python interpreter for claw migrate")?;
-
-    let mut command = Command::new(&python);
-    command
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .env(
-            "HERMES_CLAW_MIGRATE_DRY_RUN",
-            if args.dry_run { "1" } else { "0" },
-        )
-        .env("HERMES_CLAW_MIGRATE_PRESET", args.preset.as_str())
-        .env(
-            "HERMES_CLAW_MIGRATE_OVERWRITE",
-            if args.overwrite { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_CLAW_MIGRATE_SECRETS",
-            if args.migrate_secrets { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_CLAW_MIGRATE_NO_BACKUP",
-            if args.no_backup { "1" } else { "0" },
-        )
-        .env(
-            "HERMES_CLAW_MIGRATE_SKILL_CONFLICT",
-            args.skill_conflict.as_str(),
-        )
-        .env(
-            "HERMES_CLAW_MIGRATE_SOURCE",
-            source_dir.display().to_string(),
-        )
-        .env("HERMES_CLAW_MIGRATE_YES", if args.yes { "1" } else { "0" });
-    if let Some(path) = args.workspace_target.as_ref() {
-        command.env(
-            "HERMES_CLAW_MIGRATE_WORKSPACE_TARGET",
-            path.display().to_string(),
-        );
+    print_migration_banner();
+    println!();
+    println!("Migration Settings");
+    println!("  Source:      {}", source_dir.display());
+    println!("  Target:      {}", context.hermes_home().display());
+    println!("  Preset:      {}", args.preset.as_str());
+    println!(
+        "  Overwrite:   {}",
+        if args.overwrite {
+            "yes"
+        } else {
+            "no (skip conflicts)"
+        }
+    );
+    println!(
+        "  Secrets:     {}",
+        if args.migrate_secrets {
+            "yes (allowlisted only)"
+        } else {
+            "no"
+        }
+    );
+    if args.skill_conflict != SkillConflict::Skip {
+        println!("  Skill conflicts: {}", args.skill_conflict.as_str());
     }
-    command.arg("-c").arg(CLAW_MIGRATE_BOOTSTRAP);
+    if let Some(path) = args.workspace_target.as_ref() {
+        println!("  Workspace:   {}", path.display());
+    }
 
-    let status = command.status()?;
-    if status.success() {
+    warn_if_openclaw_running(args.yes)?;
+    warn_if_gateway_running(context, args.yes)?;
+
+    let preview_report = run_native_preview(context, source_dir.clone(), &args)?;
+    let preview_count = preview_report.summary.get("migrated").copied().unwrap_or(0);
+    let preview_conflicts = preview_report.summary.get("conflict").copied().unwrap_or(0);
+
+    if preview_count == 0 && preview_conflicts == 0 {
+        println!();
+        println!("Nothing to migrate from OpenClaw.");
+        print_migration_report(&preview_report, true);
         return Ok(());
     }
-    Err(exit_status_message("claw", status).into())
+
+    println!();
+    if preview_count > 0 {
+        println!("Migration Preview — {preview_count} item(s) would be imported");
+    } else {
+        println!("Migration Preview — {preview_conflicts} conflict(s), nothing would be imported");
+    }
+    println!("No changes have been made yet. Review the list below:");
+    print_migration_report(&preview_report, true);
+
+    if args.dry_run {
+        return Ok(());
+    }
+
+    if preview_conflicts > 0 && !args.overwrite {
+        println!();
+        println!("Plan has {preview_conflicts} conflict(s). Refusing to apply.");
+        println!("Each conflict is an item whose target already exists in ~/.hermes/.");
+        println!("Re-run with --overwrite to replace conflicting targets.");
+        println!("Or re-run with --dry-run to review the full plan.");
+        return Ok(());
+    }
+
+    println!();
+    if !args.yes {
+        if !io::stdin().is_terminal() {
+            println!("Non-interactive session — preview only.");
+            println!("To execute, re-run with: hermes claw migrate --yes");
+            return Ok(());
+        }
+        if !confirm_prompt("Proceed with migration? [Y/n] ")? {
+            println!("Migration cancelled.");
+            return Ok(());
+        }
+    }
+
+    let mut backup_archive = None;
+    if !args.no_backup {
+        match create_pre_migration_backup(context, 5) {
+            Ok(path) => {
+                backup_archive = path;
+                if let Some(path) = backup_archive.as_ref() {
+                    println!();
+                    println!("Pre-migration backup: {}", path.display());
+                    println!("Restore with: hermes import {}", path.display());
+                }
+            }
+            Err(error) => {
+                println!();
+                println!("Could not create pre-migration backup: {error}");
+                println!("Re-run with --no-backup to skip, or free up disk space.");
+                return Ok(());
+            }
+        }
+    }
+
+    let report = match run_native_apply(context, source_dir, &args) {
+        Ok(report) => report,
+        Err(error) => {
+            println!();
+            println!("Migration failed: {error}");
+            if let Some(path) = backup_archive.as_ref() {
+                println!("A pre-migration backup is available at: {}", path.display());
+                println!("Restore with: hermes import {}", path.display());
+            }
+            return Ok(());
+        }
+    };
+
+    print_migration_report(&report, false);
+    Ok(())
 }
 
 fn print_migration_banner() {
@@ -176,41 +236,6 @@ fn print_migration_banner() {
     println!("┌─────────────────────────────────────────────────────────┐");
     println!("│          ⚕ Hermes — OpenClaw Migration                 │");
     println!("└─────────────────────────────────────────────────────────┘");
-}
-
-fn print_migration_script_missing(candidates: &[PathBuf]) {
-    print_migration_banner();
-    println!();
-    println!("Migration script not found.");
-    println!("Expected at one of:");
-    for candidate in candidates {
-        println!("  {}", candidate.display());
-    }
-    println!("Make sure the openclaw-migration skill is installed.");
-}
-
-const CLAW_MIGRATE_BOOTSTRAP: &str = concat!(
-    "import argparse\n",
-    "import os\n",
-    "from hermes_cli.claw import _cmd_migrate\n",
-    "_cmd_migrate(argparse.Namespace(\n",
-    "    source=(os.environ.get('HERMES_CLAW_MIGRATE_SOURCE') or None),\n",
-    "    dry_run=(os.environ.get('HERMES_CLAW_MIGRATE_DRY_RUN') == '1'),\n",
-    "    preset=(os.environ.get('HERMES_CLAW_MIGRATE_PRESET') or 'full'),\n",
-    "    overwrite=(os.environ.get('HERMES_CLAW_MIGRATE_OVERWRITE') == '1'),\n",
-    "    migrate_secrets=(os.environ.get('HERMES_CLAW_MIGRATE_SECRETS') == '1'),\n",
-    "    no_backup=(os.environ.get('HERMES_CLAW_MIGRATE_NO_BACKUP') == '1'),\n",
-    "    workspace_target=(os.environ.get('HERMES_CLAW_MIGRATE_WORKSPACE_TARGET') or None),\n",
-    "    skill_conflict=(os.environ.get('HERMES_CLAW_MIGRATE_SKILL_CONFLICT') or 'skip'),\n",
-    "    yes=(os.environ.get('HERMES_CLAW_MIGRATE_YES') == '1'),\n",
-    "))\n",
-);
-
-fn exit_status_message(command: &str, status: ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("{command} exited with status {code}"),
-        None => format!("{command} terminated by signal"),
-    }
 }
 
 fn print_cleanup(args: CleanupArgs) -> Result<(), Box<dyn Error>> {
@@ -368,37 +393,6 @@ fn resolve_migrate_source(args: &MigrateArgs) -> Result<PathBuf, Box<dyn Error>>
         }
     }
     Ok(default)
-}
-
-fn migration_script_candidates(project_root: &Path, hermes_home: &Path) -> Vec<PathBuf> {
-    vec![
-        optional_skills_root(project_root)
-            .join(OPENCLAW_MIGRATION_SCRIPT_REL.iter().collect::<PathBuf>()),
-        hermes_home.join(
-            ["skills"]
-                .iter()
-                .chain(OPENCLAW_MIGRATION_SCRIPT_REL.iter())
-                .collect::<PathBuf>(),
-        ),
-    ]
-}
-
-fn optional_skills_root(project_root: &Path) -> PathBuf {
-    env::var_os("HERMES_OPTIONAL_SKILLS")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| project_root.join("optional-skills"))
-}
-
-fn detect_hermes_home() -> PathBuf {
-    env::var_os("HERMES_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/"))
-                .join(".hermes")
-        })
 }
 
 fn source_dir_is_empty(source_dir: &Path) -> bool {
@@ -643,6 +637,200 @@ fn detect_openclaw_processes() -> Vec<String> {
     found
 }
 
+fn warn_if_openclaw_running(auto_yes: bool) -> Result<(), Box<dyn Error>> {
+    let running = detect_openclaw_processes();
+    if running.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("OpenClaw appears to be running:");
+    for detail in &running {
+        println!("  * {detail}");
+    }
+    println!("Messaging platforms only allow one active session per bot token. If you continue,");
+    println!("both OpenClaw and Hermes may try to use the same token, causing disconnects.");
+    println!("Recommendation: stop OpenClaw before migrating.");
+    println!();
+    if auto_yes || io::stdin().is_terminal() {
+        return Ok(());
+    }
+    println!("Non-interactive session — continuing to preview only.");
+    Ok(())
+}
+
+fn warn_if_gateway_running(context: &HermesContext, auto_yes: bool) -> Result<(), Box<dyn Error>> {
+    let Some(connected) = connected_gateway_platforms(context)? else {
+        return Ok(());
+    };
+    if connected.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "Hermes gateway is running with active connections: {}",
+        connected.join(", ")
+    );
+    println!("Migrating bot tokens while the gateway is active will cause conflicts.");
+    println!("Recommendation: stop the gateway first with `hermes stop`.");
+    println!();
+    if auto_yes || io::stdin().is_terminal() {
+        return Ok(());
+    }
+    println!("Non-interactive session — continuing to preview only.");
+    Ok(())
+}
+
+fn connected_gateway_platforms(
+    context: &HermesContext,
+) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    let pid_path = context.hermes_home().join("gateway.pid");
+    let Some(pid) = read_gateway_pid(&pid_path) else {
+        return Ok(None);
+    };
+    if !process_running(pid) {
+        return Ok(None);
+    }
+
+    let state_path = context.hermes_home().join("gateway_state.json");
+    if !state_path.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    let raw = std::fs::read_to_string(state_path)?;
+    let state: JsonValue = serde_json::from_str(&raw)?;
+    let connected = state
+        .get("platforms")
+        .and_then(JsonValue::as_object)
+        .map(|platforms| {
+            platforms
+                .iter()
+                .filter_map(|(name, info)| {
+                    (info.get("state").and_then(JsonValue::as_str) == Some("connected"))
+                        .then(|| name.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Some(connected))
+}
+
+fn read_gateway_pid(path: &Path) -> Option<i64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('{') {
+        let value = serde_json::from_str::<JsonValue>(trimmed).ok()?;
+        return value.get("pid").and_then(JsonValue::as_i64);
+    }
+    trimmed.parse::<i64>().ok()
+}
+
+fn process_running(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        let status = unsafe { libc::kill(pid, 0) };
+        status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn print_migration_report(report: &MigrationReport, dry_run: bool) {
+    let migrated = report.summary.get("migrated").copied().unwrap_or(0);
+    let skipped = report.summary.get("skipped").copied().unwrap_or(0);
+    let conflicts = report.summary.get("conflict").copied().unwrap_or(0);
+    let errors = report.summary.get("error").copied().unwrap_or(0);
+
+    println!();
+    if dry_run {
+        println!("Dry Run Results");
+        println!("No files were modified. This is a preview of what would happen.");
+    } else {
+        println!("Migration Results");
+    }
+    println!("Preset: {}", report.preset);
+    println!();
+
+    print_items(
+        "migrated",
+        if dry_run { "Would migrate" } else { "Migrated" },
+        &report.items,
+    );
+    print_items(
+        "conflict",
+        "Conflicts (skipped — use --overwrite to force)",
+        &report.items,
+    );
+    print_items("skipped", "Skipped", &report.items);
+    print_items("error", "Errors", &report.items);
+
+    let mut parts = Vec::new();
+    if migrated > 0 {
+        parts.push(format!(
+            "{migrated} {}",
+            if dry_run { "would migrate" } else { "migrated" }
+        ));
+    }
+    if conflicts > 0 {
+        parts.push(format!("{conflicts} conflict(s)"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    if errors > 0 {
+        parts.push(format!("{errors} error(s)"));
+    }
+    if parts.is_empty() {
+        println!("Summary: Nothing to migrate.");
+    } else {
+        println!("Summary: {}", parts.join(", "));
+    }
+
+    if let Some(output_dir) = report.output_dir.as_ref() {
+        println!("Full report saved to: {}", output_dir.display());
+    }
+    for warning in &report.warnings {
+        println!("Warning: {warning}");
+    }
+    for step in &report.next_steps {
+        println!("Next: {step}");
+    }
+}
+
+fn print_items(status: &str, label: &str, items: &[MigrationItem]) {
+    let matching = items
+        .iter()
+        .filter(|item| item.status == status)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for item in matching {
+        let kind = item.kind.as_str();
+        let tail = if matches!(status, "migrated" | "conflict") {
+            item.destination.as_deref().unwrap_or_default()
+        } else {
+            item.reason.as_str()
+        };
+        if tail.is_empty() {
+            println!("      {kind}");
+        } else {
+            println!("      {kind:<22} {tail}");
+        }
+    }
+    println!();
+}
+
 fn confirm_prompt(prompt: &str) -> Result<bool, Box<dyn Error>> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(prompt.as_bytes())?;
@@ -724,6 +912,32 @@ mod tests {
         }
     }
 
+    fn test_context(temp: &TempDir) -> HermesContext {
+        let hermes_home = temp.path().join(".hermes");
+        fs::create_dir_all(&hermes_home).unwrap();
+        HermesContext::new(temp.path()).with_hermes_home_env(Some(hermes_home))
+    }
+
+    #[cfg(unix)]
+    fn install_fake_python(temp: &TempDir) -> PathBuf {
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+printf 'called\\n' >> '{}'\n\
+exit 9\n",
+            temp.path().join("python.log").display()
+        );
+        for name in ["python", "python3"] {
+            let path = bin_dir.join(name);
+            fs::write(&path, &script).unwrap();
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        bin_dir
+    }
+
     #[test]
     fn archive_path_adds_timestamp_when_base_exists() {
         let temp = TempDir::new().unwrap();
@@ -767,104 +981,86 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn migrate_without_openclaw_source_stays_native() {
-        let _guard = test_env_lock().lock().unwrap();
+        let _guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
+        let context = test_context(&temp);
+        let fake_bin = install_fake_python(&temp);
         let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-printf 'called\\n' >> '{}'\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
 
         let old_home = env::var_os("HOME");
+        let old_path = env::var_os("PATH");
         set_env_var("HOME", temp.path());
-        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
-        let result = print_migrate(MigrateArgs {
-            source: None,
-            dry_run: true,
-            preset: MigratePreset::Full,
-            overwrite: false,
-            migrate_secrets: false,
-            no_backup: false,
-            workspace_target: None,
-            skill_conflict: SkillConflict::Skip,
-            yes: false,
-        });
+        set_env_var("PATH", &fake_bin);
+        let result = print_migrate(
+            &context,
+            MigrateArgs {
+                source: None,
+                dry_run: true,
+                preset: MigratePreset::Full,
+                overwrite: false,
+                migrate_secrets: false,
+                no_backup: false,
+                workspace_target: None,
+                skill_conflict: SkillConflict::Skip,
+                yes: false,
+            },
+        );
         let python_called = log.exists();
 
         match old_home {
             Some(value) => set_env_var("HOME", value),
             None => remove_env_var("HOME"),
         }
-        remove_env_var("HERMES_CLAW_PYTHON");
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
         result.unwrap();
         assert!(!python_called);
     }
 
     #[test]
     #[cfg(unix)]
-    fn migrate_with_missing_script_stays_native() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn migrate_with_minimal_source_stays_native_without_optional_skill_script() {
+        let _guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
+        let context = test_context(&temp);
         let source = temp.path().join(".openclaw");
-        let optional_skills = temp.path().join("optional-skills");
-        let hermes_home = temp.path().join(".hermes");
         fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&optional_skills).unwrap();
-        fs::create_dir_all(&hermes_home).unwrap();
-
-        let fake_python = temp.path().join("python3");
-        let log = temp.path().join("python.log");
+        fs::create_dir_all(source.join("workspace.default")).unwrap();
         fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-printf 'called\\n' >> '{}'\n\
-exit 9\n",
-                log.display()
-            ),
+            source.join("workspace.default").join("SOUL.md"),
+            b"native soul",
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let old_home = env::var_os("HERMES_HOME");
-        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
-        set_env_var("HERMES_HOME", &hermes_home);
-        set_env_var("HERMES_OPTIONAL_SKILLS", &optional_skills);
-        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
-        let result = print_migrate(MigrateArgs {
-            source: Some(source),
-            dry_run: true,
-            preset: MigratePreset::Full,
-            overwrite: false,
-            migrate_secrets: false,
-            no_backup: false,
-            workspace_target: None,
-            skill_conflict: SkillConflict::Skip,
-            yes: false,
-        });
+        let fake_bin = install_fake_python(&temp);
+        let log = temp.path().join("python.log");
+        let old_path = env::var_os("PATH");
+        set_env_var("PATH", &fake_bin);
+        let result = print_migrate(
+            &context,
+            MigrateArgs {
+                source: Some(source),
+                dry_run: true,
+                preset: MigratePreset::Full,
+                overwrite: false,
+                migrate_secrets: false,
+                no_backup: false,
+                workspace_target: None,
+                skill_conflict: SkillConflict::Skip,
+                yes: false,
+            },
+        );
         let python_called = log.exists();
 
-        match old_home {
-            Some(value) => set_env_var("HERMES_HOME", value),
-            None => remove_env_var("HERMES_HOME"),
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
         }
-        match old_optional {
-            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
-            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
-        }
-        remove_env_var("HERMES_CLAW_PYTHON");
         result.unwrap();
         assert!(!python_called);
     }
@@ -872,64 +1068,37 @@ exit 9\n",
     #[test]
     #[cfg(unix)]
     fn migrate_with_empty_source_stays_native() {
-        let _guard = test_env_lock().lock().unwrap();
+        let _guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
+        let context = test_context(&temp);
         let source = temp.path().join(".openclaw");
-        let optional_skills = temp.path().join("optional-skills");
-        let script = optional_skills
-            .join("migration")
-            .join("openclaw-migration")
-            .join("scripts")
-            .join("openclaw_to_hermes.py");
-        let hermes_home = temp.path().join(".hermes");
         fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(script.parent().unwrap()).unwrap();
-        fs::write(&script, b"# placeholder").unwrap();
-        fs::create_dir_all(&hermes_home).unwrap();
-
-        let fake_python = temp.path().join("python3");
+        let fake_bin = install_fake_python(&temp);
         let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-printf 'called\\n' >> '{}'\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let old_home = env::var_os("HERMES_HOME");
-        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
-        set_env_var("HERMES_HOME", &hermes_home);
-        set_env_var("HERMES_OPTIONAL_SKILLS", &optional_skills);
-        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
-        let result = print_migrate(MigrateArgs {
-            source: Some(source),
-            dry_run: true,
-            preset: MigratePreset::Full,
-            overwrite: false,
-            migrate_secrets: false,
-            no_backup: false,
-            workspace_target: None,
-            skill_conflict: SkillConflict::Skip,
-            yes: false,
-        });
+        let old_path = env::var_os("PATH");
+        set_env_var("PATH", &fake_bin);
+        let result = print_migrate(
+            &context,
+            MigrateArgs {
+                source: Some(source),
+                dry_run: true,
+                preset: MigratePreset::Full,
+                overwrite: false,
+                migrate_secrets: false,
+                no_backup: false,
+                workspace_target: None,
+                skill_conflict: SkillConflict::Skip,
+                yes: false,
+            },
+        );
         let python_called = log.exists();
 
-        match old_home {
-            Some(value) => set_env_var("HERMES_HOME", value),
-            None => remove_env_var("HERMES_HOME"),
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
         }
-        match old_optional {
-            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
-            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
-        }
-        remove_env_var("HERMES_CLAW_PYTHON");
         result.unwrap();
         assert!(!python_called);
     }
@@ -937,126 +1106,93 @@ exit 9\n",
     #[test]
     #[cfg(unix)]
     fn migrate_with_config_only_source_stays_native() {
-        let _guard = test_env_lock().lock().unwrap();
+        let _guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
+        let context = test_context(&temp);
         let source = temp.path().join(".openclaw");
-        let optional_skills = temp.path().join("optional-skills");
-        let script = optional_skills
-            .join("migration")
-            .join("openclaw-migration")
-            .join("scripts")
-            .join("openclaw_to_hermes.py");
-        let hermes_home = temp.path().join(".hermes");
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("openclaw.json"), b"{}").unwrap();
-        fs::create_dir_all(script.parent().unwrap()).unwrap();
-        fs::write(&script, b"# placeholder").unwrap();
-        fs::create_dir_all(&hermes_home).unwrap();
-
-        let fake_python = temp.path().join("python3");
+        let fake_bin = install_fake_python(&temp);
         let log = temp.path().join("python.log");
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-printf 'called\\n' >> '{}'\n\
-exit 9\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
-
-        let old_home = env::var_os("HERMES_HOME");
-        let old_optional = env::var_os("HERMES_OPTIONAL_SKILLS");
-        set_env_var("HERMES_HOME", &hermes_home);
-        set_env_var("HERMES_OPTIONAL_SKILLS", &optional_skills);
-        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
-        let result = print_migrate(MigrateArgs {
-            source: Some(source),
-            dry_run: true,
-            preset: MigratePreset::Full,
-            overwrite: false,
-            migrate_secrets: false,
-            no_backup: false,
-            workspace_target: None,
-            skill_conflict: SkillConflict::Skip,
-            yes: false,
-        });
+        let old_path = env::var_os("PATH");
+        set_env_var("PATH", &fake_bin);
+        let result = print_migrate(
+            &context,
+            MigrateArgs {
+                source: Some(source),
+                dry_run: true,
+                preset: MigratePreset::Full,
+                overwrite: false,
+                migrate_secrets: false,
+                no_backup: false,
+                workspace_target: None,
+                skill_conflict: SkillConflict::Skip,
+                yes: false,
+            },
+        );
         let python_called = log.exists();
 
-        match old_home {
-            Some(value) => set_env_var("HERMES_HOME", value),
-            None => remove_env_var("HERMES_HOME"),
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
         }
-        match old_optional {
-            Some(value) => set_env_var("HERMES_OPTIONAL_SKILLS", value),
-            None => remove_env_var("HERMES_OPTIONAL_SKILLS"),
-        }
-        remove_env_var("HERMES_CLAW_PYTHON");
         result.unwrap();
         assert!(!python_called);
     }
 
     #[test]
     #[cfg(unix)]
-    fn migrate_uses_python_override_and_env_flags() {
-        let _guard = test_env_lock().lock().unwrap();
+    fn migrate_apply_creates_pre_migration_backup_without_python() {
+        let _guard = test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
-        let fake_python = temp.path().join("python3");
+        let context = test_context(&temp);
+        let fake_bin = install_fake_python(&temp);
         let log = temp.path().join("python.log");
         let source = temp.path().join(".openclaw");
-        let workspace = temp.path().join("workspace");
-        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(source.join("workspace.default")).unwrap();
         fs::write(
-            source.join("openclaw.json"),
-            br#"{"model":{"provider":"openrouter"}}"#,
+            source.join("workspace.default").join("SOUL.md"),
+            b"native soul",
         )
         .unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(
-            &fake_python,
-            format!(
-                "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  printf 'source=%s dry=%s preset=%s overwrite=%s secrets=%s no_backup=%s workspace=%s conflict=%s yes=%s\\n' \\\n\
-    \"$HERMES_CLAW_MIGRATE_SOURCE\" \"$HERMES_CLAW_MIGRATE_DRY_RUN\" \"$HERMES_CLAW_MIGRATE_PRESET\" \\\n\
-    \"$HERMES_CLAW_MIGRATE_OVERWRITE\" \"$HERMES_CLAW_MIGRATE_SECRETS\" \"$HERMES_CLAW_MIGRATE_NO_BACKUP\" \\\n\
-    \"$HERMES_CLAW_MIGRATE_WORKSPACE_TARGET\" \"$HERMES_CLAW_MIGRATE_SKILL_CONFLICT\" \"$HERMES_CLAW_MIGRATE_YES\" >> '{}'\n\
-  exit 0\n\
-fi\n\
-exit 9\n",
-                log.display()
-            ),
+
+        let old_path = env::var_os("PATH");
+        set_env_var("PATH", &fake_bin);
+        print_migrate(
+            &context,
+            MigrateArgs {
+                source: Some(source.clone()),
+                dry_run: false,
+                preset: MigratePreset::Full,
+                overwrite: true,
+                migrate_secrets: false,
+                no_backup: false,
+                workspace_target: None,
+                skill_conflict: SkillConflict::Skip,
+                yes: true,
+            },
         )
         .unwrap();
-        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_python, perms).unwrap();
 
-        set_env_var("HERMES_CLAW_PYTHON", &fake_python);
-        print_migrate(MigrateArgs {
-            source: Some(source.clone()),
-            dry_run: true,
-            preset: MigratePreset::UserData,
-            overwrite: true,
-            migrate_secrets: true,
-            no_backup: true,
-            workspace_target: Some(workspace.clone()),
-            skill_conflict: SkillConflict::Rename,
-            yes: true,
-        })
-        .unwrap();
-
-        let output = fs::read_to_string(&log).unwrap();
-        assert!(output.contains(&format!(
-            "source={} dry=1 preset=user-data overwrite=1 secrets=1 no_backup=1 workspace={} conflict=rename yes=1",
-            source.display(),
-            workspace.display()
-        )));
-
-        remove_env_var("HERMES_CLAW_PYTHON");
+        assert!(!log.exists());
+        let backups = fs::read_dir(context.hermes_home().join("backups"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("pre-migration-") && name.ends_with(".zip"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(context.hermes_home().join("SOUL.md")).unwrap(),
+            "native soul"
+        );
+        match old_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
     }
 }

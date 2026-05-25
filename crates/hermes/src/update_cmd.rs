@@ -389,13 +389,8 @@ fn stop_stale_dashboards_after_update() -> Result<(), Box<dyn Error>> {
 }
 
 fn post_update_messages(gateway_mode: bool) -> Vec<String> {
-    let mut messages = Vec::new();
-    if gateway_mode {
-        messages.push(String::from(
-            "Remaining Python-only update behavior: gateway-mode watcher handoff.",
-        ));
-    }
-    messages
+    let _ = gateway_mode;
+    Vec::new()
 }
 
 fn collect_profile_homes(
@@ -1104,13 +1099,8 @@ exit 0\n",
     }
 
     #[test]
-    fn post_update_messages_include_gateway_note_only() {
-        let messages = post_update_messages(true);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0],
-            "Remaining Python-only update behavior: gateway-mode watcher handoff."
-        );
+    fn post_update_messages_are_empty_for_gateway_update_too() {
+        assert!(post_update_messages(true).is_empty());
     }
 
     #[test]

@@ -397,7 +397,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Memory { command } => memory_cmd::print_memory(&context, &config, command)?,
         Command::Mcp { command } => mcp_cmd::print_mcp(&context, command)?,
         Command::Insights(args) => insights_cmd::print_insights(&context, args)?,
-        Command::Claw { command } => claw_cmd::print_claw(command)?,
+        Command::Claw { command } => claw_cmd::print_claw(&context, command)?,
         Command::Acp(args) => acp_cmd::print_acp(args)?,
         Command::Slack { command } => slack_cmd::print_slack(&context, &config, command)?,
         Command::Webhook { command } => webhook::print_webhook(&context, &config, command)?,
