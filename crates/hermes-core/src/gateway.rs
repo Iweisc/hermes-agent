@@ -18,6 +18,13 @@ pub const RESTART_NOTIFY_FILENAME: &str = ".restart_notify.json";
 pub const RESTART_LAST_PROCESSED_FILENAME: &str = ".restart_last_processed.json";
 pub const CLEAN_SHUTDOWN_FILENAME: &str = ".clean_shutdown";
 pub const RESTART_FAILURE_COUNTS_FILENAME: &str = ".restart_failure_counts";
+pub const UPDATE_PENDING_FILENAME: &str = ".update_pending.json";
+pub const UPDATE_PENDING_CLAIMED_FILENAME: &str = ".update_pending.claimed.json";
+pub const UPDATE_PROMPT_FILENAME: &str = ".update_prompt.json";
+pub const UPDATE_RESPONSE_FILENAME: &str = ".update_response";
+pub const UPDATE_OUTPUT_FILENAME: &str = ".update_output.txt";
+pub const UPDATE_EXIT_CODE_FILENAME: &str = ".update_exit_code";
+pub const DEFAULT_TELEGRAM_FOLLOWUP_GRACE_SECONDS: f64 = 3.0;
 pub const STARTUP_RECENT_ACTIVITY_WINDOW_SECONDS: i64 = 120;
 pub const STUCK_LOOP_THRESHOLD: u64 = 3;
 pub const PAIRING_CODE_LENGTH: usize = 8;
@@ -274,6 +281,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub home_channels: HashMap<Platform, HomeChannel>,
     #[serde(default)]
+    pub quick_commands: HashMap<String, GatewayQuickCommand>,
+    #[serde(default)]
     pub default_reset_policy: SessionResetPolicy,
     #[serde(default)]
     pub reset_by_type: HashMap<String, SessionResetPolicy>,
@@ -291,6 +300,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             home_channels: HashMap::new(),
+            quick_commands: HashMap::new(),
             default_reset_policy: SessionResetPolicy::default(),
             reset_by_type: HashMap::new(),
             reset_by_platform: HashMap::new(),
@@ -325,6 +335,12 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        for (name, quick_command) in &self.quick_commands {
+            if normalize_command_name(name).is_none() {
+                return Err(format!("quick command name '{name}' must not be empty"));
+            }
+            quick_command.validate()?;
+        }
         self.default_reset_policy.validate()?;
         for policy in self.reset_by_type.values() {
             policy.validate()?;
@@ -334,6 +350,38 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum GatewayQuickCommand {
+    Alias { target: String },
+    Exec { command: String },
+}
+
+impl GatewayQuickCommand {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Alias { target } => {
+                if target.trim().is_empty() {
+                    return Err("quick command alias target must not be empty".to_string());
+                }
+            }
+            Self::Exec { command } => {
+                if command.trim().is_empty() {
+                    return Err("quick command exec command must not be empty".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayQuickCommandExecOutcome {
+    Success { stdout: String, stderr: String },
+    Timeout { timeout_seconds: u64 },
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,11 +951,47 @@ pub struct ActiveSession {
     pub phase: ActiveSessionPhase,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayRunningAgentActivity {
+    pub seconds_since_activity: f64,
+    pub last_activity_desc: Option<String>,
+    pub api_call_count: u32,
+    pub max_iterations: u32,
+}
+
+impl GatewayRunningAgentActivity {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.seconds_since_activity.is_finite() || self.seconds_since_activity < 0.0 {
+            return Err(
+                "running agent seconds_since_activity must be a non-negative finite number"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayStaleSessionOutcome {
+    NotTracked,
+    Kept,
+    Evicted {
+        session_key: String,
+        age_seconds: f64,
+        idle_seconds: f64,
+        timeout_seconds: f64,
+        wall_ttl_seconds: f64,
+        activity_detail: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingReason {
     Busy,
     Interrupt,
     Drain,
+    Starting,
+    PassiveQueue,
     ExplicitQueue,
 }
 
@@ -916,6 +1000,11 @@ pub enum GatewayIngressDecision {
     DispatchCommand {
         session_key: String,
         canonical: &'static str,
+        event: MessageEvent,
+    },
+    ExecQuickCommand {
+        name: String,
+        shell_command: String,
         event: MessageEvent,
     },
     StartTurn {
@@ -1160,6 +1249,343 @@ pub enum GatewayPairingCodeDecision {
     Suppress,
     SendPairingCode { code: String },
     SendTryLater,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayUpdatePromptIntercept {
+    None,
+    Consume {
+        response_text: String,
+        host_plan: GatewayHostPlan,
+    },
+    ContinueDispatch {
+        recognized_command: String,
+        host_actions: Vec<GatewayHostAction>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewaySlashConfirmChoice {
+    Once,
+    Always,
+    Cancel,
+}
+
+impl GatewaySlashConfirmChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewaySlashConfirmEntry {
+    pub confirm_id: String,
+    pub command: String,
+    pub created_at: f64,
+}
+
+impl GatewaySlashConfirmEntry {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.confirm_id.trim().is_empty() {
+            return Err("slash confirm_id must not be empty".to_string());
+        }
+        if self.command.trim().is_empty() {
+            return Err("slash confirm command must not be empty".to_string());
+        }
+        if !self.created_at.is_finite() || self.created_at < 0.0 {
+            return Err(
+                "slash confirm created_at must be a non-negative finite number".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewaySlashConfirmResolution {
+    pub session_key: String,
+    pub confirm_id: String,
+    pub command: String,
+    pub choice: GatewaySlashConfirmChoice,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewaySlashConfirmEventOutcome {
+    NoIntercept {
+        cleared_stale: bool,
+    },
+    Resolved {
+        resolution: GatewaySlashConfirmResolution,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewaySlashConfirmState {
+    pending: HashMap<String, GatewaySlashConfirmEntry>,
+    timeout_seconds: f64,
+}
+
+impl Default for GatewaySlashConfirmState {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            timeout_seconds: 300.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayUpdatePendingMarker {
+    pub platform: Platform,
+    pub chat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+impl GatewayUpdatePendingMarker {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.chat_id.trim().is_empty() {
+            return Err("update pending chat_id must not be empty".to_string());
+        }
+        if self
+            .session_key
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("update pending session_key must not be empty".to_string());
+        }
+        if self
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("update pending thread_id must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayUpdatePromptMarker {
+    pub prompt: String,
+    #[serde(default)]
+    pub default: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl GatewayUpdatePromptMarker {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.prompt.trim().is_empty() {
+            return Err("update prompt must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayUpdateTarget {
+    pub platform: Platform,
+    pub chat_id: String,
+    pub session_key: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayUpdatePromptForwardPlan {
+    pub target: GatewayUpdateTarget,
+    pub prompt: GatewayUpdatePromptMarker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GatewayUpdateWatcherState {
+    pending_prompt_sessions: HashMap<String, bool>,
+}
+
+impl GatewayUpdateWatcherState {
+    pub fn has_pending_prompt(&self, session_key: &str) -> bool {
+        self.pending_prompt_sessions
+            .get(session_key)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub fn mark_prompt_forwarded(&mut self, session_key: &str) -> Result<(), String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("update watcher session_key must not be empty".to_string());
+        }
+        self.pending_prompt_sessions
+            .insert(session_key.to_string(), true);
+        Ok(())
+    }
+
+    pub fn clear_prompt_pending(&mut self, session_key: &str) {
+        self.pending_prompt_sessions.remove(session_key);
+    }
+
+    pub fn plan_prompt_forward(
+        &self,
+        home_dir: &Path,
+    ) -> Result<Option<GatewayUpdatePromptForwardPlan>, String> {
+        let Some(target) = read_update_target(home_dir)? else {
+            return Ok(None);
+        };
+        if self.has_pending_prompt(&target.session_key) {
+            return Ok(None);
+        }
+        let Some(prompt) = read_update_prompt_marker(home_dir)? else {
+            return Ok(None);
+        };
+        Ok(Some(GatewayUpdatePromptForwardPlan { target, prompt }))
+    }
+}
+
+impl GatewaySlashConfirmState {
+    pub fn new(timeout_seconds: f64) -> Result<Self, String> {
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(
+                "slash confirm timeout_seconds must be a non-negative finite number".to_string(),
+            );
+        }
+        Ok(Self {
+            pending: HashMap::new(),
+            timeout_seconds,
+        })
+    }
+
+    pub fn timeout_seconds(&self) -> f64 {
+        self.timeout_seconds
+    }
+
+    pub fn register(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        command: &str,
+        created_at: f64,
+    ) -> Result<(), String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("slash confirm session_key must not be empty".to_string());
+        }
+        let entry = GatewaySlashConfirmEntry {
+            confirm_id: confirm_id.to_string(),
+            command: command.to_string(),
+            created_at,
+        };
+        entry.validate()?;
+        self.pending.insert(session_key.to_string(), entry);
+        Ok(())
+    }
+
+    pub fn get_pending(&self, session_key: &str) -> Option<&GatewaySlashConfirmEntry> {
+        self.pending.get(session_key)
+    }
+
+    pub fn clear(&mut self, session_key: &str) -> bool {
+        self.pending.remove(session_key).is_some()
+    }
+
+    pub fn clear_if_stale(&mut self, session_key: &str, now_seconds: f64) -> Result<bool, String> {
+        if !now_seconds.is_finite() || now_seconds < 0.0 {
+            return Err(
+                "slash confirm now_seconds must be a non-negative finite number".to_string(),
+            );
+        }
+        let Some(entry) = self.pending.get(session_key) else {
+            return Ok(false);
+        };
+        if now_seconds - entry.created_at > self.timeout_seconds {
+            self.pending.remove(session_key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn resolve(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        choice: GatewaySlashConfirmChoice,
+        now_seconds: f64,
+    ) -> Result<Option<GatewaySlashConfirmResolution>, String> {
+        if !now_seconds.is_finite() || now_seconds < 0.0 {
+            return Err(
+                "slash confirm now_seconds must be a non-negative finite number".to_string(),
+            );
+        }
+        let Some(entry) = self.pending.get(session_key) else {
+            return Ok(None);
+        };
+        if entry.confirm_id != confirm_id {
+            return Ok(None);
+        }
+        let entry = self
+            .pending
+            .remove(session_key)
+            .expect("entry existed before removal");
+        if now_seconds - entry.created_at > self.timeout_seconds {
+            return Ok(None);
+        }
+        Ok(Some(GatewaySlashConfirmResolution {
+            session_key: session_key.to_string(),
+            confirm_id: entry.confirm_id,
+            command: entry.command,
+            choice,
+        }))
+    }
+
+    pub fn handle_event(
+        &mut self,
+        session_key: &str,
+        event: &MessageEvent,
+        tool_approval_live: bool,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmEventOutcome, String> {
+        let pending = self.pending.contains_key(session_key);
+        match plan_slash_confirm_intercept(event, pending, tool_approval_live) {
+            GatewaySlashConfirmIntercept::None => {
+                Ok(GatewaySlashConfirmEventOutcome::NoIntercept {
+                    cleared_stale: false,
+                })
+            }
+            GatewaySlashConfirmIntercept::Resolve { choice } => {
+                let Some(confirm_id) = self
+                    .pending
+                    .get(session_key)
+                    .map(|entry| entry.confirm_id.clone())
+                else {
+                    return Ok(GatewaySlashConfirmEventOutcome::NoIntercept {
+                        cleared_stale: false,
+                    });
+                };
+                let resolution = self
+                    .resolve(session_key, &confirm_id, choice, now_seconds)?
+                    .ok_or_else(|| {
+                        "slash confirm resolution disappeared before execution".to_string()
+                    })?;
+                Ok(GatewaySlashConfirmEventOutcome::Resolved { resolution })
+            }
+            GatewaySlashConfirmIntercept::ContinueDispatchAndClearStale => {
+                let cleared_stale = self.clear_if_stale(session_key, now_seconds)?;
+                Ok(GatewaySlashConfirmEventOutcome::NoIntercept { cleared_stale })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewaySlashConfirmIntercept {
+    None,
+    Resolve { choice: GatewaySlashConfirmChoice },
+    ContinueDispatchAndClearStale,
 }
 
 #[derive(Debug, Clone)]
@@ -1576,13 +2002,175 @@ pub fn plan_unauthorized_dm_pairing_response(
     }))
 }
 
+pub fn plan_update_prompt_intercept(
+    home_dir: &Path,
+    event: &MessageEvent,
+    pending: bool,
+) -> Result<GatewayUpdatePromptIntercept, String> {
+    if !pending {
+        return Ok(GatewayUpdatePromptIntercept::None);
+    }
+
+    let raw = event.text.trim();
+    let command = event.get_command();
+    let recognized_command = command
+        .as_deref()
+        .and_then(resolve_command)
+        .map(|resolved| resolved.canonical.to_string());
+    let response_text = match command.as_deref() {
+        Some("approve" | "yes") => Some("y".to_string()),
+        Some("deny" | "no") => Some("n".to_string()),
+        _ if recognized_command.is_some() => None,
+        _ => Some(raw.to_string()),
+    };
+
+    if let Some(response_text) = response_text {
+        let label = if response_text.len() <= 20 {
+            response_text.clone()
+        } else {
+            format!("{}…", &response_text[..20])
+        };
+        return Ok(GatewayUpdatePromptIntercept::Consume {
+            response_text: response_text.clone(),
+            host_plan: GatewayHostPlan {
+                reply: Some(format!("✓ Sent `{label}` to the update process.")),
+                actions: vec![
+                    GatewayHostAction::WriteText {
+                        path: gateway_update_response_path(home_dir),
+                        content: response_text,
+                    },
+                    GatewayHostAction::DeleteFile {
+                        path: gateway_update_prompt_path(home_dir),
+                    },
+                ],
+            },
+        });
+    }
+
+    let recognized_command = recognized_command
+        .ok_or_else(|| "recognized command expected for update bypass".to_string())?;
+    Ok(GatewayUpdatePromptIntercept::ContinueDispatch {
+        recognized_command,
+        host_actions: vec![
+            GatewayHostAction::WriteText {
+                path: gateway_update_response_path(home_dir),
+                content: String::new(),
+            },
+            GatewayHostAction::DeleteFile {
+                path: gateway_update_prompt_path(home_dir),
+            },
+        ],
+    })
+}
+
+pub fn plan_slash_confirm_intercept(
+    event: &MessageEvent,
+    pending_confirm: bool,
+    tool_approval_live: bool,
+) -> GatewaySlashConfirmIntercept {
+    if !pending_confirm || tool_approval_live {
+        return GatewaySlashConfirmIntercept::None;
+    }
+
+    let raw = event.text.trim().to_ascii_lowercase();
+    let choice = match event.get_command().as_deref() {
+        Some("approve" | "yes" | "ok" | "confirm") => Some(GatewaySlashConfirmChoice::Once),
+        Some("always" | "remember") => Some(GatewaySlashConfirmChoice::Always),
+        Some("cancel" | "no" | "deny" | "nevermind") => Some(GatewaySlashConfirmChoice::Cancel),
+        _ if matches!(raw.as_str(), "approve" | "approve once" | "once") => {
+            Some(GatewaySlashConfirmChoice::Once)
+        }
+        _ if matches!(raw.as_str(), "always" | "always approve") => {
+            Some(GatewaySlashConfirmChoice::Always)
+        }
+        _ if matches!(raw.as_str(), "cancel" | "nevermind" | "no") => {
+            Some(GatewaySlashConfirmChoice::Cancel)
+        }
+        _ => None,
+    };
+
+    match choice {
+        Some(choice) => GatewaySlashConfirmIntercept::Resolve { choice },
+        None => GatewaySlashConfirmIntercept::ContinueDispatchAndClearStale,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayStaleRunningAgentPlan {
+    pub should_evict: bool,
+    pub age_seconds: f64,
+    pub idle_seconds: f64,
+    pub timeout_seconds: f64,
+    pub wall_ttl_seconds: f64,
+    pub activity_detail: Option<String>,
+}
+
+pub fn plan_stale_running_agent_eviction(
+    started_at_seconds: f64,
+    now_seconds: f64,
+    timeout_seconds: f64,
+    is_pending_sentinel: bool,
+    activity: Option<&GatewayRunningAgentActivity>,
+) -> Result<GatewayStaleRunningAgentPlan, String> {
+    if !started_at_seconds.is_finite() || started_at_seconds < 0.0 {
+        return Err(
+            "stale running agent started_at_seconds must be a non-negative finite number"
+                .to_string(),
+        );
+    }
+    if !now_seconds.is_finite() || now_seconds < 0.0 {
+        return Err(
+            "stale running agent now_seconds must be a non-negative finite number".to_string(),
+        );
+    }
+    if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+        return Err(
+            "stale running agent timeout_seconds must be a non-negative finite number".to_string(),
+        );
+    }
+    let age_seconds = now_seconds - started_at_seconds;
+    let mut idle_seconds = f64::INFINITY;
+    let mut activity_detail = None;
+    if let Some(activity) = activity {
+        activity.validate()?;
+        idle_seconds = activity.seconds_since_activity;
+        activity_detail = Some(format!(
+            "last_activity={} ({:.0}s ago) | iteration={}/{}",
+            activity.last_activity_desc.as_deref().unwrap_or("unknown"),
+            idle_seconds,
+            activity.api_call_count,
+            activity.max_iterations
+        ));
+    }
+    let wall_ttl_seconds = if timeout_seconds > 0.0 {
+        (timeout_seconds * 10.0).max(7200.0)
+    } else {
+        f64::INFINITY
+    };
+    let should_evict = !is_pending_sentinel
+        && ((timeout_seconds > 0.0 && idle_seconds >= timeout_seconds)
+            || age_seconds > wall_ttl_seconds);
+    Ok(GatewayStaleRunningAgentPlan {
+        should_evict,
+        age_seconds,
+        idle_seconds,
+        timeout_seconds,
+        wall_ttl_seconds,
+        activity_detail,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayRuntime {
     pub session_store: SessionStore,
     active_sessions: HashMap<String, ActiveSession>,
+    active_session_started_at: HashMap<String, f64>,
     pending_events: HashMap<String, MessageEvent>,
     queued_events: HashMap<String, VecDeque<MessageEvent>>,
     busy_ack_timestamps: HashMap<String, f64>,
+    slash_confirms: GatewaySlashConfirmState,
+    update_watcher: GatewayUpdateWatcherState,
+    telegram_followup_grace_seconds: f64,
     busy_input_mode: BusyInputMode,
     draining: bool,
     queue_during_drain: bool,
@@ -1601,9 +2189,13 @@ impl GatewayRuntime {
         Ok(Self {
             session_store: SessionStore::new(sessions_dir, config)?,
             active_sessions: HashMap::new(),
+            active_session_started_at: HashMap::new(),
             pending_events: HashMap::new(),
             queued_events: HashMap::new(),
             busy_ack_timestamps: HashMap::new(),
+            slash_confirms: GatewaySlashConfirmState::default(),
+            update_watcher: GatewayUpdateWatcherState::default(),
+            telegram_followup_grace_seconds: DEFAULT_TELEGRAM_FOLLOWUP_GRACE_SECONDS,
             busy_input_mode,
             draining: false,
             queue_during_drain: false,
@@ -1620,6 +2212,39 @@ impl GatewayRuntime {
 
     pub fn set_busy_input_mode(&mut self, busy_input_mode: BusyInputMode) {
         self.busy_input_mode = busy_input_mode;
+    }
+
+    pub fn slash_confirms(&self) -> &GatewaySlashConfirmState {
+        &self.slash_confirms
+    }
+
+    pub fn slash_confirms_mut(&mut self) -> &mut GatewaySlashConfirmState {
+        &mut self.slash_confirms
+    }
+
+    pub fn update_watcher(&self) -> &GatewayUpdateWatcherState {
+        &self.update_watcher
+    }
+
+    pub fn update_watcher_mut(&mut self) -> &mut GatewayUpdateWatcherState {
+        &mut self.update_watcher
+    }
+
+    pub fn telegram_followup_grace_seconds(&self) -> f64 {
+        self.telegram_followup_grace_seconds
+    }
+
+    pub fn set_telegram_followup_grace_seconds(
+        &mut self,
+        telegram_followup_grace_seconds: f64,
+    ) -> Result<(), String> {
+        if !telegram_followup_grace_seconds.is_finite() || telegram_followup_grace_seconds < 0.0 {
+            return Err(
+                "telegram followup grace seconds must be a non-negative finite number".to_string(),
+            );
+        }
+        self.telegram_followup_grace_seconds = telegram_followup_grace_seconds;
+        Ok(())
     }
 
     pub fn prepare_busy_reply_context(
@@ -2233,6 +2858,30 @@ impl GatewayRuntime {
         self.active_sessions.get(session_key)
     }
 
+    pub fn active_session_started_at(&self, session_key: &str) -> Option<f64> {
+        self.active_session_started_at.get(session_key).copied()
+    }
+
+    pub fn set_active_session_started_at(
+        &mut self,
+        session_key: &str,
+        started_at_seconds: f64,
+    ) -> Result<(), String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("active session key must not be empty".to_string());
+        }
+        if !started_at_seconds.is_finite() || started_at_seconds < 0.0 {
+            return Err(
+                "active session started_at_seconds must be a non-negative finite number"
+                    .to_string(),
+            );
+        }
+        self.active_session_started_at
+            .insert(session_key.to_string(), started_at_seconds);
+        Ok(())
+    }
+
     pub fn pending_event(&self, session_key: &str) -> Option<&MessageEvent> {
         self.pending_events.get(session_key)
     }
@@ -2251,6 +2900,48 @@ impl GatewayRuntime {
                 session_key: session_key.to_string(),
                 phase: ActiveSessionPhase::Running { can_steer },
             });
+    }
+
+    pub fn evict_stale_active_session(
+        &mut self,
+        session_key: &str,
+        now_seconds: f64,
+        timeout_seconds: f64,
+        is_pending_sentinel: bool,
+        activity: Option<&GatewayRunningAgentActivity>,
+    ) -> Result<GatewayStaleSessionOutcome, String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Err("active session key must not be empty".to_string());
+        }
+        if !self.active_sessions.contains_key(session_key) {
+            return Ok(GatewayStaleSessionOutcome::NotTracked);
+        }
+        let Some(started_at_seconds) = self.active_session_started_at.get(session_key).copied()
+        else {
+            return Ok(GatewayStaleSessionOutcome::NotTracked);
+        };
+        let plan = plan_stale_running_agent_eviction(
+            started_at_seconds,
+            now_seconds,
+            timeout_seconds,
+            is_pending_sentinel,
+            activity,
+        )?;
+        if !plan.should_evict {
+            return Ok(GatewayStaleSessionOutcome::Kept);
+        }
+        self.active_sessions.remove(session_key);
+        self.active_session_started_at.remove(session_key);
+        self.busy_ack_timestamps.remove(session_key);
+        Ok(GatewayStaleSessionOutcome::Evicted {
+            session_key: session_key.to_string(),
+            age_seconds: plan.age_seconds,
+            idle_seconds: plan.idle_seconds,
+            timeout_seconds: plan.timeout_seconds,
+            wall_ttl_seconds: plan.wall_ttl_seconds,
+            activity_detail: plan.activity_detail,
+        })
     }
 
     pub fn enqueue_fifo_follow_up(
@@ -2275,6 +2966,7 @@ impl GatewayRuntime {
         mut event: MessageEvent,
     ) -> Result<GatewayIngressDecision, String> {
         event.coerce_plaintext_gateway_command();
+        rewrite_quick_command_alias(&mut event, &self.session_store.config);
         let session_key = build_session_key(
             &event.source,
             self.session_store.config.group_sessions_per_user,
@@ -2282,13 +2974,12 @@ impl GatewayRuntime {
         )?;
 
         if self.active_sessions.contains_key(&session_key) {
-            let can_steer = matches!(
-                self.active_sessions
-                    .get(&session_key)
-                    .map(|state| state.phase),
-                Some(ActiveSessionPhase::Running { can_steer: true })
-            );
-            return self.handle_active_session_event(session_key, event, can_steer);
+            let phase = self
+                .active_sessions
+                .get(&session_key)
+                .map(|state| state.phase)
+                .unwrap_or(ActiveSessionPhase::PendingStart);
+            return self.handle_active_session_event(session_key, event, phase);
         }
 
         if let Some(command) = event.get_command().as_deref().and_then(resolve_command) {
@@ -2305,6 +2996,16 @@ impl GatewayRuntime {
             return Ok(GatewayIngressDecision::Reject {
                 message: "⏳ Gateway is restarting and is not accepting new work right now."
                     .to_string(),
+            });
+        }
+
+        if let Some((name, shell_command)) =
+            resolve_exec_quick_command(&event, &self.session_store.config)
+        {
+            return Ok(GatewayIngressDecision::ExecQuickCommand {
+                name,
+                shell_command,
+                event,
             });
         }
 
@@ -2330,6 +3031,7 @@ impl GatewayRuntime {
         session_key: &str,
     ) -> Result<Option<GatewayIngressDecision>, String> {
         self.active_sessions.remove(session_key);
+        self.active_session_started_at.remove(session_key);
         self.busy_ack_timestamps.remove(session_key);
         let pending_event = self.pending_events.remove(session_key);
         let next_pending = self.promote_queued_event(session_key, pending_event);
@@ -2357,13 +3059,61 @@ impl GatewayRuntime {
         &mut self,
         session_key: String,
         event: MessageEvent,
-        can_steer: bool,
+        phase: ActiveSessionPhase,
     ) -> Result<GatewayIngressDecision, String> {
+        if phase == ActiveSessionPhase::PendingStart {
+            if matches!(event.get_command().as_deref(), Some("stop")) {
+                self.active_sessions.remove(&session_key);
+                self.active_session_started_at.remove(&session_key);
+                self.busy_ack_timestamps.remove(&session_key);
+                return Ok(GatewayIngressDecision::Reject {
+                    message: "⚡ Force-stopped. The agent was still starting — session unlocked."
+                        .to_string(),
+                });
+            }
+            if event.get_command().is_none() {
+                let depth = self.store_pending_event(&session_key, event, true);
+                return Ok(GatewayIngressDecision::QueuePending {
+                    session_key,
+                    depth,
+                    reason: PendingReason::Starting,
+                });
+            }
+        }
+
+        if matches!(phase, ActiveSessionPhase::Running { .. }) {
+            if event.message_type == MessageType::Photo {
+                let depth = self.store_pending_event(&session_key, event, false);
+                return Ok(GatewayIngressDecision::QueuePending {
+                    session_key,
+                    depth,
+                    reason: PendingReason::PassiveQueue,
+                });
+            }
+
+            if event.source.platform.as_str() == "telegram"
+                && event.message_type == MessageType::Text
+                && self.telegram_followup_grace_seconds > 0.0
+            {
+                if let Some(started_at_seconds) = self.active_session_started_at(&session_key) {
+                    let now_seconds = current_unix_seconds()?;
+                    if now_seconds - started_at_seconds <= self.telegram_followup_grace_seconds {
+                        let depth = self.store_pending_event(&session_key, event, true);
+                        return Ok(GatewayIngressDecision::QueuePending {
+                            session_key,
+                            depth,
+                            reason: PendingReason::PassiveQueue,
+                        });
+                    }
+                }
+            }
+        }
+
         let state = RunningSessionState {
             draining: self.draining,
             queue_during_drain: self.queue_during_drain,
             busy_input_mode: self.busy_input_mode,
-            can_steer,
+            can_steer: matches!(phase, ActiveSessionPhase::Running { can_steer: true }),
         };
         match plan_running_session_action(&event, &state) {
             RunningSessionAction::DispatchCommand { canonical } => {
@@ -2417,6 +3167,42 @@ impl GatewayRuntime {
         merge_text: bool,
     ) -> usize {
         match self.pending_events.get_mut(session_key) {
+            Some(existing)
+                if existing.message_type == MessageType::Photo
+                    && event.message_type == MessageType::Photo =>
+            {
+                existing.media_urls.extend(event.media_urls);
+                existing.media_types.extend(event.media_types);
+                if !event.text.is_empty() {
+                    if existing.text.is_empty() {
+                        existing.text = event.text;
+                    } else {
+                        existing.text = format!("{}\n{}", existing.text, event.text);
+                    }
+                }
+            }
+            Some(existing) if !existing.media_urls.is_empty() || !event.media_urls.is_empty() => {
+                if !event.media_urls.is_empty() {
+                    existing.media_urls.extend(event.media_urls);
+                    existing.media_types.extend(event.media_types);
+                }
+                if !event.text.is_empty() {
+                    if existing.text.is_empty() {
+                        existing.text = event.text;
+                    } else {
+                        existing.text = format!("{}\n{}", existing.text, event.text);
+                    }
+                }
+                if existing.message_type == MessageType::Photo
+                    || event.message_type == MessageType::Photo
+                {
+                    existing.message_type = MessageType::Photo;
+                } else if existing.message_type == MessageType::Text
+                    && event.message_type != MessageType::Text
+                {
+                    existing.message_type = event.message_type;
+                }
+            }
             Some(existing)
                 if merge_text
                     && existing.message_type == MessageType::Text
@@ -2555,6 +3341,111 @@ pub fn gateway_clean_shutdown_path(runtime_dir: &Path) -> PathBuf {
 
 pub fn gateway_restart_failure_counts_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(RESTART_FAILURE_COUNTS_FILENAME)
+}
+
+pub fn gateway_update_pending_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_PENDING_FILENAME)
+}
+
+pub fn gateway_update_pending_claimed_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_PENDING_CLAIMED_FILENAME)
+}
+
+pub fn gateway_update_output_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_OUTPUT_FILENAME)
+}
+
+pub fn gateway_update_exit_code_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_EXIT_CODE_FILENAME)
+}
+
+pub fn gateway_update_prompt_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_PROMPT_FILENAME)
+}
+
+pub fn gateway_update_response_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(UPDATE_RESPONSE_FILENAME)
+}
+
+pub fn read_update_pending_marker(
+    home_dir: &Path,
+) -> Result<Option<GatewayUpdatePendingMarker>, String> {
+    read_json_marker(&gateway_update_pending_path(home_dir))
+}
+
+pub fn read_update_claimed_marker(
+    home_dir: &Path,
+) -> Result<Option<GatewayUpdatePendingMarker>, String> {
+    read_json_marker(&gateway_update_pending_claimed_path(home_dir))
+}
+
+pub fn read_update_prompt_marker(
+    home_dir: &Path,
+) -> Result<Option<GatewayUpdatePromptMarker>, String> {
+    read_json_marker(&gateway_update_prompt_path(home_dir))
+}
+
+pub fn read_update_exit_code(home_dir: &Path) -> Result<Option<i32>, String> {
+    let path = gateway_update_exit_code_path(home_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("reading {} failed: {error}", path.display()))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(1));
+    }
+    trimmed
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|error| format!("parsing {} failed: {error}", path.display()))
+}
+
+pub fn read_update_target(home_dir: &Path) -> Result<Option<GatewayUpdateTarget>, String> {
+    for marker in [
+        read_update_claimed_marker(home_dir)?,
+        read_update_pending_marker(home_dir)?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        marker.validate()?;
+        let session_key = marker
+            .session_key
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", marker.platform.as_str(), marker.chat_id));
+        return Ok(Some(GatewayUpdateTarget {
+            platform: marker.platform,
+            chat_id: marker.chat_id,
+            session_key,
+            thread_id: marker.thread_id,
+        }));
+    }
+    Ok(None)
+}
+
+pub fn plan_update_watcher_cleanup(home_dir: &Path) -> Vec<GatewayHostAction> {
+    vec![
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_pending_path(home_dir),
+        },
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_pending_claimed_path(home_dir),
+        },
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_output_path(home_dir),
+        },
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_exit_code_path(home_dir),
+        },
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_prompt_path(home_dir),
+        },
+        GatewayHostAction::DeleteFile {
+            path: gateway_update_response_path(home_dir),
+        },
+    ]
 }
 
 pub fn restart_notification_pending(runtime_dir: &Path) -> bool {
@@ -3602,6 +4493,80 @@ pub fn plan_active_session_ingress(event: &MessageEvent) -> ActiveSessionIngress
     }
 }
 
+pub fn rewrite_quick_command_alias(event: &mut MessageEvent, config: &RuntimeConfig) -> bool {
+    let Some(command) = event.get_command() else {
+        return false;
+    };
+    if resolve_command(&command).is_some() {
+        return false;
+    }
+    let Some(GatewayQuickCommand::Alias { target }) = config.quick_commands.get(&command) else {
+        return false;
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let target = if target.starts_with('/') {
+        target.to_string()
+    } else {
+        format!("/{target}")
+    };
+    let user_args = event.get_command_args().trim().to_string();
+    event.text = format!("{target} {user_args}").trim().to_string();
+    true
+}
+
+pub fn resolve_exec_quick_command(
+    event: &MessageEvent,
+    config: &RuntimeConfig,
+) -> Option<(String, String)> {
+    let command = event.get_command()?;
+    if resolve_command(&command).is_some() {
+        return None;
+    }
+    match config.quick_commands.get(&command) {
+        Some(GatewayQuickCommand::Exec {
+            command: shell_command,
+        }) if !shell_command.trim().is_empty() => Some((command, shell_command.clone())),
+        _ => None,
+    }
+}
+
+pub fn plan_exec_quick_command_response(
+    name: &str,
+    outcome: &GatewayQuickCommandExecOutcome,
+) -> Result<String, String> {
+    let name = normalize_command_name(name)
+        .ok_or_else(|| "quick command name must not be empty".to_string())?;
+    let response = match outcome {
+        GatewayQuickCommandExecOutcome::Success { stdout, stderr } => {
+            let output = if stdout.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            if output.is_empty() {
+                "Command returned no output.".to_string()
+            } else {
+                output.to_string()
+            }
+        }
+        GatewayQuickCommandExecOutcome::Timeout { timeout_seconds } => {
+            format!("Quick command timed out ({timeout_seconds}s).")
+        }
+        GatewayQuickCommandExecOutcome::Error { message } => {
+            format!("Quick command error: {message}")
+        }
+    };
+    if response.is_empty() {
+        return Err(format!(
+            "quick command '/{name}' produced an empty response"
+        ));
+    }
+    Ok(response)
+}
+
 pub fn plan_running_session_action(
     event: &MessageEvent,
     state: &RunningSessionState,
@@ -3675,6 +4640,7 @@ pub fn plan_ingress_host_response(
 
     let message = match decision {
         GatewayIngressDecision::DispatchCommand { .. }
+        | GatewayIngressDecision::ExecQuickCommand { .. }
         | GatewayIngressDecision::StartTurn { .. } => None,
         GatewayIngressDecision::Reject { message } => Some(message.clone()),
         GatewayIngressDecision::SteerActive { .. } => {
@@ -3698,6 +4664,7 @@ pub fn plan_ingress_host_response(
             PendingReason::Drain => Some(
                 "⏳ Gateway restarting — queued for the next turn after it comes back.".to_string(),
             ),
+            PendingReason::Starting | PendingReason::PassiveQueue => None,
             PendingReason::ExplicitQueue => Some("Queued for the next turn.".to_string()),
             PendingReason::Busy | PendingReason::Interrupt => {
                 let Some(busy) = busy else {
@@ -4749,6 +5716,13 @@ fn generate_pairing_code(
     Err("unable to generate unique pairing code".to_string())
 }
 
+fn current_unix_seconds() -> Result<f64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .map_err(|error| format!("system time before unix epoch: {error}"))
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -5378,6 +6352,144 @@ mod tests {
         };
         assert_eq!(alias_event.get_command().as_deref(), Some("reset"));
         assert_eq!(alias_event.get_command_args(), "tomorrow -- now");
+    }
+
+    #[test]
+    fn quick_command_alias_rewrite_forwards_args_and_preserves_builtin_precedence() {
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "sc".to_string(),
+            GatewayQuickCommand::Alias {
+                target: "/goal status".to_string(),
+            },
+        );
+        config.quick_commands.insert(
+            "help".to_string(),
+            GatewayQuickCommand::Alias {
+                target: "/new".to_string(),
+            },
+        );
+
+        let mut alias_event = MessageEvent {
+            text: "/sc extra args".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        assert!(rewrite_quick_command_alias(&mut alias_event, &config));
+        assert_eq!(alias_event.text, "/goal status extra args");
+
+        let mut builtin_event = MessageEvent {
+            text: "/help".to_string(),
+            ..alias_event.clone()
+        };
+        assert!(!rewrite_quick_command_alias(&mut builtin_event, &config));
+        assert_eq!(builtin_event.text, "/help");
+    }
+
+    #[test]
+    fn resolve_exec_quick_command_respects_builtin_precedence() {
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "limits".to_string(),
+            GatewayQuickCommand::Exec {
+                command: "echo ok".to_string(),
+            },
+        );
+        config.quick_commands.insert(
+            "help".to_string(),
+            GatewayQuickCommand::Exec {
+                command: "echo nope".to_string(),
+            },
+        );
+
+        let exec_event = MessageEvent {
+            text: "/limits".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        assert_eq!(
+            resolve_exec_quick_command(&exec_event, &config),
+            Some(("limits".to_string(), "echo ok".to_string()))
+        );
+
+        let builtin_event = MessageEvent {
+            text: "/help".to_string(),
+            ..exec_event
+        };
+        assert_eq!(resolve_exec_quick_command(&builtin_event, &config), None);
+    }
+
+    #[test]
+    fn quick_command_exec_response_formats_success_timeout_and_error() {
+        assert_eq!(
+            plan_exec_quick_command_response(
+                "limits",
+                &GatewayQuickCommandExecOutcome::Success {
+                    stdout: "ok\n".to_string(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            plan_exec_quick_command_response(
+                "limits",
+                &GatewayQuickCommandExecOutcome::Success {
+                    stdout: String::new(),
+                    stderr: "warn\n".to_string(),
+                },
+            )
+            .unwrap(),
+            "warn"
+        );
+        assert_eq!(
+            plan_exec_quick_command_response(
+                "limits",
+                &GatewayQuickCommandExecOutcome::Success {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap(),
+            "Command returned no output."
+        );
+        assert_eq!(
+            plan_exec_quick_command_response(
+                "limits",
+                &GatewayQuickCommandExecOutcome::Timeout {
+                    timeout_seconds: 30
+                },
+            )
+            .unwrap(),
+            "Quick command timed out (30s)."
+        );
+        assert_eq!(
+            plan_exec_quick_command_response(
+                "limits",
+                &GatewayQuickCommandExecOutcome::Error {
+                    message: "boom".to_string(),
+                },
+            )
+            .unwrap(),
+            "Quick command error: boom"
+        );
     }
 
     #[test]
@@ -6719,6 +7831,216 @@ mod tests {
     }
 
     #[test]
+    fn update_prompt_intercept_consumes_approve_as_yes_response() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            "{\"prompt\":\"test\"}",
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/approve".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let intercept = plan_update_prompt_intercept(temp.path(), &event, true).unwrap();
+        let GatewayUpdatePromptIntercept::Consume {
+            response_text,
+            host_plan,
+        } = intercept
+        else {
+            panic!("expected consumed update prompt response");
+        };
+        assert_eq!(response_text, "y");
+        assert_eq!(
+            host_plan.reply.as_deref(),
+            Some("✓ Sent `y` to the update process.")
+        );
+        apply_filesystem_host_actions(&host_plan.actions).unwrap();
+        assert_eq!(
+            fs::read_to_string(gateway_update_response_path(temp.path())).unwrap(),
+            "y"
+        );
+        assert!(!gateway_update_prompt_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn update_prompt_intercept_bypasses_recognized_slash_command_with_blank_response() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            "{\"prompt\":\"test\"}",
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/new".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let intercept = plan_update_prompt_intercept(temp.path(), &event, true).unwrap();
+        let GatewayUpdatePromptIntercept::ContinueDispatch {
+            recognized_command,
+            host_actions,
+        } = intercept
+        else {
+            panic!("expected update prompt bypass");
+        };
+        assert_eq!(recognized_command, "new");
+        apply_filesystem_host_actions(&host_actions).unwrap();
+        assert_eq!(
+            fs::read_to_string(gateway_update_response_path(temp.path())).unwrap(),
+            ""
+        );
+        assert!(!gateway_update_prompt_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn update_prompt_intercept_treats_unknown_slash_as_verbatim_response() {
+        let temp = tempdir().unwrap();
+        let event = MessageEvent {
+            text: "/foo".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let intercept = plan_update_prompt_intercept(temp.path(), &event, true).unwrap();
+        let GatewayUpdatePromptIntercept::Consume {
+            response_text,
+            host_plan,
+        } = intercept
+        else {
+            panic!("expected consumed unknown slash response");
+        };
+        assert_eq!(response_text, "/foo");
+        assert_eq!(
+            host_plan.reply.as_deref(),
+            Some("✓ Sent `/foo` to the update process.")
+        );
+    }
+
+    #[test]
+    fn update_watcher_reads_claimed_target_before_pending_and_falls_back_session_key() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("pending-session".to_string()),
+            thread_id: None,
+        };
+        let claimed = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "222".to_string(),
+            session_key: None,
+            thread_id: Some("thread-9".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_pending_claimed_path(temp.path()),
+            serde_json::to_vec(&claimed).unwrap(),
+        )
+        .unwrap();
+
+        let target = read_update_target(temp.path()).unwrap().unwrap();
+        assert_eq!(target.chat_id, "222");
+        assert_eq!(target.session_key, "telegram:222");
+        assert_eq!(target.thread_id.as_deref(), Some("thread-9"));
+    }
+
+    #[test]
+    fn update_watcher_state_suppresses_duplicate_forward_until_cleared() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Restore local changes?".to_string(),
+            default: "y".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let first = state.plan_prompt_forward(temp.path()).unwrap().unwrap();
+        assert_eq!(first.target.session_key, "agent:main:telegram:dm:111");
+        assert_eq!(first.prompt.prompt, "Restore local changes?");
+
+        state
+            .mark_prompt_forwarded(&first.target.session_key)
+            .unwrap();
+        assert!(state.plan_prompt_forward(temp.path()).unwrap().is_none());
+
+        state.clear_prompt_pending(&first.target.session_key);
+        assert!(state.plan_prompt_forward(temp.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn update_watcher_cleanup_deletes_all_marker_files() {
+        let temp = tempdir().unwrap();
+        for path in [
+            gateway_update_pending_path(temp.path()),
+            gateway_update_pending_claimed_path(temp.path()),
+            gateway_update_output_path(temp.path()),
+            gateway_update_exit_code_path(temp.path()),
+            gateway_update_prompt_path(temp.path()),
+            gateway_update_response_path(temp.path()),
+        ] {
+            fs::write(path, "x").unwrap();
+        }
+
+        let deferred =
+            apply_filesystem_host_actions(&plan_update_watcher_cleanup(temp.path())).unwrap();
+        assert!(deferred.is_empty());
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+        assert!(!gateway_update_prompt_path(temp.path()).exists());
+        assert!(!gateway_update_response_path(temp.path()).exists());
+    }
+
+    #[test]
     fn pairing_store_invalid_approvals_trigger_lockout() {
         let temp = tempdir().unwrap();
         let store = GatewayPairingStore::new(temp.path()).unwrap();
@@ -6805,7 +8127,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_ingest_starts_turn_for_plain_text() {
+    fn runtime_pending_start_plain_text_queues_silently() {
         let temp = tempdir().unwrap();
         let mut runtime = GatewayRuntime::new(
             temp.path(),
@@ -6813,6 +8135,509 @@ mod tests {
             BusyInputMode::Interrupt,
         )
         .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::PendingStart,
+            },
+        );
+        let event = MessageEvent {
+            text: "follow up".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: Some("msg-pending".to_string()),
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let result = runtime
+            .handle_event_host(event, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            result.decision,
+            GatewayIngressDecision::QueuePending {
+                session_key: ref key,
+                reason: PendingReason::Starting,
+                ..
+            } if key == &session_key
+        ));
+        assert!(result.response.is_none());
+        assert_eq!(runtime.queue_depth(&session_key), 1);
+        assert!(handler.interrupts.is_empty());
+        assert!(handler.steers.is_empty());
+    }
+
+    #[test]
+    fn runtime_pending_start_stop_releases_session_and_replies() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::PendingStart,
+            },
+        );
+        runtime
+            .set_active_session_started_at(&session_key, 100.0)
+            .unwrap();
+        let event = MessageEvent {
+            text: "/stop".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: Some("msg-stop".to_string()),
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let result = runtime
+            .handle_event_host(event, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            result.decision,
+            GatewayIngressDecision::Reject { .. }
+        ));
+        assert_eq!(
+            result.response.unwrap().message,
+            "⚡ Force-stopped. The agent was still starting — session unlocked."
+        );
+        assert!(runtime.active_session(&session_key).is_none());
+        assert!(runtime.active_session_started_at(&session_key).is_none());
+        assert!(handler.interrupts.is_empty());
+        assert!(handler.steers.is_empty());
+    }
+
+    #[test]
+    fn runtime_running_photo_followup_queues_silently_and_merges_media() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::Running { can_steer: false },
+            },
+        );
+        let first = MessageEvent {
+            text: "first".to_string(),
+            message_type: MessageType::Photo,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: vec!["https://example.com/a.jpg".to_string()],
+            media_types: vec!["image/jpeg".to_string()],
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let second = MessageEvent {
+            text: "second".to_string(),
+            message_type: MessageType::Photo,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: vec!["https://example.com/b.jpg".to_string()],
+            media_types: vec!["image/jpeg".to_string()],
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let first_result = runtime
+            .handle_event_host(first, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            first_result.decision,
+            GatewayIngressDecision::QueuePending {
+                reason: PendingReason::PassiveQueue,
+                ..
+            }
+        ));
+        assert!(first_result.response.is_none());
+
+        let second_result = runtime
+            .handle_event_host(second, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            second_result.decision,
+            GatewayIngressDecision::QueuePending {
+                reason: PendingReason::PassiveQueue,
+                ..
+            }
+        ));
+        assert!(second_result.response.is_none());
+        let pending = runtime.pending_event(&session_key).unwrap();
+        assert_eq!(pending.message_type, MessageType::Photo);
+        assert_eq!(pending.media_urls.len(), 2);
+        assert!(pending.text.contains("first"));
+        assert!(pending.text.contains("second"));
+        assert!(handler.interrupts.is_empty());
+    }
+
+    #[test]
+    fn runtime_running_telegram_grace_followup_queues_and_merges_text() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime.set_telegram_followup_grace_seconds(3.0).unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::Running { can_steer: false },
+            },
+        );
+        let now = current_unix_seconds().unwrap();
+        runtime
+            .set_active_session_started_at(&session_key, now)
+            .unwrap();
+        let first = MessageEvent {
+            text: "part one".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let second = MessageEvent {
+            text: "part two".to_string(),
+            ..first.clone()
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let first_result = runtime
+            .handle_event_host(first, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            first_result.decision,
+            GatewayIngressDecision::QueuePending {
+                reason: PendingReason::PassiveQueue,
+                ..
+            }
+        ));
+        assert!(first_result.response.is_none());
+
+        let second_result = runtime
+            .handle_event_host(second, None, &mut handler)
+            .unwrap();
+        assert!(matches!(
+            second_result.decision,
+            GatewayIngressDecision::QueuePending {
+                reason: PendingReason::PassiveQueue,
+                ..
+            }
+        ));
+        let pending = runtime.pending_event(&session_key).unwrap();
+        assert_eq!(pending.text, "part one\npart two");
+        assert!(handler.interrupts.is_empty());
+        assert!(handler.steers.is_empty());
+    }
+
+    #[test]
+    fn slash_confirm_intercept_maps_text_and_command_choices() {
+        let command_event = MessageEvent {
+            text: "/always".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        assert_eq!(
+            plan_slash_confirm_intercept(&command_event, true, false),
+            GatewaySlashConfirmIntercept::Resolve {
+                choice: GatewaySlashConfirmChoice::Always
+            }
+        );
+
+        let text_event = MessageEvent {
+            text: "approve once".to_string(),
+            ..command_event.clone()
+        };
+        assert_eq!(
+            plan_slash_confirm_intercept(&text_event, true, false),
+            GatewaySlashConfirmIntercept::Resolve {
+                choice: GatewaySlashConfirmChoice::Once
+            }
+        );
+    }
+
+    #[test]
+    fn slash_confirm_intercept_yields_to_tool_approval_and_clears_stale_on_unrelated_input() {
+        let event = MessageEvent {
+            text: "/approve".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        assert_eq!(
+            plan_slash_confirm_intercept(&event, true, true),
+            GatewaySlashConfirmIntercept::None
+        );
+
+        let unrelated = MessageEvent {
+            text: "hello".to_string(),
+            ..event
+        };
+        assert_eq!(
+            plan_slash_confirm_intercept(&unrelated, true, false),
+            GatewaySlashConfirmIntercept::ContinueDispatchAndClearStale
+        );
+    }
+
+    #[test]
+    fn slash_confirm_state_resolve_keeps_mismatch_and_drops_stale_match() {
+        let mut state = GatewaySlashConfirmState::new(300.0).unwrap();
+        state
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        assert_eq!(
+            state
+                .resolve(
+                    "session-1",
+                    "wrong-id",
+                    GatewaySlashConfirmChoice::Once,
+                    120.0,
+                )
+                .unwrap(),
+            None
+        );
+        assert!(state.get_pending("session-1").is_some());
+
+        assert_eq!(
+            state
+                .resolve(
+                    "session-1",
+                    "confirm-1",
+                    GatewaySlashConfirmChoice::Once,
+                    500.1,
+                )
+                .unwrap(),
+            None
+        );
+        assert!(state.get_pending("session-1").is_none());
+    }
+
+    #[test]
+    fn slash_confirm_state_handle_event_resolves_choice_and_clears_entry() {
+        let mut state = GatewaySlashConfirmState::default();
+        state
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+        let event = MessageEvent {
+            text: "/always".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let outcome = state
+            .handle_event("session-1", &event, false, 120.0)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewaySlashConfirmEventOutcome::Resolved {
+                resolution: GatewaySlashConfirmResolution {
+                    session_key: "session-1".to_string(),
+                    confirm_id: "confirm-1".to_string(),
+                    command: "reload-mcp".to_string(),
+                    choice: GatewaySlashConfirmChoice::Always,
+                }
+            }
+        );
+        assert!(state.get_pending("session-1").is_none());
+    }
+
+    #[test]
+    fn slash_confirm_state_handle_event_clears_only_stale_pending_on_unrelated_input() {
+        let mut state = GatewaySlashConfirmState::default();
+        state
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+        let event = MessageEvent {
+            text: "hello".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let fresh = state
+            .handle_event("session-1", &event, false, 200.0)
+            .unwrap();
+        assert_eq!(
+            fresh,
+            GatewaySlashConfirmEventOutcome::NoIntercept {
+                cleared_stale: false
+            }
+        );
+        assert!(state.get_pending("session-1").is_some());
+
+        let stale = state
+            .handle_event("session-1", &event, false, 500.1)
+            .unwrap();
+        assert_eq!(
+            stale,
+            GatewaySlashConfirmEventOutcome::NoIntercept {
+                cleared_stale: true
+            }
+        );
+        assert!(state.get_pending("session-1").is_none());
+    }
+
+    #[test]
+    fn stale_running_agent_plan_preserves_pending_sentinel() {
+        let plan = plan_stale_running_agent_eviction(100.0, 1000.0, 1800.0, true, None).unwrap();
+        assert!(!plan.should_evict);
+        assert_eq!(plan.age_seconds, 900.0);
+        assert!(plan.idle_seconds.is_infinite());
+    }
+
+    #[test]
+    fn stale_running_agent_plan_evicts_idle_running_agent() {
+        let activity = GatewayRunningAgentActivity {
+            seconds_since_activity: 1900.0,
+            last_activity_desc: Some("waiting on tool".to_string()),
+            api_call_count: 4,
+            max_iterations: 12,
+        };
+        let plan = plan_stale_running_agent_eviction(100.0, 2000.0, 1800.0, false, Some(&activity))
+            .unwrap();
+        assert!(plan.should_evict);
+        assert_eq!(plan.idle_seconds, 1900.0);
+        assert!(
+            plan.activity_detail
+                .as_deref()
+                .unwrap()
+                .contains("last_activity=waiting on tool")
+        );
+    }
+
+    #[test]
+    fn stale_running_agent_plan_evicts_noninstrumented_non_sentinel_session() {
+        let plan = plan_stale_running_agent_eviction(100.0, 200.0, 1800.0, false, None).unwrap();
+        assert!(plan.should_evict);
+        assert!(plan.idle_seconds.is_infinite());
+    }
+
+    #[test]
+    fn runtime_evict_stale_active_session_clears_runtime_state() {
+        let temp = tempdir().unwrap();
+        let mut runtime =
+            GatewayRuntime::new(temp.path(), RuntimeConfig::default(), BusyInputMode::Queue)
+                .unwrap();
+        let session_key = build_session_key(&session_source("dm"), true, false).unwrap();
+        runtime.active_sessions.insert(
+            session_key.clone(),
+            ActiveSession {
+                session_key: session_key.clone(),
+                phase: ActiveSessionPhase::Running { can_steer: false },
+            },
+        );
+        runtime
+            .set_active_session_started_at(&session_key, 100.0)
+            .unwrap();
+        runtime
+            .prepare_busy_reply_context(
+                &session_key,
+                true,
+                150.0,
+                30.0,
+                GatewayBusyReplyStatus::default(),
+            )
+            .unwrap();
+
+        let outcome = runtime
+            .evict_stale_active_session(&session_key, 2000.0, 1800.0, false, None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            GatewayStaleSessionOutcome::Evicted {
+                session_key: ref key,
+                ..
+            } if key == &session_key
+        ));
+        assert!(runtime.active_session(&session_key).is_none());
+        assert!(runtime.active_session_started_at(&session_key).is_none());
+    }
+
+    #[test]
+    fn runtime_ingest_starts_turn_for_plain_text() {
+        let temp = tempdir().unwrap();
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "sc".to_string(),
+            GatewayQuickCommand::Alias {
+                target: "/new".to_string(),
+            },
+        );
+        let mut runtime =
+            GatewayRuntime::new(temp.path(), config, BusyInputMode::Interrupt).unwrap();
         let event = MessageEvent {
             text: "hello".to_string(),
             message_type: MessageType::Text,
@@ -6844,17 +8669,33 @@ mod tests {
                 .map(|state| state.phase),
             Some(ActiveSessionPhase::PendingStart)
         );
+
+        let alias_event = MessageEvent {
+            text: "/sc".to_string(),
+            ..event
+        };
+        let alias_decision = runtime.ingest_event(alias_event).unwrap();
+        assert!(matches!(
+            alias_decision,
+            GatewayIngressDecision::DispatchCommand {
+                canonical: "new",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn runtime_ingest_dispatches_gateway_command_without_claiming_turn() {
         let temp = tempdir().unwrap();
-        let mut runtime = GatewayRuntime::new(
-            temp.path(),
-            RuntimeConfig::default(),
-            BusyInputMode::Interrupt,
-        )
-        .unwrap();
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "limits".to_string(),
+            GatewayQuickCommand::Exec {
+                command: "echo ok".to_string(),
+            },
+        );
+        let mut runtime =
+            GatewayRuntime::new(temp.path(), config, BusyInputMode::Interrupt).unwrap();
         let event = MessageEvent {
             text: "/help".to_string(),
             message_type: MessageType::Text,
@@ -6868,13 +8709,28 @@ mod tests {
             channel_prompt: None,
             internal: false,
         };
-        let decision = runtime.ingest_event(event).unwrap();
+        let decision = runtime.ingest_event(event.clone()).unwrap();
         assert!(matches!(
             decision,
             GatewayIngressDecision::DispatchCommand {
                 canonical: "help",
                 ..
             }
+        ));
+        assert!(runtime.active_sessions.is_empty());
+
+        let exec_event = MessageEvent {
+            text: "/limits".to_string(),
+            ..event
+        };
+        let exec_decision = runtime.ingest_event(exec_event).unwrap();
+        assert!(matches!(
+            exec_decision,
+            GatewayIngressDecision::ExecQuickCommand {
+                ref name,
+                ref shell_command,
+                ..
+            } if name == "limits" && shell_command == "echo ok"
         ));
         assert!(runtime.active_sessions.is_empty());
     }
