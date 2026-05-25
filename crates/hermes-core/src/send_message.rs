@@ -469,11 +469,6 @@ fn apply_config_yaml_overrides(configs: &mut ConfigSet, hermes_home: &Path) {
         load_telegram_config_from_yaml(hermes_home),
     ) {
         (Some(config), _) => {
-            if env_trimmed("TELEGRAM_API_BASE_URL").is_none()
-                && let Some(base_url) = load_telegram_base_url(hermes_home)
-            {
-                config.base_url = base_url;
-            }
             if config.home.is_none() {
                 config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
             }
@@ -482,6 +477,12 @@ fn apply_config_yaml_overrides(configs: &mut ConfigSet, hermes_home: &Path) {
         _ => {}
     }
     if let Some(config) = configs.telegram.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("TELEGRAM_API_BASE_URL")
+                .or_else(|| load_telegram_base_url(hermes_home))
+                .as_deref(),
+            TELEGRAM_DEFAULT_BASE_URL,
+        );
         if config.home.is_none() {
             config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
         }
@@ -530,13 +531,19 @@ fn apply_config_yaml_overrides(configs: &mut ConfigSet, hermes_home: &Path) {
         configs.feishu.as_mut(),
         load_feishu_config_from_yaml(hermes_home),
     ) {
-        (Some(config), _) => {
-            if config.home.is_none() {
-                config.home = load_platform_home_target_from_yaml(hermes_home, "feishu", "Home");
-            }
-        }
+        (Some(_config), _) => {}
         (None, Some(yaml)) => configs.feishu = Some(yaml),
         _ => {}
+    }
+    if let Some(config) = configs.feishu.as_mut() {
+        if let Ok(domain) = env::var("FEISHU_DOMAIN")
+            && let Ok(base_url) = normalize_feishu_base_url(&domain)
+        {
+            config.base_url = base_url;
+        }
+        if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "feishu", "Home");
+        }
     }
 
     let matrix_yaml = load_matrix_config_from_yaml(hermes_home);
@@ -709,17 +716,17 @@ fn load_feishu_config_from_yaml(hermes_home: &Path) -> Option<FeishuConfig> {
 }
 
 fn load_matrix_config() -> Option<MatrixConfig> {
-    let homeserver = normalize_base_url(
-        env_trimmed("MATRIX_HOMESERVER").as_deref(),
-        MATRIX_DEFAULT_BASE_URL,
-    );
-    if homeserver.is_empty() {
-        return None;
-    }
     let token = env_trimmed("MATRIX_ACCESS_TOKEN");
     let user_id = env_trimmed("MATRIX_USER_ID");
     let password = env_trimmed("MATRIX_PASSWORD");
     if token.is_none() && (user_id.is_none() || password.is_none()) {
+        return None;
+    }
+    let homeserver = normalize_base_url(
+        env_trimmed("MATRIX_HOMESERVER").as_deref(),
+        MATRIX_DEFAULT_BASE_URL,
+    );
+    if homeserver.is_empty() || env_trimmed("MATRIX_HOMESERVER").is_none() {
         return None;
     }
     Some(MatrixConfig {
@@ -1622,7 +1629,7 @@ fn telegram_send_single_media(
         &display_path,
     ) {
         Ok(message_id) => Ok(message_id),
-        Err(_error) if method == "sendPhoto" => telegram_send_single_media_request(
+        Err(_error) if method == "sendPhoto" => match telegram_send_single_media_request(
             client,
             config,
             target,
@@ -1631,8 +1638,67 @@ fn telegram_send_single_media(
             &file_name,
             bytes,
             &display_path,
-        ),
-        Err(error) => Err(error),
+        ) {
+            Ok(message_id) => Ok(message_id),
+            Err(error) => {
+                telegram_send_media_text_fallback(client, config, target, attachment, &display_path)
+                    .map_err(|fallback_error| format!("{error}; {fallback_error}"))
+            }
+        },
+        Err(error) => {
+            telegram_send_media_text_fallback(client, config, target, attachment, &display_path)
+                .map_err(|fallback_error| format!("{error}; {fallback_error}"))
+        }
+    }
+}
+
+fn telegram_send_media_text_fallback(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+    display_path: &str,
+) -> Result<Option<String>, String> {
+    let fallback_text = telegram_media_text_fallback(attachment);
+    let mut active_thread_id = telegram_message_thread_id(target.thread_id.as_deref());
+    let mut thread_fallback_used = false;
+
+    loop {
+        let body = telegram_send_text_request(
+            client,
+            config,
+            &target.chat_id,
+            &fallback_text,
+            None,
+            active_thread_id.as_deref(),
+        )
+        .map_err(|error| {
+            format!(
+                "Failed to send fallback text for media {display_path}: {}",
+                error.0
+            )
+        })?;
+
+        if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(body.pointer("/result/message_id").and_then(value_as_string));
+        }
+
+        let description = body
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if telegram_is_thread_not_found_error(description)
+            && active_thread_id.is_some()
+            && !thread_fallback_used
+        {
+            active_thread_id = None;
+            thread_fallback_used = true;
+            continue;
+        }
+
+        return Err(format!(
+            "Failed to send fallback text for media {display_path}: {description}"
+        ));
     }
 }
 
@@ -1757,6 +1823,24 @@ fn telegram_can_media_group_photo(attachment: &MediaAttachment) -> bool {
     )
 }
 
+fn telegram_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice
+        || TELEGRAM_SEND_AUDIO_EXTS.contains(&ext.as_str())
+        || TELEGRAM_VOICE_EXTS.contains(&ext.as_str())
+    {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
+}
+
 fn telegram_has_html(content: &str) -> bool {
     Regex::new(r"<[a-zA-Z/][^>]*>")
         .expect("valid telegram html detection regex")
@@ -1855,6 +1939,9 @@ fn load_telegram_base_url(hermes_home: &Path) -> Option<String> {
 }
 
 fn load_matrix_config_from_yaml(hermes_home: &Path) -> Option<MatrixConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "matrix") != Some(true) {
+        return None;
+    }
     let homeserver =
         load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "homeserver"])
             .map(|value| normalize_base_url(Some(value.as_str()), MATRIX_DEFAULT_BASE_URL))
@@ -1884,6 +1971,9 @@ fn load_matrix_config_from_yaml(hermes_home: &Path) -> Option<MatrixConfig> {
 }
 
 fn load_signal_config_from_yaml(hermes_home: &Path) -> Option<SignalConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "signal") != Some(true) {
+        return None;
+    }
     let http_url =
         load_config_yaml_string(hermes_home, &["platforms", "signal", "extra", "http_url"])
             .map(|value| normalize_base_url(Some(value.as_str()), ""))
@@ -2203,15 +2293,7 @@ fn send_discord_standard_channel(
 
     if !message.is_empty() {
         for chunk in truncate_message(message, DISCORD_MAX_MESSAGE_LENGTH) {
-            let response = client
-                .post(url)
-                .header("Authorization", format!("Bot {}", config.token))
-                .header("Content-Type", "application/json")
-                .json(&json!({ "content": chunk }))
-                .send()
-                .map_err(|error| SendError(format!("Discord send failed: {error}")))?;
-            let body = parse_json_response(response, "Discord send failed")?;
-            last_message_id = body.get("id").and_then(value_as_string);
+            last_message_id = send_discord_text_message(client, config, url, &chunk)?;
             delivered_any = true;
         }
     }
@@ -2233,10 +2315,23 @@ fn send_discord_standard_channel(
         let bytes = match fs::read(&attachment.path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {error}",
-                    attachment.path.display()
-                ));
+                if message.is_empty() {
+                    match send_discord_media_text_fallback(client, config, url, attachment) {
+                        Ok(message_id) => {
+                            last_message_id = message_id;
+                            delivered_any = true;
+                        }
+                        Err(fallback_error) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
                 continue;
             }
         };
@@ -2249,21 +2344,48 @@ fn send_discord_standard_channel(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {error}",
-                    attachment.path.display()
-                ));
+                if message.is_empty() {
+                    match send_discord_media_text_fallback(client, config, url, attachment) {
+                        Ok(message_id) => {
+                            last_message_id = message_id;
+                            delivered_any = true;
+                        }
+                        Err(fallback_error) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
                 continue;
             }
         };
         let body = match parse_json_response(response, "Discord media send failed") {
             Ok(body) => body,
             Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {}",
-                    attachment.path.display(),
-                    error.0
-                ));
+                if message.is_empty() {
+                    match send_discord_media_text_fallback(client, config, url, attachment) {
+                        Ok(message_id) => {
+                            last_message_id = message_id;
+                            delivered_any = true;
+                        }
+                        Err(fallback_error) => warnings.push(format!(
+                            "Failed to send media {}: {}; {fallback_error}",
+                            attachment.path.display(),
+                            error.0
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    ));
+                }
                 continue;
             }
         };
@@ -2289,6 +2411,55 @@ fn send_discord_standard_channel(
     })
 }
 
+fn send_discord_text_message(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    content: &str,
+) -> Result<Option<String>, SendError> {
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bot {}", config.token))
+        .header("Content-Type", "application/json")
+        .json(&json!({ "content": content }))
+        .send()
+        .map_err(|error| SendError(format!("Discord send failed: {error}")))?;
+    let body = parse_json_response(response, "Discord send failed")?;
+    Ok(body.get("id").and_then(value_as_string))
+}
+
+fn send_discord_media_text_fallback(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    attachment: &MediaAttachment,
+) -> Result<Option<String>, String> {
+    let mut last_message_id = None;
+    for chunk in truncate_message(
+        &discord_media_text_fallback(attachment),
+        DISCORD_MAX_MESSAGE_LENGTH,
+    ) {
+        last_message_id = send_discord_text_message(client, config, url, &chunk)
+            .map_err(|error| format!("Failed to send fallback text for media: {}", error.0))?;
+    }
+    Ok(last_message_id)
+}
+
+fn discord_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
+}
+
 fn send_discord_forum_channel(
     client: &Client,
     config: &DiscordConfig,
@@ -2298,7 +2469,7 @@ fn send_discord_forum_channel(
 ) -> Result<SentMessage, SendError> {
     let url = format!("{}/channels/{}/threads", config.base_url, target.chat_id);
     let mut warnings = Vec::new();
-    let text_chunks = if message.is_empty() {
+    let mut text_chunks = if message.is_empty() {
         Vec::new()
     } else {
         truncate_message(message, DISCORD_MAX_MESSAGE_LENGTH)
@@ -2390,9 +2561,65 @@ fn send_discord_forum_channel(
             .post(&url)
             .header("Authorization", format!("Bot {}", config.token))
             .multipart(form)
-            .send()
-            .map_err(|error| SendError(format!("Discord forum thread creation failed: {error}")))?;
-        parse_json_response(response, "Discord forum thread creation failed")?
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if text_chunks.is_empty() => {
+                let fallback = discord_forum_media_text_fallback_chunks(media);
+                if fallback.is_empty() {
+                    return Err(SendError(format!(
+                        "Discord forum thread creation failed: {error}"
+                    )));
+                }
+                text_chunks = fallback;
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", config.token))
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "name": thread_name,
+                        "message": { "content": text_chunks[0] },
+                    }))
+                    .send()
+                    .map_err(|fallback_error| {
+                        SendError(format!(
+                            "Discord forum thread creation failed: {error}; fallback text thread creation failed: {fallback_error}"
+                        ))
+                    })?
+            }
+            Err(error) => {
+                return Err(SendError(format!(
+                    "Discord forum thread creation failed: {error}"
+                )));
+            }
+        };
+        match parse_json_response(response, "Discord forum thread creation failed") {
+            Ok(body) => body,
+            Err(error) if text_chunks.is_empty() => {
+                let fallback = discord_forum_media_text_fallback_chunks(media);
+                if fallback.is_empty() {
+                    return Err(error);
+                }
+                text_chunks = fallback;
+                let fallback_response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", config.token))
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "name": thread_name,
+                        "message": { "content": text_chunks[0] },
+                    }))
+                    .send()
+                    .map_err(|fallback_error| {
+                        SendError(format!(
+                            "{}; fallback text thread creation failed: {fallback_error}",
+                            error.0
+                        ))
+                    })?;
+                parse_json_response(fallback_response, "Discord forum thread creation failed")?
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     let thread_id = body.get("id").and_then(value_as_string);
@@ -2438,6 +2665,20 @@ fn send_discord_forum_channel(
             .then(|| format!("Sent to discord home channel (chat_id: {})", target.chat_id)),
         warnings,
     })
+}
+
+fn discord_forum_media_text_fallback_chunks(media: &[MediaAttachment]) -> Vec<String> {
+    let fallback = media
+        .iter()
+        .filter(|attachment| attachment.path.is_file())
+        .map(discord_media_text_fallback)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fallback.is_empty() {
+        Vec::new()
+    } else {
+        truncate_message(&fallback, DISCORD_MAX_MESSAGE_LENGTH)
+    }
 }
 
 fn derive_discord_forum_thread_name(message: &str) -> String {
@@ -2687,38 +2928,17 @@ fn send_slack(
     let formatted_message = slack_format_message(message);
 
     if !formatted_message.is_empty() {
-        let url = format!("{}/chat.postMessage", config.base_url);
         for (index, chunk) in truncate_message(&formatted_message, SLACK_MAX_MESSAGE_LENGTH)
             .into_iter()
             .enumerate()
         {
-            let mut payload = serde_json::Map::new();
-            payload.insert("channel".to_string(), Value::String(target.chat_id.clone()));
-            payload.insert("text".to_string(), Value::String(chunk));
-            payload.insert("mrkdwn".to_string(), Value::Bool(true));
-            if let Some(thread_id) = target.thread_id.as_ref() {
-                payload.insert("thread_ts".to_string(), Value::String(thread_id.clone()));
-                if config.reply_broadcast && index == 0 {
-                    payload.insert("reply_broadcast".to_string(), Value::Bool(true));
-                }
-            }
-            let response = client
-                .post(&url)
-                .bearer_auth(&config.token)
-                .header("Content-Type", "application/json")
-                .json(&Value::Object(payload))
-                .send()
-                .map_err(|error| SendError(format!("Slack send failed: {error}")))?;
-            let body = parse_json_response(response, "Slack send failed")?;
-            if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-                return Err(SendError(format!(
-                    "Slack send failed: {}",
-                    body.get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                )));
-            }
-            last_message_id = body.get("ts").and_then(value_as_string);
+            last_message_id = Some(send_slack_text_message(
+                &client,
+                config,
+                target,
+                &chunk,
+                index == 0,
+            )?);
             delivered_any = true;
         }
     }
@@ -2733,10 +2953,27 @@ fn send_slack(
         let bytes = match fs::read(&attachment.path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {error}",
-                    attachment.path.display()
-                ));
+                if message.is_empty() {
+                    match send_slack_media_text_fallback(&client, config, target, attachment) {
+                        Some(Ok(message_id)) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Some(Err(fallback_error)) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                        None => warnings.push(format!(
+                            "Failed to send media {}: {error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
                 continue;
             }
         };
@@ -2745,11 +2982,32 @@ fn send_slack(
                 last_message_id = Some(message_id);
                 delivered_any = true;
             }
-            Err(error) => warnings.push(format!(
-                "Failed to send media {}: {}",
-                attachment.path.display(),
-                error.0
-            )),
+            Err(error) => {
+                if message.is_empty() {
+                    match send_slack_media_text_fallback(&client, config, target, attachment) {
+                        Some(Ok(message_id)) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Some(Err(fallback_error)) => warnings.push(format!(
+                            "Failed to send media {}: {}; {fallback_error}",
+                            attachment.path.display(),
+                            error.0
+                        )),
+                        None => warnings.push(format!(
+                            "Failed to send media {}: {}",
+                            attachment.path.display(),
+                            error.0
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    ));
+                }
+            }
         }
     }
 
@@ -2769,6 +3027,45 @@ fn send_slack(
             .then(|| format!("Sent to slack home channel (chat_id: {})", target.chat_id)),
         warnings,
     })
+}
+
+fn send_slack_text_message(
+    client: &Client,
+    config: &SlackConfig,
+    target: &ResolvedTarget,
+    text: &str,
+    first_thread_chunk: bool,
+) -> Result<String, SendError> {
+    let url = format!("{}/chat.postMessage", config.base_url);
+    let mut payload = serde_json::Map::new();
+    payload.insert("channel".to_string(), Value::String(target.chat_id.clone()));
+    payload.insert("text".to_string(), Value::String(text.to_string()));
+    payload.insert("mrkdwn".to_string(), Value::Bool(true));
+    if let Some(thread_id) = target.thread_id.as_ref() {
+        payload.insert("thread_ts".to_string(), Value::String(thread_id.clone()));
+        if config.reply_broadcast && first_thread_chunk {
+            payload.insert("reply_broadcast".to_string(), Value::Bool(true));
+        }
+    }
+    let response = client
+        .post(&url)
+        .bearer_auth(&config.token)
+        .header("Content-Type", "application/json")
+        .json(&Value::Object(payload))
+        .send()
+        .map_err(|error| SendError(format!("Slack send failed: {error}")))?;
+    let body = parse_json_response(response, "Slack send failed")?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(SendError(format!(
+            "Slack send failed: {}",
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        )));
+    }
+    body.get("ts")
+        .and_then(value_as_string)
+        .ok_or_else(|| SendError("Slack send failed: missing ts".to_string()))
 }
 
 fn slack_upload_file(
@@ -2863,6 +3160,28 @@ fn slack_upload_file(
         .unwrap_or(file_id))
 }
 
+fn send_slack_media_text_fallback(
+    client: &Client,
+    config: &SlackConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Option<Result<String, String>> {
+    let ext = file_extension(&attachment.path);
+    let text = if IMAGE_EXTS.contains(&ext.as_str()) {
+        Some(format!("🖼️ Image: {}", attachment.path.display()))
+    } else if VIDEO_EXTS.contains(&ext.as_str()) {
+        Some(format!("🎬 Video: {}", attachment.path.display()))
+    } else if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        None
+    } else {
+        Some(format!("📎 File: {}", attachment.path.display()))
+    }?;
+    Some(
+        send_slack_text_message(client, config, target, &text, true)
+            .map_err(|error| format!("Failed to send fallback text for media: {}", error.0)),
+    )
+}
+
 fn send_feishu(
     config: &FeishuConfig,
     target: &ResolvedTarget,
@@ -2924,10 +3243,25 @@ fn send_feishu(
         let bytes = match fs::read(&attachment.path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {error}",
-                    attachment.path.display()
-                ));
+                if message.is_empty() {
+                    match send_feishu_media_text_fallback(
+                        &client, config, &token, target, attachment,
+                    ) {
+                        Ok(message_id) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Err(fallback_error) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
                 continue;
             }
         };
@@ -2937,11 +3271,27 @@ fn send_feishu(
                     match feishu_upload_image(&client, config, &token, &file_name, &bytes) {
                         Ok(image_key) => image_key,
                         Err(error) => {
-                            warnings.push(format!(
-                                "Failed to send media {}: {}",
-                                attachment.path.display(),
-                                error.0
-                            ));
+                            if message.is_empty() {
+                                match send_feishu_media_text_fallback(
+                                    &client, config, &token, target, attachment,
+                                ) {
+                                    Ok(message_id) => {
+                                        last_message_id = Some(message_id);
+                                        delivered_any = true;
+                                    }
+                                    Err(fallback_error) => warnings.push(format!(
+                                        "Failed to send media {}: {}; {fallback_error}",
+                                        attachment.path.display(),
+                                        error.0
+                                    )),
+                                }
+                            } else {
+                                warnings.push(format!(
+                                    "Failed to send media {}: {}",
+                                    attachment.path.display(),
+                                    error.0
+                                ));
+                            }
                             continue;
                         }
                     };
@@ -2956,11 +3306,27 @@ fn send_feishu(
                 ) {
                     Ok(message_id) => message_id,
                     Err(error) => {
-                        warnings.push(format!(
-                            "Failed to send media {}: {}",
-                            attachment.path.display(),
-                            error.0
-                        ));
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -2979,11 +3345,27 @@ fn send_feishu(
                 ) {
                     Ok(file_key) => file_key,
                     Err(error) => {
-                        warnings.push(format!(
-                            "Failed to send media {}: {}",
-                            attachment.path.display(),
-                            error.0
-                        ));
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
                         continue;
                     }
                 };
@@ -2998,11 +3380,27 @@ fn send_feishu(
                 ) {
                     Ok(message_id) => message_id,
                     Err(error) => {
-                        warnings.push(format!(
-                            "Failed to send media {}: {}",
-                            attachment.path.display(),
-                            error.0
-                        ));
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -3041,6 +3439,40 @@ fn feishu_build_outbound_payload(content: &str) -> (String, String) {
         );
     }
     ("text".to_string(), json!({ "text": content }).to_string())
+}
+
+fn send_feishu_media_text_fallback(
+    client: &Client,
+    config: &FeishuConfig,
+    token: &str,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Result<String, String> {
+    feishu_send_message(
+        client,
+        config,
+        token,
+        target,
+        "text",
+        json!({ "text": feishu_media_text_fallback(attachment) }).to_string(),
+        "Feishu send failed",
+    )
+    .map_err(|error| format!("Failed to send fallback text for media: {}", error.0))
+}
+
+fn feishu_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
 }
 
 fn feishu_contains_markdown_table(content: &str) -> bool {
@@ -5694,7 +6126,7 @@ mod tests {
             &runtime,
         );
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
         assert_eq!(parsed["platform"], json!("slack"));
         assert_eq!(parsed["chat_id"], json!("CENG12345"));
         join.join().unwrap();
@@ -5906,6 +6338,69 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_discord_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                (500, "upload exploded".to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["content"], json!(expected_fallback));
+                (200, json!({ "id": "msg-fallback" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["message_id"], json!("msg-fallback"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_discord_long_text_in_multiple_chunks() {
         let _guard = acquire_test_lock();
         clear_discord_forum_cache();
@@ -6082,6 +6577,78 @@ mod tests {
         assert_eq!(parsed["chat_id"], json!("123"));
         assert_eq!(parsed["thread_id"], json!("thread-1"));
         assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_discord_forum_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "456",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/456/threads "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                (500, "upload exploded".to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/456/threads "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["name"], json!("clip.mp4"));
+                assert_eq!(payload["message"]["content"], json!(expected_fallback));
+                (
+                    200,
+                    json!({
+                        "id": "thread-fallback",
+                        "message": { "id": "msg-fallback" }
+                    })
+                    .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:456",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["thread_id"], json!("thread-fallback"));
+        assert_eq!(parsed["message_id"], json!("msg-fallback"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
@@ -6463,6 +7030,48 @@ mod tests {
         assert_eq!(parsed["chat_id"], json!("98765"));
         assert_eq!(parsed["message_id"], json!("58"));
         join.join().unwrap();
+    }
+
+    #[test]
+    fn telegram_yaml_runtime_respects_env_base_url_override() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (yaml_base_url, yaml_join) =
+            mock_server(0, move |_index, _headers, _body| unreachable!());
+        let (env_base_url, env_join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["text"], json!("env wins"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 59 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    extra:\n      base_url: {yaml_base_url}\n    home_channel:\n      chat_id: '98765'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&env_base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram",
+                "message": "env wins",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("98765"));
+        assert_eq!(parsed["message_id"], json!("59"));
+        env_join.join().unwrap();
+        yaml_join.join().unwrap();
     }
 
     #[test]
@@ -6904,6 +7513,56 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_telegram_text_when_video_upload_is_rejected() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendVideo "));
+                (
+                    500,
+                    json!({
+                        "ok": false,
+                        "description": "video upload exploded"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["text"], json!(expected_fallback));
+                assert!(payload.get("parse_mode").is_none());
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 115 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("115"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_telegram_voice_media() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -7145,6 +7804,67 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["chat_id"], json!("oc_home"));
         assert_eq!(parsed["message_id"], json!("om_yaml_1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn feishu_yaml_runtime_respects_env_domain_override() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_home"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hi from env domain"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_env_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: cli_test\n      app_secret: secret_test\n      domain: feishu\n    home_channel:\n      chat_id: oc_home\n      name: Home\n",
+        )
+        .unwrap();
+
+        with_env_var("FEISHU_APP_ID", None);
+        with_env_var("FEISHU_APP_SECRET", None);
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu",
+                "message": "hi from env domain",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("oc_home"));
+        assert_eq!(parsed["message_id"], json!("om_env_1"));
         join.join().unwrap();
     }
 
@@ -7522,6 +8242,68 @@ mod tests {
                 media_path.display()
             )])
         );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_feishu_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let expected_fallback = format!("🖼️ Image: {}", media_path.display());
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                (
+                    200,
+                    json!({ "code": 99991663, "msg": "upload disabled" }).to_string(),
+                )
+            }
+            2 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!(expected_fallback));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_fallback_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_fallback_1"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
@@ -7931,7 +8713,7 @@ mod tests {
         fs::write(
             temp.path().join("config.yaml"),
             format!(
-                "platforms:\n  matrix:\n    token: matrix-config-token\n    extra:\n      homeserver: {base_url}\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n"
+                "platforms:\n  matrix:\n    enabled: true\n    token: matrix-config-token\n    extra:\n      homeserver: {base_url}\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n"
             ),
         )
         .unwrap();
@@ -7953,6 +8735,29 @@ mod tests {
         assert_eq!(parsed["chat_id"], json!("!roomid:example.org"));
         assert_eq!(parsed["message_id"], json!("$event-config"));
         join.join().unwrap();
+    }
+
+    #[test]
+    fn matrix_env_runtime_requires_homeserver() {
+        let _guard = acquire_test_lock();
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        assert!(load_matrix_config().is_none());
+    }
+
+    #[test]
+    fn matrix_yaml_runtime_config_requires_enabled_flag() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  matrix:\n    token: matrix-config-token\n    extra:\n      homeserver: https://matrix.example.org\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n",
+        )
+        .unwrap();
+        assert_eq!(load_platform_enabled_from_yaml(temp.path(), "matrix"), None);
+        assert!(load_matrix_config_from_yaml(temp.path()).is_none());
     }
 
     #[test]
@@ -8425,6 +9230,18 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["chat_id"], json!("group:group-123"));
         join.join().unwrap();
+    }
+
+    #[test]
+    fn signal_yaml_runtime_config_requires_enabled_flag() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  signal:\n    extra:\n      http_url: http://127.0.0.1:8080\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:group-123'\n      name: Alerts\n",
+        )
+        .unwrap();
+        assert_eq!(load_platform_enabled_from_yaml(temp.path(), "signal"), None);
+        assert!(load_signal_config_from_yaml(temp.path()).is_none());
     }
 
     #[test]
@@ -9258,6 +10075,56 @@ mod tests {
                 media_path.display()
             )])
         );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_slack_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.txt");
+        fs::write(&media_path, b"slack-bytes").unwrap();
+        let expected_fallback = format!("📎 File: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /files.getUploadURLExternal "));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "error": "upload_disabled"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /chat.postMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["channel"], json!("C12345678"));
+                assert_eq!(payload["text"], json!(expected_fallback));
+                assert_eq!(payload["mrkdwn"], json!(true));
+                (
+                    200,
+                    json!({ "ok": true, "ts": "1710000000.000202" }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("slack"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000202"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
