@@ -21,7 +21,7 @@ bedrock = BedrockProfile(
     name="bedrock",
     aliases=("aws", "aws-bedrock", "amazon-bedrock", "amazon"),
     api_mode="bedrock_converse",
-    env_vars=(),  # AWS SDK credentials — not env vars
+    env_vars=("BEDROCK_BASE_URL",),  # runtime override only; credentials stay on AWS SDK
     base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
     auth_type="aws_sdk",
 )

@@ -13,7 +13,7 @@ from providers.base import ProviderProfile
 opencode_zen = ProviderProfile(
     name="opencode-zen",
     aliases=("opencode", "opencode_zen", "zen"),
-    env_vars=("OPENCODE_ZEN_API_KEY",),
+    env_vars=("OPENCODE_ZEN_API_KEY", "OPENCODE_ZEN_BASE_URL"),
     base_url="https://opencode.ai/zen/v1",
     default_aux_model="gemini-3-flash",
 )
@@ -21,7 +21,7 @@ opencode_zen = ProviderProfile(
 opencode_go = ProviderProfile(
     name="opencode-go",
     aliases=("opencode_go", "go", "opencode-go-sub"),
-    env_vars=("OPENCODE_GO_API_KEY",),
+    env_vars=("OPENCODE_GO_API_KEY", "OPENCODE_GO_BASE_URL"),
     base_url="https://opencode.ai/zen/go/v1",
     default_aux_model="glm-5",
 )
