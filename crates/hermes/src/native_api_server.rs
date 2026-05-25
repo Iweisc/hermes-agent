@@ -779,8 +779,8 @@ async fn handle_runs(
                 model_for_task,
                 messages_for_task.clone(),
                 session_id,
-                None,
-                None,
+                Some(Arc::clone(&interrupt_requested_for_task)),
+                Some(progress_callback),
             )
             .await
         } else {
@@ -5086,6 +5086,111 @@ mod tests {
     }
 
     #[test]
+    fn native_api_server_session_backed_run_events_include_tool_and_message_updates() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let (base_url, join) = mock_model_server_sequence(
+            vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_todo_session_run_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "todo",
+                                    "arguments": "{}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "session tool-backed hello"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+            |_| {},
+        );
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "say hi",
+                "session_id": "sess-run-events-1",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap();
+
+        let response = client
+            .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+            .send()
+            .unwrap();
+        let body = response.text().unwrap();
+        assert!(body.contains("event: tool.started"));
+        assert!(body.contains("\"tool\":\"todo\""));
+        assert!(body.contains("event: tool.completed"));
+        assert!(body.contains("\"error\":false"));
+        assert!(body.contains("event: message.delta"));
+        assert!(body.contains("\"delta\":\"session tool-backed hello\""));
+        assert!(body.contains("event: run.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn native_api_server_runs_can_be_stopped() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let response_body = json!({
@@ -5198,6 +5303,113 @@ mod tests {
             .unwrap()
             .text()
             .unwrap();
+        assert!(events.contains("event: run.stopping"));
+        assert!(events.contains("event: run.cancelled"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_session_backed_runs_can_be_stopped() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "id": "chatcmpl-run-stop-session",
+            "choices": [{
+                "message": {
+                    "content": "session run stop hello"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) =
+            mock_model_server_with_delay(response_body, std::time::Duration::from_millis(250));
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let started: Value = client
+            .post(format!("http://{addr}/v1/runs"))
+            .json(&json!({
+                "input": "say hi",
+                "session_id": "sess-run-stop-1",
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stopping: Value = client
+            .post(format!("http://{addr}/v1/runs/{run_id}/stop"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(stopping["status"], json!("stopping"));
+
+        let mut status = Value::Null;
+        for _ in 0..40 {
+            status = client
+                .get(format!("http://{addr}/v1/runs/{run_id}"))
+                .send()
+                .unwrap()
+                .json()
+                .unwrap();
+            if status["status"] == json!("cancelled") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(status["status"], json!("cancelled"));
+        assert_eq!(status["last_event"], json!("run.cancelled"));
+
+        let response = client
+            .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+            .send()
+            .unwrap();
+        let events = response.text().unwrap();
         assert!(events.contains("event: run.stopping"));
         assert!(events.contains("event: run.cancelled"));
 
