@@ -3342,7 +3342,9 @@ fn run_background_prompt(
                 "Clarify is unavailable in background tasks: {question}"
             ))
         })
-        .with_delegate_callback(move |request| delegate.execute(request));
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
     let result = context.run_chat_completions_turn(
         &config,
         prompt,
