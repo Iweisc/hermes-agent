@@ -679,6 +679,230 @@ fn load_bridged_provider_metadata(
     })
 }
 
+fn load_provider_status_metadata(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Result<BridgedProviderMetadata, Box<dyn Error>> {
+    native_provider_metadata(context, provider_name)
+        .map(Ok)
+        .unwrap_or_else(|| load_bridged_provider_metadata(context, provider_name))
+}
+
+fn native_provider_metadata(
+    context: &HermesContext,
+    provider_name: &str,
+) -> Option<BridgedProviderMetadata> {
+    let fields = native_status_fields(context, provider_name)?;
+    Some(BridgedProviderMetadata {
+        has_post_setup: matches!(provider_name, "honcho" | "hindsight"),
+        has_save_config: matches!(provider_name, "holographic" | "mem0" | "supermemory"),
+        is_available: native_provider_available(context, provider_name),
+        schema: fields
+            .into_iter()
+            .map(setup_field_to_bridged_schema)
+            .collect(),
+    })
+}
+
+fn native_status_fields(context: &HermesContext, provider_name: &str) -> Option<Vec<SetupField>> {
+    match provider_name {
+        "honcho" => Some(vec![
+            SetupField {
+                key: String::from("api_key"),
+                description: String::from("Honcho API key"),
+                kind: FieldKind::String,
+                default: None,
+                secret: true,
+                env_var: Some(String::from("HONCHO_API_KEY")),
+                url: Some(String::from("https://app.honcho.dev")),
+                required: false,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
+            },
+            SetupField {
+                key: String::from("baseUrl"),
+                description: String::from("Honcho base URL (for self-hosted)"),
+                kind: FieldKind::String,
+                default: None,
+                secret: false,
+                env_var: None,
+                url: None,
+                required: false,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
+            },
+        ]),
+        "hindsight" => Some(vec![
+            SetupField {
+                key: String::from("api_key"),
+                description: String::from("Hindsight Cloud API key"),
+                kind: FieldKind::String,
+                default: None,
+                secret: true,
+                env_var: Some(String::from("HINDSIGHT_API_KEY")),
+                url: Some(String::from("https://ui.hindsight.vectorize.io")),
+                required: false,
+                choices: Vec::new(),
+                when: BTreeMap::new(),
+                default_from: None,
+            },
+            SetupField {
+                key: String::from("llm_api_key"),
+                description: String::from("Hindsight embedded LLM API key"),
+                kind: FieldKind::String,
+                default: None,
+                secret: true,
+                env_var: Some(String::from("HINDSIGHT_LLM_API_KEY")),
+                url: None,
+                required: false,
+                choices: Vec::new(),
+                when: BTreeMap::from([(String::from("mode"), String::from("local_embedded"))]),
+                default_from: None,
+            },
+        ]),
+        "byterover" | "holographic" | "mem0" | "openviking" | "retaindb" | "supermemory" => Some(
+            setup_provider_spec(
+                context,
+                ProviderInfo {
+                    name: provider_name.to_string(),
+                    description: String::new(),
+                },
+            )
+            .fields,
+        ),
+        _ => None,
+    }
+}
+
+fn setup_field_to_bridged_schema(field: SetupField) -> BridgedSchemaField {
+    BridgedSchemaField {
+        key: field.key,
+        description: Some(field.description),
+        default: field.default.map(JsonValue::String),
+        secret: field.secret,
+        env_var: field.env_var,
+        url: field.url,
+        required: field.required,
+        choices: field.choices,
+        when: field
+            .when
+            .into_iter()
+            .map(|(key, value)| (key, JsonValue::String(value)))
+            .collect(),
+        default_from: field.default_from.map(|value| BridgedDefaultFrom {
+            field: value.field,
+            map: value.map,
+        }),
+    }
+}
+
+fn native_provider_available(context: &HermesContext, provider_name: &str) -> bool {
+    match provider_name {
+        "byterover" => resolve_binary("brv").is_some(),
+        "holographic" => true,
+        "honcho" => {
+            env_nonempty("HONCHO_API_KEY")
+                || json_file_has_any(
+                    &context.hermes_home().join("honcho.json"),
+                    &["apiKey", "api_key", "baseUrl", "base_url"],
+                )
+        }
+        "hindsight" => native_hindsight_available(context),
+        "mem0" => {
+            env_nonempty("MEM0_API_KEY")
+                || provider_config_has_any(context, "mem0", &["api_key", "apiKey"])
+                || json_file_has_any(
+                    &context.hermes_home().join("mem0.json"),
+                    &["api_key", "apiKey"],
+                )
+        }
+        "openviking" => {
+            env_nonempty("OPENVIKING_ENDPOINT")
+                || provider_config_has_any(context, "openviking", &["endpoint"])
+        }
+        "retaindb" => {
+            env_nonempty("RETAINDB_API_KEY")
+                || provider_config_has_any(context, "retaindb", &["api_key", "apiKey"])
+        }
+        "supermemory" => {
+            env_nonempty("SUPERMEMORY_API_KEY")
+                || json_file_has_any(
+                    &context.hermes_home().join("supermemory.json"),
+                    &["api_key", "apiKey"],
+                )
+        }
+        _ => false,
+    }
+}
+
+fn native_hindsight_available(context: &HermesContext) -> bool {
+    let config_path = context.hermes_home().join("hindsight").join("config.json");
+    let mode = json_file_string(&config_path, &["mode"])
+        .or_else(|| provider_config_string(context, "hindsight", &["mode"]))
+        .unwrap_or_else(|| String::from("cloud"));
+
+    match mode.as_str() {
+        "local" | "local_embedded" | "local_external" => true,
+        _ => {
+            env_nonempty("HINDSIGHT_API_KEY")
+                || env_nonempty("HINDSIGHT_API_URL")
+                || provider_config_has_any(context, "hindsight", &["api_key", "apiKey", "api_url"])
+                || json_file_has_any(&config_path, &["api_key", "apiKey", "api_url"])
+        }
+    }
+}
+
+fn env_nonempty(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn provider_config_has_any(context: &HermesContext, provider_name: &str, keys: &[&str]) -> bool {
+    provider_config_string(context, provider_name, keys).is_some()
+}
+
+fn provider_config_string(
+    context: &HermesContext,
+    provider_name: &str,
+    keys: &[&str],
+) -> Option<String> {
+    let values = load_existing_provider_values(context, provider_name).ok()?;
+    keys.iter().find_map(|key| {
+        values
+            .get(*key)
+            .map(SetupValue::display)
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn json_file_has_any(path: &Path, keys: &[&str]) -> bool {
+    json_file_string(path, keys).is_some()
+}
+
+fn json_file_string(path: &Path, keys: &[&str]) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<JsonValue>(&text).ok()?;
+    let object = value.as_object()?;
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(json_scalar_string)
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn json_scalar_string(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::Bool(boolean) => Some(boolean.to_string()),
+        JsonValue::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 fn bridged_schema_field_to_setup_field(
     field: BridgedSchemaField,
 ) -> Result<SetupField, Box<dyn Error>> {
@@ -2393,7 +2617,7 @@ fn render_status(context: &HermesContext, loaded: &LoadedConfig) -> String {
             }
         ));
         if found {
-            if let Ok(metadata) = load_bridged_provider_metadata(context, provider_name) {
+            if let Ok(metadata) = load_provider_status_metadata(context, provider_name) {
                 lines.push(format!(
                     "  Status:    {}",
                     if metadata.is_available {
@@ -2818,6 +3042,16 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    fn write_user_memory_plugin(home: &Path, name: &str) {
+        let plugin_dir = home.join("plugins").join(name);
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            "class Custom(MemoryProvider):\n    pass\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3411,6 +3645,50 @@ exit 9\n",
 
     #[test]
     #[cfg(unix)]
+    fn render_status_uses_native_metadata_for_bundled_provider_without_python() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let loaded = LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str("memory:\n  provider: honcho\n").unwrap(),
+            config: hermes_core::HermesConfig {
+                memory: hermes_core::MemoryConfig {
+                    provider: String::from("honcho"),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+        };
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        set_env_var("HONCHO_API_KEY", "test-honcho-key");
+
+        let output = render_status(&context, &loaded);
+        assert!(output.contains("Plugin:    installed ✓"));
+        assert!(output.contains("Status:    available ✓"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+        remove_env_var("HONCHO_API_KEY");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn render_status_reports_unavailable_provider_requirements() {
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
@@ -3431,13 +3709,14 @@ exit 9\n",
 
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let loaded = LoadedConfig {
             path: home.join("config.yaml"),
-            raw: serde_yaml::from_str("memory:\n  provider: honcho\n").unwrap(),
+            raw: serde_yaml::from_str("memory:\n  provider: custom\n").unwrap(),
             config: hermes_core::HermesConfig {
                 memory: hermes_core::MemoryConfig {
-                    provider: String::from("honcho"),
+                    provider: String::from("custom"),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3482,13 +3761,14 @@ exit 9\n",
 
         let home = temp.path().join(".hermes");
         fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
         let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
         let loaded = LoadedConfig {
             path: home.join("config.yaml"),
-            raw: serde_yaml::from_str("memory:\n  provider: honcho\n").unwrap(),
+            raw: serde_yaml::from_str("memory:\n  provider: custom\n").unwrap(),
             config: hermes_core::HermesConfig {
                 memory: hermes_core::MemoryConfig {
-                    provider: String::from("honcho"),
+                    provider: String::from("custom"),
                     ..Default::default()
                 },
                 ..Default::default()
