@@ -24,6 +24,7 @@ struct NativeGatewayServer<'a> {
     session_store: &'a SessionStore,
     sessions: HashMap<String, NativeGatewaySessionState>,
     input_rx: Option<mpsc::Receiver<Option<String>>>,
+    input_closed: bool,
     active_turn: Option<ActiveTurn>,
 }
 
@@ -43,6 +44,7 @@ impl<'a> NativeGatewayServer<'a> {
             session_store,
             sessions: HashMap::new(),
             input_rx: None,
+            input_closed: false,
             active_turn: None,
         }
     }
@@ -54,6 +56,7 @@ impl<'a> NativeGatewayServer<'a> {
     ) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<Option<String>>();
         self.input_rx = Some(rx);
+        self.input_closed = false;
         write_jsonrpc_event(writer, json!({"type": "gateway.ready", "payload": {}}))?;
         let result = thread::scope(|scope| -> io::Result<()> {
             scope.spawn(|| {
@@ -82,15 +85,22 @@ impl<'a> NativeGatewayServer<'a> {
             Ok(())
         });
         self.input_rx = None;
+        self.input_closed = false;
         self.active_turn = None;
         result
     }
 
-    fn recv_input_line_blocking(&self) -> Option<String> {
-        self.input_rx
-            .as_ref()
-            .and_then(|rx| rx.recv().ok())
-            .flatten()
+    fn recv_input_line_blocking(&mut self) -> Option<String> {
+        if self.input_closed {
+            return None;
+        }
+        match self.input_rx.as_ref().and_then(|rx| rx.recv().ok()) {
+            Some(Some(line)) => Some(line),
+            Some(None) | None => {
+                self.input_closed = true;
+                None
+            }
+        }
     }
 
     fn drain_input_lines<W: Write>(
@@ -105,7 +115,11 @@ impl<'a> NativeGatewayServer<'a> {
         loop {
             match rx.try_recv() {
                 Ok(Some(line)) => lines.push(line),
-                Ok(None) | Err(mpsc::TryRecvError::Empty) => break,
+                Ok(None) => {
+                    self.input_closed = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
@@ -780,5 +794,75 @@ mod tests {
                 && frame["params"]["payload"]["text"] == json!("hello from native gateway")
         }));
         assert_eq!(frames.last().unwrap()["result"]["ok"], json!(true));
+    }
+
+    #[test]
+    fn native_gateway_direct_prompt_submit_completes() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello from direct prompt"
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("rust-gw-direct"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: Some(json!({
+                    "provider": "custom",
+                    "base_url": base_url,
+                    "api_mode": "chat_completions",
+                })),
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("rust-gw-direct"),
+            NativeGatewaySessionState {
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                overrides: ModelOverrides {
+                    model: Some(String::from("test-model")),
+                    provider: Some(String::from("custom")),
+                    base_url: Some(base_url),
+                    api_key: Some(String::from("test-key")),
+                    api_mode: Some(String::from("chat_completions")),
+                },
+            },
+        );
+
+        let mut output = Vec::new();
+        let result = server
+            .handle_prompt_submit(
+                &mut output,
+                json!({"session_id":"rust-gw-direct","text":"hello"}),
+            )
+            .unwrap();
+
+        assert_eq!(result["ok"], json!(true));
+        let lines = String::from_utf8(output).unwrap();
+        let frames = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(frames.iter().any(|frame| {
+            frame["params"]["type"] == json!("message.complete")
+                && frame["params"]["payload"]["text"] == json!("hello from direct prompt")
+        }));
     }
 }
