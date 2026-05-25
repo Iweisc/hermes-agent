@@ -5537,7 +5537,9 @@ exit 9\n",
         fs::set_permissions(&fake_python, perms).unwrap();
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
-        let mut input = io::Cursor::new(b"20\n".to_vec());
+        let done_choice =
+            crate::gateway_cmd::gateway_setup_menu_choice_count(&context, false).unwrap();
+        let mut input = io::Cursor::new(format!("{done_choice}\n").into_bytes());
         let mut output = Vec::new();
         run_native_gateway_setup_with_io(&context, &mut input, &mut output).unwrap();
 

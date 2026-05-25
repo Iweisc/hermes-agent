@@ -439,6 +439,9 @@ mod tests {
         let home = temp_path("set");
         fs::create_dir_all(&home).unwrap();
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        let expected_api_mode = resolve_provider_api_mode("openai", "gpt-5")
+            .or_else(|| get_provider_profile("openai").map(|profile| profile.api_mode))
+            .expect("openai provider has a default api_mode");
         set_model(
             &context,
             &context.load_config_document().unwrap(),
@@ -456,7 +459,7 @@ mod tests {
         assert!(written.contains("default: gpt-5"));
         assert!(written.contains("provider: openai"));
         assert!(written.contains("base_url: https://api.openai.com/v1"));
-        assert!(written.contains("api_mode: chat_completions"));
+        assert!(written.contains(&format!("api_mode: {expected_api_mode}")));
         let _ = fs::remove_dir_all(home);
     }
 
