@@ -167,6 +167,8 @@ struct MemoryPluginSetupManifest {
     post_setup: bool,
     #[serde(default, alias = "has_save_config")]
     save_config: bool,
+    #[serde(default, alias = "save_config_path", alias = "config_file")]
+    save_config_file: Option<String>,
     #[serde(default, alias = "available")]
     is_available: Option<bool>,
 }
@@ -1203,10 +1205,7 @@ fn run_native_provider_setup(
     }
 
     save_provider_activation(context, &provider.name, &provider_values)?;
-    persist_native_provider_state(context, &provider.name, &provider_values)?;
-    if provider.bridge_save_config && !provider_values.is_empty() {
-        bridge_memory_save_config(context, &provider.name, &provider_values)?;
-    }
+    persist_native_provider_setup_outputs(context, provider, &provider_values)?;
     for (key, value) in &env_updates {
         save_env_value(context.env_path(), key, value)?;
     }
@@ -2125,6 +2124,69 @@ fn persist_native_provider_state(
         ),
         _ => Ok(()),
     }
+}
+
+fn persist_native_provider_setup_outputs(
+    context: &HermesContext,
+    provider: &SetupProvider,
+    provider_values: &BTreeMap<String, SetupValue>,
+) -> Result<(), Box<dyn Error>> {
+    persist_native_provider_state(context, &provider.name, provider_values)?;
+    if provider_values.is_empty() {
+        return Ok(());
+    }
+
+    let manifest_saved = persist_manifest_provider_state(context, &provider.name, provider_values)?;
+    if provider.bridge_save_config && !manifest_saved {
+        bridge_memory_save_config(context, &provider.name, provider_values)?;
+    }
+    Ok(())
+}
+
+fn persist_manifest_provider_state(
+    context: &HermesContext,
+    provider_name: &str,
+    provider_values: &BTreeMap<String, SetupValue>,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(dir) = find_memory_provider_dir(context, provider_name) else {
+        return Ok(false);
+    };
+    let Some(manifest) = read_memory_plugin_manifest(&dir) else {
+        return Ok(false);
+    };
+    let Some(setup) = manifest.setup else {
+        return Ok(false);
+    };
+    let Some(raw_path) = setup.save_config_file.as_deref() else {
+        return Ok(false);
+    };
+
+    let path = resolve_profile_relative_config_path(context, raw_path)?;
+    write_json_config(&path, provider_values)?;
+    Ok(true)
+}
+
+fn resolve_profile_relative_config_path(
+    context: &HermesContext,
+    raw_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("memory provider save_config_file cannot be empty".into());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("memory provider save_config_file must be relative to HERMES_HOME".into());
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err("memory provider save_config_file must stay inside HERMES_HOME".into());
+            }
+        }
+    }
+    Ok(context.hermes_home().join(path))
 }
 
 fn write_json_config(
@@ -3325,7 +3387,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(
             temp.path().join("plugin.yaml"),
-            "pip_dependencies:\n  - mem0ai\nexternal_dependencies:\n  - name: brv\n    install: curl install\n    check: brv --version\nsetup:\n  save_config: true\n  schema:\n    - key: mode\n      description: Mode\n      default: cloud\n      choices: [cloud, local]\n",
+            "pip_dependencies:\n  - mem0ai\nexternal_dependencies:\n  - name: brv\n    install: curl install\n    check: brv --version\nsetup:\n  save_config: true\n  save_config_file: custom.json\n  schema:\n    - key: mode\n      description: Mode\n      default: cloud\n      choices: [cloud, local]\n",
         )
         .unwrap();
 
@@ -3335,6 +3397,7 @@ mod tests {
         assert_eq!(manifest.external_dependencies[0].name, "brv");
         let setup = manifest.setup.unwrap();
         assert!(setup.save_config);
+        assert_eq!(setup.save_config_file.as_deref(), Some("custom.json"));
         assert_eq!(setup.schema.len(), 1);
         assert_eq!(setup.schema[0].key, "mode");
     }
@@ -3379,6 +3442,72 @@ mod tests {
         let json_text = fs::read_to_string(home.join("mem0.json")).unwrap();
         assert!(json_text.contains("\"user_id\": \"alice\""));
         assert!(json_text.contains("\"rerank\": false"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn manifest_save_config_file_writes_json_without_python_bridge() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        write_user_memory_plugin(&home, "custom");
+        fs::write(
+            home.join("plugins").join("custom").join("plugin.yaml"),
+            "description: Custom provider\nsetup:\n  save_config: true\n  save_config_file: custom/config.json\n",
+        )
+        .unwrap();
+
+        let fake_python = temp.path().join("python3");
+        let log = temp.path().join("python.log");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\nprintf called >> '{}'\nexit 9\n", log.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_python).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_python, perms).unwrap();
+
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home.clone()));
+        let provider = SetupProvider {
+            name: String::from("custom"),
+            description: String::new(),
+            hint: String::new(),
+            mode: SetupMode::NativeGeneric,
+            fields: Vec::new(),
+            bridge_save_config: true,
+        };
+        let mut values = BTreeMap::new();
+        values.insert(
+            String::from("mode"),
+            SetupValue::String(String::from("local")),
+        );
+        values.insert(String::from("enabled"), SetupValue::Bool(true));
+
+        set_env_var("HERMES_MEMORY_PYTHON", &fake_python);
+        persist_native_provider_setup_outputs(&context, &provider, &values).unwrap();
+
+        let json_text = fs::read_to_string(home.join("custom").join("config.json")).unwrap();
+        assert!(json_text.contains("\"mode\": \"local\""));
+        assert!(json_text.contains("\"enabled\": true"));
+        assert!(!log.exists());
+
+        remove_env_var("HERMES_MEMORY_PYTHON");
+    }
+
+    #[test]
+    fn manifest_save_config_file_rejects_parent_paths() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        fs::create_dir_all(&home).unwrap();
+        let context = HermesContext::new(temp.path()).with_hermes_home_env(Some(home));
+
+        let err = resolve_profile_relative_config_path(&context, "../outside.json").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("save_config_file must stay inside HERMES_HOME")
+        );
     }
 
     #[test]
