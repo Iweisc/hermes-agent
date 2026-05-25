@@ -35,6 +35,7 @@ const SIGNAL_MAX_ATTACHMENT_SIZE: u64 = 100 * 1024 * 1024;
 const SIGNAL_RATE_LIMIT_BUCKET_CAPACITY: f64 = 50.0;
 const SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER: f64 = 4.0;
 const SIGNAL_RATE_LIMIT_MAX_ATTEMPTS: usize = 2;
+const SIGNAL_BATCH_PACING_NOTICE_THRESHOLD_SECS: f64 = 10.0;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm"];
@@ -203,6 +204,8 @@ impl Display for SendError {
 static FEISHU_TOKEN_CACHE: OnceLock<Mutex<Option<FeishuTokenEntry>>> = OnceLock::new();
 static DISCORD_FORUM_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static SIGNAL_SCHEDULER: OnceLock<Mutex<SignalAttachmentScheduler>> = OnceLock::new();
+#[cfg(test)]
+static SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE: OnceLock<Mutex<Option<f64>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct SignalAttachmentScheduler {
@@ -1224,75 +1227,81 @@ fn send_telegram(
         }
     }
 
+    let mut pending_photo_group = Vec::new();
+    let flush_pending_photo_group =
+        |pending: &mut Vec<MediaAttachment>,
+         last_message_id: &mut Option<String>,
+         delivered_any: &mut bool,
+         warnings: &mut Vec<String>| {
+            if pending.is_empty() {
+                return;
+            }
+            if pending.len() == 1 {
+                match telegram_send_single_media(&client, config, target, &pending[0]) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(error) => warnings.push(error),
+                }
+                pending.clear();
+                return;
+            }
+            for batch in pending.chunks(10) {
+                match telegram_send_media_group_photos(&client, config, target, batch) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(_error) => {
+                        for attachment in batch {
+                            match telegram_send_single_media(&client, config, target, attachment) {
+                                Ok(message_id) => {
+                                    *last_message_id = message_id;
+                                    *delivered_any = true;
+                                }
+                                Err(error) => warnings.push(error),
+                            }
+                        }
+                    }
+                }
+            }
+            pending.clear();
+        };
+
     for attachment in media {
-        if !attachment.path.is_file() {
-            warnings.push(format!(
-                "Media file not found, skipping: {}",
-                attachment.path.display()
-            ));
-            continue;
-        }
-        let (method, field) = telegram_upload_endpoint(attachment);
-        let url = format!("{}/bot{}/{}", config.base_url, config.token, method);
-        let file_name = attachment
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let bytes = match fs::read(&attachment.path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        if telegram_can_media_group_photo(attachment) {
+            if !attachment.path.is_file() {
                 warnings.push(format!(
-                    "Failed to send media {}: {error}",
+                    "Media file not found, skipping: {}",
                     attachment.path.display()
                 ));
                 continue;
             }
-        };
-        let part = Part::bytes(bytes).file_name(file_name);
-        let mut form = Form::new()
-            .text("chat_id", target.chat_id.clone())
-            .part(field.to_string(), part);
-        if let Some(thread_id) = telegram_message_thread_id(target.thread_id.as_deref()) {
-            form = form.text("message_thread_id", thread_id.clone());
+            pending_photo_group.push(attachment.clone());
+            continue;
         }
 
-        let response = client.post(url).multipart(form).send();
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {error}",
-                    attachment.path.display()
-                ));
-                continue;
+        flush_pending_photo_group(
+            &mut pending_photo_group,
+            &mut last_message_id,
+            &mut delivered_any,
+            &mut warnings,
+        );
+        match telegram_send_single_media(&client, config, target, attachment) {
+            Ok(message_id) => {
+                last_message_id = message_id;
+                delivered_any = true;
             }
-        };
-        let body = match parse_json_response(response, "Telegram media send failed") {
-            Ok(body) => body,
-            Err(error) => {
-                warnings.push(format!(
-                    "Failed to send media {}: {}",
-                    attachment.path.display(),
-                    error.0
-                ));
-                continue;
-            }
-        };
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            warnings.push(format!(
-                "Failed to send media {}: {}",
-                attachment.path.display(),
-                body.get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            ));
-            continue;
+            Err(error) => warnings.push(error),
         }
-        last_message_id = body.pointer("/result/message_id").and_then(value_as_string);
-        delivered_any = true;
     }
+    flush_pending_photo_group(
+        &mut pending_photo_group,
+        &mut last_message_id,
+        &mut delivered_any,
+        &mut warnings,
+    );
 
     if !delivered_any {
         return Err(SendError(
@@ -1408,6 +1417,151 @@ fn telegram_send_text_request(
     ))
 }
 
+fn telegram_send_single_media(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Result<Option<String>, String> {
+    if !attachment.path.is_file() {
+        return Err(format!(
+            "Media file not found, skipping: {}",
+            attachment.path.display()
+        ));
+    }
+    let file_name = attachment
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = fs::read(&attachment.path).map_err(|error| {
+        format!(
+            "Failed to send media {}: {error}",
+            attachment.path.display()
+        )
+    })?;
+    let display_path = attachment.path.display().to_string();
+    let (method, field) = telegram_upload_endpoint(attachment);
+    match telegram_send_single_media_request(
+        client,
+        config,
+        target,
+        method,
+        field,
+        &file_name,
+        bytes.clone(),
+        &display_path,
+    ) {
+        Ok(message_id) => Ok(message_id),
+        Err(_error) if method == "sendPhoto" => telegram_send_single_media_request(
+            client,
+            config,
+            target,
+            "sendDocument",
+            "document",
+            &file_name,
+            bytes,
+            &display_path,
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn telegram_send_single_media_request(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    method: &str,
+    field: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+    display_path: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{}/bot{}/{}", config.base_url, config.token, method);
+    let part = Part::bytes(bytes).file_name(file_name.to_string());
+    let mut form = Form::new()
+        .text("chat_id", target.chat_id.clone())
+        .part(field.to_string(), part);
+    if let Some(thread_id) = telegram_message_thread_id(target.thread_id.as_deref()) {
+        form = form.text("message_thread_id", thread_id);
+    }
+
+    let response = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("Failed to send media {display_path}: {error}"))?;
+    let body = parse_json_response(response, "Telegram media send failed")
+        .map_err(|error| format!("Failed to send media {display_path}: {}", error.0))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!(
+            "Failed to send media {display_path}: {}",
+            body.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+    Ok(body.pointer("/result/message_id").and_then(value_as_string))
+}
+
+fn telegram_send_media_group_photos(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachments: &[MediaAttachment],
+) -> Result<Option<String>, String> {
+    let url = format!("{}/bot{}/sendMediaGroup", config.base_url, config.token);
+    let mut media = Vec::new();
+    let mut form = Form::new().text("chat_id", target.chat_id.clone());
+    if let Some(thread_id) = telegram_message_thread_id(target.thread_id.as_deref()) {
+        form = form.text("message_thread_id", thread_id);
+    }
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let file_name = attachment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let bytes = fs::read(&attachment.path).map_err(|error| {
+            format!(
+                "Failed to send media {}: {error}",
+                attachment.path.display()
+            )
+        })?;
+        let field_name = format!("file{index}");
+        media.push(json!({
+            "type": "photo",
+            "media": format!("attach://{field_name}"),
+        }));
+        form = form.part(field_name, Part::bytes(bytes).file_name(file_name));
+    }
+    form = form.text("media", Value::Array(media).to_string());
+
+    let response = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("Telegram media group send failed: {error}"))?;
+    let body = parse_json_response(response, "Telegram media group send failed")
+        .map_err(|error| error.0)?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(body
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_string());
+    }
+    Ok(body
+        .get("result")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("message_id"))
+        .and_then(value_as_string))
+}
+
 fn telegram_upload_endpoint(attachment: &MediaAttachment) -> (&'static str, &'static str) {
     let ext = file_extension(&attachment.path);
     if IMAGE_EXTS.contains(&ext.as_str()) {
@@ -1423,6 +1577,16 @@ fn telegram_upload_endpoint(attachment: &MediaAttachment) -> (&'static str, &'st
         return ("sendAudio", "audio");
     }
     ("sendDocument", "document")
+}
+
+fn telegram_can_media_group_photo(attachment: &MediaAttachment) -> bool {
+    if attachment.is_voice {
+        return false;
+    }
+    matches!(
+        file_extension(&attachment.path).as_str(),
+        "png" | "jpg" | "jpeg" | "webp"
+    )
 }
 
 fn telegram_has_html(content: &str) -> bool {
@@ -2666,6 +2830,7 @@ fn send_matrix(
     let client = http_client()?;
     let token = matrix_access_token(&client, config)?;
     let mut last_message_id = None;
+    let mut warnings = Vec::new();
 
     if !message.is_empty() {
         for chunk in truncate_message(message, MATRIX_MAX_MESSAGE_LENGTH) {
@@ -2687,12 +2852,32 @@ fn send_matrix(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let fallback = format!("(file not found: {})", attachment.path.display());
+                let message_id = send_matrix_message(
+                    &client,
+                    &token,
+                    &config.homeserver,
+                    target,
+                    matrix_text_payload(&fallback),
+                    "Matrix send failed",
+                )?;
+                last_message_id = Some(message_id);
+                warnings.push(format!(
+                    "Matrix attachment missing, sent fallback text instead: {}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                return Err(SendError(format!(
+                    "Reading media {} failed: {error}",
+                    attachment.path.display()
+                )));
+            }
+        };
         let mime_type = guess_matrix_mime_type(&attachment.path, &bytes);
         let content_uri =
             matrix_upload_media(&client, &token, config, &file_name, &mime_type, &bytes)?;
@@ -2722,7 +2907,7 @@ fn send_matrix(
         note: target
             .used_home_channel
             .then(|| format!("Sent to matrix home room (chat_id: {})", target.chat_id)),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -3324,6 +3509,21 @@ fn send_signal(
         } else {
             &[]
         };
+        if attachment_count > 0 {
+            let estimated = signal_scheduler_estimate_wait(attachment_count);
+            if estimated >= signal_batch_pacing_notice_threshold_secs() {
+                let _ = signal_send_notice(
+                    config,
+                    target,
+                    &format!(
+                        "(More images coming — pausing ~{} for Signal rate limit, batch {}/{})",
+                        signal_format_wait(estimated),
+                        batch_number,
+                        attachment_batches.len()
+                    ),
+                );
+            }
+        }
 
         for attempt in 1..=SIGNAL_RATE_LIMIT_MAX_ATTEMPTS {
             signal_scheduler_acquire(attachment_count)?;
@@ -3466,6 +3666,19 @@ fn signal_batch_timeout_secs(attachment_count: usize) -> u64 {
     (attachment_count as u64 * 5).max(60)
 }
 
+fn signal_batch_pacing_notice_threshold_secs() -> f64 {
+    #[cfg(test)]
+    if let Some(override_value) = SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE.get() {
+        if let Some(value) = *override_value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            return value;
+        }
+    }
+    SIGNAL_BATCH_PACING_NOTICE_THRESHOLD_SECS
+}
+
 fn signal_scheduler() -> &'static Mutex<SignalAttachmentScheduler> {
     SIGNAL_SCHEDULER.get_or_init(|| {
         Mutex::new(SignalAttachmentScheduler {
@@ -3505,6 +3718,28 @@ fn signal_scheduler_acquire(n: usize) -> Result<f64, SendError> {
     }
 }
 
+fn signal_scheduler_estimate_wait(n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let scheduler = signal_scheduler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let elapsed = std::time::Instant::now()
+        .duration_since(scheduler.last_refill)
+        .as_secs_f64();
+    let mut projected = scheduler.tokens;
+    if elapsed > 0.0 && projected < scheduler.capacity {
+        projected = (projected + elapsed * scheduler.refill_rate).min(scheduler.capacity);
+    }
+    let deficit = n as f64 - projected;
+    if deficit <= 0.0 {
+        0.0
+    } else {
+        deficit / scheduler.refill_rate
+    }
+}
+
 fn signal_scheduler_report_rpc_duration(rpc_duration: Duration, n_attachments: usize) {
     if n_attachments == 0 {
         return;
@@ -3536,6 +3771,31 @@ fn scheduler_refill(scheduler: &mut SignalAttachmentScheduler) {
             (scheduler.tokens + elapsed * scheduler.refill_rate).min(scheduler.capacity);
     }
     scheduler.last_refill = now;
+}
+
+fn signal_format_wait(seconds: f64) -> String {
+    let seconds = seconds.max(0.0);
+    if seconds < 90.0 {
+        format!("{}s", seconds.round() as i64)
+    } else {
+        format!("{} min", ((seconds / 60.0).round() as i64).max(1))
+    }
+}
+
+fn signal_send_notice(
+    config: &SignalConfig,
+    target: &ResolvedTarget,
+    message: &str,
+) -> Result<(), SendError> {
+    let client = http_client_with_timeout(Duration::from_secs(30))?;
+    let body = signal_send_batch(&client, config, target, message, &[], &[], 0, 0)?;
+    if let Some(error) = body.get("error").filter(|value| !value.is_null()) {
+        return Err(SendError(format!(
+            "Signal pacing notice failed: {}",
+            signal_error_text(error)
+        )));
+    }
+    Ok(())
 }
 
 fn extract_signal_retry_after_seconds(error: &Value) -> Option<f64> {
@@ -4591,6 +4851,15 @@ mod tests {
             scheduler.refill_rate = 1.0 / SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER;
             scheduler.last_refill = std::time::Instant::now();
         }
+        set_signal_batch_pacing_notice_threshold_override(None);
+    }
+
+    fn set_signal_batch_pacing_notice_threshold_override(value: Option<f64>) {
+        let override_value =
+            SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE.get_or_init(|| Mutex::new(None));
+        *override_value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = value;
     }
 
     fn runtime_for(temp: &TempDir) -> ToolRuntime {
@@ -5278,6 +5547,75 @@ mod tests {
     }
 
     #[test]
+    fn sends_discord_forum_post_with_starter_attachment() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("launch.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/threads "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("\"name\":\"Launch plan\""));
+            assert!(body.contains("\"content\":\"## Launch plan\\nBody text\""));
+            assert!(body.contains("\"attachments\""));
+            assert!(body.contains("\"id\":\"0\""));
+            assert!(body.contains("\"filename\":\"launch.png\""));
+            assert!(body.contains("name=\"files[0]\""));
+            assert!(body.contains("filename=\"launch.png\""));
+            assert!(body.contains("png-bytes"));
+            (
+                200,
+                json!({
+                    "id": "thread-1",
+                    "message": { "id": "starter-1" }
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("## Launch plan\nBody text\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["chat_id"], json!("123"));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_discord_forum_long_text_in_single_thread() {
         let _guard = acquire_test_lock();
         clear_discord_forum_cache();
@@ -5663,6 +6001,303 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["thread_id"], json!("22182"));
         assert_eq!(parsed["message_id"], json!("71"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_multiple_photos_via_media_group() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("name=\"media\""));
+            assert!(body.contains("\"type\":\"photo\""));
+            assert!(body.contains("attach://file0"));
+            assert!(body.contains("attach://file1"));
+            assert!(body.contains("name=\"message_thread_id\""));
+            assert!(body.contains("\r\n12\r\n"));
+            assert!(body.contains("filename=\"one.png\""));
+            assert!(body.contains("filename=\"two.png\""));
+            assert!(body.contains("png-one"));
+            assert!(body.contains("png-two"));
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "result": [
+                        { "message_id": 81 },
+                        { "message_id": 82 }
+                    ]
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}\nMEDIA:{}", first.display(), second.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("82"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_from_telegram_media_group_to_individual_uploads() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+                (
+                    500,
+                    json!({
+                        "ok": false,
+                        "description": "media group exploded"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"one.png\""));
+                assert!(body.contains("png-one"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 91 } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"two.png\""));
+                assert!(body.contains("png-two"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 92 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}\nMEDIA:{}", first.display(), second.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("92"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn chunks_telegram_media_groups_above_ten_photos() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let mut paths = Vec::new();
+        for index in 0..11 {
+            let path = temp.path().join(format!("img-{index}.png"));
+            fs::write(&path, format!("png-{index}")).unwrap();
+            paths.push(path);
+        }
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+            let expected_count = if index == 0 { 10 } else { 1 };
+            let attach_count = body.matches("attach://file").count();
+            assert_eq!(attach_count, expected_count);
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "result": [{
+                        "message_id": 100 + index
+                    }]
+                })
+                .to_string(),
+            )
+        });
+
+        let message = paths
+            .iter()
+            .map(|path| format!("MEDIA:{}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("101"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn batches_telegram_photos_even_when_mixed_with_document_media() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        let document = temp.path().join("notes.pdf");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        fs::write(&document, b"pdf-doc").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+                assert!(body.contains("attach://file0"));
+                assert!(body.contains("attach://file1"));
+                assert!(body.contains("filename=\"one.png\""));
+                assert!(body.contains("filename=\"two.png\""));
+                (
+                    200,
+                    json!({
+                        "ok": true,
+                        "result": [
+                            { "message_id": 111 },
+                            { "message_id": 112 }
+                        ]
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendDocument "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"notes.pdf\""));
+                assert!(body.contains("pdf-doc"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 113 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!(
+                    "MEDIA:{}\nMEDIA:{}\nMEDIA:{}",
+                    first.display(),
+                    second.display(),
+                    document.display(),
+                ),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("113"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_telegram_document_when_photo_upload_is_rejected() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("wide.png");
+        fs::write(&media_path, b"png-wide").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                (
+                    400,
+                    json!({
+                        "ok": false,
+                        "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendDocument "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"wide.png\""));
+                assert!(body.contains("png-wide"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 114 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("114"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
@@ -6159,6 +6794,141 @@ mod tests {
     }
 
     #[test]
+    fn sends_feishu_thread_image_via_reply_endpoint() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                assert!(body.contains("name=\"image_type\""));
+                assert!(body.contains("name=\"image\""));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "image_key": "img_thread_123" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/messages/om_thread/reply "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("image"));
+                assert_eq!(payload["reply_in_thread"], json!(true));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["image_key"], json!("img_thread_123"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_thread_image_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media:om_thread",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("om_thread"));
+        assert_eq!(parsed["message_id"], json!("om_thread_image_1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_feishu_thread_file_via_reply_endpoint() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("spec.pdf");
+        fs::write(&media_path, b"pdf-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/files "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                assert!(body.contains("name=\"file_type\""));
+                assert!(body.contains("\r\npdf\r\n"));
+                assert!(body.contains("name=\"file_name\""));
+                assert!(body.contains("spec.pdf"));
+                assert!(body.contains("name=\"file\""));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "file_key": "file_thread_123" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/messages/om_thread/reply "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("file"));
+                assert_eq!(payload["reply_in_thread"], json!(true));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["file_key"], json!("file_thread_123"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_thread_file_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media:om_thread",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("om_thread"));
+        assert_eq!(parsed["message_id"], json!("om_thread_file_1"));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_matrix_text_via_client_server_api() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -6437,6 +7207,48 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("matrix"));
         assert_eq!(parsed["message_id"], json!("$event-media"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_matrix_text_when_media_file_is_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let expected_body = format!("(file not found: {})", missing_path.display());
+        let expected_warning = format!(
+            "Matrix attachment missing, sent fallback text instead: {}",
+            missing_path.display()
+        );
+        let (base_url, join) = mock_server(1, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with(
+                    "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+                ));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.text"));
+                assert_eq!(payload["body"], json!(expected_body));
+                assert_eq!(payload["format"], json!("org.matrix.custom.html"));
+                assert_eq!(payload["formatted_body"], json!(expected_body));
+                (200, json!({ "event_id": "$event-missing" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": format!("MEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("matrix"));
+        assert_eq!(parsed["message_id"], json!("$event-missing"));
+        assert_eq!(parsed["warnings"], json!([expected_warning]));
         join.join().unwrap();
     }
 
@@ -7060,6 +7872,65 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("signal"));
         assert_eq!(parsed["chat_id"], json!("group:group-123"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_signal_pacing_notice_before_attachment_batch() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        set_signal_batch_pacing_notice_threshold_override(Some(0.0));
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("image.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let media_path_for_assert = media_path.clone();
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            match index {
+                0 => {
+                    assert_eq!(payload["method"], json!("send"));
+                    assert_eq!(payload["params"]["recipient"], json!(["+15551234567"]));
+                    assert_eq!(
+                        payload["params"]["message"],
+                        json!(
+                            "(More images coming — pausing ~0s for Signal rate limit, batch 1/1)"
+                        )
+                    );
+                    assert!(payload["params"].get("attachments").is_none());
+                }
+                1 => {
+                    assert_eq!(payload["method"], json!("send"));
+                    assert_eq!(payload["params"]["message"], json!("caption"));
+                    assert_eq!(
+                        payload["params"]["attachments"],
+                        json!([media_path_for_assert.display().to_string()])
+                    );
+                }
+                _ => unreachable!(),
+            }
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000000 + index } })
+                    .to_string(),
+            )
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("caption\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        set_signal_batch_pacing_notice_threshold_override(None);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
