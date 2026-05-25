@@ -7,7 +7,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -34,6 +34,10 @@ const DEFAULT_API_SERVER_HOST: &str = "127.0.0.1";
 const DEFAULT_API_SERVER_PORT: u16 = 8642;
 const MAX_STORED_RESPONSES: usize = 100;
 const MAX_SESSION_HEADER_LEN: usize = 256;
+#[cfg(test)]
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeApiServerSettings {
@@ -875,8 +879,8 @@ async fn handle_run_events(
         }
 
         loop {
-            match subscriber.recv().await {
-                Ok(event) => {
+            match tokio::time::timeout(SSE_KEEPALIVE_INTERVAL, subscriber.recv()).await {
+                Ok(Ok(event)) => {
                     let terminal = run_event_is_terminal(&event);
                     if tx.send(format_run_event_chunk(&event)).await.is_err() {
                         return;
@@ -886,10 +890,15 @@ async fn handle_run_events(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
                     let _ = tx.send(": stream closed\n\n".to_string()).await;
                     return;
+                }
+                Err(_) => {
+                    if tx.send(": keepalive\n\n".to_string()).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -1620,7 +1629,23 @@ fn chat_completions_streaming_response(
         }
 
         let mut emitted_text = false;
-        while let Some(event) = event_rx.recv().await {
+        loop {
+            let event = match tokio::time::timeout(SSE_KEEPALIVE_INTERVAL, event_rx.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return,
+                Err(_) => {
+                    if !send_sse_chunk(
+                        &body_tx,
+                        &interrupt_requested,
+                        ": keepalive\n\n".to_string(),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
             match event {
                 LiveResponseEvent::Progress(AgentProgressEvent::MessageDelta { delta }) => {
                     emitted_text = true;
@@ -1889,7 +1914,37 @@ fn responses_streaming_response(
             return;
         }
 
-        while let Some(event) = event_rx.recv().await {
+        loop {
+            let event = match tokio::time::timeout(SSE_KEEPALIVE_INTERVAL, event_rx.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return,
+                Err(_) => {
+                    if !send_sse_chunk(
+                        &body_tx,
+                        &interrupt_requested,
+                        ": keepalive\n\n".to_string(),
+                    )
+                    .await
+                    {
+                        if should_store {
+                            persist_incomplete_stream_response_snapshot(
+                                &state_for_stream,
+                                &settings.model_name,
+                                &response_id_for_stream,
+                                created_at,
+                                &emitted_items,
+                                &final_text,
+                                &messages,
+                                instructions.as_deref(),
+                                conversation.as_deref(),
+                                session_id.as_deref(),
+                            );
+                        }
+                        return;
+                    }
+                    continue;
+                }
+            };
             match event {
                 LiveResponseEvent::Progress(AgentProgressEvent::ToolStarted {
                     tool_call_id,
@@ -3850,6 +3905,84 @@ mod tests {
     }
 
     #[test]
+    fn native_api_server_chat_completions_streams_keepalive() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "message": {
+                    "content": "keepalive hello"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) =
+            mock_model_server_with_delay(response_body, std::time::Duration::from_millis(120));
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let body = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "say hi"
+                }],
+                "stream": true,
+            }))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(body.contains(": keepalive"));
+        assert!(body.contains("\"content\":\"keepalive hello\""));
+        assert!(body.contains("data: [DONE]"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
     fn native_api_server_responses_streams_sse_output() {
         let _guard = crate::cli_test_env_lock().lock().unwrap();
         let response_body = json!({
@@ -3925,6 +4058,81 @@ mod tests {
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.output_text.delta"));
         assert!(body.contains("\"delta\":\"responses hello\""));
+        assert!(body.contains("event: response.completed"));
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn native_api_server_responses_streams_keepalive() {
+        let _guard = crate::cli_test_env_lock().lock().unwrap();
+        let response_body = json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "message": {
+                    "content": "responses keepalive hello"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, join) =
+            mock_model_server_with_delay(response_body, std::time::Duration::from_millis(120));
+        let config_text = format!(
+            "model:\n  default: gpt-4.1-mini\n  provider: openai\n  base_url: {base_url}\n  api_key: test-key\nplatforms:\n  api_server:\n    enabled: true\n    extra:\n      host: 127.0.0.1\n      port: 0\n"
+        );
+        let (_temp, context, loaded) = temp_context(&config_text);
+        let settings = NativeApiServerSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            api_key: String::new(),
+            cors_origins: Vec::new(),
+            model_name: "hermes-agent".to_string(),
+        };
+        let state = NativeApiServerState {
+            context,
+            loaded,
+            settings: settings.clone(),
+            response_store: Arc::new(Mutex::new(ResponseStore::default())),
+            run_store: Arc::new(Mutex::new(RunStore::default())),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                serve_native_api_server(listener, state, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+            });
+        });
+
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..20 {
+            if client.get(format!("http://{addr}/health")).send().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let body = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "input": "say hi",
+                "stream": true,
+            }))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(body.contains(": keepalive"));
+        assert!(body.contains("\"delta\":\"responses keepalive hello\""));
         assert!(body.contains("event: response.completed"));
 
         let _ = shutdown_tx.send(());
