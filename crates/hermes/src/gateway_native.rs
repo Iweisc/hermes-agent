@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +18,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 
+use crate::python_bridge::{project_root, resolve_repo_python};
+
 #[derive(Debug, Clone)]
 struct NativeGatewaySessionState {
     cwd: PathBuf,
@@ -26,6 +31,7 @@ struct NativeGatewayServer<'a> {
     config: &'a LoadedConfig,
     session_store: &'a SessionStore,
     sessions: HashMap<String, NativeGatewaySessionState>,
+    slash_workers: HashMap<String, SlashWorker>,
     input_rx: Option<mpsc::Receiver<Option<String>>>,
     input_closed: bool,
     active_turn: Option<ActiveTurn>,
@@ -34,6 +40,17 @@ struct NativeGatewayServer<'a> {
 struct ActiveTurn {
     turn: GatewayTurnSession,
 }
+
+struct SlashWorker {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
+    next_request_id: u64,
+}
+
+#[cfg(test)]
+static SLASH_WORKER_PYTHON_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 impl<'a> NativeGatewayServer<'a> {
     fn new(
@@ -46,6 +63,7 @@ impl<'a> NativeGatewayServer<'a> {
             config,
             session_store,
             sessions: HashMap::new(),
+            slash_workers: HashMap::new(),
             input_rx: None,
             input_closed: false,
             active_turn: None,
@@ -215,6 +233,7 @@ impl<'a> NativeGatewayServer<'a> {
             "config.get" => self.handle_config_get(params),
             "complete.path" => self.handle_complete_path(params),
             "complete.slash" => self.handle_complete_slash(params),
+            "slash.exec" => self.handle_slash_exec(params),
             "prompt.submit" => {
                 return match self.handle_prompt_submit(writer, params) {
                     Ok(value) => write_jsonrpc_result(writer, id, value),
@@ -523,6 +542,71 @@ impl<'a> NativeGatewayServer<'a> {
         }))
     }
 
+    fn handle_slash_exec(&mut self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let command = params
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (-32602, String::from("command is required"), None))?;
+        let (command_base, command_arg) = split_slash_command(command);
+        if pending_input_commands().contains(&command_base.as_str()) {
+            return Err((
+                4018,
+                format!("pending-input command: use command.dispatch for /{command_base}"),
+                None,
+            ));
+        }
+        if worker_blocked_commands().contains(&command_base.as_str()) {
+            let subcommand = command_arg
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(subcommand.as_str(), "restore" | "rewind") {
+                return Err((
+                    4018,
+                    String::from(
+                        "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore",
+                    ),
+                    None,
+                ));
+            }
+        }
+        let state = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| (-32004, String::from("session not found"), None))?;
+        let model = state
+            .overrides
+            .model
+            .clone()
+            .or_else(|| self.config.configured_model_name())
+            .unwrap_or_default();
+        if !self.slash_workers.contains_key(&session_id) {
+            let worker = SlashWorker::start(&session_id, &model)
+                .map_err(|error| (5030, format!("slash worker start failed: {error}"), None))?;
+            self.slash_workers.insert(session_id.clone(), worker);
+        }
+        let worker = self.slash_workers.get_mut(&session_id).ok_or_else(|| {
+            (
+                5030,
+                String::from("slash worker missing after startup"),
+                None,
+            )
+        })?;
+        match worker.run(command) {
+            Ok(output) => Ok(json!({
+                "output": if output.is_empty() { "(no output)" } else { output.as_str() },
+            })),
+            Err(error) => {
+                self.slash_workers.remove(&session_id);
+                Err((5030, error, None))
+            }
+        }
+    }
+
     fn handle_commands_catalog(&self) -> Result<Value, (i64, String, Option<Value>)> {
         let commands =
             parse_gateway_commands(&self.config.raw).map_err(|error| (-32603, error, None))?;
@@ -609,6 +693,113 @@ impl<'a> NativeGatewayServer<'a> {
             })),
             _ => Err((-32602, format!("unsupported config key: {key}"), None)),
         }
+    }
+}
+
+impl SlashWorker {
+    fn start(session_key: &str, model: &str) -> Result<Self, String> {
+        let root = project_root();
+        #[cfg(test)]
+        let python = SLASH_WORKER_PYTHON_OVERRIDE
+            .lock()
+            .map_err(|_| String::from("slash worker override lock poisoned"))?
+            .clone()
+            .or_else(|| resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")));
+        #[cfg(not(test))]
+        let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"));
+        let python = python
+            .ok_or_else(|| String::from("could not find a Python interpreter for slash worker"))?;
+        let mut child = Command::new(python)
+            .current_dir(&root)
+            .arg("-m")
+            .arg("tui_gateway.slash_worker")
+            .arg("--session-key")
+            .arg(session_key)
+            .arg("--model")
+            .arg(model)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| String::from("slash worker stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| String::from("slash worker stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| String::from("slash worker stderr unavailable"))?;
+        Ok(Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
+            next_request_id: 1,
+        })
+    }
+
+    fn run(&mut self, command: &str) -> Result<String, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        let payload = json!({
+            "id": request_id,
+            "command": command,
+        });
+        serde_json::to_writer(&mut self.stdin, &payload).map_err(|error| error.to_string())?;
+        self.stdin
+            .write_all(b"\n")
+            .map_err(|error| error.to_string())?;
+        self.stdin.flush().map_err(|error| error.to_string())?;
+
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err(self.read_worker_error("slash worker exited without a response"));
+        }
+        let response = serde_json::from_str::<Value>(line.trim())
+            .map_err(|error| format!("invalid slash worker response: {error}"))?;
+        if response.get("id").and_then(Value::as_u64) != Some(request_id) {
+            return Err(String::from("slash worker response id mismatch"));
+        }
+        if response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            Ok(response
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string())
+        } else {
+            Err(response
+                .get("error")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| String::from("slash worker request failed")))
+        }
+    }
+
+    fn read_worker_error(&mut self, fallback: &str) -> String {
+        let mut stderr = String::new();
+        let _ = self.stderr.read_to_string(&mut stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            fallback.to_string()
+        } else {
+            format!("{fallback}: {detail}")
+        }
+    }
+}
+
+impl Drop for SlashWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -910,6 +1101,23 @@ fn complete_slash_items(text: &str, raw_config: &YamlValue) -> Result<(Vec<Value
 
     items.truncate(30);
     Ok((items, 1))
+}
+
+fn split_slash_command(command: &str) -> (String, &str) {
+    let trimmed = command.trim();
+    let raw = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let mut parts = raw.splitn(2, char::is_whitespace);
+    let base = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let arg = parts.next().unwrap_or_default().trim_start();
+    (base, arg)
+}
+
+fn pending_input_commands() -> &'static [&'static str] {
+    &["retry", "queue", "q", "steer", "plan", "goal"]
+}
+
+fn worker_blocked_commands() -> &'static [&'static str] {
+    &["snapshot", "snap"]
 }
 
 fn details_completions(text: &str) -> Option<(Vec<Value>, usize)> {
@@ -1258,14 +1466,18 @@ pub(crate) fn run_native_gateway_jsonrpc<R: BufRead + Send, W: Write>(
 mod tests {
     use std::io::{BufRead, BufReader, Cursor, Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
+    #[cfg(not(windows))]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+
+    static PYTHON_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1309,6 +1521,25 @@ mod tests {
             }
         });
         format!("http://{}", addr)
+    }
+
+    #[cfg(not(windows))]
+    fn write_fake_python_worker(root: &Path, args_log: &Path, request_log: &Path) -> PathBuf {
+        let script = root.join("fake-python.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\ncount=0\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  count=$((count + 1))\n  printf '{{\"id\":%s,\"ok\":true,\"output\":\"worker:%s\"}}\\n' \"$count\" \"$count\"\ndone\n",
+                args_log.display(),
+                args_log.display(),
+                request_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        script
     }
 
     #[test]
@@ -1625,5 +1856,117 @@ mod tests {
         );
         assert!(frames[3]["result"]["mtime"].as_f64().unwrap() > 0.0);
         assert_eq!(frames[4]["result"]["session_id"], json!("recent-session"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_gateway_slash_exec_reuses_worker_and_rejects_pending_input_commands() {
+        let _guard = PYTHON_ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let args_log = temp.path().join("worker-args.log");
+        let request_log = temp.path().join("worker-requests.log");
+        let fake_python = write_fake_python_worker(temp.path(), &args_log, &request_log);
+        let old_python = {
+            let mut override_path = SLASH_WORKER_PYTHON_OVERRIDE.lock().unwrap();
+            let old = override_path.clone();
+            *override_path = Some(fake_python);
+            old
+        };
+
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("slash-session"),
+            NativeGatewaySessionState {
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                overrides: ModelOverrides {
+                    model: Some(String::from("test-model")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut first = Vec::new();
+        server
+            .handle_request(
+                "slash.exec",
+                json!(1),
+                json!({"session_id":"slash-session","command":"/help"}),
+                &mut first,
+                false,
+            )
+            .unwrap();
+        let mut second = Vec::new();
+        server
+            .handle_request(
+                "slash.exec",
+                json!(2),
+                json!({"session_id":"slash-session","command":"/logs"}),
+                &mut second,
+                false,
+            )
+            .unwrap();
+        let mut blocked = Vec::new();
+        server
+            .handle_request(
+                "slash.exec",
+                json!(3),
+                json!({"session_id":"slash-session","command":"/plan next"}),
+                &mut blocked,
+                false,
+            )
+            .unwrap();
+
+        *SLASH_WORKER_PYTHON_OVERRIDE.lock().unwrap() = old_python;
+
+        let first_frame = serde_json::from_slice::<Value>(&first).unwrap();
+        let second_frame = serde_json::from_slice::<Value>(&second).unwrap();
+        let blocked_frame = serde_json::from_slice::<Value>(&blocked).unwrap();
+        assert_eq!(first_frame["result"]["output"], json!("worker:1"));
+        assert_eq!(second_frame["result"]["output"], json!("worker:2"));
+        assert_eq!(blocked_frame["error"]["code"], json!(4018));
+        assert!(
+            blocked_frame["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("command.dispatch")
+        );
+
+        let args_lines = fs::read_to_string(args_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(args_lines.len(), 1);
+        assert!(args_lines[0].contains("-m"));
+        assert!(args_lines[0].contains("tui_gateway.slash_worker"));
+        assert!(args_lines[0].contains("--session-key"));
+        assert!(args_lines[0].contains("slash-session"));
+
+        let request_lines = fs::read_to_string(request_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(request_lines.len(), 2);
+        assert!(
+            request_lines
+                .iter()
+                .any(|line| line.contains("\"command\":\"/help\""))
+        );
+        assert!(
+            request_lines
+                .iter()
+                .any(|line| line.contains("\"command\":\"/logs\""))
+        );
+        assert!(
+            !request_lines
+                .iter()
+                .any(|line| line.contains("\"command\":\"/plan next\""))
+        );
     }
 }
