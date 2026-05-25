@@ -4148,6 +4148,7 @@ def write(path, audio, samplerate):
 
     #[test]
     fn piper_tts_missing_package_returns_helpful_error() {
+        let _guard = env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
         let pyroot = temp.path().join("pyroot");
         install_fake_piper_package(&pyroot, true);

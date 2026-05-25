@@ -7,7 +7,7 @@ xai = ProviderProfile(
     name="xai",
     aliases=("grok", "x-ai", "x.ai"),
     api_mode="codex_responses",
-    env_vars=("XAI_API_KEY",),
+    env_vars=("XAI_API_KEY", "XAI_BASE_URL"),
     base_url="https://api.x.ai/v1",
     auth_type="api_key",
 )

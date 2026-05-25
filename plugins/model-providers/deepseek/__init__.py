@@ -6,7 +6,7 @@ from providers.base import ProviderProfile
 deepseek = ProviderProfile(
     name="deepseek",
     aliases=("deepseek-chat",),
-    env_vars=("DEEPSEEK_API_KEY",),
+    env_vars=("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"),
     display_name="DeepSeek",
     description="DeepSeek — native DeepSeek API",
     signup_url="https://platform.deepseek.com/",

@@ -1046,6 +1046,7 @@ mod tests {
 
     #[test]
     fn load_config_document_normalizes_legacy_max_turns() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let (_temp, ctx) = test_context();
         ctx.ensure_hermes_home().expect("ensure home");
         fs::write(ctx.config_path(), "max_turns: 42\n").expect("write config");
@@ -1134,6 +1135,7 @@ mod tests {
 
     #[test]
     fn resolve_model_runtime_allows_bedrock_without_api_key() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let (_temp, ctx) = test_context();
         ctx.ensure_hermes_home().expect("ensure home");
         fs::write(
@@ -1209,6 +1211,7 @@ mod tests {
 
     #[test]
     fn resolve_model_runtime_keeps_anthropic_url_inference_ahead_of_model_routing() {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
         let (_temp, ctx) = test_context();
         ctx.ensure_hermes_home().expect("ensure home");
         fs::write(

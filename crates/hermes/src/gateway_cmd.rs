@@ -1875,6 +1875,13 @@ fn load_gateway_setup_metadata(
     Ok(platforms)
 }
 
+pub(crate) fn gateway_setup_menu_choice_count(
+    context: &HermesContext,
+    accept_hooks: bool,
+) -> Result<usize, Box<dyn Error>> {
+    Ok(load_gateway_setup_metadata(context, accept_hooks)?.len() + 1)
+}
+
 fn native_gateway_setup_metadata(context: &HermesContext) -> Vec<GatewaySetupPlatform> {
     let mut platforms = gateway_builtin_platform_specs()
         .iter()
