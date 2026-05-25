@@ -429,6 +429,23 @@ sys.__stdout__.write(json.dumps(response))
 sys.__stdout__.flush()
 "#;
 
+const DISPATCH_RPC_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "helper",
+    "method": payload.get("method", ""),
+    "params": payload.get("params", {}) or {},
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
 const SKIN_PAYLOAD_HELPER: &str = r#"
 import json
 import sys
@@ -482,6 +499,7 @@ struct ProxyState {
     child_to_local: HashMap<String, String>,
     next_internal_request: u64,
     next_local_session: u64,
+    next_paste: u64,
     next_prompt_request: u64,
     pending: HashMap<String, PendingRequest>,
     prompt_requests: HashMap<String, PromptRequestBinding>,
@@ -679,6 +697,35 @@ fn handle_native_request(
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
+        "delegation.status" => {
+            forward_child_request(id, "delegation.status", &params, state, child_stdin, false)?
+        }
+        "delegation.pause" => {
+            forward_child_request(id, "delegation.pause", &params, state, child_stdin, false)?
+        }
+        "subagent.interrupt" => {
+            forward_child_request(id, "subagent.interrupt", &params, state, child_stdin, false)?
+        }
+        "spawn_tree.save" => handle_helper_dispatch(id, "spawn_tree.save", &params, helper)?,
+        "spawn_tree.list" => handle_helper_dispatch(id, "spawn_tree.list", &params, helper)?,
+        "spawn_tree.load" => handle_helper_dispatch(id, "spawn_tree.load", &params, helper)?,
+        "process.stop" => {
+            forward_child_request(id, "process.stop", &params, state, child_stdin, false)?
+        }
+        "reload.env" => {
+            forward_child_request(id, "reload.env", &params, state, child_stdin, false)?
+        }
+        "paste.collapse" => handle_paste_collapse(id, &params, state, helper)?,
+        "model.options" => {
+            forward_child_request(id, "model.options", &params, state, child_stdin, true)?
+        }
+        "model.save_key" => {
+            forward_child_request(id, "model.save_key", &params, state, child_stdin, true)?
+        }
+        "model.disconnect" => {
+            forward_child_request(id, "model.disconnect", &params, state, child_stdin, true)?
+        }
         "config.get" => handle_config_get(id, &params, state, helper, child_stdin)?,
         "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
         "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
@@ -1366,6 +1413,51 @@ fn handle_session_status(
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
 }
 
+fn handle_helper_dispatch(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let response = run_python_helper_json(
+        helper,
+        DISPATCH_RPC_HELPER,
+        Some(&json!({"method": method, "params": params})),
+    )
+    .map_err(|error| format!("{method} helper failed: {error}"))?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
+fn forward_child_request(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+    map_session_id: bool,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let mut forwarded_params = params.clone();
+    if map_session_id
+        && let Some(local_id) = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        if session_exists(state, local_id)? {
+            ensure_child_session(child_stdin, state, local_id)?;
+            if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+                forwarded_params.insert("session_id".to_string(), json!(child_id));
+            } else {
+                forwarded_params.remove("session_id");
+            }
+        }
+    }
+    let response =
+        send_blocking_child_request(child_stdin, state, method, Value::Object(forwarded_params))?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_config_get(
     id: Value,
     params: &Map<String, Value>,
@@ -1470,6 +1562,41 @@ fn handle_config_set(
         )?;
     }
     Ok(Some(response))
+}
+
+fn handle_paste_collapse(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Ok(Some(error_response(id, 4004, "empty paste")));
+    }
+
+    let counter = next_paste_counter(state)?;
+    let line_count = text.matches('\n').count() + 1;
+    let paste_dir = helper.hermes_home.join("pastes");
+    fs::create_dir_all(&paste_dir)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let paste_file = paste_dir.join(format!("paste_{counter}_{timestamp}.txt"));
+    fs::write(&paste_file, text)?;
+
+    Ok(Some(ok_response(
+        id,
+        json!({
+            "placeholder": format!("[Pasted text #{counter}: {line_count} lines → {}]", paste_file.display()),
+            "path": paste_file.display().to_string(),
+            "lines": line_count,
+        }),
+    )))
 }
 
 fn requires_child_config_get(key: &str) -> bool {
@@ -3190,6 +3317,14 @@ fn active_store_session_ids(
         .values()
         .filter_map(|binding| binding.store_session_id.clone())
         .collect())
+}
+
+fn next_paste_counter(state: &Arc<Mutex<ProxyState>>) -> Result<u64, Box<dyn Error>> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| "proxy state lock poisoned while incrementing paste counter")?;
+    guard.next_paste = guard.next_paste.saturating_add(1);
+    Ok(guard.next_paste)
 }
 
 fn run_python_helper_json(
@@ -5037,6 +5172,132 @@ mod tests {
         assert_eq!(response["id"], json!("r-config-helper-get"));
         assert_eq!(response["result"]["value"], json!("queue"));
         assert!(mtime["result"]["mtime"].as_f64().unwrap_or_default() > 0.0);
+    }
+
+    #[test]
+    fn model_options_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-model-options".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-model-options", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "model.options");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"model\":\"demo/model\",\"provider\":\"demo\",\"providers\":[]}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request(
+            json!("r-model-options"),
+            "model.options",
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            true,
+        )
+        .unwrap()
+        .expect("model.options response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-model-options"));
+        assert_eq!(response["result"]["model"], json!("demo/model"));
+        assert_eq!(response["result"]["provider"], json!("demo"));
+    }
+
+    #[test]
+    fn spawn_tree_helper_dispatch_uses_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-spawn-tree-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let helper = helper_context_at(hermes_home.clone());
+
+        let save = handle_helper_dispatch(
+            json!("r-spawn-save"),
+            "spawn_tree.save",
+            json!({
+                "session_id": "rs_tui_00000001",
+                "finished_at": 1234.0,
+                "started_at": 1200.0,
+                "label": "demo",
+                "subagents": [{"id": "sub-1"}]
+            })
+            .as_object()
+            .unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.save response");
+        let path = save["result"]["path"].as_str().unwrap().to_string();
+        let listed = handle_helper_dispatch(
+            json!("r-spawn-list"),
+            "spawn_tree.list",
+            json!({"session_id": "rs_tui_00000001", "limit": 10})
+                .as_object()
+                .unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.list response");
+        let loaded = handle_helper_dispatch(
+            json!("r-spawn-load"),
+            "spawn_tree.load",
+            json!({"path": path}).as_object().unwrap(),
+            &helper,
+        )
+        .unwrap()
+        .expect("spawn_tree.load response");
+
+        assert_eq!(listed["id"], json!("r-spawn-list"));
+        assert_eq!(listed["result"]["entries"][0]["label"], json!("demo"));
+        assert_eq!(loaded["result"]["session_id"], json!("rs_tui_00000001"));
+        assert_eq!(loaded["result"]["subagents"][0]["id"], json!("sub-1"));
+    }
+
+    #[test]
+    fn paste_collapse_writes_paste_file_in_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-paste-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+
+        let response = handle_paste_collapse(
+            json!("r-paste"),
+            json!({"text": "one\ntwo"}).as_object().unwrap(),
+            &state,
+            &helper_context_at(hermes_home.clone()),
+        )
+        .unwrap()
+        .expect("paste.collapse response");
+
+        let path = response["result"]["path"].as_str().unwrap();
+        let written = fs::read_to_string(path).unwrap();
+        assert_eq!(written, "one\ntwo");
+        assert_eq!(response["result"]["lines"], json!(2));
+        assert!(
+            response["result"]["placeholder"]
+                .as_str()
+                .unwrap()
+                .contains("Pasted text #1")
+        );
     }
 
     #[test]
