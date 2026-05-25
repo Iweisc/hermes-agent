@@ -348,6 +348,7 @@ print(json.dumps({
 const INITIAL_SESSION_INFO_HELPER: &str = r#"
 import json
 import os
+import sys
 
 result = {
     "model": "",
@@ -374,11 +375,13 @@ try:
 except Exception:
     pass
 
-print(json.dumps(result))
+sys.__stdout__.write(json.dumps(result))
+sys.__stdout__.flush()
 "#;
 
 const GATEWAY_READY_HELPER: &str = r#"
 import json
+import sys
 
 result = {"skin": {}}
 try:
@@ -388,7 +391,35 @@ try:
 except Exception:
     pass
 
-print(json.dumps(result))
+sys.__stdout__.write(json.dumps(result))
+sys.__stdout__.flush()
+"#;
+
+const CONFIG_SET_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import dispatch
+
+payload = json.load(sys.stdin)
+response = dispatch({
+    "jsonrpc": "2.0",
+    "id": "cfg",
+    "method": "config.set",
+    "params": payload,
+})
+sys.__stdout__.write(json.dumps(response))
+sys.__stdout__.flush()
+"#;
+
+const SKIN_PAYLOAD_HELPER: &str = r#"
+import json
+import sys
+
+from tui_gateway.server import resolve_skin
+
+sys.__stdout__.write(json.dumps(resolve_skin()))
+sys.__stdout__.flush()
 "#;
 
 #[derive(Debug, Clone)]
@@ -631,6 +662,7 @@ fn handle_native_request(
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
+        "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
         "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
         "session.interrupt" => handle_session_interrupt(id, &params, state, helper, child_stdin)?,
@@ -1314,6 +1346,81 @@ fn handle_session_status(
         ),
     ]);
     Ok(Some(ok_response(id, json!({"output": lines.join("\n")}))))
+}
+
+fn handle_config_set(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(key) = params
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4002, "config key required")));
+    };
+    let local_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if local_id.is_some() && requires_child_config_set(key) {
+        let local_id = local_id.unwrap_or_default();
+        if !session_exists(state, local_id)? {
+            return Ok(Some(error_response(id, 4001, "session not found")));
+        }
+        ensure_child_session(child_stdin, state, local_id)?;
+        let Some(child_id) = lookup_child_session_id(state, local_id)? else {
+            return Ok(Some(error_response(
+                id,
+                4001,
+                "child session not materialized",
+            )));
+        };
+
+        let mut forwarded_params = params.clone();
+        forwarded_params.insert("session_id".to_string(), json!(child_id));
+        let response = send_blocking_child_request(
+            child_stdin,
+            state,
+            "config.set",
+            Value::Object(forwarded_params),
+        )?;
+        return Ok(Some(rebind_response_id(response, id)));
+    }
+
+    let response = run_python_helper_json(helper, CONFIG_SET_HELPER, Some(&json!(params)))
+        .map_err(|error| format!("config.set helper failed: {error}"))?;
+    let response = rebind_response_id(response, id);
+    if key == "skin" && response.get("result").is_some() {
+        let skin =
+            run_python_helper_json(helper, SKIN_PAYLOAD_HELPER, None).unwrap_or_else(|_| json!({}));
+        write_json(
+            stdout,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "skin.changed",
+                    "payload": skin,
+                },
+            }),
+        )?;
+    }
+    Ok(Some(response))
+}
+
+fn requires_child_config_set(key: &str) -> bool {
+    matches!(
+        key,
+        "model" | "fast" | "verbose" | "yolo" | "reasoning" | "personality"
+    )
 }
 
 fn handle_prompt_background(
@@ -3035,6 +3142,7 @@ fn run_python_helper_json(
         .arg("-c")
         .arg(script)
         .current_dir(&helper.work_root)
+        .env("HERMES_HOME", &helper.hermes_home)
         .env("HERMES_PYTHON_SRC_ROOT", &helper.project_root)
         .env("PYTHONPATH", &helper.python_path)
         .stdin(Stdio::piped())
@@ -4300,14 +4408,19 @@ mod tests {
     }
 
     fn helper_context() -> HelperContext {
+        helper_context_at(std::env::temp_dir())
+    }
+
+    fn helper_context_at(hermes_home: PathBuf) -> HelperContext {
+        let project_root = project_root();
         HelperContext {
             context: HermesContext::new(std::env::temp_dir())
-                .with_hermes_home_env(Some(std::env::temp_dir())),
-            hermes_home: std::env::temp_dir(),
-            project_root: project_root(),
-            python: PathBuf::from("python3"),
-            python_path: String::new(),
-            work_root: project_root(),
+                .with_hermes_home_env(Some(hermes_home.clone())),
+            hermes_home,
+            python: resolve_repo_python(&project_root).unwrap_or_else(|| PathBuf::from("python3")),
+            python_path: compose_python_path(&project_root),
+            work_root: project_root.clone(),
+            project_root,
         }
     }
 
@@ -4700,6 +4813,81 @@ mod tests {
         assert_eq!(response["result"]["status"], json!("streaming"));
         let guard = state.lock().unwrap();
         assert!(guard.sessions[&local_id].store_session_dirty);
+    }
+
+    #[test]
+    fn config_set_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-config-child".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-config", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "config.set");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"key\":\"reasoning\",\"value\":\"high\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_config_set(
+            json!("r-config-child"),
+            json!({"key": "reasoning", "session_id": local_id, "value": "high"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context(),
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-config-child"));
+        assert_eq!(response["result"]["key"], json!("reasoning"));
+        assert_eq!(response["result"]["value"], json!("high"));
+    }
+
+    #[test]
+    fn config_set_helper_path_uses_isolated_hermes_home() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let hermes_home = std::env::temp_dir().join(format!(
+            "hermes-rs-agent-config-home-{nonce}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&hermes_home).unwrap();
+        let state = test_state();
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let (_child, child_stdin) = dummy_child_stdin();
+
+        let response = handle_config_set(
+            json!("r-config-helper"),
+            json!({"key": "busy", "value": "queue"})
+                .as_object()
+                .unwrap(),
+            &state,
+            &helper_context_at(hermes_home.clone()),
+            &stdout,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("config.set response");
+
+        assert_eq!(response["id"], json!("r-config-helper"));
+        assert_eq!(response["result"]["key"], json!("busy"));
+        assert_eq!(response["result"]["value"], json!("queue"));
+        let config_text = fs::read_to_string(hermes_home.join("config.yaml")).unwrap();
+        assert!(config_text.contains("busy_input_mode: queue"));
     }
 
     #[test]
