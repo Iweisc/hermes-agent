@@ -85,6 +85,7 @@ fn normalize_choices(value: Option<&Value>) -> Result<Option<Vec<String>>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn clarify_returns_user_response_with_callback() {
@@ -102,6 +103,33 @@ mod tests {
         );
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["user_response"], json!("B"));
+    }
+
+    #[test]
+    fn clarify_emits_request_callback_before_prompt() {
+        let seen = Arc::new(Mutex::new(Vec::<crate::ClarifyRequest>::new()));
+        let seen_capture = Arc::clone(&seen);
+        let runtime = ToolRuntime::default()
+            .with_clarify_request_callback(move |request| {
+                seen_capture.lock().unwrap().push(request.clone());
+            })
+            .with_clarify_callback(|_, _| Ok("B".to_string()));
+        let result = handle_clarify(
+            &json!({
+                "question": "Pick one",
+                "choices": ["A", "B"],
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["user_response"], json!("B"));
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].question, "Pick one");
+        assert_eq!(
+            requests[0].choices,
+            Some(vec![String::from("A"), String::from("B")])
+        );
     }
 
     #[test]

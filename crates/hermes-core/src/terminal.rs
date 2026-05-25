@@ -107,6 +107,12 @@ pub fn handle_terminal(args: &Value, runtime: &ToolRuntime) -> String {
         Ok(command) => command,
         Err(error) => return json_error(error),
     };
+    match runtime.check_terminal_command_approval(&command) {
+        crate::ApprovalCheckResult::Approved => {}
+        crate::ApprovalCheckResult::Blocked { message } => {
+            return json_error(message);
+        }
+    }
     let background = match optional_bool(args, "background") {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return json_error(error),
@@ -656,7 +662,18 @@ fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
 mod tests {
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+
     use tempfile::TempDir;
+
+    fn loaded_config(raw: &str, home: &Path) -> crate::LoadedConfig {
+        crate::LoadedConfig {
+            path: home.join("config.yaml"),
+            raw: serde_yaml::from_str(raw).unwrap(),
+            config: crate::HermesConfig::default(),
+            warnings: Vec::new(),
+        }
+    }
 
     #[test]
     fn foreground_terminal_runs_and_returns_output() {
@@ -746,5 +763,108 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn terminal_blocks_dangerous_command_when_user_denies_approval() {
+        let temp = TempDir::new().unwrap();
+        let loaded = loaded_config("approvals:\n  mode: manual\n", temp.path());
+        let seen = Arc::new(Mutex::new(Vec::<crate::ApprovalRequest>::new()));
+        let seen_capture = Arc::clone(&seen);
+        let observed = Arc::new(Mutex::new(Vec::<crate::ApprovalRequest>::new()));
+        let observed_capture = Arc::clone(&observed);
+        let mut runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_approval_request_callback(move |request| {
+                observed_capture.lock().unwrap().push(request.clone());
+            })
+            .with_approval_callback(move |request| {
+                seen_capture.lock().unwrap().push(request.clone());
+                Ok("deny".to_string())
+            });
+        runtime.load_approvals(&loaded);
+
+        let result = handle_terminal(
+            &json!({
+                "command": "bash -c \"printf blocked\\n\"",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("User denied this potentially dangerous command")
+        );
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].description, "shell command via -c/-lc flag");
+        assert_eq!(
+            requests[0].choices,
+            vec!["once", "session", "always", "deny"]
+        );
+        let observed_requests = observed.lock().unwrap().clone();
+        assert_eq!(observed_requests, requests);
+    }
+
+    #[test]
+    fn terminal_allows_once_when_user_approves_dangerous_command() {
+        let temp = TempDir::new().unwrap();
+        let loaded = loaded_config("approvals:\n  mode: manual\n", temp.path());
+        let mut runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_approval_callback(|_| Ok("once".to_string()));
+        runtime.load_approvals(&loaded);
+
+        let result = handle_terminal(
+            &json!({
+                "command": "bash -c \"printf approved\"",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["exit_code"], json!(0));
+        assert_eq!(parsed["output"], json!("approved"));
+    }
+
+    #[test]
+    fn terminal_reuses_persisted_always_approval_from_config() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "approvals:\n  mode: manual\n",
+        )
+        .unwrap();
+        let loaded = loaded_config("approvals:\n  mode: manual\n", temp.path());
+
+        let mut first_runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_approval_callback(|_| Ok("always".to_string()));
+        first_runtime.load_approvals(&loaded);
+        let first = handle_terminal(
+            &json!({
+                "command": "bash -c \"printf persisted\"",
+            }),
+            &first_runtime,
+        );
+        let first_json: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first_json["exit_code"], json!(0));
+
+        let saved = fs::read_to_string(temp.path().join("config.yaml")).unwrap();
+        assert!(saved.contains("shell command via -c/-lc flag"));
+
+        let mut second_runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        second_runtime.load_approvals(&loaded_config(&saved, temp.path()));
+        let second = handle_terminal(
+            &json!({
+                "command": "bash -c \"printf persisted\"",
+            }),
+            &second_runtime,
+        );
+        let second_json: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second_json["exit_code"], json!(0));
+        assert_eq!(second_json["output"], json!("persisted"));
     }
 }

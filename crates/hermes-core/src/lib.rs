@@ -8,16 +8,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub mod agent;
+mod approvals;
 mod auth;
 mod browser;
+mod checkpoints;
 mod clarify;
 mod code_execution;
 pub mod config;
+mod context_engine;
 mod cronjob;
 pub mod delegate;
 mod discord;
 pub mod env_loader;
 mod feishu;
+mod gateway_events;
 mod homeassistant;
 mod image_gen;
 mod kanban;
@@ -27,6 +31,7 @@ mod moa;
 pub mod providers;
 mod rl;
 mod send_message;
+mod shell_hooks;
 mod skills;
 mod spotify;
 pub mod state;
@@ -39,6 +44,7 @@ mod web;
 mod yuanbao;
 
 pub use agent::AgentTurnResult;
+pub use approvals::{ApprovalCheckResult, ApprovalManager, ApprovalRequest};
 pub use auth::{
     AuthStatusSummary, CopilotAcpRuntimeCredentials, CopilotRuntimeCredentials,
     GoogleGeminiRuntimeCredentials, MinimaxOAuthRuntimeCredentials, NousRuntimeCredentials,
@@ -53,12 +59,14 @@ pub use config::{
     MemoryConfig, ModelOverrides, ModelRuntimeConfig, NetworkConfig, SecurityConfig,
     TerminalConfig,
 };
+pub use context_engine::{ContextEngine, ContextEngineSessionStart};
 pub use cronjob::{
     CronRunResult, CronTickResult, SILENT_MARKER, handle_cronjob, run_cron_job_now,
     run_due_cron_jobs,
 };
 pub use delegate::DelegateExecutor;
 pub use env_loader::EnvLoadReport;
+pub use gateway_events::{GatewayEventBridge, GatewayEventEnvelope};
 pub use kanban::{
     KanbanDispatchOptions, KanbanDispatchResult, KanbanRunResult, dispatch_kanban_once,
     kanban_has_spawnable_ready, run_kanban_task,
@@ -76,8 +84,9 @@ pub use state::{
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,
 };
 pub use tools::{
-    ToolDefinition, ToolRuntime, ToolsetInfo, coerce_tool_args, dispatch_tool, get_all_tool_names,
-    get_all_toolsets, get_tool_definitions, get_toolset_for_tool, get_toolset_info,
+    ClarifyRequest, StepToolRecord, StepUpdate, ToolDefinition, ToolProgressUpdate, ToolRuntime,
+    ToolsetInfo, coerce_tool_args, dispatch_tool, get_all_tool_names, get_all_toolsets,
+    get_tool_definitions, get_tool_definitions_for_runtime, get_toolset_for_tool, get_toolset_info,
     get_toolset_names, resolve_toolset, tool_error, tool_result, validate_toolset,
 };
 
