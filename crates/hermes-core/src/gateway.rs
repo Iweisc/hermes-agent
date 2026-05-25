@@ -24,6 +24,8 @@ pub const UPDATE_PROMPT_FILENAME: &str = ".update_prompt.json";
 pub const UPDATE_RESPONSE_FILENAME: &str = ".update_response";
 pub const UPDATE_OUTPUT_FILENAME: &str = ".update_output.txt";
 pub const UPDATE_EXIT_CODE_FILENAME: &str = ".update_exit_code";
+pub const UPDATE_STREAM_MAX_CHUNK: usize = 3500;
+pub const UPDATE_TIMEOUT_EXIT_CODE: i32 = 124;
 pub const DEFAULT_TELEGRAM_FOLLOWUP_GRACE_SECONDS: f64 = 3.0;
 pub const STARTUP_RECENT_ACTIVITY_WINDOW_SECONDS: i64 = 120;
 pub const STUCK_LOOP_THRESHOLD: u64 = 3;
@@ -1313,6 +1315,136 @@ pub struct GatewaySlashConfirmResolution {
     pub choice: GatewaySlashConfirmChoice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewaySlashConfirmRequestPlan {
+    pub platform: Platform,
+    pub chat_id: String,
+    pub thread_id: Option<String>,
+    pub session_key: String,
+    pub confirm_id: String,
+    pub command: String,
+    pub title: String,
+    pub message: String,
+    pub fallback_ack: String,
+}
+
+impl GatewaySlashConfirmRequestPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.chat_id.trim().is_empty() {
+            return Err("slash confirm chat_id must not be empty".to_string());
+        }
+        if self.session_key.trim().is_empty() {
+            return Err("slash confirm session_key must not be empty".to_string());
+        }
+        if self.confirm_id.trim().is_empty() {
+            return Err("slash confirm confirm_id must not be empty".to_string());
+        }
+        if self.command.trim().is_empty() {
+            return Err("slash confirm command must not be empty".to_string());
+        }
+        if self.title.trim().is_empty() {
+            return Err("slash confirm title must not be empty".to_string());
+        }
+        if self.message.trim().is_empty() {
+            return Err("slash confirm message must not be empty".to_string());
+        }
+        if self
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("slash confirm thread_id must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn immediate_ack(&self, used_buttons: bool) -> Option<String> {
+        if used_buttons {
+            None
+        } else {
+            Some(self.fallback_ack.clone())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayQuickCommandRequestPlan {
+    pub platform: Platform,
+    pub chat_id: String,
+    pub thread_id: Option<String>,
+    pub reply_to_message_id: Option<String>,
+    pub name: String,
+    pub shell_command: String,
+}
+
+impl GatewayQuickCommandRequestPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.chat_id.trim().is_empty() {
+            return Err("quick command chat_id must not be empty".to_string());
+        }
+        if self.name.trim().is_empty() {
+            return Err("quick command name must not be empty".to_string());
+        }
+        if self.shell_command.trim().is_empty() {
+            return Err("quick command shell_command must not be empty".to_string());
+        }
+        if self
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("quick command thread_id must not be empty".to_string());
+        }
+        if self
+            .reply_to_message_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("quick command reply_to_message_id must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn from_decision(decision: &GatewayIngressDecision) -> Result<Option<Self>, String> {
+        let GatewayIngressDecision::ExecQuickCommand {
+            name,
+            shell_command,
+            event,
+        } = decision
+        else {
+            return Ok(None);
+        };
+        let plan = Self {
+            platform: event.source.platform.clone(),
+            chat_id: event.source.chat_id.clone(),
+            thread_id: event.source.thread_id.clone(),
+            reply_to_message_id: event.message_id.clone(),
+            name: name.clone(),
+            shell_command: shell_command.clone(),
+        };
+        plan.validate()?;
+        Ok(Some(plan))
+    }
+
+    pub fn plan_response(
+        &self,
+        outcome: &GatewayQuickCommandExecOutcome,
+    ) -> Result<GatewayIngressHostResponse, String> {
+        let message = plan_exec_quick_command_response(&self.name, outcome)?;
+        Ok(GatewayIngressHostResponse {
+            message,
+            reply_to_message_id: self.reply_to_message_id.clone(),
+            thread_id: self.thread_id.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayQuickCommandHostExecution {
+    pub request: GatewayQuickCommandRequestPlan,
+    pub response: GatewayIngressHostResponse,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum GatewaySlashConfirmEventOutcome {
     NoIntercept {
@@ -1320,6 +1452,40 @@ pub enum GatewaySlashConfirmEventOutcome {
     },
     Resolved {
         resolution: GatewaySlashConfirmResolution,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewaySlashConfirmHostEventOutcome {
+    NoIntercept {
+        session_key: String,
+        cleared_stale: bool,
+    },
+    Resolved {
+        resolution: GatewaySlashConfirmResolution,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewaySlashConfirmCallbackOutcome {
+    NoPending,
+    Resolved {
+        resolution: GatewaySlashConfirmResolution,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewaySlashConfirmCallbackPresentation {
+    pub acknowledgement_label: String,
+    pub decision_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewaySlashConfirmCallbackExecution {
+    NoPending,
+    Resolved {
+        resolution: GatewaySlashConfirmResolution,
+        presentation: GatewaySlashConfirmCallbackPresentation,
     },
 }
 
@@ -1401,14 +1567,175 @@ pub struct GatewayUpdateTarget {
 pub struct GatewayUpdatePromptForwardPlan {
     pub target: GatewayUpdateTarget,
     pub prompt: GatewayUpdatePromptMarker,
+    pub pre_prompt_messages: Vec<GatewayUpdateStreamMessage>,
+    pub fallback_message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayUpdateStreamMessage {
+    pub target: GatewayUpdateTarget,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GatewayUpdateOutputState {
+    bytes_sent: usize,
+    buffer: String,
+    last_stream_at: Option<f64>,
+}
+
+impl Default for GatewayUpdateOutputState {
+    fn default() -> Self {
+        Self {
+            bytes_sent: 0,
+            buffer: String::new(),
+            last_stream_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayUpdateWatcherCompletionPlan {
+    pub exit_code: i32,
+    pub outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    pub host_actions: Vec<GatewayHostAction>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayUpdateWatcherTimeoutPlan {
+    pub exit_code: i32,
+    pub outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    pub host_actions: Vec<GatewayHostAction>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayUpdateWatcherPollPlan {
+    Noop,
+    Stream {
+        outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    },
+    Prompt {
+        prompt_forward: GatewayUpdatePromptForwardPlan,
+    },
+    Complete {
+        completion: GatewayUpdateWatcherCompletionPlan,
+    },
+    Timeout {
+        timeout: GatewayUpdateWatcherTimeoutPlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayUpdateNotificationPlan {
+    NoPending,
+    Deferred {
+        host_actions: Vec<GatewayHostAction>,
+    },
+    Ready {
+        outbound_message: Option<GatewayUpdateStreamMessage>,
+        host_actions: Vec<GatewayHostAction>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayUpdateNotificationExecution {
+    NoPending,
+    Deferred,
+    Ready {
+        outbound_message: Option<GatewayUpdateStreamMessage>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayUpdateWatchHostPlan {
+    Noop,
+    Live {
+        poll: GatewayUpdateWatcherPollPlan,
+    },
+    FallbackNotification {
+        pre_actions: Vec<GatewayHostAction>,
+        notification: GatewayUpdateNotificationPlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayUpdateWatchExecution {
+    Noop,
+    Stream {
+        outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    },
+    Prompt {
+        prompt_forward: GatewayUpdatePromptForwardPlan,
+    },
+    Complete {
+        outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    },
+    Timeout {
+        outbound_messages: Vec<GatewayUpdateStreamMessage>,
+    },
+    FallbackDeferred,
+    FallbackReady {
+        outbound_message: Option<GatewayUpdateStreamMessage>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GatewayUpdateWatcherState {
     pending_prompt_sessions: HashMap<String, bool>,
+    output: GatewayUpdateOutputState,
 }
 
 impl GatewayUpdateWatcherState {
+    pub fn plan_host_step(
+        &mut self,
+        home_dir: &Path,
+        now_seconds: f64,
+        stream_interval_seconds: f64,
+        timed_out: bool,
+        live_delivery_available: bool,
+    ) -> Result<GatewayUpdateWatchHostPlan, String> {
+        if live_delivery_available {
+            return self
+                .plan_poll(home_dir, now_seconds, stream_interval_seconds, timed_out)
+                .map(|poll| match poll {
+                    GatewayUpdateWatcherPollPlan::Noop => GatewayUpdateWatchHostPlan::Noop,
+                    poll => GatewayUpdateWatchHostPlan::Live { poll },
+                });
+        }
+
+        let mut pre_actions = Vec::new();
+        if timed_out && read_update_exit_code(home_dir)?.is_none() {
+            pre_actions.push(GatewayHostAction::WriteText {
+                path: gateway_update_exit_code_path(home_dir),
+                content: UPDATE_TIMEOUT_EXIT_CODE.to_string(),
+            });
+        }
+
+        let notification = plan_update_notification_with_exit_override(
+            home_dir,
+            if timed_out {
+                Some(UPDATE_TIMEOUT_EXIT_CODE)
+            } else {
+                None
+            },
+        );
+        match notification {
+            GatewayUpdateNotificationPlan::NoPending => Ok(GatewayUpdateWatchHostPlan::Noop),
+            notification => Ok(GatewayUpdateWatchHostPlan::FallbackNotification {
+                pre_actions,
+                notification,
+            }),
+        }
+    }
+
+    pub fn note_poll_started(&mut self, now_seconds: f64) -> Result<(), String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
+        if self.output.last_stream_at.is_none() {
+            self.output.last_stream_at = Some(now_seconds);
+        }
+        Ok(())
+    }
+
     pub fn has_pending_prompt(&self, session_key: &str) -> bool {
         self.pending_prompt_sessions
             .get(session_key)
@@ -1430,10 +1757,85 @@ impl GatewayUpdateWatcherState {
         self.pending_prompt_sessions.remove(session_key);
     }
 
-    pub fn plan_prompt_forward(
-        &self,
+    pub fn sync_output(&mut self, home_dir: &Path) -> Result<(), String> {
+        let path = gateway_update_output_path(home_dir);
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("reading {} failed: {error}", path.display()))?;
+        if content.len() > self.output.bytes_sent {
+            self.output
+                .buffer
+                .push_str(&content[self.output.bytes_sent..]);
+            self.output.bytes_sent = content.len();
+        }
+        Ok(())
+    }
+
+    pub fn plan_periodic_flush(
+        &mut self,
+        target: &GatewayUpdateTarget,
+        now_seconds: f64,
+        stream_interval_seconds: f64,
+    ) -> Result<Vec<GatewayUpdateStreamMessage>, String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
+        validate_non_negative_finite_seconds(
+            stream_interval_seconds,
+            "update watcher stream_interval_seconds",
+        )?;
+        let Some(last_stream_at) = self.output.last_stream_at else {
+            self.output.last_stream_at = Some(now_seconds);
+            return Ok(Vec::new());
+        };
+        if self.output.buffer.trim().is_empty()
+            || (now_seconds - last_stream_at) < stream_interval_seconds
+        {
+            return Ok(Vec::new());
+        }
+        self.take_buffered_messages(target, now_seconds)
+    }
+
+    pub fn plan_poll(
+        &mut self,
         home_dir: &Path,
+        now_seconds: f64,
+        stream_interval_seconds: f64,
+        timed_out: bool,
+    ) -> Result<GatewayUpdateWatcherPollPlan, String> {
+        self.note_poll_started(now_seconds)?;
+        if let Some(completion) = self.plan_completion(home_dir, now_seconds)? {
+            return Ok(GatewayUpdateWatcherPollPlan::Complete { completion });
+        }
+        if timed_out {
+            return self
+                .plan_timeout(home_dir, now_seconds)
+                .map(|timeout| GatewayUpdateWatcherPollPlan::Timeout { timeout });
+        }
+        if let Some(prompt_forward) = self.plan_prompt_forward(home_dir, now_seconds)? {
+            self.mark_prompt_forwarded(&prompt_forward.target.session_key)?;
+            return Ok(GatewayUpdateWatcherPollPlan::Prompt { prompt_forward });
+        }
+        let Some(target) = read_update_target(home_dir)? else {
+            return Ok(GatewayUpdateWatcherPollPlan::Noop);
+        };
+        self.sync_output(home_dir)?;
+        let outbound_messages =
+            self.plan_periodic_flush(&target, now_seconds, stream_interval_seconds)?;
+        if outbound_messages.is_empty() {
+            Ok(GatewayUpdateWatcherPollPlan::Noop)
+        } else {
+            Ok(GatewayUpdateWatcherPollPlan::Stream { outbound_messages })
+        }
+    }
+
+    pub fn plan_prompt_forward(
+        &mut self,
+        home_dir: &Path,
+        now_seconds: f64,
     ) -> Result<Option<GatewayUpdatePromptForwardPlan>, String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
         let Some(target) = read_update_target(home_dir)? else {
             return Ok(None);
         };
@@ -1443,7 +1845,93 @@ impl GatewayUpdateWatcherState {
         let Some(prompt) = read_update_prompt_marker(home_dir)? else {
             return Ok(None);
         };
-        Ok(Some(GatewayUpdatePromptForwardPlan { target, prompt }))
+        self.sync_output(home_dir)?;
+        let pre_prompt_messages = self.take_buffered_messages(&target, now_seconds)?;
+        Ok(Some(GatewayUpdatePromptForwardPlan {
+            target,
+            prompt: prompt.clone(),
+            pre_prompt_messages,
+            fallback_message: format_update_prompt_fallback_message(&prompt),
+        }))
+    }
+
+    pub fn plan_completion(
+        &mut self,
+        home_dir: &Path,
+        now_seconds: f64,
+    ) -> Result<Option<GatewayUpdateWatcherCompletionPlan>, String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
+        let Some(exit_code) = read_update_exit_code(home_dir)? else {
+            return Ok(None);
+        };
+        self.sync_output(home_dir)?;
+        let target = read_update_target(home_dir)?;
+        let mut outbound_messages = Vec::new();
+        if let Some(target) = target.as_ref() {
+            outbound_messages.extend(self.take_buffered_messages(target, now_seconds)?);
+            outbound_messages.push(GatewayUpdateStreamMessage {
+                target: target.clone(),
+                message: format_update_completion_message(exit_code),
+            });
+            self.clear_prompt_pending(&target.session_key);
+        }
+        Ok(Some(GatewayUpdateWatcherCompletionPlan {
+            exit_code,
+            outbound_messages,
+            host_actions: plan_update_watcher_cleanup(home_dir),
+        }))
+    }
+
+    pub fn plan_timeout(
+        &mut self,
+        home_dir: &Path,
+        now_seconds: f64,
+    ) -> Result<GatewayUpdateWatcherTimeoutPlan, String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
+        self.sync_output(home_dir)?;
+        let target = read_update_target(home_dir)?;
+        let mut outbound_messages = Vec::new();
+        if let Some(target) = target.as_ref() {
+            outbound_messages.extend(self.take_buffered_messages(target, now_seconds)?);
+            outbound_messages.push(GatewayUpdateStreamMessage {
+                target: target.clone(),
+                message: "❌ Hermes update timed out after 30 minutes.".to_string(),
+            });
+            self.clear_prompt_pending(&target.session_key);
+        }
+        let mut host_actions = vec![GatewayHostAction::WriteText {
+            path: gateway_update_exit_code_path(home_dir),
+            content: UPDATE_TIMEOUT_EXIT_CODE.to_string(),
+        }];
+        host_actions.extend(plan_update_watcher_cleanup(home_dir));
+        Ok(GatewayUpdateWatcherTimeoutPlan {
+            exit_code: UPDATE_TIMEOUT_EXIT_CODE,
+            outbound_messages,
+            host_actions,
+        })
+    }
+
+    fn take_buffered_messages(
+        &mut self,
+        target: &GatewayUpdateTarget,
+        now_seconds: f64,
+    ) -> Result<Vec<GatewayUpdateStreamMessage>, String> {
+        validate_non_negative_finite_seconds(now_seconds, "update watcher now_seconds")?;
+        let clean = strip_update_stream_ansi(&self.output.buffer)
+            .trim()
+            .to_string();
+        self.output.buffer.clear();
+        self.output.last_stream_at = Some(now_seconds);
+        if clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(split_update_stream_chunks(&clean)
+            .into_iter()
+            .map(|message| GatewayUpdateStreamMessage {
+                target: target.clone(),
+                message,
+            })
+            .collect())
     }
 }
 
@@ -1705,6 +2193,9 @@ pub enum GatewayHostHandleOutcome {
         session_key: String,
         response: GatewayIngressHostResponse,
     },
+    ExecQuickCommand {
+        request: GatewayQuickCommandRequestPlan,
+    },
     Executed(GatewayIngressExecutionResult),
 }
 
@@ -1773,6 +2264,10 @@ pub enum GatewayHostAction {
     },
     DeleteFile {
         path: PathBuf,
+    },
+    MoveFile {
+        from: PathBuf,
+        to: PathBuf,
     },
     SendNotification {
         notification: GatewayNotification,
@@ -2169,6 +2664,7 @@ pub struct GatewayRuntime {
     queued_events: HashMap<String, VecDeque<MessageEvent>>,
     busy_ack_timestamps: HashMap<String, f64>,
     slash_confirms: GatewaySlashConfirmState,
+    next_slash_confirm_id: u64,
     update_watcher: GatewayUpdateWatcherState,
     telegram_followup_grace_seconds: f64,
     busy_input_mode: BusyInputMode,
@@ -2194,6 +2690,7 @@ impl GatewayRuntime {
             queued_events: HashMap::new(),
             busy_ack_timestamps: HashMap::new(),
             slash_confirms: GatewaySlashConfirmState::default(),
+            next_slash_confirm_id: 1,
             update_watcher: GatewayUpdateWatcherState::default(),
             telegram_followup_grace_seconds: DEFAULT_TELEGRAM_FOLLOWUP_GRACE_SECONDS,
             busy_input_mode,
@@ -2222,12 +2719,245 @@ impl GatewayRuntime {
         &mut self.slash_confirms
     }
 
+    pub fn begin_slash_confirm_request(
+        &mut self,
+        event: &MessageEvent,
+        command: &str,
+        title: &str,
+        message: &str,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmRequestPlan, String> {
+        validate_non_negative_finite_seconds(now_seconds, "slash confirm now_seconds")?;
+        let command = command.trim();
+        if command.is_empty() {
+            return Err("slash confirm command must not be empty".to_string());
+        }
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("slash confirm title must not be empty".to_string());
+        }
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("slash confirm message must not be empty".to_string());
+        }
+
+        let session_key = build_session_key(&event.source, true, false)?;
+        let confirm_id = self.next_slash_confirm_id.to_string();
+        self.next_slash_confirm_id = self.next_slash_confirm_id.saturating_add(1);
+        self.slash_confirms
+            .register(&session_key, &confirm_id, command, now_seconds)?;
+
+        let plan = GatewaySlashConfirmRequestPlan {
+            platform: event.source.platform.clone(),
+            chat_id: event.source.chat_id.clone(),
+            thread_id: event.source.thread_id.clone(),
+            session_key,
+            confirm_id,
+            command: command.to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+            fallback_ack: message.to_string(),
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn handle_slash_confirm_host_event(
+        &mut self,
+        event: &MessageEvent,
+        tool_approval_live: bool,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmHostEventOutcome, String> {
+        let session_key = build_session_key(
+            &event.source,
+            self.session_store.config.group_sessions_per_user,
+            self.session_store.config.thread_sessions_per_user,
+        )?;
+        match self.slash_confirms.handle_event(
+            &session_key,
+            event,
+            tool_approval_live,
+            now_seconds,
+        )? {
+            GatewaySlashConfirmEventOutcome::NoIntercept { cleared_stale } => {
+                Ok(GatewaySlashConfirmHostEventOutcome::NoIntercept {
+                    session_key,
+                    cleared_stale,
+                })
+            }
+            GatewaySlashConfirmEventOutcome::Resolved { resolution } => {
+                Ok(GatewaySlashConfirmHostEventOutcome::Resolved { resolution })
+            }
+        }
+    }
+
+    pub fn resolve_slash_confirm_callback(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        choice: GatewaySlashConfirmChoice,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmCallbackOutcome, String> {
+        match self
+            .slash_confirms
+            .resolve(session_key, confirm_id, choice, now_seconds)?
+        {
+            Some(resolution) => Ok(GatewaySlashConfirmCallbackOutcome::Resolved { resolution }),
+            None => Ok(GatewaySlashConfirmCallbackOutcome::NoPending),
+        }
+    }
+
+    pub fn complete_slash_confirm_callback(
+        &mut self,
+        session_key: &str,
+        confirm_id: &str,
+        choice: GatewaySlashConfirmChoice,
+        actor_display: &str,
+        now_seconds: f64,
+    ) -> Result<GatewaySlashConfirmCallbackExecution, String> {
+        let actor_display = actor_display.trim();
+        if actor_display.is_empty() {
+            return Err("slash confirm actor_display must not be empty".to_string());
+        }
+
+        match self.resolve_slash_confirm_callback(session_key, confirm_id, choice, now_seconds)? {
+            GatewaySlashConfirmCallbackOutcome::NoPending => {
+                Ok(GatewaySlashConfirmCallbackExecution::NoPending)
+            }
+            GatewaySlashConfirmCallbackOutcome::Resolved { resolution } => {
+                let (acknowledgement_label, decision_prefix) = match choice {
+                    GatewaySlashConfirmChoice::Once => ("✅ Approved once", "✅ Approved once"),
+                    GatewaySlashConfirmChoice::Always => {
+                        ("🔒 Always approve", "🔒 Always approved")
+                    }
+                    GatewaySlashConfirmChoice::Cancel => ("❌ Cancelled", "❌ Cancelled"),
+                };
+                Ok(GatewaySlashConfirmCallbackExecution::Resolved {
+                    resolution,
+                    presentation: GatewaySlashConfirmCallbackPresentation {
+                        acknowledgement_label: acknowledgement_label.to_string(),
+                        decision_text: format!("{decision_prefix} by {actor_display}"),
+                    },
+                })
+            }
+        }
+    }
+
+    pub fn complete_quick_command_host_request(
+        &self,
+        request: &GatewayQuickCommandRequestPlan,
+        outcome: &GatewayQuickCommandExecOutcome,
+    ) -> Result<GatewayQuickCommandHostExecution, String> {
+        request.validate()?;
+        let response = request.plan_response(outcome)?;
+        Ok(GatewayQuickCommandHostExecution {
+            request: request.clone(),
+            response,
+        })
+    }
+
     pub fn update_watcher(&self) -> &GatewayUpdateWatcherState {
         &self.update_watcher
     }
 
     pub fn update_watcher_mut(&mut self) -> &mut GatewayUpdateWatcherState {
         &mut self.update_watcher
+    }
+
+    pub fn execute_update_watch_host_step(
+        &mut self,
+        home_dir: &Path,
+        now_seconds: f64,
+        stream_interval_seconds: f64,
+        timed_out: bool,
+        live_delivery_available: bool,
+    ) -> Result<GatewayUpdateWatchExecution, String> {
+        let plan = self.update_watcher.plan_host_step(
+            home_dir,
+            now_seconds,
+            stream_interval_seconds,
+            timed_out,
+            live_delivery_available,
+        )?;
+
+        match plan {
+            GatewayUpdateWatchHostPlan::Noop => Ok(GatewayUpdateWatchExecution::Noop),
+            GatewayUpdateWatchHostPlan::Live { poll } => match poll {
+                GatewayUpdateWatcherPollPlan::Noop => Ok(GatewayUpdateWatchExecution::Noop),
+                GatewayUpdateWatcherPollPlan::Stream { outbound_messages } => {
+                    Ok(GatewayUpdateWatchExecution::Stream { outbound_messages })
+                }
+                GatewayUpdateWatcherPollPlan::Prompt { prompt_forward } => {
+                    Ok(GatewayUpdateWatchExecution::Prompt { prompt_forward })
+                }
+                GatewayUpdateWatcherPollPlan::Complete { completion } => {
+                    apply_required_filesystem_actions(&completion.host_actions)?;
+                    Ok(GatewayUpdateWatchExecution::Complete {
+                        outbound_messages: completion.outbound_messages,
+                    })
+                }
+                GatewayUpdateWatcherPollPlan::Timeout { timeout } => {
+                    apply_required_filesystem_actions(&timeout.host_actions)?;
+                    Ok(GatewayUpdateWatchExecution::Timeout {
+                        outbound_messages: timeout.outbound_messages,
+                    })
+                }
+            },
+            GatewayUpdateWatchHostPlan::FallbackNotification {
+                pre_actions,
+                notification,
+            } => {
+                let target = read_update_target(home_dir)?;
+                apply_required_filesystem_actions(&pre_actions)?;
+                match notification {
+                    GatewayUpdateNotificationPlan::NoPending => {
+                        Ok(GatewayUpdateWatchExecution::Noop)
+                    }
+                    GatewayUpdateNotificationPlan::Deferred { host_actions } => {
+                        apply_required_filesystem_actions(&host_actions)?;
+                        Ok(GatewayUpdateWatchExecution::FallbackDeferred)
+                    }
+                    GatewayUpdateNotificationPlan::Ready {
+                        outbound_message,
+                        host_actions,
+                    } => {
+                        apply_required_filesystem_actions(&host_actions)?;
+                        if let Some(target) = target.as_ref() {
+                            self.update_watcher
+                                .clear_prompt_pending(&target.session_key);
+                        }
+                        Ok(GatewayUpdateWatchExecution::FallbackReady { outbound_message })
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn execute_update_notification_host(
+        &mut self,
+        home_dir: &Path,
+    ) -> Result<GatewayUpdateNotificationExecution, String> {
+        let target = read_update_target(home_dir)?;
+        match plan_update_notification(home_dir) {
+            GatewayUpdateNotificationPlan::NoPending => {
+                Ok(GatewayUpdateNotificationExecution::NoPending)
+            }
+            GatewayUpdateNotificationPlan::Deferred { host_actions } => {
+                apply_required_filesystem_actions(&host_actions)?;
+                Ok(GatewayUpdateNotificationExecution::Deferred)
+            }
+            GatewayUpdateNotificationPlan::Ready {
+                outbound_message,
+                host_actions,
+            } => {
+                apply_required_filesystem_actions(&host_actions)?;
+                if let Some(target) = target.as_ref() {
+                    self.update_watcher
+                        .clear_prompt_pending(&target.session_key);
+                }
+                Ok(GatewayUpdateNotificationExecution::Ready { outbound_message })
+            }
+        }
     }
 
     pub fn telegram_followup_grace_seconds(&self) -> f64 {
@@ -2631,8 +3361,11 @@ impl GatewayRuntime {
             return Ok(GatewayHostHandleOutcome::DroppedUnauthorizedColdPath { session_key });
         }
 
-        self.handle_event_host(event, busy, handler)
-            .map(GatewayHostHandleOutcome::Executed)
+        let execution = self.handle_event_host(event, busy, handler)?;
+        if let Some(request) = GatewayQuickCommandRequestPlan::from_decision(&execution.decision)? {
+            return Ok(GatewayHostHandleOutcome::ExecQuickCommand { request });
+        }
+        Ok(GatewayHostHandleOutcome::Executed(execution))
     }
 
     pub fn handle_event_host_with_pairing<H: GatewayIngressEffectHandler>(
@@ -3402,6 +4135,16 @@ pub fn read_update_exit_code(home_dir: &Path) -> Result<Option<i32>, String> {
         .map_err(|error| format!("parsing {} failed: {error}", path.display()))
 }
 
+pub fn read_update_output(home_dir: &Path) -> Result<Option<String>, String> {
+    let path = gateway_update_output_path(home_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| format!("reading {} failed: {error}", path.display()))
+}
+
 pub fn read_update_target(home_dir: &Path) -> Result<Option<GatewayUpdateTarget>, String> {
     for marker in [
         read_update_claimed_marker(home_dir)?,
@@ -3425,6 +4168,90 @@ pub fn read_update_target(home_dir: &Path) -> Result<Option<GatewayUpdateTarget>
     Ok(None)
 }
 
+fn plan_update_notification_with_exit_override(
+    home_dir: &Path,
+    exit_code_override: Option<i32>,
+) -> GatewayUpdateNotificationPlan {
+    let pending_path = gateway_update_pending_path(home_dir);
+    let claimed_path = gateway_update_pending_claimed_path(home_dir);
+    let output_path = gateway_update_output_path(home_dir);
+    let exit_code_path = gateway_update_exit_code_path(home_dir);
+
+    let has_pending = pending_path.exists();
+    let has_claimed = claimed_path.exists();
+    if !has_pending && !has_claimed {
+        return GatewayUpdateNotificationPlan::NoPending;
+    }
+
+    let mut pre_actions = Vec::new();
+    if has_pending {
+        pre_actions.push(GatewayHostAction::MoveFile {
+            from: pending_path.clone(),
+            to: claimed_path.clone(),
+        });
+    }
+
+    let exit_code = exit_code_override.or_else(|| read_update_exit_code(home_dir).ok().flatten());
+    if exit_code.is_none() {
+        let mut host_actions = pre_actions;
+        host_actions.push(GatewayHostAction::MoveFile {
+            from: claimed_path,
+            to: pending_path,
+        });
+        return GatewayUpdateNotificationPlan::Deferred { host_actions };
+    }
+
+    let marker_result = if has_pending {
+        read_update_pending_marker(home_dir)
+    } else {
+        read_update_claimed_marker(home_dir)
+    };
+
+    let target = marker_result
+        .and_then(|marker| {
+            marker
+                .map(|marker| {
+                    marker.validate()?;
+                    let session_key = marker.session_key.clone().unwrap_or_else(|| {
+                        format!("{}:{}", marker.platform.as_str(), marker.chat_id)
+                    });
+                    Ok(GatewayUpdateTarget {
+                        platform: marker.platform,
+                        chat_id: marker.chat_id,
+                        session_key,
+                        thread_id: marker.thread_id,
+                    })
+                })
+                .transpose()
+        })
+        .ok()
+        .flatten();
+
+    let outbound_message = target.map(|target| GatewayUpdateStreamMessage {
+        target,
+        message: format_update_notification_message(
+            exit_code.unwrap_or(1),
+            read_update_output(home_dir).ok().flatten().as_deref(),
+        ),
+    });
+
+    let mut host_actions = pre_actions;
+    host_actions.push(GatewayHostAction::DeleteFile { path: claimed_path });
+    host_actions.push(GatewayHostAction::DeleteFile { path: output_path });
+    host_actions.push(GatewayHostAction::DeleteFile {
+        path: exit_code_path,
+    });
+
+    GatewayUpdateNotificationPlan::Ready {
+        outbound_message,
+        host_actions,
+    }
+}
+
+pub fn plan_update_notification(home_dir: &Path) -> GatewayUpdateNotificationPlan {
+    plan_update_notification_with_exit_override(home_dir, None)
+}
+
 pub fn plan_update_watcher_cleanup(home_dir: &Path) -> Vec<GatewayHostAction> {
     vec![
         GatewayHostAction::DeleteFile {
@@ -3446,6 +4273,89 @@ pub fn plan_update_watcher_cleanup(home_dir: &Path) -> Vec<GatewayHostAction> {
             path: gateway_update_response_path(home_dir),
         },
     ]
+}
+
+fn validate_non_negative_finite_seconds(value: f64, label: &str) -> Result<(), String> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{label} must be a non-negative finite number"));
+    }
+    Ok(())
+}
+
+fn strip_update_stream_ansi(text: &str) -> String {
+    let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("valid ansi regex");
+    ansi.replace_all(text, "").into_owned()
+}
+
+fn split_update_stream_chunks(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in trimmed.chars() {
+        if !current.is_empty() && current.len() + ch.len_utf8() > UPDATE_STREAM_MAX_CHUNK {
+            chunks.push(format!("```\n{current}\n```"));
+            current.clear();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(format!("```\n{current}\n```"));
+    }
+    chunks
+}
+
+fn format_update_prompt_fallback_message(prompt: &GatewayUpdatePromptMarker) -> String {
+    let default_hint = if prompt.default.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (default: {})", prompt.default.trim())
+    };
+    format!(
+        "⚕ **Update needs your input:**\n\n{}{}\n\nReply `/approve` (yes) or `/deny` (no), or type your answer directly.",
+        prompt.prompt, default_hint
+    )
+}
+
+fn format_update_completion_message(exit_code: i32) -> String {
+    if exit_code == 0 {
+        "✅ Hermes update finished.".to_string()
+    } else {
+        format!("❌ Hermes update failed (exit code {exit_code}).")
+    }
+}
+
+fn format_update_notification_message(exit_code: i32, output: Option<&str>) -> String {
+    let clean_output = output
+        .map(strip_update_stream_ansi)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            if text.chars().count() > UPDATE_STREAM_MAX_CHUNK {
+                let tail = text
+                    .chars()
+                    .rev()
+                    .take(UPDATE_STREAM_MAX_CHUNK)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>();
+                format!("…{tail}")
+            } else {
+                text
+            }
+        });
+
+    match clean_output {
+        Some(output) if exit_code == 0 => {
+            format!("✅ Hermes update finished.\n\n```\n{output}\n```")
+        }
+        Some(output) => format!("❌ Hermes update failed.\n\n```\n{output}\n```"),
+        None if exit_code == 0 => "✅ Hermes update finished successfully.".to_string(),
+        None => "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details.".to_string(),
+    }
 }
 
 pub fn restart_notification_pending(runtime_dir: &Path) -> bool {
@@ -3556,10 +4466,31 @@ pub fn apply_filesystem_host_actions(
                     }
                 }
             }
+            GatewayHostAction::MoveFile { from, to } => {
+                if !from.exists() {
+                    continue;
+                }
+                fs::rename(from, to).map_err(|error| {
+                    format!(
+                        "moving {} -> {} failed: {error}",
+                        from.display(),
+                        to.display()
+                    )
+                })?;
+            }
             other => deferred.push(other.clone()),
         }
     }
     Ok(deferred)
+}
+
+fn apply_required_filesystem_actions(actions: &[GatewayHostAction]) -> Result<(), String> {
+    let deferred = apply_filesystem_host_actions(actions)?;
+    if deferred.is_empty() {
+        Ok(())
+    } else {
+        Err("update watch execution received non-filesystem host actions".to_string())
+    }
 }
 
 pub fn execute_host_actions<H: GatewayHostActionHandler>(
@@ -3584,6 +4515,18 @@ pub fn execute_host_actions<H: GatewayHostActionHandler>(
                         return Err(format!("deleting {} failed: {error}", path.display()));
                     }
                 }
+            }
+            GatewayHostAction::MoveFile { from, to } => {
+                if !from.exists() {
+                    continue;
+                }
+                fs::rename(from, to).map_err(|error| {
+                    format!(
+                        "moving {} -> {} failed: {error}",
+                        from.display(),
+                        to.display()
+                    )
+                })?;
             }
             GatewayHostAction::SendNotification { notification } => {
                 let target = notification.dedupe_key();
@@ -7572,6 +8515,152 @@ mod tests {
     }
 
     #[test]
+    fn runtime_handle_event_host_authorized_returns_exec_quick_command_request() {
+        let temp = tempdir().unwrap();
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "limits".to_string(),
+            GatewayQuickCommand::Exec {
+                command: "echo ok".to_string(),
+            },
+        );
+        let mut runtime =
+            GatewayRuntime::new(temp.path(), config, BusyInputMode::Interrupt).unwrap();
+        let event = MessageEvent {
+            text: "/limits".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: Some("msg-9".to_string()),
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let result = runtime
+            .handle_event_host_authorized(event, true, None, &mut handler)
+            .unwrap();
+        let GatewayHostHandleOutcome::ExecQuickCommand { request } = result else {
+            panic!("expected explicit quick command host outcome");
+        };
+        assert_eq!(request.name, "limits");
+        assert_eq!(request.shell_command, "echo ok");
+        assert_eq!(request.chat_id, "12345");
+        assert_eq!(request.reply_to_message_id.as_deref(), Some("msg-9"));
+        assert_eq!(request.thread_id, None);
+    }
+
+    #[test]
+    fn quick_command_request_plan_builds_host_response_with_reply_target() {
+        let plan = GatewayQuickCommandRequestPlan {
+            platform: telegram(),
+            chat_id: "12345".to_string(),
+            thread_id: Some("thread-4".to_string()),
+            reply_to_message_id: Some("msg-3".to_string()),
+            name: "limits".to_string(),
+            shell_command: "echo ok".to_string(),
+        };
+
+        let response = plan
+            .plan_response(&GatewayQuickCommandExecOutcome::Success {
+                stdout: "ok\n".to_string(),
+                stderr: String::new(),
+            })
+            .unwrap();
+        assert_eq!(response.message, "ok");
+        assert_eq!(response.reply_to_message_id.as_deref(), Some("msg-3"));
+        assert_eq!(response.thread_id.as_deref(), Some("thread-4"));
+    }
+
+    #[test]
+    fn runtime_complete_quick_command_host_request_wraps_request_and_response() {
+        let temp = tempdir().unwrap();
+        let runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let request = GatewayQuickCommandRequestPlan {
+            platform: telegram(),
+            chat_id: "12345".to_string(),
+            thread_id: Some("thread-4".to_string()),
+            reply_to_message_id: Some("msg-3".to_string()),
+            name: "limits".to_string(),
+            shell_command: "echo ok".to_string(),
+        };
+
+        let execution = runtime
+            .complete_quick_command_host_request(
+                &request,
+                &GatewayQuickCommandExecOutcome::Success {
+                    stdout: "ok\n".to_string(),
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(execution.request, request);
+        assert_eq!(execution.response.message, "ok");
+        assert_eq!(
+            execution.response.reply_to_message_id.as_deref(),
+            Some("msg-3")
+        );
+        assert_eq!(execution.response.thread_id.as_deref(), Some("thread-4"));
+    }
+
+    #[test]
+    fn runtime_complete_quick_command_host_request_formats_timeout_response() {
+        let temp = tempdir().unwrap();
+        let mut config = RuntimeConfig::default();
+        config.quick_commands.insert(
+            "limits".to_string(),
+            GatewayQuickCommand::Exec {
+                command: "echo ok".to_string(),
+            },
+        );
+        let mut runtime =
+            GatewayRuntime::new(temp.path(), config, BusyInputMode::Interrupt).unwrap();
+        let event = MessageEvent {
+            text: "/limits".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: Some("msg-9".to_string()),
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let mut handler = RecordingIngressHandler::default();
+
+        let outcome = runtime
+            .handle_event_host_authorized(event, true, None, &mut handler)
+            .unwrap();
+        let GatewayHostHandleOutcome::ExecQuickCommand { request } = outcome else {
+            panic!("expected quick command request outcome");
+        };
+        let execution = runtime
+            .complete_quick_command_host_request(
+                &request,
+                &GatewayQuickCommandExecOutcome::Timeout {
+                    timeout_seconds: 30,
+                },
+            )
+            .unwrap();
+        assert!(execution.response.message.contains("timed out"));
+        assert_eq!(
+            execution.response.reply_to_message_id.as_deref(),
+            Some("msg-9")
+        );
+    }
+
+    #[test]
     fn runtime_handle_event_host_with_authorization_drops_missing_user_id() {
         let temp = tempdir().unwrap();
         let mut runtime = GatewayRuntime::new(
@@ -8002,17 +9091,621 @@ mod tests {
         .unwrap();
 
         let mut state = GatewayUpdateWatcherState::default();
-        let first = state.plan_prompt_forward(temp.path()).unwrap().unwrap();
+        state.note_poll_started(5.0).unwrap();
+        let first = state
+            .plan_prompt_forward(temp.path(), 5.0)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.target.session_key, "agent:main:telegram:dm:111");
         assert_eq!(first.prompt.prompt, "Restore local changes?");
+        assert!(first.pre_prompt_messages.is_empty());
+        assert!(first.fallback_message.contains("Reply `/approve`"));
 
         state
             .mark_prompt_forwarded(&first.target.session_key)
             .unwrap();
-        assert!(state.plan_prompt_forward(temp.path()).unwrap().is_none());
+        assert!(
+            state
+                .plan_prompt_forward(temp.path(), 6.0)
+                .unwrap()
+                .is_none()
+        );
 
         state.clear_prompt_pending(&first.target.session_key);
-        assert!(state.plan_prompt_forward(temp.path()).unwrap().is_some());
+        assert!(
+            state
+                .plan_prompt_forward(temp.path(), 7.0)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn update_watcher_state_periodic_flush_strips_ansi_and_chunks_output() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let long_line = format!(
+            "\u{001b}[32m{}\u{001b}[0m",
+            "x".repeat(UPDATE_STREAM_MAX_CHUNK + 100)
+        );
+        fs::write(gateway_update_output_path(temp.path()), long_line).unwrap();
+
+        let target = read_update_target(temp.path()).unwrap().unwrap();
+        let mut state = GatewayUpdateWatcherState::default();
+        state.note_poll_started(10.0).unwrap();
+        state.sync_output(temp.path()).unwrap();
+
+        assert!(
+            state
+                .plan_periodic_flush(&target, 10.5, 1.0)
+                .unwrap()
+                .is_empty()
+        );
+
+        let chunks = state.plan_periodic_flush(&target, 11.2, 1.0).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].message.starts_with("```\n"));
+        assert!(!chunks[0].message.contains('\u{001b}'));
+        assert!(chunks[0].message.contains(&"x".repeat(32)));
+        assert!(chunks[1].message.ends_with("\n```"));
+    }
+
+    #[test]
+    fn update_watcher_poll_returns_stream_after_interval() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "hello\nworld\n").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        assert_eq!(
+            state.plan_poll(temp.path(), 1.0, 1.0, false).unwrap(),
+            GatewayUpdateWatcherPollPlan::Noop
+        );
+
+        let plan = state.plan_poll(temp.path(), 2.5, 1.0, false).unwrap();
+        let GatewayUpdateWatcherPollPlan::Stream { outbound_messages } = plan else {
+            panic!("expected stream poll plan");
+        };
+        assert_eq!(outbound_messages.len(), 1);
+        assert!(outbound_messages[0].message.contains("hello"));
+        assert!(outbound_messages[0].message.contains("world"));
+    }
+
+    #[test]
+    fn update_watcher_poll_returns_prompt_and_marks_pending() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Restore local changes?".to_string(),
+            default: "y".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "context\n").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state.plan_poll(temp.path(), 5.0, 1.0, false).unwrap();
+        let GatewayUpdateWatcherPollPlan::Prompt { prompt_forward } = plan else {
+            panic!("expected prompt poll plan");
+        };
+        assert_eq!(prompt_forward.pre_prompt_messages.len(), 1);
+        assert!(state.has_pending_prompt("agent:main:telegram:dm:111"));
+        assert_eq!(
+            state.plan_poll(temp.path(), 6.0, 1.0, false).unwrap(),
+            GatewayUpdateWatcherPollPlan::Noop
+        );
+    }
+
+    #[test]
+    fn update_watcher_poll_completion_precedes_prompt_and_stream() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Restore local changes?".to_string(),
+            default: "y".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done\n").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state.plan_poll(temp.path(), 7.0, 1.0, false).unwrap();
+        let GatewayUpdateWatcherPollPlan::Complete { completion } = plan else {
+            panic!("expected completion poll plan");
+        };
+        assert_eq!(completion.exit_code, 0);
+        assert_eq!(completion.outbound_messages.len(), 2);
+        assert_eq!(
+            completion.outbound_messages[1].message,
+            "✅ Hermes update finished."
+        );
+    }
+
+    #[test]
+    fn update_watcher_poll_timeout_uses_timeout_branch_without_exit_code() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "still running\n").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state.plan_poll(temp.path(), 10.0, 1.0, true).unwrap();
+        let GatewayUpdateWatcherPollPlan::Timeout { timeout } = plan else {
+            panic!("expected timeout poll plan");
+        };
+        assert_eq!(timeout.exit_code, UPDATE_TIMEOUT_EXIT_CODE);
+        assert_eq!(timeout.outbound_messages.len(), 2);
+        assert_eq!(
+            timeout.outbound_messages[1].message,
+            "❌ Hermes update timed out after 30 minutes."
+        );
+    }
+
+    #[test]
+    fn update_watcher_host_step_uses_live_poll_when_delivery_is_available() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Restore local changes?".to_string(),
+            default: "y".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state
+            .plan_host_step(temp.path(), 4.0, 1.0, false, true)
+            .unwrap();
+        let GatewayUpdateWatchHostPlan::Live { poll } = plan else {
+            panic!("expected live host watch plan");
+        };
+        assert!(matches!(poll, GatewayUpdateWatcherPollPlan::Prompt { .. }));
+        assert!(state.has_pending_prompt("agent:main:telegram:dm:111"));
+    }
+
+    #[test]
+    fn update_watcher_host_step_uses_fallback_notification_when_live_delivery_is_unavailable() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state
+            .plan_host_step(temp.path(), 4.0, 1.0, false, false)
+            .unwrap();
+        let GatewayUpdateWatchHostPlan::FallbackNotification {
+            pre_actions,
+            notification,
+        } = plan
+        else {
+            panic!("expected fallback notification host plan");
+        };
+        assert!(pre_actions.is_empty());
+        assert!(matches!(
+            notification,
+            GatewayUpdateNotificationPlan::Deferred { .. }
+        ));
+    }
+
+    #[test]
+    fn update_watcher_host_step_timeout_without_live_delivery_routes_through_notification_plan() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "still running\n").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        let plan = state
+            .plan_host_step(temp.path(), 20.0, 1.0, true, false)
+            .unwrap();
+        let GatewayUpdateWatchHostPlan::FallbackNotification {
+            pre_actions,
+            notification,
+        } = plan
+        else {
+            panic!("expected fallback timeout notification plan");
+        };
+        assert!(matches!(
+            &pre_actions[0],
+            GatewayHostAction::WriteText { path, content }
+                if path == &gateway_update_exit_code_path(temp.path())
+                    && content == &UPDATE_TIMEOUT_EXIT_CODE.to_string()
+        ));
+        let GatewayUpdateNotificationPlan::Ready {
+            outbound_message, ..
+        } = notification
+        else {
+            panic!("expected ready fallback notification plan");
+        };
+        let outbound = outbound_message.expect("fallback outbound message");
+        assert!(outbound.message.contains("❌ Hermes update failed."));
+        assert!(outbound.message.contains("still running"));
+    }
+
+    #[test]
+    fn runtime_execute_update_watch_host_step_returns_live_prompt_and_marks_pending() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Restore local changes?".to_string(),
+            default: "y".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+
+        let result = runtime
+            .execute_update_watch_host_step(temp.path(), 4.0, 1.0, false, true)
+            .unwrap();
+        let GatewayUpdateWatchExecution::Prompt { prompt_forward } = result else {
+            panic!("expected live prompt execution");
+        };
+        assert_eq!(
+            prompt_forward.target.session_key,
+            "agent:main:telegram:dm:111"
+        );
+        assert!(
+            runtime
+                .update_watcher()
+                .has_pending_prompt("agent:main:telegram:dm:111")
+        );
+        assert!(gateway_update_prompt_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn runtime_execute_update_watch_host_step_applies_live_completion_cleanup() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done\n").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+        runtime
+            .update_watcher_mut()
+            .mark_prompt_forwarded("agent:main:telegram:dm:111")
+            .unwrap();
+
+        let result = runtime
+            .execute_update_watch_host_step(temp.path(), 5.0, 1.0, false, true)
+            .unwrap();
+        let GatewayUpdateWatchExecution::Complete { outbound_messages } = result else {
+            panic!("expected live completion execution");
+        };
+        assert_eq!(outbound_messages.len(), 2);
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+        assert!(
+            !runtime
+                .update_watcher()
+                .has_pending_prompt("agent:main:telegram:dm:111")
+        );
+    }
+
+    #[test]
+    fn runtime_execute_update_watch_host_step_applies_fallback_defer_moves() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let result = runtime
+            .execute_update_watch_host_step(temp.path(), 6.0, 1.0, false, false)
+            .unwrap();
+        assert_eq!(result, GatewayUpdateWatchExecution::FallbackDeferred);
+        assert!(gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn runtime_execute_update_watch_host_step_applies_fallback_ready_cleanup_and_clears_prompt_state()
+     {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: Some("agent:main:telegram:dm:67890".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done\n").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+        runtime
+            .update_watcher_mut()
+            .mark_prompt_forwarded("agent:main:telegram:dm:67890")
+            .unwrap();
+
+        let result = runtime
+            .execute_update_watch_host_step(temp.path(), 7.0, 1.0, false, false)
+            .unwrap();
+        let GatewayUpdateWatchExecution::FallbackReady { outbound_message } = result else {
+            panic!("expected fallback ready execution");
+        };
+        let outbound = outbound_message.unwrap();
+        assert!(outbound.message.contains("✅ Hermes update finished."));
+        assert!(outbound.message.contains("done"));
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+        assert!(
+            !runtime
+                .update_watcher()
+                .has_pending_prompt("agent:main:telegram:dm:67890")
+        );
+    }
+
+    #[test]
+    fn update_watcher_prompt_forward_flushes_buffer_before_prompt() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: Some("thread-7".to_string()),
+        };
+        let prompt = GatewayUpdatePromptMarker {
+            prompt: "Configure new options?".to_string(),
+            default: "n".to_string(),
+            id: Some("prompt-1".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_prompt_path(temp.path()),
+            serde_json::to_vec(&prompt).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_output_path(temp.path()),
+            "update output\nwith context\n",
+        )
+        .unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        state.note_poll_started(1.0).unwrap();
+        let plan = state
+            .plan_prompt_forward(temp.path(), 2.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.pre_prompt_messages.len(), 1);
+        assert_eq!(
+            plan.pre_prompt_messages[0].target.thread_id.as_deref(),
+            Some("thread-7")
+        );
+        assert!(
+            plan.pre_prompt_messages[0]
+                .message
+                .contains("update output")
+        );
+        assert!(plan.fallback_message.contains("(default: n)"));
+        assert!(plan.fallback_message.contains("Configure new options?"));
+    }
+
+    #[test]
+    fn update_watcher_completion_flushes_output_and_cleans_prompt_state() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done\n").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        state.note_poll_started(3.0).unwrap();
+        state
+            .mark_prompt_forwarded("agent:main:telegram:dm:111")
+            .unwrap();
+
+        let plan = state.plan_completion(temp.path(), 4.0).unwrap().unwrap();
+        assert_eq!(plan.exit_code, 0);
+        assert_eq!(plan.outbound_messages.len(), 2);
+        assert!(plan.outbound_messages[0].message.contains("done"));
+        assert_eq!(
+            plan.outbound_messages[1].message,
+            "✅ Hermes update finished."
+        );
+        assert_eq!(plan.host_actions.len(), 6);
+        assert!(!state.has_pending_prompt("agent:main:telegram:dm:111"));
+    }
+
+    #[test]
+    fn update_watcher_timeout_writes_124_flushes_output_and_cleans_prompt_state() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "still running\n").unwrap();
+
+        let mut state = GatewayUpdateWatcherState::default();
+        state.note_poll_started(8.0).unwrap();
+        state
+            .mark_prompt_forwarded("agent:main:telegram:dm:111")
+            .unwrap();
+
+        let plan = state.plan_timeout(temp.path(), 9.0).unwrap();
+        assert_eq!(plan.exit_code, UPDATE_TIMEOUT_EXIT_CODE);
+        assert_eq!(plan.outbound_messages.len(), 2);
+        assert!(plan.outbound_messages[0].message.contains("still running"));
+        assert_eq!(
+            plan.outbound_messages[1].message,
+            "❌ Hermes update timed out after 30 minutes."
+        );
+        assert!(matches!(
+            &plan.host_actions[0],
+            GatewayHostAction::WriteText { path, content }
+                if path == &gateway_update_exit_code_path(temp.path())
+                    && content == &UPDATE_TIMEOUT_EXIT_CODE.to_string()
+        ));
+        assert_eq!(plan.host_actions.len(), 7);
+        assert!(!state.has_pending_prompt("agent:main:telegram:dm:111"));
     }
 
     #[test]
@@ -8038,6 +9731,281 @@ mod tests {
         assert!(!gateway_update_exit_code_path(temp.path()).exists());
         assert!(!gateway_update_prompt_path(temp.path()).exists());
         assert!(!gateway_update_response_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn update_notification_no_pending_is_noop() {
+        let temp = tempdir().unwrap();
+        assert_eq!(
+            plan_update_notification(temp.path()),
+            GatewayUpdateNotificationPlan::NoPending
+        );
+    }
+
+    #[test]
+    fn update_notification_defers_by_claiming_then_restoring_pending_marker() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "still running").unwrap();
+
+        let plan = plan_update_notification(temp.path());
+        let GatewayUpdateNotificationPlan::Deferred { host_actions } = plan else {
+            panic!("expected deferred update notification plan");
+        };
+        assert_eq!(
+            host_actions,
+            vec![
+                GatewayHostAction::MoveFile {
+                    from: gateway_update_pending_path(temp.path()),
+                    to: gateway_update_pending_claimed_path(temp.path()),
+                },
+                GatewayHostAction::MoveFile {
+                    from: gateway_update_pending_claimed_path(temp.path()),
+                    to: gateway_update_pending_path(temp.path()),
+                }
+            ]
+        );
+        let deferred = apply_filesystem_host_actions(&host_actions).unwrap();
+        assert!(deferred.is_empty());
+        assert!(gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn update_notification_ready_formats_success_output_and_cleans_files() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: Some("777".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_output_path(temp.path()),
+            "\u{001b}[32m✓ Code updated!\u{001b}[0m\nDone",
+        )
+        .unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+
+        let plan = plan_update_notification(temp.path());
+        let GatewayUpdateNotificationPlan::Ready {
+            outbound_message,
+            host_actions,
+        } = plan
+        else {
+            panic!("expected ready update notification plan");
+        };
+        let outbound = outbound_message.expect("outbound update message");
+        assert_eq!(outbound.target.chat_id, "67890");
+        assert_eq!(outbound.target.thread_id.as_deref(), Some("777"));
+        assert_eq!(outbound.target.session_key, "telegram:67890");
+        assert!(outbound.message.contains("✅ Hermes update finished."));
+        assert!(outbound.message.contains("Code updated!"));
+        assert!(!outbound.message.contains('\u{001b}'));
+
+        let deferred = apply_filesystem_host_actions(&host_actions).unwrap();
+        assert!(deferred.is_empty());
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn update_notification_ready_recovers_from_claimed_marker_and_truncates_failure_output() {
+        let temp = tempdir().unwrap();
+        let claimed = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: Some("agent:main:telegram:dm:111".to_string()),
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_claimed_path(temp.path()),
+            serde_json::to_vec(&claimed).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            gateway_update_output_path(temp.path()),
+            format!("prefix{}", "x".repeat(5000)),
+        )
+        .unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "1").unwrap();
+
+        let plan = plan_update_notification(temp.path());
+        let GatewayUpdateNotificationPlan::Ready {
+            outbound_message, ..
+        } = plan
+        else {
+            panic!("expected ready update notification plan");
+        };
+        let outbound = outbound_message.expect("outbound update message");
+        assert!(outbound.message.contains("❌ Hermes update failed."));
+        assert!(outbound.message.contains('…'));
+        assert!(outbound.message.len() < 4500);
+    }
+
+    #[test]
+    fn update_notification_ready_uses_generic_success_message_without_output() {
+        let temp = tempdir().unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "111".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+
+        let plan = plan_update_notification(temp.path());
+        let GatewayUpdateNotificationPlan::Ready {
+            outbound_message, ..
+        } = plan
+        else {
+            panic!("expected ready update notification plan");
+        };
+        assert_eq!(
+            outbound_message.unwrap().message,
+            "✅ Hermes update finished successfully."
+        );
+    }
+
+    #[test]
+    fn update_notification_corrupt_pending_cleans_files_without_outbound_message() {
+        let temp = tempdir().unwrap();
+        fs::write(gateway_update_pending_path(temp.path()), "{corrupt json!!").unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+
+        let plan = plan_update_notification(temp.path());
+        let GatewayUpdateNotificationPlan::Ready {
+            outbound_message,
+            host_actions,
+        } = plan
+        else {
+            panic!("expected ready cleanup plan");
+        };
+        assert!(outbound_message.is_none());
+        let deferred = apply_filesystem_host_actions(&host_actions).unwrap();
+        assert!(deferred.is_empty());
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn runtime_execute_update_notification_host_no_pending_is_noop() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .execute_update_notification_host(temp.path())
+                .unwrap(),
+            GatewayUpdateNotificationExecution::NoPending
+        );
+    }
+
+    #[test]
+    fn runtime_execute_update_notification_host_applies_deferred_marker_restore() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: None,
+            thread_id: None,
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let result = runtime
+            .execute_update_notification_host(temp.path())
+            .unwrap();
+        assert_eq!(result, GatewayUpdateNotificationExecution::Deferred);
+        assert!(gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn runtime_execute_update_notification_host_applies_ready_cleanup_and_clears_prompt_state() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let pending = GatewayUpdatePendingMarker {
+            platform: telegram(),
+            chat_id: "67890".to_string(),
+            session_key: Some("agent:main:telegram:dm:67890".to_string()),
+            thread_id: Some("thread-7".to_string()),
+        };
+        fs::write(
+            gateway_update_pending_path(temp.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        fs::write(gateway_update_output_path(temp.path()), "done\n").unwrap();
+        fs::write(gateway_update_exit_code_path(temp.path()), "0").unwrap();
+        runtime
+            .update_watcher_mut()
+            .mark_prompt_forwarded("agent:main:telegram:dm:67890")
+            .unwrap();
+
+        let result = runtime
+            .execute_update_notification_host(temp.path())
+            .unwrap();
+        let GatewayUpdateNotificationExecution::Ready { outbound_message } = result else {
+            panic!("expected ready execution");
+        };
+        let outbound = outbound_message.unwrap();
+        assert_eq!(outbound.target.thread_id.as_deref(), Some("thread-7"));
+        assert!(outbound.message.contains("✅ Hermes update finished."));
+        assert!(outbound.message.contains("done"));
+        assert!(!gateway_update_pending_path(temp.path()).exists());
+        assert!(!gateway_update_pending_claimed_path(temp.path()).exists());
+        assert!(!gateway_update_output_path(temp.path()).exists());
+        assert!(!gateway_update_exit_code_path(temp.path()).exists());
+        assert!(
+            !runtime
+                .update_watcher()
+                .has_pending_prompt("agent:main:telegram:dm:67890")
+        );
     }
 
     #[test]
@@ -8548,6 +10516,341 @@ mod tests {
             }
         );
         assert!(state.get_pending("session-1").is_none());
+    }
+
+    #[test]
+    fn runtime_begin_slash_confirm_request_registers_pending_and_returns_threaded_plan() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let mut event = MessageEvent {
+            text: "/reload-mcp".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("group"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        event.source.thread_id = Some("thread-9".to_string());
+
+        let plan = runtime
+            .begin_slash_confirm_request(
+                &event,
+                "reload-mcp",
+                "Reload MCP?",
+                "Approve reloading MCP servers?",
+                100.0,
+            )
+            .unwrap();
+        assert_eq!(plan.platform, telegram());
+        assert_eq!(plan.chat_id, "12345");
+        assert_eq!(plan.thread_id.as_deref(), Some("thread-9"));
+        assert_eq!(plan.confirm_id, "1");
+        assert_eq!(
+            plan.session_key,
+            build_session_key(&event.source, true, false).unwrap()
+        );
+        assert_eq!(
+            runtime
+                .slash_confirms()
+                .get_pending(&plan.session_key)
+                .unwrap()
+                .command,
+            "reload-mcp"
+        );
+    }
+
+    #[test]
+    fn runtime_begin_slash_confirm_request_replaces_pending_and_increments_confirm_id() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/reload-mcp".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+
+        let first = runtime
+            .begin_slash_confirm_request(&event, "reload-mcp", "Reload?", "First prompt", 100.0)
+            .unwrap();
+        let second = runtime
+            .begin_slash_confirm_request(&event, "rollback", "Rollback?", "Second prompt", 101.0)
+            .unwrap();
+
+        assert_eq!(first.confirm_id, "1");
+        assert_eq!(second.confirm_id, "2");
+        let pending = runtime
+            .slash_confirms()
+            .get_pending(&second.session_key)
+            .unwrap();
+        assert_eq!(pending.confirm_id, "2");
+        assert_eq!(pending.command, "rollback");
+    }
+
+    #[test]
+    fn slash_confirm_request_plan_immediate_ack_depends_on_button_delivery() {
+        let plan = GatewaySlashConfirmRequestPlan {
+            platform: telegram(),
+            chat_id: "12345".to_string(),
+            thread_id: None,
+            session_key: "agent:main:telegram:dm:12345".to_string(),
+            confirm_id: "7".to_string(),
+            command: "reload-mcp".to_string(),
+            title: "Reload MCP?".to_string(),
+            message: "Approve reloading MCP servers?".to_string(),
+            fallback_ack: "Approve reloading MCP servers?".to_string(),
+        };
+        assert_eq!(plan.immediate_ack(true), None);
+        assert_eq!(
+            plan.immediate_ack(false).as_deref(),
+            Some("Approve reloading MCP servers?")
+        );
+    }
+
+    #[test]
+    fn runtime_handle_slash_confirm_host_event_resolves_pending_choice() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "/always".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let session_key = build_session_key(&event.source, true, false).unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register(&session_key, "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        let outcome = runtime
+            .handle_slash_confirm_host_event(&event, false, 120.0)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewaySlashConfirmHostEventOutcome::Resolved {
+                resolution: GatewaySlashConfirmResolution {
+                    session_key,
+                    confirm_id: "confirm-1".to_string(),
+                    command: "reload-mcp".to_string(),
+                    choice: GatewaySlashConfirmChoice::Always,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_handle_slash_confirm_host_event_returns_session_key_for_no_intercept() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        let event = MessageEvent {
+            text: "hello".to_string(),
+            message_type: MessageType::Text,
+            source: session_source("dm"),
+            message_id: None,
+            platform_update_id: None,
+            media_urls: Vec::new(),
+            media_types: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        let session_key = build_session_key(&event.source, true, false).unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register(&session_key, "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        let outcome = runtime
+            .handle_slash_confirm_host_event(&event, false, 500.1)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewaySlashConfirmHostEventOutcome::NoIntercept {
+                session_key,
+                cleared_stale: true,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_resolve_slash_confirm_callback_returns_resolution() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        let outcome = runtime
+            .resolve_slash_confirm_callback(
+                "session-1",
+                "confirm-1",
+                GatewaySlashConfirmChoice::Once,
+                120.0,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewaySlashConfirmCallbackOutcome::Resolved {
+                resolution: GatewaySlashConfirmResolution {
+                    session_key: "session-1".to_string(),
+                    confirm_id: "confirm-1".to_string(),
+                    command: "reload-mcp".to_string(),
+                    choice: GatewaySlashConfirmChoice::Once,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_resolve_slash_confirm_callback_returns_no_pending_for_mismatch_or_expiry() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .resolve_slash_confirm_callback(
+                    "session-1",
+                    "wrong-id",
+                    GatewaySlashConfirmChoice::Once,
+                    120.0,
+                )
+                .unwrap(),
+            GatewaySlashConfirmCallbackOutcome::NoPending
+        );
+        assert!(runtime.slash_confirms().get_pending("session-1").is_some());
+
+        assert_eq!(
+            runtime
+                .resolve_slash_confirm_callback(
+                    "session-1",
+                    "confirm-1",
+                    GatewaySlashConfirmChoice::Once,
+                    500.1,
+                )
+                .unwrap(),
+            GatewaySlashConfirmCallbackOutcome::NoPending
+        );
+        assert!(runtime.slash_confirms().get_pending("session-1").is_none());
+    }
+
+    #[test]
+    fn runtime_complete_slash_confirm_callback_returns_presentation_and_resolution() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+        runtime
+            .slash_confirms_mut()
+            .register("session-1", "confirm-1", "reload-mcp", 100.0)
+            .unwrap();
+
+        let outcome = runtime
+            .complete_slash_confirm_callback(
+                "session-1",
+                "confirm-1",
+                GatewaySlashConfirmChoice::Always,
+                "Kai",
+                120.0,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GatewaySlashConfirmCallbackExecution::Resolved {
+                resolution: GatewaySlashConfirmResolution {
+                    session_key: "session-1".to_string(),
+                    confirm_id: "confirm-1".to_string(),
+                    command: "reload-mcp".to_string(),
+                    choice: GatewaySlashConfirmChoice::Always,
+                },
+                presentation: GatewaySlashConfirmCallbackPresentation {
+                    acknowledgement_label: "🔒 Always approve".to_string(),
+                    decision_text: "🔒 Always approved by Kai".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_complete_slash_confirm_callback_returns_no_pending_when_missing() {
+        let temp = tempdir().unwrap();
+        let mut runtime = GatewayRuntime::new(
+            temp.path(),
+            RuntimeConfig::default(),
+            BusyInputMode::Interrupt,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .complete_slash_confirm_callback(
+                    "session-1",
+                    "confirm-1",
+                    GatewaySlashConfirmChoice::Once,
+                    "Kai",
+                    120.0,
+                )
+                .unwrap(),
+            GatewaySlashConfirmCallbackExecution::NoPending
+        );
     }
 
     #[test]
