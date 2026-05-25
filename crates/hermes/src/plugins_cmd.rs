@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -741,10 +741,10 @@ fn missing_manifest_env_names(context: &HermesContext, manifest: &Mapping) -> Ve
         .filter(|spec| {
             std::env::var(&spec.name)
                 .ok()
-                .is_none_or(|value| value.trim().is_empty())
+                .map_or(true, |value| value.trim().is_empty())
                 && file_env
                     .get(&spec.name)
-                    .is_none_or(|value| value.trim().is_empty())
+                    .map_or(true, |value| value.trim().is_empty())
         })
         .map(|spec| spec.name)
         .collect()
