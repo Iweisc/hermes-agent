@@ -705,6 +705,23 @@ fn handle_native_request(
         "rollback.restore" => {
             handle_session_bound_child_request(id, "rollback.restore", &params, state, child_stdin)?
         }
+        "reload.mcp" => forward_child_request(id, "reload.mcp", &params, state, child_stdin, true)?,
+        "browser.manage" => handle_browser_manage(id, &params, state, child_stdin)?,
+        "tools.configure" => {
+            forward_child_request(id, "tools.configure", &params, state, child_stdin, true)?
+        }
+        "skills.reload" => {
+            forward_child_request(id, "skills.reload", &params, state, child_stdin, false)?
+        }
+        "skills.manage" => forward_child_request_timeout(
+            id,
+            "skills.manage",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(45),
+        )?,
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
         "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
@@ -1502,6 +1519,40 @@ fn handle_session_bound_child_request(
     Ok(Some(rebind_response_id(response, id)))
 }
 
+fn handle_browser_manage(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let mut forwarded_params = params.clone();
+    let local_session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(local_id) = local_session_id.as_deref()
+        && session_exists(state, local_id)?
+    {
+        ensure_child_session(child_stdin, state, local_id)?;
+        if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+            forwarded_params.insert("session_id".to_string(), json!(child_id));
+        } else {
+            forwarded_params.remove("session_id");
+        }
+    }
+    let response = send_blocking_child_request_timeout(
+        child_stdin,
+        state,
+        "browser.manage",
+        Value::Object(forwarded_params),
+        local_session_id,
+        Duration::from_secs(20),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_helper_dispatch(
     id: Value,
     method: &str,
@@ -1525,6 +1576,26 @@ fn forward_child_request(
     child_stdin: &Arc<Mutex<ChildStdin>>,
     map_session_id: bool,
 ) -> Result<Option<Value>, Box<dyn Error>> {
+    forward_child_request_timeout(
+        id,
+        method,
+        params,
+        state,
+        child_stdin,
+        map_session_id,
+        Duration::from_secs(5),
+    )
+}
+
+fn forward_child_request_timeout(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+    map_session_id: bool,
+    timeout: Duration,
+) -> Result<Option<Value>, Box<dyn Error>> {
     let mut forwarded_params = params.clone();
     if map_session_id
         && let Some(local_id) = params
@@ -1542,7 +1613,7 @@ fn forward_child_request(
             }
         }
     }
-    let response = send_blocking_child_request(
+    let response = send_blocking_child_request_timeout(
         child_stdin,
         state,
         method,
@@ -1557,6 +1628,7 @@ fn forward_child_request(
         } else {
             None
         },
+        timeout,
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -3184,6 +3256,24 @@ fn send_blocking_child_request(
     params: Value,
     local_session_id: Option<String>,
 ) -> Result<Value, Box<dyn Error>> {
+    send_blocking_child_request_timeout(
+        stdin,
+        state,
+        method,
+        params,
+        local_session_id,
+        Duration::from_secs(5),
+    )
+}
+
+fn send_blocking_child_request_timeout(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    state: &Arc<Mutex<ProxyState>>,
+    method: &str,
+    params: Value,
+    local_session_id: Option<String>,
+    timeout: Duration,
+) -> Result<Value, Box<dyn Error>> {
     let (response_tx, response_rx) = mpsc::channel();
     let request_id = {
         let mut guard = state
@@ -3218,7 +3308,7 @@ fn send_blocking_child_request(
         stdin.flush()?;
     }
 
-    match response_rx.recv_timeout(Duration::from_secs(5)) {
+    match response_rx.recv_timeout(timeout) {
         Ok(response) => Ok(response),
         Err(_) => {
             let mut guard = state
@@ -5207,6 +5297,77 @@ mod tests {
         assert_eq!(response["result"]["success"], json!(true));
         assert_eq!(response["result"]["history_removed"], json!(2));
         assert_eq!(response["result"]["restored_to"], json!("abc123"));
+    }
+
+    #[test]
+    fn browser_manage_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-browser".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-browser", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "browser.manage");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"connected\":true,\"url\":\"http://127.0.0.1:9222\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_browser_manage(
+            json!("r-browser-manage"),
+            json!({"action": "status", "session_id": local_id})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("browser.manage response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-browser-manage"));
+        assert_eq!(response["result"]["connected"], json!(true));
+        assert_eq!(response["result"]["url"], json!("http://127.0.0.1:9222"));
+    }
+
+    #[test]
+    fn skills_manage_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "skills.manage");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"skills\":{{\"Built-in\":[\"demo\"]}}}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-skills-manage"),
+            "skills.manage",
+            json!({"action": "list"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(45),
+        )
+        .unwrap()
+        .expect("skills.manage response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-skills-manage"));
+        assert_eq!(response["result"]["skills"]["Built-in"][0], json!("demo"));
     }
 
     #[test]
