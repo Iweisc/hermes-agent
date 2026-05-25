@@ -35,6 +35,7 @@ mod update_cmd;
 mod webhook;
 mod whatsapp_cmd;
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -48,13 +49,23 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
+use chrono::TimeZone;
 use clap::{Args, Parser, Subcommand};
 use hermes_core::{
-    DelegateExecutor, EnvLoadReport, HermesContext, KanbanDispatchOptions, LoadedConfig,
-    LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime, dispatch_kanban_once,
-    get_tool_definitions, handle_cronjob, is_container, is_wsl, kanban_has_spawnable_ready,
-    run_cron_job_now, run_due_cron_jobs, run_kanban_task,
+    DelegateExecutor, EnvLoadReport, HermesContext, KanbanCreateTaskInput, KanbanDispatchOptions,
+    KanbanTaskQuery, LoadedConfig, LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime,
+    VALID_KANBAN_STATUSES, VALID_WORKSPACE_KINDS, add_comment, add_notify_sub, archive_task,
+    assign_task, block_task, board_stats, build_worker_context, claim_task, complete_task,
+    create_kanban_board, create_task, current_kanban_board, dispatch_kanban_once,
+    edit_completed_task_result, gc_events, gc_worker_logs, get_task, get_tool_definitions,
+    handle_cronjob, heartbeat_worker, is_container, is_wsl, kanban_db_path_for_home,
+    kanban_has_spawnable_ready, kanban_task_detail, known_assignees, link_tasks, list_events,
+    list_kanban_boards, list_notify_subs, list_runs, list_tasks, open_kanban_db, read_worker_log,
+    reassign_task, reclaim_task, release_stale_claims, remove_kanban_board, remove_notify_sub,
+    rename_kanban_board, run_cron_job_now, run_due_cron_jobs, run_kanban_task,
+    set_current_kanban_board, unblock_task, unlink_tasks,
 };
+use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
 
 #[cfg(test)]
@@ -188,6 +199,8 @@ enum Command {
     },
     Logs(logs::LogsArgs),
     Kanban {
+        #[arg(long)]
+        board: Option<String>,
         #[command(subcommand)]
         command: KanbanCommand,
     },
@@ -322,18 +335,220 @@ struct CronEditArgs {
 
 #[derive(Subcommand, Debug)]
 enum KanbanCommand {
-    Tick {
+    Init,
+    Boards {
+        #[command(subcommand)]
+        command: Option<KanbanBoardsCommand>,
+    },
+    Create {
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long = "parent")]
+        parents: Vec<String>,
+        #[arg(long, default_value = "scratch")]
+        workspace: String,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        #[arg(long)]
+        triage: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+        #[arg(long = "max-runtime")]
+        max_runtime: Option<String>,
+        #[arg(long = "created-by")]
+        created_by: Option<String>,
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(alias = "ls")]
+    List {
+        #[arg(long, conflicts_with = "assignee")]
+        mine: bool,
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        archived: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Assign {
+        id: String,
+        profile: String,
+    },
+    Reclaim {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Reassign {
+        id: String,
+        profile: String,
+        #[arg(long)]
+        reclaim: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Link {
+        parent_id: String,
+        child_id: String,
+    },
+    Unlink {
+        parent_id: String,
+        child_id: String,
+    },
+    Claim {
+        id: String,
+        #[arg(long)]
+        ttl: Option<i64>,
+    },
+    Comment {
+        id: String,
+        text: Vec<String>,
+        #[arg(long)]
+        author: Option<String>,
+    },
+    Complete {
+        ids: Vec<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long)]
+        metadata: Option<String>,
+    },
+    Edit {
+        id: String,
+        #[arg(long)]
+        result: String,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        metadata: Option<String>,
+    },
+    Archive {
+        ids: Vec<String>,
+    },
+    Block {
+        task_id: String,
+        reason: Vec<String>,
+        #[arg(long = "ids", num_args = 1..)]
+        ids: Vec<String>,
+    },
+    Unblock {
+        ids: Vec<String>,
+    },
+    Heartbeat {
+        id: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    Context {
+        id: String,
+    },
+    Runs {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Stats {
+        #[arg(long)]
+        json: bool,
+    },
+    NotifySubscribe {
+        id: String,
+        #[arg(long)]
+        platform: String,
+        #[arg(long = "chat-id")]
+        chat_id: String,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+        #[arg(long = "user-id")]
+        user_id: Option<String>,
+    },
+    NotifyList {
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    NotifyUnsubscribe {
+        id: String,
+        #[arg(long)]
+        platform: String,
+        #[arg(long = "chat-id")]
+        chat_id: String,
+        #[arg(long = "thread-id")]
+        thread_id: Option<String>,
+    },
+    Log {
+        id: String,
+        #[arg(long = "tail", alias = "tail-bytes")]
+        tail_bytes: Option<usize>,
+    },
+    Gc {
+        #[arg(long = "event-retention-days", default_value_t = 30)]
+        event_retention_days: i64,
+        #[arg(long = "log-retention-days", default_value_t = 30)]
+        log_retention_days: i64,
+    },
+    Assignees {
+        #[arg(long)]
+        json: bool,
+    },
+    Tail {
+        id: String,
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+    },
+    Watch {
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        kinds: Option<String>,
+        #[arg(long, default_value_t = 0.5)]
+        interval: f64,
+    },
+    #[command(alias = "diag")]
+    Diagnostics {
+        #[arg(long)]
+        severity: Option<String>,
+        #[arg(long = "task")]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(alias = "tick")]
+    Dispatch {
         #[arg(long)]
         dry_run: bool,
-        #[arg(long)]
+        #[arg(long = "max")]
         max_spawn: Option<usize>,
         #[arg(long)]
         failure_limit: Option<i64>,
+        #[arg(long)]
+        json: bool,
     },
     Daemon {
         #[arg(long, default_value_t = 60.0)]
         interval: f64,
-        #[arg(long)]
+        #[arg(long = "max")]
         max_spawn: Option<usize>,
         #[arg(long)]
         failure_limit: Option<i64>,
@@ -341,11 +556,54 @@ enum KanbanCommand {
         pidfile: Option<PathBuf>,
         #[arg(long, short = 'v')]
         verbose: bool,
+        #[arg(long)]
+        force: bool,
     },
     Run {
         id: String,
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KanbanBoardsCommand {
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long = "all")]
+        all: bool,
+    },
+    #[command(alias = "new")]
+    Create {
+        slug: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        icon: Option<String>,
+        #[arg(long)]
+        color: Option<String>,
+        #[arg(long)]
+        switch: bool,
+    },
+    #[command(alias = "use")]
+    Switch {
+        slug: String,
+    },
+    #[command(alias = "current")]
+    Show,
+    Rename {
+        slug: String,
+        name: String,
+    },
+    #[command(name = "rm", alias = "remove", alias = "delete")]
+    Remove {
+        slug: String,
+        #[arg(long = "delete")]
+        delete: bool,
     },
 }
 
@@ -438,7 +696,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Sessions { command } => print_sessions(&context, &session_store, command)?,
         Command::Cron { command } => print_cron(&context, &config, &session_store, command)?,
         Command::Logs(args) => logs::print_logs(&context, args)?,
-        Command::Kanban { command } => print_kanban(&context, &config, command)?,
+        Command::Kanban { board, command } => print_kanban(&context, &config, board, command)?,
         Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
@@ -1138,6 +1396,7 @@ fn truncate_plain(value: &str, max_chars: usize) -> String {
 fn print_kanban(
     context: &HermesContext,
     config: &LoadedConfig,
+    board: Option<String>,
     command: KanbanCommand,
 ) -> Result<(), Box<dyn Error>> {
     struct PidFileGuard {
@@ -1162,11 +1421,746 @@ fn print_kanban(
         }
     }
 
+    struct BoardEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl BoardEnvGuard {
+        fn set(board: Option<&str>) -> Result<Option<Self>, Box<dyn Error>> {
+            let Some(board) = board else {
+                return Ok(None);
+            };
+            let trimmed = board.trim();
+            if trimmed.is_empty() {
+                return Err("board must not be empty".into());
+            }
+            let prior = std::env::var_os("HERMES_KANBAN_BOARD");
+            unsafe { std::env::set_var("HERMES_KANBAN_BOARD", trimmed) };
+            Ok(Some(Self { prior }))
+        }
+    }
+
+    impl Drop for BoardEnvGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => unsafe { std::env::set_var("HERMES_KANBAN_BOARD", value) },
+                None => unsafe { std::env::remove_var("HERMES_KANBAN_BOARD") },
+            }
+        }
+    }
+
+    let _board_env_guard = BoardEnvGuard::set(board.as_deref())?;
+
     match command {
-        KanbanCommand::Tick {
+        KanbanCommand::Init => {
+            let _conn = open_kanban_db(&context.hermes_home())?;
+            let path = kanban_db_path_for_home(&context.hermes_home())?;
+            println!("Kanban DB initialized at {}", path.display());
+            println!();
+            let profiles = discover_kanban_profiles(context);
+            if profiles.is_empty() {
+                println!("No profiles found under ~/.hermes/profiles/.");
+                println!("Create one with `hermes -p <name> setup` before assigning tasks.");
+            } else {
+                println!(
+                    "Discovered {} profile(s) on disk; any of these can be an --assignee:",
+                    profiles.len()
+                );
+                for profile in profiles {
+                    println!("  {profile}");
+                }
+            }
+            println!();
+            println!("Next step: start the gateway so ready tasks actually get picked up.");
+            println!("  hermes gateway start");
+            println!();
+            println!(
+                "The gateway hosts an embedded dispatcher that ticks every 60 seconds\nby default (config: kanban.dispatch_interval_seconds). Without a\nrunning gateway, tasks stay in 'ready' forever."
+            );
+        }
+        KanbanCommand::Boards { command } => {
+            let board_command = command.unwrap_or(KanbanBoardsCommand::List {
+                json: false,
+                all: false,
+            });
+            match board_command {
+                KanbanBoardsCommand::List { json, all } => {
+                    let boards = list_kanban_boards(&context.hermes_home(), all)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&boards)?);
+                    } else if boards.is_empty() {
+                        println!("No boards");
+                    } else {
+                        for board in boards {
+                            let current = if board.current { "*" } else { " " };
+                            println!(
+                                "{current} {}  ready={} blocked={} total={}  {}",
+                                board.slug,
+                                board.ready_count,
+                                board.blocked_count,
+                                board.task_count,
+                                board.name
+                            );
+                        }
+                    }
+                }
+                KanbanBoardsCommand::Create {
+                    slug,
+                    name,
+                    description,
+                    icon,
+                    color,
+                    switch,
+                } => {
+                    let board = create_kanban_board(
+                        &context.hermes_home(),
+                        &slug,
+                        name.as_deref(),
+                        description.as_deref(),
+                        icon.as_deref(),
+                        color.as_deref(),
+                    )?;
+                    if switch {
+                        set_current_kanban_board(&context.hermes_home(), &board.slug)?;
+                    }
+                    println!("Created board: {}", board.slug);
+                    if switch {
+                        println!("current={}", board.slug);
+                    }
+                }
+                KanbanBoardsCommand::Switch { slug } => {
+                    if !hermes_core::kanban_board_exists(&context.hermes_home(), &slug)? {
+                        return Err(format!("board {slug:?} does not exist").into());
+                    }
+                    set_current_kanban_board(&context.hermes_home(), &slug)?;
+                    println!("{slug}");
+                }
+                KanbanBoardsCommand::Show => {
+                    println!("{}", current_kanban_board(&context.hermes_home())?);
+                }
+                KanbanBoardsCommand::Rename { slug, name } => {
+                    let board = rename_kanban_board(&context.hermes_home(), &slug, &name)?;
+                    println!("Renamed board {} -> {}", board.slug, board.name);
+                }
+                KanbanBoardsCommand::Remove { slug, delete } => {
+                    let result = remove_kanban_board(&context.hermes_home(), &slug, !delete)?;
+                    println!("{} {}", result.action, result.slug);
+                    if let Some(path) = result.new_path {
+                        println!("path={path}");
+                    }
+                }
+            }
+        }
+        KanbanCommand::Create {
+            title,
+            body,
+            assignee,
+            parents,
+            workspace,
+            tenant,
+            priority,
+            triage,
+            idempotency_key,
+            max_runtime,
+            created_by,
+            skills,
+            json,
+        } => {
+            let (workspace_kind, workspace_path) = parse_kanban_workspace(&workspace)?;
+            let max_runtime_seconds = max_runtime
+                .as_deref()
+                .map(parse_kanban_runtime_seconds)
+                .transpose()?;
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            let task_id = create_task(
+                &mut conn,
+                KanbanCreateTaskInput {
+                    title,
+                    body,
+                    assignee,
+                    parents,
+                    tenant,
+                    priority,
+                    workspace_kind,
+                    workspace_path,
+                    triage,
+                    idempotency_key,
+                    max_runtime_seconds,
+                    skills: (!skills.is_empty()).then_some(skills),
+                    created_by: created_by.unwrap_or_else(|| String::from("user")),
+                },
+            )?;
+            let task = get_task(&conn, &task_id)?
+                .ok_or_else(|| format!("created task {task_id} disappeared"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else {
+                println!(
+                    "Created {}  ({}, assignee={})",
+                    task.id,
+                    task.status,
+                    task.assignee.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        KanbanCommand::List {
+            mine,
+            assignee,
+            status,
+            tenant,
+            archived,
+            json,
+        } => {
+            if let Some(status) = status.as_deref()
+                && !VALID_KANBAN_STATUSES.contains(&status)
+            {
+                return Err(
+                    format!("status must be one of {}", VALID_KANBAN_STATUSES.join(", ")).into(),
+                );
+            }
+            let assignee = if mine {
+                Some(kanban_cli_profile_name(context))
+            } else {
+                assignee
+            };
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            let _ = release_stale_claims(&mut conn);
+            let _ = hermes_core::recompute_ready(&mut conn);
+            let tasks = list_tasks(
+                &conn,
+                &KanbanTaskQuery {
+                    assignee,
+                    status,
+                    tenant,
+                    include_archived: archived,
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
+                println!("No tasks");
+            } else {
+                for task in tasks {
+                    println!(
+                        "{}  {:8}  {:16}  {}",
+                        task.id,
+                        task.status,
+                        task.assignee.as_deref().unwrap_or("(unassigned)"),
+                        task.title
+                    );
+                }
+            }
+        }
+        KanbanCommand::Show { id, json } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let detail =
+                kanban_task_detail(&conn, &id)?.ok_or_else(|| format!("task {id} not found"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&detail)?);
+            } else {
+                println!("{}  {}", detail.task.id, detail.task.title);
+                println!("status={}", detail.task.status);
+                println!(
+                    "assignee={}",
+                    detail.task.assignee.as_deref().unwrap_or("(unassigned)")
+                );
+                if let Some(summary) = detail.latest_summary.as_deref() {
+                    println!("latest_summary={summary}");
+                }
+                if !detail.comments.is_empty() {
+                    println!("comments={}", detail.comments.len());
+                }
+                if !detail.runs.is_empty() {
+                    println!("runs={}", detail.runs.len());
+                }
+            }
+        }
+        KanbanCommand::Assign { id, profile } => {
+            let profile = (!profile.eq_ignore_ascii_case("none")).then_some(profile.as_str());
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !assign_task(&mut conn, &id, profile)? {
+                return Err(format!("task {id} not found").into());
+            }
+            println!("Assigned {id}");
+        }
+        KanbanCommand::Reclaim { id, reason } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !reclaim_task(&mut conn, &id, reason.as_deref())? {
+                return Err(format!("cannot reclaim {id}").into());
+            }
+            println!("Reclaimed {id}");
+        }
+        KanbanCommand::Reassign {
+            id,
+            profile,
+            reclaim,
+            reason,
+        } => {
+            let profile = (!profile.eq_ignore_ascii_case("none")).then_some(profile.as_str());
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !reassign_task(&mut conn, &id, profile, reclaim, reason.as_deref())? {
+                return Err(format!("cannot reassign {id}").into());
+            }
+            println!("Reassigned {id}");
+        }
+        KanbanCommand::Link {
+            parent_id,
+            child_id,
+        } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            link_tasks(&mut conn, &parent_id, &child_id)?;
+            println!("Linked {parent_id} -> {child_id}");
+        }
+        KanbanCommand::Unlink {
+            parent_id,
+            child_id,
+        } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !unlink_tasks(&mut conn, &parent_id, &child_id)? {
+                return Err(format!("no such link: {parent_id} -> {child_id}").into());
+            }
+            println!("Unlinked {parent_id} -> {child_id}");
+        }
+        KanbanCommand::Claim { id, ttl } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            let task = claim_task(&mut conn, &id, ttl.unwrap_or(15 * 60), None)?
+                .ok_or_else(|| format!("cannot claim {id}"))?;
+            println!(
+                "{}  status={}  workspace={}",
+                task.id,
+                task.status,
+                task.workspace_path.as_deref().unwrap_or("")
+            );
+        }
+        KanbanCommand::Comment { id, text, author } => {
+            if text.is_empty() {
+                return Err("comment text is required".into());
+            }
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            let author = author.unwrap_or_else(|| kanban_cli_profile_name(context));
+            add_comment(&mut conn, &id, &author, &text.join(" "))?;
+            println!("Commented on {id}");
+        }
+        KanbanCommand::Complete {
+            ids,
+            summary,
+            result,
+            metadata,
+        } => {
+            if ids.is_empty() {
+                return Err("at least one task id is required".into());
+            }
+            if ids.len() > 1 && (summary.is_some() || metadata.is_some()) {
+                return Err("--summary / --metadata can't be used with multiple ids".into());
+            }
+            let metadata = metadata.as_deref().map(parse_kanban_metadata).transpose()?;
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            for id in ids {
+                if !complete_task(
+                    &mut conn,
+                    &id,
+                    result.as_deref(),
+                    summary.as_deref(),
+                    metadata.as_ref(),
+                    &[],
+                    None,
+                )? {
+                    return Err(format!("cannot complete {id}").into());
+                }
+                println!("Completed {id}");
+            }
+        }
+        KanbanCommand::Edit {
+            id,
+            result,
+            summary,
+            metadata,
+        } => {
+            let metadata = metadata.as_deref().map(parse_kanban_metadata).transpose()?;
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !edit_completed_task_result(
+                &mut conn,
+                &id,
+                &result,
+                summary.as_deref(),
+                metadata.as_ref(),
+            )? {
+                return Err(format!("cannot edit {id} (unknown id or task is not done)").into());
+            }
+            println!("Edited {id}");
+        }
+        KanbanCommand::Archive { ids } => {
+            if ids.is_empty() {
+                return Err("at least one task id is required".into());
+            }
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            for id in ids {
+                if !archive_task(&mut conn, &id)? {
+                    return Err(format!("cannot archive {id}").into());
+                }
+                println!("Archived {id}");
+            }
+        }
+        KanbanCommand::Block {
+            task_id,
+            reason,
+            ids,
+        } => {
+            let mut all_ids = Vec::with_capacity(ids.len() + 1);
+            all_ids.push(task_id);
+            all_ids.extend(ids);
+            let author = kanban_cli_profile_name(context);
+            let reason = reason.join(" ");
+            let reason = reason.trim().to_string();
+            if all_ids.is_empty() {
+                return Err("at least one task id is required".into());
+            }
+            let reason_value = (!reason.is_empty()).then_some(reason.as_str());
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            for id in all_ids {
+                if let Some(reason) = reason_value {
+                    add_comment(&mut conn, &id, &author, &format!("BLOCKED: {reason}"))?;
+                }
+                if !block_task(&mut conn, &id, reason_value.unwrap_or("blocked"), None)? {
+                    return Err(format!("cannot block {id}").into());
+                }
+                if let Some(reason) = reason_value {
+                    println!("Blocked {id}: {reason}");
+                } else {
+                    println!("Blocked {id}");
+                }
+            }
+        }
+        KanbanCommand::Unblock { ids } => {
+            if ids.is_empty() {
+                return Err("at least one task id is required".into());
+            }
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            for id in ids {
+                if !unblock_task(&mut conn, &id)? {
+                    return Err(format!("cannot unblock {id}").into());
+                }
+                println!("Unblocked {id}");
+            }
+        }
+        KanbanCommand::Heartbeat { id, note } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !heartbeat_worker(&mut conn, &id, note.as_deref(), None)? {
+                return Err(format!("cannot heartbeat {id}").into());
+            }
+            println!("Heartbeat recorded for {id}");
+        }
+        KanbanCommand::Context { id } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            println!("{}", build_worker_context(&conn, &id)?);
+        }
+        KanbanCommand::Runs { id, json } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let runs = list_runs(&conn, &id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+            } else if runs.is_empty() {
+                println!("(no runs yet for {id})");
+            } else {
+                for run in runs {
+                    println!(
+                        "{}  {}  {}",
+                        run.id,
+                        run.outcome.as_deref().unwrap_or(&run.status),
+                        run.summary.as_deref().unwrap_or("")
+                    );
+                }
+            }
+        }
+        KanbanCommand::Stats { json } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let stats = board_stats(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                for (status, count) in stats.by_status {
+                    println!("{status}={count}");
+                }
+                if let Some(age) = stats.oldest_ready_age_seconds {
+                    println!("oldest_ready_age_seconds={age}");
+                }
+            }
+        }
+        KanbanCommand::NotifySubscribe {
+            id,
+            platform,
+            chat_id,
+            thread_id,
+            user_id,
+        } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            add_notify_sub(
+                &mut conn,
+                &id,
+                &platform,
+                &chat_id,
+                thread_id.as_deref(),
+                user_id.as_deref(),
+            )?;
+            println!("Subscribed {id}");
+        }
+        KanbanCommand::NotifyList { task_id, json } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let subs = list_notify_subs(&conn, task_id.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&subs)?);
+            } else if subs.is_empty() {
+                println!("No subscriptions");
+            } else {
+                for sub in subs {
+                    println!(
+                        "{}  {}  {}  {}",
+                        sub.task_id, sub.platform, sub.chat_id, sub.thread_id
+                    );
+                }
+            }
+        }
+        KanbanCommand::NotifyUnsubscribe {
+            id,
+            platform,
+            chat_id,
+            thread_id,
+        } => {
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            if !remove_notify_sub(&mut conn, &id, &platform, &chat_id, thread_id.as_deref())? {
+                return Err(format!("no such subscription for {id}").into());
+            }
+            println!("Unsubscribed {id}");
+        }
+        KanbanCommand::Log { id, tail_bytes } => {
+            match read_worker_log(&context.hermes_home(), &id, tail_bytes)? {
+                Some(contents) => print!("{contents}"),
+                None => println!("No log for {id}"),
+            }
+        }
+        KanbanCommand::Gc {
+            event_retention_days,
+            log_retention_days,
+        } => {
+            if event_retention_days < 0 || log_retention_days < 0 {
+                return Err("retention days must be non-negative".into());
+            }
+            let mut conn = open_kanban_db(&context.hermes_home())?;
+            let removed_events = gc_events(&mut conn, event_retention_days * 24 * 3600)?;
+            let removed_logs =
+                gc_worker_logs(&context.hermes_home(), log_retention_days * 24 * 3600)?;
+            println!("removed_events={removed_events}");
+            println!("removed_logs={removed_logs}");
+        }
+        KanbanCommand::Assignees { json } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let assignees = known_assignees(&conn, context)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&assignees)?);
+            } else if assignees.is_empty() {
+                println!("No assignees");
+            } else {
+                for assignee in assignees {
+                    let on_disk = if assignee.on_disk { "disk" } else { "board" };
+                    println!(
+                        "{}  {:4}  {}",
+                        assignee.name,
+                        on_disk,
+                        serde_json::to_string(&assignee.counts)?
+                    );
+                }
+            }
+        }
+        KanbanCommand::Tail { id, interval } => {
+            if interval <= 0.0 {
+                return Err("interval must be positive".into());
+            }
+            println!("Tailing events for {id}. Ctrl-C to stop.");
+            let running = Arc::new(AtomicBool::new(true));
+            let signal_flag = Arc::clone(&running);
+            ctrlc::set_handler(move || {
+                signal_flag.store(false, Ordering::SeqCst);
+            })?;
+            let mut last_id = 0_i64;
+            while running.load(Ordering::SeqCst) {
+                let conn = open_kanban_db(&context.hermes_home())?;
+                for event in list_events(&conn, &id)? {
+                    if event.id <= last_id {
+                        continue;
+                    }
+                    let payload = event
+                        .payload
+                        .as_ref()
+                        .map(|value| format!(" {value}"))
+                        .unwrap_or_default();
+                    println!(
+                        "[{}] {}{}",
+                        chrono::Local
+                            .timestamp_opt(event.created_at, 0)
+                            .single()
+                            .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| event.created_at.to_string()),
+                        event.kind,
+                        payload,
+                    );
+                    last_id = event.id;
+                }
+                drop(conn);
+                sleep(Duration::from_secs_f64(interval.max(0.1)));
+            }
+            println!("(stopped)");
+        }
+        KanbanCommand::Watch {
+            assignee,
+            tenant,
+            kinds,
+            interval,
+        } => {
+            if interval <= 0.0 {
+                return Err("interval must be positive".into());
+            }
+            let kinds = kinds.map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            let running = Arc::new(AtomicBool::new(true));
+            let signal_flag = Arc::clone(&running);
+            ctrlc::set_handler(move || {
+                signal_flag.store(false, Ordering::SeqCst);
+            })?;
+            println!("Watching kanban events. Ctrl-C to stop.");
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let mut cursor: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM task_events", [], |row| {
+                    row.get(0)
+                })?;
+            drop(conn);
+            while running.load(Ordering::SeqCst) {
+                let conn = open_kanban_db(&context.hermes_home())?;
+                let mut stmt = conn.prepare(
+                    "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, t.assignee, t.tenant
+                       FROM task_events e
+                  LEFT JOIN tasks t ON t.id = e.task_id
+                      WHERE e.id > ?
+                      ORDER BY e.id ASC
+                      LIMIT 200",
+                )?;
+                let rows = stmt.query_map([cursor], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, task_id, kind, payload, created_at, row_assignee, row_tenant) = row?;
+                    cursor = cursor.max(id);
+                    if let Some(filter) = kinds.as_ref()
+                        && !filter.contains(&kind)
+                    {
+                        continue;
+                    }
+                    if assignee
+                        .as_deref()
+                        .is_some_and(|value| row_assignee.as_deref() != Some(value))
+                    {
+                        continue;
+                    }
+                    if tenant
+                        .as_deref()
+                        .is_some_and(|value| row_tenant.as_deref() != Some(value))
+                    {
+                        continue;
+                    }
+                    println!(
+                        "[{}] {:10} {:18} (@{}){}",
+                        chrono::Local
+                            .timestamp_opt(created_at, 0)
+                            .single()
+                            .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| created_at.to_string()),
+                        task_id,
+                        kind,
+                        row_assignee.as_deref().unwrap_or("-"),
+                        payload
+                            .as_deref()
+                            .map(|value| format!(" {value}"))
+                            .unwrap_or_default()
+                    );
+                }
+                drop(stmt);
+                drop(conn);
+                sleep(Duration::from_secs_f64(interval.max(0.1)));
+            }
+            println!("(stopped)");
+        }
+        KanbanCommand::Diagnostics {
+            severity,
+            task_id,
+            json,
+        } => {
+            let conn = open_kanban_db(&context.hermes_home())?;
+            let mut entries = collect_kanban_diagnostics(&conn, task_id.as_deref())?;
+            if let Some(severity) = severity.as_deref() {
+                entries.retain(|entry| {
+                    entry
+                        .diagnostics
+                        .iter()
+                        .any(|diag| diag.severity == severity)
+                });
+                for entry in &mut entries {
+                    entry.diagnostics.retain(|diag| diag.severity == severity);
+                }
+                entries.retain(|entry| !entry.diagnostics.is_empty());
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No active diagnostics on this board.");
+            } else {
+                let total: usize = entries.iter().map(|entry| entry.diagnostics.len()).sum();
+                println!(
+                    "{total} active diagnostic(s) across {} task(s):",
+                    entries.len()
+                );
+                println!();
+                for entry in entries {
+                    println!(
+                        "  {}  {:8}  @{:18}  {}",
+                        entry.task_id,
+                        entry.status,
+                        entry
+                            .assignee
+                            .clone()
+                            .unwrap_or_else(|| String::from("(unassigned)")),
+                        entry.title
+                    );
+                    for diag in entry.diagnostics {
+                        println!("    [{}] {}: {}", diag.severity, diag.kind, diag.title);
+                        if !diag.data.is_empty() {
+                            println!("       data: {}", serde_json::to_string(&diag.data)?);
+                        }
+                        for action in diag.actions.iter().filter(|action| action.suggested) {
+                            println!("       -> {}", action.label);
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+        KanbanCommand::Dispatch {
             dry_run,
             max_spawn,
             failure_limit,
+            json,
         } => {
             if max_spawn.is_some_and(|value| value == 0) {
                 return Err("max_spawn must be positive".into());
@@ -1183,23 +2177,67 @@ fn print_kanban(
                     failure_limit,
                 },
             )?;
-            println!("dry_run={dry_run}");
-            println!("reclaimed={}", result.reclaimed);
-            println!("promoted={}", result.promoted);
-            println!("spawned={}", result.spawned.len());
-            println!("skipped_unassigned={}", result.skipped_unassigned.len());
-            println!("skipped_nonspawnable={}", result.skipped_nonspawnable.len());
-            println!("crashed={}", result.crashed.len());
-            println!("timed_out={}", result.timed_out.len());
-            println!("auto_blocked={}", result.auto_blocked.len());
-            for item in result.spawned {
+            if json {
                 println!(
-                    "{}\tassignee={}\tworkspace={}\tpid={}",
-                    item.task_id,
-                    item.assignee,
-                    item.workspace_path,
-                    item.pid.map(|value| value.to_string()).unwrap_or_default()
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "reclaimed": result.reclaimed,
+                        "crashed": result.crashed,
+                        "timed_out": result.timed_out,
+                        "auto_blocked": result.auto_blocked,
+                        "promoted": result.promoted,
+                        "spawned": result.spawned.iter().map(|item| json!({
+                            "task_id": item.task_id,
+                            "assignee": item.assignee,
+                            "workspace": item.workspace_path,
+                            "pid": item.pid,
+                        })).collect::<Vec<_>>(),
+                        "skipped_unassigned": result.skipped_unassigned,
+                        "skipped_nonspawnable": result.skipped_nonspawnable,
+                    }))?
                 );
+            } else {
+                println!("Reclaimed:    {}", result.reclaimed);
+                println!("Crashed:      {}", result.crashed.len());
+                if !result.crashed.is_empty() {
+                    println!("  {}", result.crashed.join(", "));
+                }
+                println!("Timed out:    {}", result.timed_out.len());
+                if !result.timed_out.is_empty() {
+                    println!("  {}", result.timed_out.join(", "));
+                }
+                println!("Auto-blocked: {}", result.auto_blocked.len());
+                if !result.auto_blocked.is_empty() {
+                    println!("  {}", result.auto_blocked.join(", "));
+                }
+                println!("Promoted:     {}", result.promoted);
+                println!("Spawned:      {}", result.spawned.len());
+                for item in result.spawned {
+                    let dry_tag = if dry_run { " (dry)" } else { "" };
+                    println!(
+                        "  - {}  ->  {}  @ {}{}",
+                        item.task_id,
+                        item.assignee,
+                        if item.workspace_path.is_empty() {
+                            "-"
+                        } else {
+                            &item.workspace_path
+                        },
+                        dry_tag
+                    );
+                }
+                if !result.skipped_unassigned.is_empty() {
+                    println!(
+                        "Skipped (unassigned): {}",
+                        result.skipped_unassigned.join(", ")
+                    );
+                }
+                if !result.skipped_nonspawnable.is_empty() {
+                    println!(
+                        "Skipped (non-spawnable assignee - terminal lane, OK): {}",
+                        result.skipped_nonspawnable.join(", ")
+                    );
+                }
             }
         }
         KanbanCommand::Daemon {
@@ -1208,6 +2246,7 @@ fn print_kanban(
             failure_limit,
             pidfile,
             verbose,
+            force,
         } => {
             if interval <= 0.0 {
                 return Err("interval must be positive".into());
@@ -1217,6 +2256,12 @@ fn print_kanban(
             }
             if failure_limit.is_some_and(|value| value <= 0) {
                 return Err("failure_limit must be positive".into());
+            }
+            if !force {
+                return Err(
+                    "hermes kanban daemon is deprecated; rerun with --force or use `hermes gateway start`"
+                        .into(),
+                );
             }
             let _pidfile_guard = match pidfile.as_deref() {
                 Some(path) => Some(PidFileGuard::create(path)?),
@@ -1230,7 +2275,7 @@ fn print_kanban(
             })?;
 
             eprintln!(
-                "Kanban dispatcher running (interval={}s, pid={}). Ctrl-C to stop.",
+                "Kanban dispatcher running STANDALONE via --force (interval={}s, pid={}). Ctrl-C to stop.",
                 interval,
                 std::process::id()
             );
@@ -1330,6 +2375,456 @@ fn print_kanban(
         }
     }
     Ok(())
+}
+
+fn discover_kanban_profiles(context: &HermesContext) -> Vec<String> {
+    let mut profiles = Vec::new();
+    let Ok(entries) = fs::read_dir(context.profiles_root()) else {
+        return profiles;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                profiles.push(trimmed.to_string());
+            }
+        }
+    }
+    profiles.sort();
+    profiles.dedup();
+    profiles
+}
+
+fn kanban_cli_profile_name(context: &HermesContext) -> String {
+    std::env::var("HERMES_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let profile = context.current_profile_name();
+            if profile == "default" {
+                String::from("user")
+            } else {
+                profile
+            }
+        })
+}
+
+fn parse_kanban_metadata(value: &str) -> Result<JsonValue, Box<dyn Error>> {
+    let parsed: JsonValue = serde_json::from_str(value)?;
+    if parsed.is_object() {
+        Ok(parsed)
+    } else {
+        Err("metadata must be a JSON object".into())
+    }
+}
+
+fn parse_kanban_workspace(value: &str) -> Result<(String, Option<String>), Box<dyn Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "scratch" || trimmed == "worktree" {
+        return Ok((
+            if trimmed == "worktree" {
+                String::from("worktree")
+            } else {
+                String::from("scratch")
+            },
+            None,
+        ));
+    }
+    if let Some(path) = trimmed.strip_prefix("dir:") {
+        let expanded = path.trim();
+        if expanded.is_empty() {
+            return Err("dir: workspace requires a path".into());
+        }
+        return Ok((String::from("dir"), Some(expanded.to_string())));
+    }
+    if VALID_WORKSPACE_KINDS.contains(&trimmed) {
+        return Ok((trimmed.to_string(), None));
+    }
+    Err(format!(
+        "workspace must be one of {} or dir:<path>",
+        VALID_WORKSPACE_KINDS.join(", ")
+    )
+    .into())
+}
+
+fn parse_kanban_runtime_seconds(value: &str) -> Result<i64, Box<dyn Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("max runtime must not be empty".into());
+    }
+    let split_at = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(split_at);
+    let amount: i64 = digits
+        .parse()
+        .map_err(|_| format!("invalid max runtime {trimmed:?}"))?;
+    if amount <= 0 {
+        return Err("max runtime must be positive".into());
+    }
+    let seconds = match unit {
+        "" | "s" => amount,
+        "m" => amount * 60,
+        "h" => amount * 60 * 60,
+        "d" => amount * 60 * 60 * 24,
+        _ => return Err(format!("invalid max runtime unit in {trimmed:?}").into()),
+    };
+    Ok(seconds)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct KanbanDiagnosticAction {
+    kind: String,
+    label: String,
+    payload: BTreeMap<String, JsonValue>,
+    suggested: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct KanbanDiagnostic {
+    kind: String,
+    severity: String,
+    title: String,
+    detail: String,
+    actions: Vec<KanbanDiagnosticAction>,
+    data: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct KanbanDiagnosticEntry {
+    task_id: String,
+    title: String,
+    status: String,
+    assignee: Option<String>,
+    diagnostics: Vec<KanbanDiagnostic>,
+}
+
+fn diagnostic_action(
+    kind: &str,
+    label: impl Into<String>,
+    payload: BTreeMap<String, JsonValue>,
+    suggested: bool,
+) -> KanbanDiagnosticAction {
+    KanbanDiagnosticAction {
+        kind: kind.to_string(),
+        label: label.into(),
+        payload,
+        suggested,
+    }
+}
+
+fn generic_diagnostic_actions(
+    task_id: &str,
+    running: bool,
+    assignee: Option<&str>,
+) -> Vec<KanbanDiagnosticAction> {
+    let mut actions = Vec::new();
+    if running {
+        let mut payload = BTreeMap::new();
+        payload.insert(String::from("task_id"), json!(task_id));
+        actions.push(diagnostic_action(
+            "reclaim",
+            format!("Reclaim {task_id}"),
+            payload,
+            true,
+        ));
+    }
+    let mut payload = BTreeMap::new();
+    payload.insert(String::from("task_id"), json!(task_id));
+    actions.push(diagnostic_action(
+        "comment",
+        format!("Comment on {task_id}"),
+        payload,
+        !running,
+    ));
+    if let Some(assignee) = assignee {
+        let mut payload = BTreeMap::new();
+        payload.insert(String::from("task_id"), json!(task_id));
+        payload.insert(String::from("assignee"), json!(assignee));
+        actions.push(diagnostic_action(
+            "reassign",
+            format!("Reassign {task_id}"),
+            payload,
+            false,
+        ));
+    }
+    actions
+}
+
+fn collect_kanban_diagnostics(
+    conn: &Connection,
+    task_id: Option<&str>,
+) -> Result<Vec<KanbanDiagnosticEntry>, Box<dyn Error>> {
+    let tasks = if let Some(task_id) = task_id {
+        match get_task(conn, task_id)? {
+            Some(task) if task.status != "archived" => vec![task],
+            Some(_) => Vec::new(),
+            None => return Err(format!("no such task: {task_id}").into()),
+        }
+    } else {
+        list_tasks(
+            conn,
+            &KanbanTaskQuery {
+                include_archived: false,
+                ..KanbanTaskQuery::default()
+            },
+        )?
+    };
+
+    let mut entries = Vec::new();
+    for task in tasks {
+        let Some(detail) = kanban_task_detail(conn, &task.id)? else {
+            continue;
+        };
+        let mut diagnostics = Vec::new();
+        let task_id = detail.task.id.clone();
+        let running = detail.task.status == "running";
+
+        let latest_completed_at = detail
+            .events
+            .iter()
+            .filter(|event| event.kind == "completed" || event.kind == "edited")
+            .map(|event| event.created_at)
+            .max()
+            .unwrap_or(0);
+        if let Some(event) = detail.events.iter().rev().find(|event| {
+            event.kind == "completion_blocked_hallucination"
+                && event.created_at >= latest_completed_at
+        }) {
+            let phantom = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("phantom_cards"))
+                .cloned()
+                .unwrap_or(JsonValue::Array(Vec::new()));
+            let verified = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("verified_cards"))
+                .cloned()
+                .unwrap_or(JsonValue::Array(Vec::new()));
+            let mut data = BTreeMap::new();
+            data.insert(String::from("phantom_ids"), phantom.clone());
+            data.insert(String::from("verified_ids"), verified);
+            diagnostics.push(KanbanDiagnostic {
+                kind: String::from("hallucinated_cards"),
+                severity: String::from("error"),
+                title: String::from("Completion claimed cards that do not exist"),
+                detail: String::from(
+                    "A completion reported created_cards that were missing or not attributable to this worker. Remove the phantom ids or create the follow-up tasks explicitly before completing again.",
+                ),
+                actions: generic_diagnostic_actions(
+                    &task_id,
+                    running,
+                    detail.task.assignee.as_deref(),
+                ),
+                data,
+            });
+        }
+
+        if detail.task.consecutive_failures >= 3 {
+            let most_recent_outcome =
+                detail
+                    .runs
+                    .iter()
+                    .rev()
+                    .find_map(|run| match run.outcome.as_deref() {
+                        Some("spawn_failed" | "timed_out" | "crashed") => run.outcome.clone(),
+                        _ => None,
+                    });
+            let mut actions =
+                generic_diagnostic_actions(&task_id, running, detail.task.assignee.as_deref());
+            if let Some(outcome) = most_recent_outcome.as_deref() {
+                if outcome == "spawn_failed"
+                    && let Some(assignee) = detail.task.assignee.as_deref()
+                {
+                    let mut payload = BTreeMap::new();
+                    payload.insert(
+                        String::from("command"),
+                        json!(format!("hermes -p {assignee} doctor")),
+                    );
+                    actions.insert(
+                        0,
+                        diagnostic_action(
+                            "cli_hint",
+                            format!("Verify profile: hermes -p {assignee} doctor"),
+                            payload,
+                            true,
+                        ),
+                    );
+                } else if matches!(outcome, "timed_out" | "crashed") {
+                    let mut payload = BTreeMap::new();
+                    payload.insert(
+                        String::from("command"),
+                        json!(format!("hermes kanban log {task_id}")),
+                    );
+                    actions.insert(
+                        0,
+                        diagnostic_action(
+                            "cli_hint",
+                            format!("Check logs: hermes kanban log {task_id}"),
+                            payload,
+                            true,
+                        ),
+                    );
+                }
+            }
+            let mut data = BTreeMap::new();
+            data.insert(
+                String::from("consecutive_failures"),
+                json!(detail.task.consecutive_failures),
+            );
+            if let Some(outcome) = most_recent_outcome.clone() {
+                data.insert(String::from("most_recent_outcome"), json!(outcome));
+            }
+            if let Some(error) = detail.task.last_failure_error.clone() {
+                data.insert(String::from("last_error"), json!(error));
+            }
+            let err_snippet = detail
+                .task
+                .last_failure_error
+                .clone()
+                .unwrap_or_default()
+                .chars()
+                .take(160)
+                .collect::<String>();
+            diagnostics.push(KanbanDiagnostic {
+                kind: String::from("repeated_failures"),
+                severity: if detail.task.consecutive_failures >= 6 {
+                    String::from("critical")
+                } else {
+                    String::from("error")
+                },
+                title: if err_snippet.is_empty() {
+                    format!("Agent failure x{}", detail.task.consecutive_failures)
+                } else {
+                    format!(
+                        "Agent failure x{}: {}",
+                        detail.task.consecutive_failures, err_snippet
+                    )
+                },
+                detail: detail
+                    .task
+                    .last_failure_error
+                    .clone()
+                    .unwrap_or_else(|| String::from("No error text was captured.")),
+                actions,
+                data,
+            });
+        }
+
+        let mut trailing_crashes = 0_i64;
+        let mut last_crash_error = None;
+        for run in detail.runs.iter().rev() {
+            match run.outcome.as_deref() {
+                Some("crashed") => {
+                    trailing_crashes += 1;
+                    if last_crash_error.is_none() {
+                        last_crash_error = run.error.clone();
+                    }
+                }
+                Some("completed" | "reclaimed") => break,
+                _ => {}
+            }
+        }
+        if detail.task.consecutive_failures < 3 && trailing_crashes >= 2 {
+            let mut actions =
+                generic_diagnostic_actions(&task_id, running, detail.task.assignee.as_deref());
+            let mut payload = BTreeMap::new();
+            payload.insert(
+                String::from("command"),
+                json!(format!("hermes kanban log {task_id}")),
+            );
+            actions.insert(
+                0,
+                diagnostic_action(
+                    "cli_hint",
+                    format!("Check logs: hermes kanban log {task_id}"),
+                    payload,
+                    true,
+                ),
+            );
+            let mut data = BTreeMap::new();
+            data.insert(String::from("consecutive_crashes"), json!(trailing_crashes));
+            if let Some(error) = last_crash_error.clone() {
+                data.insert(String::from("last_error"), json!(error));
+            }
+            diagnostics.push(KanbanDiagnostic {
+                kind: String::from("repeated_crashes"),
+                severity: if trailing_crashes >= 4 {
+                    String::from("critical")
+                } else {
+                    String::from("error")
+                },
+                title: format!("Agent crashed {trailing_crashes}x"),
+                detail: last_crash_error
+                    .unwrap_or_else(|| String::from("No error text was captured.")),
+                actions,
+                data,
+            });
+        }
+
+        if detail.task.status == "blocked" {
+            let latest_blocked = detail
+                .events
+                .iter()
+                .filter(|event| event.kind == "blocked")
+                .map(|event| event.created_at)
+                .max()
+                .unwrap_or(0);
+            if latest_blocked > 0 {
+                let cleared = detail.events.iter().any(|event| {
+                    event.created_at > latest_blocked
+                        && matches!(event.kind.as_str(), "commented" | "unblocked")
+                });
+                let age_hours = (chrono::Local::now().timestamp() - latest_blocked) / 3600;
+                if !cleared && age_hours >= 24 {
+                    let mut payload = BTreeMap::new();
+                    payload.insert(String::from("task_id"), json!(task_id));
+                    diagnostics.push(KanbanDiagnostic {
+                        kind: String::from("stuck_in_blocked"),
+                        severity: String::from("warning"),
+                        title: format!("Task has been blocked for {age_hours}h"),
+                        detail: String::from(
+                            "This task has been blocked for a long time without a newer comment or unblock event.",
+                        ),
+                        actions: vec![diagnostic_action(
+                            "comment",
+                            "Add a comment / unblock the task",
+                            payload,
+                            true,
+                        )],
+                        data: {
+                            let mut data = BTreeMap::new();
+                            data.insert(String::from("age_hours"), json!(age_hours));
+                            data
+                        },
+                    });
+                }
+            }
+        }
+
+        if !diagnostics.is_empty() {
+            diagnostics.sort_by_key(|diag| match diag.severity.as_str() {
+                "critical" => 0,
+                "error" => 1,
+                _ => 2,
+            });
+            entries.push(KanbanDiagnosticEntry {
+                task_id: detail.task.id.clone(),
+                title: detail.task.title.clone(),
+                status: detail.task.status.clone(),
+                assignee: detail.task.assignee.clone(),
+                diagnostics,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) fn disabled_memory_toolsets(memory: &hermes_core::MemoryConfig) -> Option<Vec<String>> {

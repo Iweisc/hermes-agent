@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,10 @@ use crate::{
 };
 
 const DEFAULT_BOARD: &str = "default";
-const VALID_WORKSPACE_KINDS: &[&str] = &["scratch", "dir", "worktree"];
+pub const VALID_KANBAN_STATUSES: &[&str] = &[
+    "triage", "todo", "ready", "running", "blocked", "done", "archived",
+];
+pub const VALID_WORKSPACE_KINDS: &[&str] = &["scratch", "dir", "worktree"];
 const CONTEXT_MAX_PRIOR_RUNS: usize = 10;
 const CONTEXT_MAX_COMMENTS: usize = 30;
 const CONTEXT_MAX_FIELD_CHARS: usize = 4096;
@@ -175,7 +178,7 @@ pub fn kanban_create_schema() -> Value {
                 },
                 "assignee": {
                     "type": "string",
-                    "description": "Profile that should execute the task."
+                    "description": "Optional profile that should execute the task."
                 },
                 "body": {
                     "type": "string",
@@ -221,7 +224,7 @@ pub fn kanban_create_schema() -> Value {
                     "description": "Optional extra skill names to force-load for the worker."
                 }
             },
-            "required": ["title", "assignee"]
+            "required": ["title"]
         }
     })
 }
@@ -440,10 +443,7 @@ pub fn handle_kanban_create(args: &Value, runtime: &ToolRuntime) -> String {
         Ok(value) => value,
         Err(error) => return tool_error(error),
     };
-    let assignee = match required_non_empty_string(args, "assignee") {
-        Ok(value) => value,
-        Err(error) => return tool_error(error),
-    };
+    let assignee = optional_non_empty_string(args, "assignee");
     let body = optional_string(args, "body");
     let parents = match optional_string_list(args, "parents") {
         Ok(value) => value.unwrap_or_default(),
@@ -591,26 +591,28 @@ pub struct KanbanRunResult {
     pub dry_run: bool,
 }
 
-#[derive(Debug, Clone)]
-struct Task {
-    id: String,
-    title: String,
-    body: Option<String>,
-    assignee: Option<String>,
-    status: String,
-    priority: i64,
-    tenant: Option<String>,
-    workspace_kind: String,
-    workspace_path: Option<String>,
-    created_by: Option<String>,
-    created_at: i64,
-    started_at: Option<i64>,
-    completed_at: Option<i64>,
-    result: Option<String>,
-    current_run_id: Option<i64>,
-    max_runtime_seconds: Option<i64>,
-    last_heartbeat_at: Option<i64>,
-    skills: Vec<String>,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub assignee: Option<String>,
+    pub status: String,
+    pub priority: i64,
+    pub tenant: Option<String>,
+    pub workspace_kind: String,
+    pub workspace_path: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub result: Option<String>,
+    pub current_run_id: Option<i64>,
+    pub max_runtime_seconds: Option<i64>,
+    pub last_heartbeat_at: Option<i64>,
+    pub consecutive_failures: i64,
+    pub last_failure_error: Option<String>,
+    pub skills: Vec<String>,
 }
 
 impl Task {
@@ -637,6 +639,8 @@ impl Task {
             current_run_id: row.get("current_run_id")?,
             max_runtime_seconds: row.get("max_runtime_seconds")?,
             last_heartbeat_at: row.get("last_heartbeat_at")?,
+            consecutive_failures: row.get("consecutive_failures")?,
+            last_failure_error: row.get("last_failure_error")?,
             skills,
         })
     }
@@ -660,23 +664,25 @@ impl Task {
             "current_run_id": self.current_run_id,
             "max_runtime_seconds": self.max_runtime_seconds,
             "last_heartbeat_at": self.last_heartbeat_at,
+            "consecutive_failures": self.consecutive_failures,
+            "last_failure_error": self.last_failure_error,
             "skills": self.skills,
         })
     }
 }
 
-#[derive(Debug, Clone)]
-struct Run {
-    id: i64,
-    task_id: String,
-    profile: Option<String>,
-    status: String,
-    outcome: Option<String>,
-    summary: Option<String>,
-    metadata: Option<Value>,
-    error: Option<String>,
-    started_at: i64,
-    ended_at: Option<i64>,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Run {
+    pub id: i64,
+    pub task_id: String,
+    pub profile: Option<String>,
+    pub status: String,
+    pub outcome: Option<String>,
+    pub summary: Option<String>,
+    pub metadata: Option<Value>,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
 }
 
 impl Run {
@@ -714,13 +720,13 @@ impl Run {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Comment {
-    id: i64,
-    task_id: String,
-    author: String,
-    body: String,
-    created_at: i64,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Comment {
+    pub id: i64,
+    pub task_id: String,
+    pub author: String,
+    pub body: String,
+    pub created_at: i64,
 }
 
 impl Comment {
@@ -735,14 +741,14 @@ impl Comment {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Event {
-    id: i64,
-    task_id: String,
-    kind: String,
-    payload: Option<Value>,
-    created_at: i64,
-    run_id: Option<i64>,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Event {
+    pub id: i64,
+    pub task_id: String,
+    pub kind: String,
+    pub payload: Option<Value>,
+    pub created_at: i64,
+    pub run_id: Option<i64>,
 }
 
 impl Event {
@@ -758,20 +764,89 @@ impl Event {
     }
 }
 
-struct CreateTaskInput {
-    title: String,
-    body: Option<String>,
-    assignee: String,
-    parents: Vec<String>,
-    tenant: Option<String>,
-    priority: i64,
-    workspace_kind: String,
-    workspace_path: Option<String>,
-    triage: bool,
-    idempotency_key: Option<String>,
-    max_runtime_seconds: Option<i64>,
-    skills: Option<Vec<String>>,
-    created_by: String,
+pub struct CreateTaskInput {
+    pub title: String,
+    pub body: Option<String>,
+    pub assignee: Option<String>,
+    pub parents: Vec<String>,
+    pub tenant: Option<String>,
+    pub priority: i64,
+    pub workspace_kind: String,
+    pub workspace_path: Option<String>,
+    pub triage: bool,
+    pub idempotency_key: Option<String>,
+    pub max_runtime_seconds: Option<i64>,
+    pub skills: Option<Vec<String>>,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KanbanTaskQuery {
+    pub assignee: Option<String>,
+    pub status: Option<String>,
+    pub tenant: Option<String>,
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanTaskDetail {
+    pub task: Task,
+    pub parents: Vec<String>,
+    pub children: Vec<String>,
+    pub comments: Vec<Comment>,
+    pub events: Vec<Event>,
+    pub runs: Vec<Run>,
+    pub latest_summary: Option<String>,
+    pub worker_context: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanBoardRecord {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub icon: String,
+    pub color: String,
+    pub created_at: Option<i64>,
+    pub archived: bool,
+    pub db_path: String,
+    pub current: bool,
+    pub task_count: i64,
+    pub ready_count: i64,
+    pub blocked_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanBoardRemoval {
+    pub slug: String,
+    pub action: String,
+    pub old_path: String,
+    pub new_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanNotifySubscription {
+    pub task_id: String,
+    pub platform: String,
+    pub chat_id: String,
+    pub thread_id: String,
+    pub user_id: Option<String>,
+    pub created_at: i64,
+    pub last_event_id: i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct KanbanBoardStats {
+    pub by_status: BTreeMap<String, i64>,
+    pub by_assignee: BTreeMap<String, BTreeMap<String, i64>>,
+    pub oldest_ready_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanAssigneeRecord {
+    pub name: String,
+    pub on_disk: bool,
+    pub counts: BTreeMap<String, i64>,
 }
 
 fn connect_kanban(runtime: &ToolRuntime) -> Result<Connection, String> {
@@ -780,6 +855,10 @@ fn connect_kanban(runtime: &ToolRuntime) -> Result<Connection, String> {
 
 fn connect_kanban_path(hermes_home: &Path) -> Result<Connection, String> {
     let path = kanban_db_path(hermes_home)?;
+    open_kanban_db_at_path(&path)
+}
+
+fn open_kanban_db_at_path(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("creating {} failed: {error}", parent.display()))?;
@@ -792,6 +871,14 @@ fn connect_kanban_path(hermes_home: &Path) -> Result<Connection, String> {
     .map_err(|error| format!("configuring kanban database failed: {error}"))?;
     init_kanban_db(&conn)?;
     Ok(conn)
+}
+
+pub fn open_kanban_db(hermes_home: &Path) -> Result<Connection, String> {
+    connect_kanban_path(hermes_home)
+}
+
+pub fn kanban_db_path_for_home(hermes_home: &Path) -> Result<PathBuf, String> {
+    kanban_db_path(hermes_home)
 }
 
 pub fn dispatch_kanban_once(
@@ -826,6 +913,339 @@ pub fn run_kanban_task(
         failure_limit,
         None,
     )
+}
+
+pub fn current_kanban_board(hermes_home: &Path) -> Result<String, String> {
+    Ok(current_board_slug(hermes_home)?.unwrap_or_else(|| DEFAULT_BOARD.to_string()))
+}
+
+pub fn set_current_kanban_board(hermes_home: &Path, board: &str) -> Result<PathBuf, String> {
+    let slug =
+        normalize_board_slug(Some(board))?.ok_or_else(|| "board slug is required".to_string())?;
+    let path = kanban_root(hermes_home).join("kanban").join("current");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("creating {} failed: {error}", parent.display()))?;
+    }
+    fs::write(&path, format!("{slug}\n"))
+        .map_err(|error| format!("writing {} failed: {error}", path.display()))?;
+    Ok(path)
+}
+
+pub fn clear_current_kanban_board(hermes_home: &Path) -> Result<(), String> {
+    let path = kanban_root(hermes_home).join("kanban").join("current");
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+fn board_dir_for_slug(hermes_home: &Path, slug: &str) -> PathBuf {
+    kanban_root(hermes_home)
+        .join("kanban")
+        .join("boards")
+        .join(slug)
+}
+
+fn board_db_path_from_slug(hermes_home: &Path, slug: &str) -> PathBuf {
+    if slug == DEFAULT_BOARD {
+        kanban_root(hermes_home).join("kanban.db")
+    } else {
+        board_dir_for_slug(hermes_home, slug).join("kanban.db")
+    }
+}
+
+fn board_metadata_path_for_slug(hermes_home: &Path, slug: &str) -> PathBuf {
+    board_dir_for_slug(hermes_home, slug).join("board.json")
+}
+
+fn default_board_name(slug: &str) -> String {
+    let mut parts = Vec::new();
+    for part in slug.replace('_', "-").split('-') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut chars = part.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let mut word = first.to_ascii_uppercase().to_string();
+        word.push_str(chars.as_str());
+        parts.push(word);
+    }
+    if parts.is_empty() {
+        slug.to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn board_task_counts(conn: &Connection) -> Result<(i64, i64, i64), String> {
+    conn.query_row(
+        "SELECT COUNT(*),
+                SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END)
+           FROM tasks
+          WHERE status != 'archived'",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
+        },
+    )
+    .map_err(|error| format!("reading board task counts failed: {error}"))
+}
+
+fn read_board_metadata_for_slug(
+    hermes_home: &Path,
+    slug: &str,
+) -> Result<KanbanBoardRecord, String> {
+    let mut record = KanbanBoardRecord {
+        slug: slug.to_string(),
+        name: default_board_name(slug),
+        description: String::new(),
+        icon: String::new(),
+        color: String::new(),
+        created_at: None,
+        archived: false,
+        db_path: board_db_path_from_slug(hermes_home, slug)
+            .display()
+            .to_string(),
+        current: current_kanban_board(hermes_home).ok().as_deref() == Some(slug),
+        task_count: 0,
+        ready_count: 0,
+        blocked_count: 0,
+    };
+    let path = board_metadata_path_for_slug(hermes_home, slug);
+    if let Ok(contents) = fs::read_to_string(&path)
+        && let Ok(value) = serde_json::from_str::<Value>(&contents)
+        && let Some(object) = value.as_object()
+    {
+        record.name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default_board_name(slug));
+        record.description = object
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        record.icon = object
+            .get("icon")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        record.color = object
+            .get("color")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        record.created_at = object.get("created_at").and_then(Value::as_i64);
+        record.archived = object
+            .get("archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+    let db_path = board_db_path_from_slug(hermes_home, slug);
+    if db_path.exists()
+        && let Ok(conn) = open_kanban_db_at_path(&db_path)
+        && let Ok((task_count, ready_count, blocked_count)) = board_task_counts(&conn)
+    {
+        record.task_count = task_count;
+        record.ready_count = ready_count;
+        record.blocked_count = blocked_count;
+    }
+    Ok(record)
+}
+
+fn write_board_metadata_for_slug(
+    hermes_home: &Path,
+    slug: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    icon: Option<&str>,
+    color: Option<&str>,
+    archived: Option<bool>,
+) -> Result<KanbanBoardRecord, String> {
+    let mut record = read_board_metadata_for_slug(hermes_home, slug)?;
+    if let Some(value) = name {
+        let trimmed = value.trim();
+        record.name = if trimmed.is_empty() {
+            default_board_name(slug)
+        } else {
+            trimmed.to_string()
+        };
+    }
+    if let Some(value) = description {
+        record.description = value.to_string();
+    }
+    if let Some(value) = icon {
+        record.icon = value.to_string();
+    }
+    if let Some(value) = color {
+        record.color = value.to_string();
+    }
+    if let Some(value) = archived {
+        record.archived = value;
+    }
+    if record.created_at.is_none() {
+        record.created_at = Some(now_ts());
+    }
+    let path = board_metadata_path_for_slug(hermes_home, slug);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("creating {} failed: {error}", parent.display()))?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "slug": record.slug,
+            "name": record.name,
+            "description": record.description,
+            "icon": record.icon,
+            "color": record.color,
+            "created_at": record.created_at,
+            "archived": record.archived,
+        }))
+        .map_err(|error| format!("serializing board metadata failed: {error}"))?,
+    )
+    .map_err(|error| format!("writing {} failed: {error}", path.display()))?;
+    read_board_metadata_for_slug(hermes_home, slug)
+}
+
+pub fn kanban_board_exists(hermes_home: &Path, board: &str) -> Result<bool, String> {
+    let slug =
+        normalize_board_slug(Some(board))?.ok_or_else(|| "board slug is required".to_string())?;
+    if slug == DEFAULT_BOARD {
+        return Ok(true);
+    }
+    let dir = board_dir_for_slug(hermes_home, &slug);
+    Ok(dir.is_dir() || dir.join("kanban.db").exists())
+}
+
+pub fn create_kanban_board(
+    hermes_home: &Path,
+    board: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    icon: Option<&str>,
+    color: Option<&str>,
+) -> Result<KanbanBoardRecord, String> {
+    let slug =
+        normalize_board_slug(Some(board))?.ok_or_else(|| "board slug is required".to_string())?;
+    fs::create_dir_all(board_dir_for_slug(hermes_home, &slug))
+        .map_err(|error| format!("creating board {slug} failed: {error}"))?;
+    open_kanban_db_at_path(&board_db_path_from_slug(hermes_home, &slug))?;
+    write_board_metadata_for_slug(
+        hermes_home,
+        &slug,
+        name,
+        description,
+        icon,
+        color,
+        Some(false),
+    )
+}
+
+pub fn list_kanban_boards(
+    hermes_home: &Path,
+    include_archived: bool,
+) -> Result<Vec<KanbanBoardRecord>, String> {
+    let mut slugs = HashSet::new();
+    slugs.insert(DEFAULT_BOARD.to_string());
+    let root = kanban_root(hermes_home).join("kanban").join("boards");
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if name == "_archived" {
+                continue;
+            }
+            if let Some(slug) = normalize_board_slug(Some(name))? {
+                slugs.insert(slug);
+            }
+        }
+    }
+    let mut boards = Vec::new();
+    for slug in slugs {
+        let board = read_board_metadata_for_slug(hermes_home, &slug)?;
+        if include_archived || !board.archived {
+            boards.push(board);
+        }
+    }
+    boards.sort_by(|left, right| {
+        (left.slug != DEFAULT_BOARD, left.slug.as_str())
+            .cmp(&(right.slug != DEFAULT_BOARD, right.slug.as_str()))
+    });
+    Ok(boards)
+}
+
+pub fn remove_kanban_board(
+    hermes_home: &Path,
+    board: &str,
+    archive: bool,
+) -> Result<KanbanBoardRemoval, String> {
+    let slug =
+        normalize_board_slug(Some(board))?.ok_or_else(|| "board slug is required".to_string())?;
+    if slug == DEFAULT_BOARD {
+        return Err("default board cannot be removed".to_string());
+    }
+    let dir = board_dir_for_slug(hermes_home, &slug);
+    if !dir.exists() {
+        return Err(format!("board {slug:?} does not exist"));
+    }
+    let old_path = dir.display().to_string();
+    let result = if archive {
+        let archived_root = kanban_root(hermes_home)
+            .join("kanban")
+            .join("boards")
+            .join("_archived");
+        fs::create_dir_all(&archived_root)
+            .map_err(|error| format!("creating {} failed: {error}", archived_root.display()))?;
+        let target = archived_root.join(format!("{slug}-{}", now_ts()));
+        fs::rename(&dir, &target)
+            .map_err(|error| format!("archiving board {slug} failed: {error}"))?;
+        KanbanBoardRemoval {
+            slug: slug.clone(),
+            action: String::from("archived"),
+            old_path,
+            new_path: Some(target.display().to_string()),
+        }
+    } else {
+        fs::remove_dir_all(&dir)
+            .map_err(|error| format!("deleting board {slug} failed: {error}"))?;
+        KanbanBoardRemoval {
+            slug: slug.clone(),
+            action: String::from("deleted"),
+            old_path,
+            new_path: None,
+        }
+    };
+    if current_kanban_board(hermes_home).ok().as_deref() == Some(slug.as_str()) {
+        clear_current_kanban_board(hermes_home)?;
+    }
+    Ok(result)
+}
+
+pub fn rename_kanban_board(
+    hermes_home: &Path,
+    board: &str,
+    name: &str,
+) -> Result<KanbanBoardRecord, String> {
+    let slug =
+        normalize_board_slug(Some(board))?.ok_or_else(|| "board slug is required".to_string())?;
+    if !kanban_board_exists(hermes_home, &slug)? {
+        return Err(format!("board {slug:?} does not exist"));
+    }
+    write_board_metadata_for_slug(hermes_home, &slug, Some(name), None, None, None, None)
 }
 
 fn init_kanban_db(conn: &Connection) -> Result<(), String> {
@@ -1109,13 +1529,12 @@ fn run_claimed_task(
     }
 }
 
-fn create_task(conn: &mut Connection, input: CreateTaskInput) -> Result<String, String> {
+pub fn create_task(conn: &mut Connection, input: CreateTaskInput) -> Result<String, String> {
     let title = input.title.trim().to_string();
     if title.is_empty() {
         return Err("title is required".to_string());
     }
-    let assignee = normalize_profile_name(&input.assignee)
-        .ok_or_else(|| "assignee is required".to_string())?;
+    let assignee = input.assignee.as_deref().and_then(normalize_profile_name);
     if !VALID_WORKSPACE_KINDS.contains(&input.workspace_kind.as_str()) {
         return Err(format!(
             "workspace_kind must be one of {}",
@@ -1223,7 +1642,7 @@ fn create_task(conn: &mut Connection, input: CreateTaskInput) -> Result<String, 
     Err("creating task failed due to repeated id collisions".to_string())
 }
 
-fn get_task(conn: &Connection, task_id: &str) -> Result<Option<Task>, String> {
+pub fn get_task(conn: &Connection, task_id: &str) -> Result<Option<Task>, String> {
     conn.query_row(
         "SELECT * FROM tasks WHERE id = ?",
         [task_id],
@@ -1233,7 +1652,7 @@ fn get_task(conn: &Connection, task_id: &str) -> Result<Option<Task>, String> {
     .map_err(|error| format!("reading task {task_id} failed: {error}"))
 }
 
-fn link_tasks(conn: &mut Connection, parent_id: &str, child_id: &str) -> Result<(), String> {
+pub fn link_tasks(conn: &mut Connection, parent_id: &str, child_id: &str) -> Result<(), String> {
     if parent_id == child_id {
         return Err("a task cannot depend on itself".to_string());
     }
@@ -1281,7 +1700,7 @@ fn link_tasks(conn: &mut Connection, parent_id: &str, child_id: &str) -> Result<
     Ok(())
 }
 
-fn parent_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
+pub fn parent_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare("SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id")
         .map_err(|error| format!("preparing parent query failed: {error}"))?;
@@ -1291,7 +1710,7 @@ fn parent_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
     collect_string_rows(rows, "reading parent id")
 }
 
-fn child_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
+pub fn child_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare("SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id")
         .map_err(|error| format!("preparing child query failed: {error}"))?;
@@ -1301,7 +1720,7 @@ fn child_ids(conn: &Connection, task_id: &str) -> Result<Vec<String>, String> {
     collect_string_rows(rows, "reading child id")
 }
 
-fn add_comment(
+pub fn add_comment(
     conn: &mut Connection,
     task_id: &str,
     author: &str,
@@ -1340,7 +1759,7 @@ fn add_comment(
     Ok(comment_id)
 }
 
-fn list_comments(conn: &Connection, task_id: &str) -> Result<Vec<Comment>, String> {
+pub fn list_comments(conn: &Connection, task_id: &str) -> Result<Vec<Comment>, String> {
     let mut stmt = conn
         .prepare("SELECT id, task_id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY created_at ASC")
         .map_err(|error| format!("preparing comment query failed: {error}"))?;
@@ -1358,7 +1777,7 @@ fn list_comments(conn: &Connection, task_id: &str) -> Result<Vec<Comment>, Strin
     collect_rows(rows, "reading comment")
 }
 
-fn list_events(conn: &Connection, task_id: &str) -> Result<Vec<Event>, String> {
+pub fn list_events(conn: &Connection, task_id: &str) -> Result<Vec<Event>, String> {
     let mut stmt = conn
         .prepare("SELECT id, task_id, kind, payload, created_at, run_id FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC")
         .map_err(|error| format!("preparing event query failed: {error}"))?;
@@ -1380,7 +1799,7 @@ fn list_events(conn: &Connection, task_id: &str) -> Result<Vec<Event>, String> {
     collect_rows(rows, "reading event")
 }
 
-fn list_runs(conn: &Connection, task_id: &str) -> Result<Vec<Run>, String> {
+pub fn list_runs(conn: &Connection, task_id: &str) -> Result<Vec<Run>, String> {
     let mut stmt = conn
         .prepare("SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at ASC, id ASC")
         .map_err(|error| format!("preparing run query failed: {error}"))?;
@@ -1390,7 +1809,7 @@ fn list_runs(conn: &Connection, task_id: &str) -> Result<Vec<Run>, String> {
     collect_rows(rows, "reading run")
 }
 
-fn latest_run(conn: &Connection, task_id: &str) -> Result<Option<Run>, String> {
+pub fn latest_run(conn: &Connection, task_id: &str) -> Result<Option<Run>, String> {
     conn.query_row(
         "SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1",
         [task_id],
@@ -1400,7 +1819,7 @@ fn latest_run(conn: &Connection, task_id: &str) -> Result<Option<Run>, String> {
     .map_err(|error| format!("reading latest run failed: {error}"))
 }
 
-fn latest_summary(conn: &Connection, task_id: &str) -> Result<Option<String>, String> {
+pub fn latest_summary(conn: &Connection, task_id: &str) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL AND summary != '' ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
         [task_id],
@@ -1410,7 +1829,7 @@ fn latest_summary(conn: &Connection, task_id: &str) -> Result<Option<String>, St
     .map_err(|error| format!("reading latest summary failed: {error}"))
 }
 
-fn complete_task(
+pub fn complete_task(
     conn: &mut Connection,
     task_id: &str,
     result: Option<&str>,
@@ -1516,7 +1935,91 @@ fn complete_task(
     Ok(true)
 }
 
-fn block_task(
+pub fn edit_completed_task_result(
+    conn: &mut Connection,
+    task_id: &str,
+    result: &str,
+    summary: Option<&str>,
+    metadata: Option<&Value>,
+) -> Result<bool, String> {
+    let task_id =
+        non_empty_trimmed(task_id.to_string()).ok_or_else(|| "task_id is required".to_string())?;
+    let result = result.trim();
+    if result.is_empty() {
+        return Err("result is required".to_string());
+    }
+    let handoff_summary = summary.unwrap_or(result);
+    let tx = begin_immediate(conn)?;
+    let status = tx
+        .query_row("SELECT status FROM tasks WHERE id = ?", [&task_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|error| format!("reading task status failed: {error}"))?;
+    if status.as_deref() != Some("done") {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE tasks SET result = ? WHERE id = ?",
+        params![result, task_id],
+    )
+    .map_err(|error| format!("updating task result failed: {error}"))?;
+
+    let mut run_id = tx
+        .query_row(
+            "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
+            [&task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("reading completed run failed: {error}"))?;
+    if let Some(existing_run_id) = run_id {
+        tx.execute(
+            "UPDATE task_runs SET summary = ?, metadata = COALESCE(?, metadata) WHERE id = ?",
+            params![
+                handoff_summary,
+                metadata.map(|value| {
+                    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+                }),
+                existing_run_id,
+            ],
+        )
+        .map_err(|error| format!("updating completed run failed: {error}"))?;
+    } else {
+        run_id = Some(synthesize_ended_run(
+            &tx,
+            &task_id,
+            "done",
+            "completed",
+            Some(handoff_summary),
+            metadata,
+            None,
+        )?);
+    }
+
+    let event_summary = truncate_line(handoff_summary, 400);
+    let fields = if metadata.is_some() {
+        vec!["result", "summary", "metadata"]
+    } else {
+        vec!["result", "summary"]
+    };
+    append_event(
+        &tx,
+        &task_id,
+        "edited",
+        Some(json!({
+            "fields": fields,
+            "result_len": result.len(),
+            "summary": (!event_summary.is_empty()).then_some(event_summary),
+        })),
+        run_id,
+    )?;
+    tx.commit()
+        .map_err(|error| format!("committing task edit failed: {error}"))?;
+    Ok(true)
+}
+
+pub fn block_task(
     conn: &mut Connection,
     task_id: &str,
     reason: &str,
@@ -1562,7 +2065,7 @@ fn block_task(
     Ok(true)
 }
 
-fn heartbeat_worker(
+pub fn heartbeat_worker(
     conn: &mut Connection,
     task_id: &str,
     note: Option<&str>,
@@ -1609,7 +2112,7 @@ fn heartbeat_worker(
     Ok(true)
 }
 
-fn recompute_ready(conn: &mut Connection) -> Result<usize, String> {
+pub fn recompute_ready(conn: &mut Connection) -> Result<usize, String> {
     let tx = begin_immediate(conn)?;
     let todo_ids = {
         let mut stmt = tx
@@ -1642,7 +2145,7 @@ fn recompute_ready(conn: &mut Connection) -> Result<usize, String> {
     Ok(promoted)
 }
 
-fn build_worker_context(conn: &Connection, task_id: &str) -> Result<String, String> {
+pub fn build_worker_context(conn: &Connection, task_id: &str) -> Result<String, String> {
     let task = get_task(conn, task_id)?.ok_or_else(|| format!("unknown task {task_id}"))?;
     let mut lines = Vec::new();
     lines.push(format!("# Kanban task {}: {}", task.id, task.title));
@@ -1773,7 +2276,387 @@ fn build_worker_context(conn: &Connection, task_id: &str) -> Result<String, Stri
     Ok(lines.join("\n").trim().to_string())
 }
 
-fn claim_task(
+pub fn list_tasks(conn: &Connection, query: &KanbanTaskQuery) -> Result<Vec<Task>, String> {
+    if let Some(status) = query.status.as_deref()
+        && !VALID_KANBAN_STATUSES.contains(&status)
+    {
+        return Err(format!(
+            "status must be one of {}",
+            VALID_KANBAN_STATUSES.join(", ")
+        ));
+    }
+
+    let mut sql = String::from("SELECT * FROM tasks WHERE 1=1");
+    let mut params = Vec::<String>::new();
+    if !query.include_archived {
+        sql.push_str(" AND status != ?");
+        params.push(String::from("archived"));
+    }
+    if let Some(assignee) = query.assignee.as_deref() {
+        sql.push_str(" AND assignee = ?");
+        params.push(assignee.to_string());
+    }
+    if let Some(status) = query.status.as_deref() {
+        sql.push_str(" AND status = ?");
+        params.push(status.to_string());
+    }
+    if let Some(tenant) = query.tenant.as_deref() {
+        sql.push_str(" AND tenant = ?");
+        params.push(tenant.to_string());
+    }
+    sql.push_str(
+        " ORDER BY CASE status
+            WHEN 'running' THEN 0
+            WHEN 'ready' THEN 1
+            WHEN 'todo' THEN 2
+            WHEN 'triage' THEN 3
+            WHEN 'blocked' THEN 4
+            WHEN 'done' THEN 5
+            ELSE 6 END,
+          priority DESC,
+          created_at ASC,
+          id ASC",
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("preparing task list failed: {error}"))?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), Task::from_row)
+        .map_err(|error| format!("querying task list failed: {error}"))?;
+    collect_rows(rows, "reading task")
+}
+
+pub fn kanban_task_detail(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<Option<KanbanTaskDetail>, String> {
+    let Some(task) = get_task(conn, task_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(KanbanTaskDetail {
+        task,
+        parents: parent_ids(conn, task_id)?,
+        children: child_ids(conn, task_id)?,
+        comments: list_comments(conn, task_id)?,
+        events: list_events(conn, task_id)?,
+        runs: list_runs(conn, task_id)?,
+        latest_summary: latest_summary(conn, task_id)?,
+        worker_context: build_worker_context(conn, task_id)?,
+    }))
+}
+
+pub fn unlink_tasks(
+    conn: &mut Connection,
+    parent_id: &str,
+    child_id: &str,
+) -> Result<bool, String> {
+    let tx = begin_immediate(conn)?;
+    let removed = tx
+        .execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            params![parent_id, child_id],
+        )
+        .map_err(|error| format!("unlinking tasks failed: {error}"))?;
+    if removed == 0 {
+        return Ok(false);
+    }
+    append_event(
+        &tx,
+        child_id,
+        "unlinked",
+        Some(json!({"parent": parent_id, "child": child_id})),
+        None,
+    )?;
+    tx.commit()
+        .map_err(|error| format!("committing task unlink failed: {error}"))?;
+    recompute_ready(conn)?;
+    Ok(true)
+}
+
+pub fn assign_task(
+    conn: &mut Connection,
+    task_id: &str,
+    profile: Option<&str>,
+) -> Result<bool, String> {
+    let status = get_task(conn, task_id)?
+        .map(|task| task.status)
+        .ok_or_else(|| format!("unknown task {task_id}"))?;
+    if status == "running" {
+        return Err(format!(
+            "cannot assign {task_id} while it is running; reclaim it first"
+        ));
+    }
+    let assignee = profile.and_then(normalize_profile_name);
+    let tx = begin_immediate(conn)?;
+    let updated = tx
+        .execute(
+            "UPDATE tasks SET assignee = ? WHERE id = ? AND status != 'archived'",
+            params![assignee, task_id],
+        )
+        .map_err(|error| format!("assigning task failed: {error}"))?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    append_event(
+        &tx,
+        task_id,
+        "assigned",
+        Some(json!({"assignee": assignee})),
+        None,
+    )?;
+    tx.commit()
+        .map_err(|error| format!("committing assignment failed: {error}"))?;
+    Ok(true)
+}
+
+pub fn unblock_task(conn: &mut Connection, task_id: &str) -> Result<bool, String> {
+    let parents = parent_ids(conn, task_id)?;
+    let next_status = if all_parents_done(conn, &parents)? {
+        "ready"
+    } else {
+        "todo"
+    };
+    let tx = begin_immediate(conn)?;
+    let updated = tx
+        .execute(
+            "UPDATE tasks
+                SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+              WHERE id = ? AND status = 'blocked'",
+            params![next_status, task_id],
+        )
+        .map_err(|error| format!("unblocking task failed: {error}"))?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    append_event(
+        &tx,
+        task_id,
+        "unblocked",
+        Some(json!({"status": next_status})),
+        None,
+    )?;
+    tx.commit()
+        .map_err(|error| format!("committing task unblock failed: {error}"))?;
+    Ok(true)
+}
+
+pub fn archive_task(conn: &mut Connection, task_id: &str) -> Result<bool, String> {
+    let tx = begin_immediate(conn)?;
+    let updated = tx
+        .execute(
+            "UPDATE tasks
+                SET status = 'archived',
+                    claim_lock = NULL,
+                    claim_expires = NULL,
+                    worker_pid = NULL
+              WHERE id = ? AND status != 'archived'",
+            [task_id],
+        )
+        .map_err(|error| format!("archiving task failed: {error}"))?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    let run_id = end_run(
+        &tx,
+        task_id,
+        "reclaimed",
+        "reclaimed",
+        Some("task archived with run still active"),
+        None,
+        None,
+    )?;
+    append_event(&tx, task_id, "archived", None, run_id)?;
+    tx.commit()
+        .map_err(|error| format!("committing task archive failed: {error}"))?;
+    Ok(true)
+}
+
+pub fn reclaim_task(
+    conn: &mut Connection,
+    task_id: &str,
+    reason: Option<&str>,
+) -> Result<bool, String> {
+    let task = get_task(conn, task_id)?.ok_or_else(|| format!("unknown task {task_id}"))?;
+    if task.status != "running" {
+        return Ok(false);
+    }
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE tasks
+            SET status = 'ready',
+                claim_lock = NULL,
+                claim_expires = NULL,
+                worker_pid = NULL,
+                consecutive_failures = 0,
+                last_failure_error = NULL
+          WHERE id = ? AND status = 'running'",
+        [task_id],
+    )
+    .map_err(|error| format!("reclaiming task failed: {error}"))?;
+    let run_id = end_run(
+        &tx,
+        task_id,
+        "ready",
+        "reclaimed",
+        reason,
+        Some(&json!({"manual": true, "reason": reason})),
+        None,
+    )?;
+    append_event(
+        &tx,
+        task_id,
+        "reclaimed",
+        Some(json!({"manual": true, "reason": reason})),
+        run_id,
+    )?;
+    tx.commit()
+        .map_err(|error| format!("committing task reclaim failed: {error}"))?;
+    Ok(true)
+}
+
+pub fn reassign_task(
+    conn: &mut Connection,
+    task_id: &str,
+    profile: Option<&str>,
+    reclaim_first: bool,
+    reason: Option<&str>,
+) -> Result<bool, String> {
+    let Some(task) = get_task(conn, task_id)? else {
+        return Ok(false);
+    };
+    if task.status == "running" {
+        if !reclaim_first || !reclaim_task(conn, task_id, reason)? {
+            return Ok(false);
+        }
+    }
+    assign_task(conn, task_id, profile)
+}
+
+pub fn board_stats(conn: &Connection) -> Result<KanbanBoardStats, String> {
+    let mut stats = KanbanBoardStats::default();
+    let mut by_status = conn
+        .prepare(
+            "SELECT status, COUNT(*)
+               FROM tasks
+              WHERE status != 'archived'
+              GROUP BY status",
+        )
+        .map_err(|error| format!("preparing status stats failed: {error}"))?;
+    let rows = by_status
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("querying status stats failed: {error}"))?;
+    for row in rows {
+        let (status, count) =
+            row.map_err(|error| format!("reading status stat failed: {error}"))?;
+        stats.by_status.insert(status, count);
+    }
+
+    let mut by_assignee = conn
+        .prepare(
+            "SELECT COALESCE(assignee, ''), status, COUNT(*)
+               FROM tasks
+              WHERE status != 'archived'
+              GROUP BY COALESCE(assignee, ''), status",
+        )
+        .map_err(|error| format!("preparing assignee stats failed: {error}"))?;
+    let rows = by_assignee
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("querying assignee stats failed: {error}"))?;
+    for row in rows {
+        let (assignee, status, count) =
+            row.map_err(|error| format!("reading assignee stat failed: {error}"))?;
+        stats
+            .by_assignee
+            .entry(if assignee.is_empty() {
+                String::from("(unassigned)")
+            } else {
+                assignee
+            })
+            .or_default()
+            .insert(status, count);
+    }
+
+    stats.oldest_ready_age_seconds = conn
+        .query_row(
+            "SELECT MIN(created_at) FROM tasks WHERE status = 'ready'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("reading oldest ready task failed: {error}"))?
+        .flatten()
+        .map(|created_at| now_ts().saturating_sub(created_at));
+    Ok(stats)
+}
+
+pub fn known_assignees(
+    conn: &Connection,
+    context: &HermesContext,
+) -> Result<Vec<KanbanAssigneeRecord>, String> {
+    let mut on_disk = HashSet::new();
+    on_disk.insert(String::from("default"));
+    if let Ok(entries) = fs::read_dir(context.profiles_root()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if context.profile_exists(name) {
+                on_disk.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut counts: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT assignee, status, COUNT(*) AS n
+               FROM tasks
+              WHERE status != 'archived' AND assignee IS NOT NULL
+              GROUP BY assignee, status",
+        )
+        .map_err(|error| format!("preparing known assignees query failed: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("querying known assignees failed: {error}"))?;
+    for row in rows {
+        let (assignee, status, count) =
+            row.map_err(|error| format!("reading known assignee failed: {error}"))?;
+        counts.entry(assignee).or_default().insert(status, count);
+    }
+
+    let mut names = on_disk;
+    names.extend(counts.keys().cloned());
+    let mut records = names
+        .into_iter()
+        .map(|name| KanbanAssigneeRecord {
+            on_disk: context.profile_exists(&name),
+            counts: counts.remove(&name).unwrap_or_default(),
+            name,
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(records)
+}
+
+pub fn claim_task(
     conn: &mut Connection,
     task_id: &str,
     ttl_seconds: i64,
@@ -1872,7 +2755,7 @@ fn claim_task(
     get_task(conn, task_id)
 }
 
-fn release_stale_claims(conn: &mut Connection) -> Result<usize, String> {
+pub fn release_stale_claims(conn: &mut Connection) -> Result<usize, String> {
     let now = now_ts();
     let stale_rows = {
         let mut stmt = conn
@@ -2328,6 +3211,164 @@ fn rotate_worker_log(path: &Path, max_bytes: u64) -> Result<(), String> {
     fs::rename(path, &rotated)
         .map_err(|error| format!("rotating {} failed: {error}", path.display()))?;
     Ok(())
+}
+
+pub fn worker_log_path_for_task(hermes_home: &Path, task_id: &str) -> Result<PathBuf, String> {
+    let task_id =
+        non_empty_trimmed(task_id.to_string()).ok_or_else(|| "task_id is required".to_string())?;
+    let root = kanban_root(hermes_home);
+    let board = current_board_slug(hermes_home)?.unwrap_or_else(|| DEFAULT_BOARD.to_string());
+    let dir = if board == DEFAULT_BOARD {
+        root.join("kanban").join("logs")
+    } else {
+        root.join("kanban").join("boards").join(board).join("logs")
+    };
+    Ok(dir.join(format!("{task_id}.log")))
+}
+
+pub fn read_worker_log(
+    hermes_home: &Path,
+    task_id: &str,
+    tail_bytes: Option<usize>,
+) -> Result<Option<String>, String> {
+    let path = worker_log_path_for_task(hermes_home, task_id)?;
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(None);
+    };
+    let slice = if let Some(limit) = tail_bytes {
+        let start = bytes.len().saturating_sub(limit);
+        &bytes[start..]
+    } else {
+        &bytes[..]
+    };
+    Ok(Some(String::from_utf8_lossy(slice).to_string()))
+}
+
+pub fn gc_worker_logs(hermes_home: &Path, older_than_seconds: i64) -> Result<usize, String> {
+    let cutoff = now_ts().saturating_sub(older_than_seconds.max(0)) as u64;
+    let dir = worker_log_path_for_task(hermes_home, "placeholder")?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "worker logs directory is unavailable".to_string())?;
+    let mut removed = 0_usize;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|meta| meta.modified()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Ok(seconds) = modified.duration_since(UNIX_EPOCH) else {
+            continue;
+        };
+        if seconds.as_secs() <= cutoff {
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+pub fn gc_events(conn: &mut Connection, older_than_seconds: i64) -> Result<usize, String> {
+    let cutoff = now_ts().saturating_sub(older_than_seconds.max(0));
+    conn.execute(
+        "DELETE FROM task_events
+          WHERE created_at < ?
+            AND task_id IN (
+                SELECT id FROM tasks WHERE status IN ('done', 'archived')
+            )",
+        [cutoff],
+    )
+    .map_err(|error| format!("garbage-collecting task events failed: {error}"))
+}
+
+pub fn add_notify_sub(
+    conn: &mut Connection,
+    task_id: &str,
+    platform: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    user_id: Option<&str>,
+) -> Result<(), String> {
+    let task_id =
+        non_empty_trimmed(task_id.to_string()).ok_or_else(|| "task_id is required".to_string())?;
+    let platform = non_empty_trimmed(platform.to_string())
+        .ok_or_else(|| "platform is required".to_string())?;
+    let chat_id =
+        non_empty_trimmed(chat_id.to_string()).ok_or_else(|| "chat_id is required".to_string())?;
+    let thread_id = thread_id.unwrap_or("").trim().to_string();
+    conn.execute(
+        "INSERT INTO kanban_notify_subs (
+            task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(task_id, platform, chat_id, thread_id)
+        DO UPDATE SET user_id = excluded.user_id",
+        params![task_id, platform, chat_id, thread_id, user_id, now_ts()],
+    )
+    .map_err(|error| format!("adding notify subscription failed: {error}"))?;
+    Ok(())
+}
+
+pub fn list_notify_subs(
+    conn: &Connection,
+    task_id: Option<&str>,
+) -> Result<Vec<KanbanNotifySubscription>, String> {
+    let (sql, params): (&str, Vec<String>) = if let Some(task_id) = task_id {
+        (
+            "SELECT task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id
+               FROM kanban_notify_subs
+              WHERE task_id = ?
+              ORDER BY task_id, platform, chat_id, thread_id",
+            vec![task_id.to_string()],
+        )
+    } else {
+        (
+            "SELECT task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id
+               FROM kanban_notify_subs
+              ORDER BY task_id, platform, chat_id, thread_id",
+            Vec::new(),
+        )
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|error| format!("preparing notify subscription query failed: {error}"))?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            Ok(KanbanNotifySubscription {
+                task_id: row.get(0)?,
+                platform: row.get(1)?,
+                chat_id: row.get(2)?,
+                thread_id: row.get(3)?,
+                user_id: row.get(4)?,
+                created_at: row.get(5)?,
+                last_event_id: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("querying notify subscriptions failed: {error}"))?;
+    collect_rows(rows, "reading notify subscription")
+}
+
+pub fn remove_notify_sub(
+    conn: &mut Connection,
+    task_id: &str,
+    platform: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+) -> Result<bool, String> {
+    let updated = conn
+        .execute(
+            "DELETE FROM kanban_notify_subs
+              WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            params![task_id, platform, chat_id, thread_id.unwrap_or("")],
+        )
+        .map_err(|error| format!("removing notify subscription failed: {error}"))?;
+    Ok(updated > 0)
 }
 
 fn record_task_failure(
@@ -3322,7 +4363,7 @@ mod tests {
             CreateTaskInput {
                 title: "Parent".to_string(),
                 body: Some("Research this change".to_string()),
-                assignee: "researcher".to_string(),
+                assignee: Some("researcher".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,
@@ -3341,7 +4382,7 @@ mod tests {
             CreateTaskInput {
                 title: "Child".to_string(),
                 body: Some("Use the parent handoff".to_string()),
-                assignee: "writer".to_string(),
+                assignee: Some("writer".to_string()),
                 parents: vec![parent_id.clone()],
                 tenant: None,
                 priority: 0,
@@ -3388,7 +4429,7 @@ mod tests {
             CreateTaskInput {
                 title: "Running".to_string(),
                 body: None,
-                assignee: "worker".to_string(),
+                assignee: Some("worker".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,
@@ -3445,7 +4486,7 @@ mod tests {
             CreateTaskInput {
                 title: "Complete".to_string(),
                 body: None,
-                assignee: "worker".to_string(),
+                assignee: Some("worker".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,
@@ -3494,7 +4535,7 @@ mod tests {
             CreateTaskInput {
                 title: "Dispatch me".to_string(),
                 body: None,
-                assignee: "worker".to_string(),
+                assignee: Some("worker".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,
@@ -3543,7 +4584,7 @@ mod tests {
             CreateTaskInput {
                 title: "Spawn me".to_string(),
                 body: None,
-                assignee: "worker".to_string(),
+                assignee: Some("worker".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,
@@ -3615,7 +4656,7 @@ mod tests {
             CreateTaskInput {
                 title: "Fail me".to_string(),
                 body: None,
-                assignee: "worker".to_string(),
+                assignee: Some("worker".to_string()),
                 parents: Vec::new(),
                 tenant: None,
                 priority: 0,

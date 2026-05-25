@@ -60,8 +60,20 @@ pub use cronjob::{
 pub use delegate::DelegateExecutor;
 pub use env_loader::EnvLoadReport;
 pub use kanban::{
-    KanbanDispatchOptions, KanbanDispatchResult, KanbanRunResult, dispatch_kanban_once,
-    kanban_has_spawnable_ready, run_kanban_task,
+    Comment as KanbanComment, CreateTaskInput as KanbanCreateTaskInput, Event as KanbanEvent,
+    KanbanAssigneeRecord, KanbanBoardRecord, KanbanBoardRemoval, KanbanBoardStats,
+    KanbanDispatchOptions, KanbanDispatchResult, KanbanNotifySubscription, KanbanRunResult,
+    KanbanTaskDetail, KanbanTaskQuery, Run as KanbanRun, Task as KanbanTask, VALID_KANBAN_STATUSES,
+    VALID_WORKSPACE_KINDS, add_comment, add_notify_sub, archive_task, assign_task, block_task,
+    board_stats, build_worker_context, child_ids, claim_task, clear_current_kanban_board,
+    complete_task, create_kanban_board, create_task, current_kanban_board, dispatch_kanban_once,
+    edit_completed_task_result, gc_events, gc_worker_logs, get_task, heartbeat_worker,
+    kanban_board_exists, kanban_db_path_for_home, kanban_has_spawnable_ready, kanban_task_detail,
+    known_assignees, latest_run, latest_summary, link_tasks, list_comments, list_events,
+    list_kanban_boards, list_notify_subs, list_runs, list_tasks, open_kanban_db, parent_ids,
+    read_worker_log, reassign_task, reclaim_task, recompute_ready, release_stale_claims,
+    remove_kanban_board, remove_notify_sub, rename_kanban_board, run_kanban_task,
+    set_current_kanban_board, unblock_task, unlink_tasks, worker_log_path_for_task,
 };
 pub use logging::{
     LoggingMode, LoggingSetup, clear_session_context, enable_verbose_logging, set_session_context,
