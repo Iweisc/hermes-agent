@@ -236,6 +236,7 @@ impl<'a> NativeGatewayServer<'a> {
             "session.resume" => self.handle_session_resume(params),
             "session.branch" => self.handle_session_branch(params),
             "session.undo" => self.handle_session_undo(params),
+            "session.usage" => self.handle_session_usage(params),
             "session.delete" => self.handle_session_delete(params),
             "session.title" => self.handle_session_title(params),
             "session.status" => self.handle_session_status(params),
@@ -490,6 +491,42 @@ impl<'a> NativeGatewayServer<'a> {
             "session_id": new_session_id,
             "title": title,
             "parent": session_id,
+        }))
+    }
+
+    fn handle_session_usage(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let usage = self
+            .session_store
+            .get_session_usage(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let model = state
+            .overrides
+            .model
+            .clone()
+            .or(usage.model.clone())
+            .unwrap_or_default();
+        let total = usage.input_tokens + usage.output_tokens;
+        let (cost_status, cost_usd) = if let Some(actual) = usage.actual_cost_usd {
+            (Some(String::from("exact")), Some(actual))
+        } else {
+            (usage.cost_status.clone(), usage.estimated_cost_usd)
+        };
+        Ok(json!({
+            "model": model,
+            "calls": usage.api_call_count,
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": total,
+            "cache_read": usage.cache_read_tokens,
+            "cache_write": usage.cache_write_tokens,
+            "cost_status": cost_status,
+            "cost_usd": cost_usd,
         }))
     }
 
@@ -2091,7 +2128,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use hermes_core::MessageAppend;
+    use hermes_core::{MessageAppend, SessionUsageDelta};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2976,6 +3013,78 @@ mod tests {
         let resize_frame = serde_json::from_slice::<Value>(&resize).unwrap();
         assert_eq!(resize_frame["result"]["cols"], json!(132));
         assert_eq!(server.sessions.get("resize-session").unwrap().cols, 132);
+    }
+
+    #[test]
+    fn native_gateway_session_usage_reads_persisted_counters() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("usage-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("stored-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .record_session_usage(
+                "usage-session",
+                &SessionUsageDelta {
+                    api_call_count: 3,
+                    input_tokens: 150,
+                    output_tokens: 55,
+                    cache_read_tokens: 13,
+                    cache_write_tokens: 7,
+                    reasoning_tokens: 10,
+                    estimated_cost_usd: Some(0.1334),
+                    actual_cost_usd: None,
+                    cost_status: Some(String::from("estimated")),
+                },
+            )
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("usage-session"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("."),
+                cols: 80,
+                overrides: ModelOverrides {
+                    model: Some(String::from("override-model")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut usage = Vec::new();
+        server
+            .handle_request(
+                "session.usage",
+                json!(1),
+                json!({"session_id":"usage-session"}),
+                &mut usage,
+                false,
+            )
+            .unwrap();
+        let usage_frame = serde_json::from_slice::<Value>(&usage).unwrap();
+        assert_eq!(usage_frame["result"]["model"], json!("override-model"));
+        assert_eq!(usage_frame["result"]["calls"], json!(3));
+        assert_eq!(usage_frame["result"]["input"], json!(150));
+        assert_eq!(usage_frame["result"]["output"], json!(55));
+        assert_eq!(usage_frame["result"]["total"], json!(205));
+        assert_eq!(usage_frame["result"]["cache_read"], json!(13));
+        assert_eq!(usage_frame["result"]["cache_write"], json!(7));
+        assert_eq!(usage_frame["result"]["cost_status"], json!("estimated"));
+        assert_eq!(usage_frame["result"]["cost_usd"], json!(0.1334));
     }
 
     #[test]

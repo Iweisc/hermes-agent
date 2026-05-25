@@ -131,6 +131,33 @@ pub struct SessionRecord {
     pub api_call_count: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionUsageRecord {
+    pub model: Option<String>,
+    pub api_call_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsageDelta {
+    pub api_call_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -388,6 +415,79 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(state_err("collecting session prefix matches"))?;
         Ok((matches.len() == 1).then(|| matches[0].clone()))
+    }
+
+    pub fn record_session_usage(
+        &self,
+        session_id: &str,
+        usage: &SessionUsageDelta,
+    ) -> Result<bool, HermesError> {
+        let rowcount = self
+            .connection
+            .execute(
+                "UPDATE sessions
+                 SET api_call_count = api_call_count + ?,
+                     input_tokens = input_tokens + ?,
+                     output_tokens = output_tokens + ?,
+                     cache_read_tokens = cache_read_tokens + ?,
+                     cache_write_tokens = cache_write_tokens + ?,
+                     reasoning_tokens = reasoning_tokens + ?,
+                     estimated_cost_usd = CASE
+                         WHEN ? IS NULL THEN estimated_cost_usd
+                         ELSE COALESCE(estimated_cost_usd, 0) + ?
+                     END,
+                     actual_cost_usd = CASE
+                         WHEN ? IS NULL THEN actual_cost_usd
+                         ELSE COALESCE(actual_cost_usd, 0) + ?
+                     END,
+                     cost_status = COALESCE(?, cost_status)
+                 WHERE id = ?",
+                params![
+                    usage.api_call_count,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.reasoning_tokens,
+                    usage.estimated_cost_usd,
+                    usage.estimated_cost_usd,
+                    usage.actual_cost_usd,
+                    usage.actual_cost_usd,
+                    usage.cost_status,
+                    session_id,
+                ],
+            )
+            .map_err(state_err("recording session usage"))?;
+        Ok(rowcount > 0)
+    }
+
+    pub fn get_session_usage(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionUsageRecord>, HermesError> {
+        self.connection
+            .query_row(
+                "SELECT model, api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status
+                 FROM sessions
+                 WHERE id = ?",
+                [session_id],
+                |row| {
+                    Ok(SessionUsageRecord {
+                        model: row.get(0)?,
+                        api_call_count: row.get(1)?,
+                        input_tokens: row.get(2)?,
+                        output_tokens: row.get(3)?,
+                        cache_read_tokens: row.get(4)?,
+                        cache_write_tokens: row.get(5)?,
+                        reasoning_tokens: row.get(6)?,
+                        estimated_cost_usd: row.get(7)?,
+                        actual_cost_usd: row.get(8)?,
+                        cost_status: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(state_err("loading session usage"))
     }
 
     pub fn sanitize_title(title: Option<&str>) -> Result<Option<String>, HermesError> {
@@ -1812,6 +1912,72 @@ mod tests {
                 .expect("get messages")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn record_and_load_session_usage_round_trips_counters() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-usage"),
+                source: String::from("cli"),
+                user_id: None,
+                model: Some(String::from("gpt-test")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+
+        let updated = store
+            .record_session_usage(
+                "sess-usage",
+                &SessionUsageDelta {
+                    api_call_count: 2,
+                    input_tokens: 120,
+                    output_tokens: 45,
+                    cache_read_tokens: 11,
+                    cache_write_tokens: 7,
+                    reasoning_tokens: 9,
+                    estimated_cost_usd: Some(0.1234),
+                    actual_cost_usd: None,
+                    cost_status: Some(String::from("estimated")),
+                },
+            )
+            .expect("record usage");
+        assert!(updated);
+
+        store
+            .record_session_usage(
+                "sess-usage",
+                &SessionUsageDelta {
+                    api_call_count: 1,
+                    input_tokens: 30,
+                    output_tokens: 10,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 1,
+                    estimated_cost_usd: Some(0.0100),
+                    actual_cost_usd: Some(0.0900),
+                    cost_status: Some(String::from("exact")),
+                },
+            )
+            .expect("record second usage");
+
+        let usage = store
+            .get_session_usage("sess-usage")
+            .expect("get usage")
+            .expect("usage");
+        assert_eq!(usage.model.as_deref(), Some("gpt-test"));
+        assert_eq!(usage.api_call_count, 3);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 55);
+        assert_eq!(usage.cache_read_tokens, 13);
+        assert_eq!(usage.cache_write_tokens, 7);
+        assert_eq!(usage.reasoning_tokens, 10);
+        assert_eq!(usage.estimated_cost_usd, Some(0.1334));
+        assert_eq!(usage.actual_cost_usd, Some(0.09));
+        assert_eq!(usage.cost_status.as_deref(), Some("exact"));
     }
 
     #[test]
