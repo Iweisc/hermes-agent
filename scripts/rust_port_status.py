@@ -344,6 +344,127 @@ def build_sync_drift(payload: dict, tracker: dict | None) -> dict:
     }
 
 
+def build_published_head_coverage(payload: dict, repo_root: Path) -> dict:
+    workers = []
+    for entry in sorted(payload["workers"], key=lambda item: item["worktree"]):
+        branch = entry["branch"]
+        remote_branch = f"origin/{branch}"
+        remote_head = git(
+            ["rev-parse", "--verify", "--short", f"refs/remotes/{remote_branch}"],
+            repo_root,
+            allow_failure=True,
+        )
+        remote_head = remote_head or None
+        remote_exists = bool(remote_head)
+        remote_head_integrated = False
+        if remote_exists:
+            result = subprocess.run(
+                [
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    f"refs/remotes/{remote_branch}",
+                    "HEAD",
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            remote_head_integrated = result.returncode == 0
+
+        local_head_matches_remote = (
+            entry["head"] == remote_head if remote_head is not None else None
+        )
+        has_uncommitted_local_changes = bool(entry["dirty_files"])
+        has_unpublished_local_head = remote_exists and local_head_matches_remote is False
+        published_head_fully_absorbed = (
+            remote_head_integrated
+            and local_head_matches_remote is True
+            and not has_uncommitted_local_changes
+        )
+        follow_up_needed = remote_head_integrated and (
+            has_uncommitted_local_changes or has_unpublished_local_head
+        )
+
+        if not remote_exists:
+            follow_up_reason = "missing_remote_head"
+        elif not remote_head_integrated:
+            follow_up_reason = "remote_head_not_integrated"
+        elif has_unpublished_local_head:
+            follow_up_reason = "local_head_ahead_of_remote_after_merge"
+        elif has_uncommitted_local_changes:
+            follow_up_reason = "uncommitted_local_changes_after_remote_merge"
+        else:
+            follow_up_reason = None
+
+        workers.append(
+            {
+                "worktree": entry["worktree"],
+                "branch": branch,
+                "remote_branch": remote_branch if remote_exists else None,
+                "remote_head": remote_head,
+                "local_head": entry["head"],
+                "remote_exists": remote_exists,
+                "remote_head_integrated": remote_head_integrated,
+                "local_head_matches_remote": local_head_matches_remote,
+                "has_uncommitted_local_changes": has_uncommitted_local_changes,
+                "has_unpublished_local_head": has_unpublished_local_head,
+                "published_head_fully_absorbed": published_head_fully_absorbed,
+                "follow_up_needed": follow_up_needed,
+                "follow_up_reason": follow_up_reason,
+                "dirty_files": entry["dirty_files"],
+            }
+        )
+
+    remote_workers = [item for item in workers if item["remote_exists"]]
+    integrated_remote_workers = [
+        item for item in remote_workers if item["remote_head_integrated"]
+    ]
+    follow_up_workers = [item for item in workers if item["follow_up_needed"]]
+    return {
+        "summary": {
+            "tracked_worker_count": len(workers),
+            "workers_with_remote_heads": len(remote_workers),
+            "workers_without_remote_heads": sum(
+                1 for item in workers if not item["remote_exists"]
+            ),
+            "published_remote_heads_integrated": len(integrated_remote_workers),
+            "published_remote_heads_pending": sum(
+                1 for item in remote_workers if not item["remote_head_integrated"]
+            ),
+            "published_heads_fully_absorbed": sum(
+                1 for item in workers if item["published_head_fully_absorbed"]
+            ),
+            "workers_needing_post_merge_follow_up": len(follow_up_workers),
+            "workers_with_uncommitted_local_changes_after_merge": sum(
+                1
+                for item in workers
+                if item["follow_up_reason"]
+                == "uncommitted_local_changes_after_remote_merge"
+            ),
+            "workers_with_unpublished_local_heads_after_merge": sum(
+                1
+                for item in workers
+                if item["follow_up_reason"] == "local_head_ahead_of_remote_after_merge"
+            ),
+            "first_pending_remote_head": next(
+                (
+                    item["worktree"]
+                    for item in workers
+                    if item["follow_up_reason"] == "remote_head_not_integrated"
+                ),
+                None,
+            ),
+            "first_post_merge_follow_up": follow_up_workers[0]["worktree"]
+            if follow_up_workers
+            else None,
+        },
+        "workers": workers,
+        "post_merge_follow_up": follow_up_workers,
+    }
+
+
 def build_live_conflict_clusters(payload: dict) -> list[dict]:
     clusters = []
     for item in payload["tracker_validation"]["remediation"]["path_actions"]:
@@ -4276,6 +4397,9 @@ def sync_tracker_state(tracker: dict, payload: dict) -> dict:
     synced["sync_drift_command"] = (
         "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift"
     )
+    synced["published_head_coverage_command"] = (
+        "python3 scripts/rust_port_status.py --select tracker_validation.published_head_coverage"
+    )
     synced["branch_batches_command"] = (
         "python3 scripts/rust_port_status.py --select tracker_validation.remediation.branch_batches"
     )
@@ -4430,141 +4554,146 @@ def sync_tracker_state(tracker: dict, payload: dict) -> dict:
         },
         {
             "step": 4,
+            "command": synced["published_head_coverage_command"],
+            "purpose": "Separate already-integrated published worker heads from residual local dirty work so post-merge blockers are not mistaken for missing merges.",
+        },
+        {
+            "step": 5,
             "command": synced["objective_audit_command"],
             "purpose": "Audit the live state against the actual integration objective so requirement status does not depend on stale tracker prose.",
         },
         {
-            "step": 5,
+            "step": 6,
             "command": synced["objective_resolution_runbook_command"],
             "purpose": "Map each incomplete objective requirement to the exact next tracker commands and current live blockers needed to move it forward.",
         },
         {
-            "step": 6,
+            "step": 7,
             "command": "python3 scripts/rust_port_status.py --select tracker_validation.execution_queue.next_batch",
             "purpose": "Get the exact next branch-operation batch for the first blocked merge wave, including owner dependency releases.",
         },
         {
-            "step": 7,
+            "step": 8,
             "command": synced["triage_command"],
             "purpose": "Classify branches as salvageable, release-only, or retask/stop before executing cleanup work.",
         },
         {
-            "step": 8,
+            "step": 9,
             "command": synced["lifecycle_command"],
             "purpose": "Decide which branches should retire after cleanup versus remain alive to receive or keep lane-owned files.",
         },
         {
-            "step": 9,
+            "step": 10,
             "command": synced["lane_gap_command"],
             "purpose": "Resolve unowned paths by checking which ones fit existing lanes versus which ones need a new or expanded lane.",
         },
         {
-            "step": 10,
+            "step": 11,
             "command": synced["tracker_realignments_command"],
             "purpose": "Convert lane-gap findings into concrete tracker edits such as allowed_paths additions, owner reviews, or new-lane decisions.",
         },
         {
-            "step": 11,
+            "step": 12,
             "command": synced["conflict_runbook_command"],
             "purpose": "Clear shared-file conflicts path-by-path using owner-specific releaser commands and wave ordering.",
         },
         {
-            "step": 12,
+            "step": 13,
             "command": synced["decision_queue_command"],
             "purpose": "Resolve unresolved owner reviews and new-lane decisions in one prioritized queue before calling branches aligned.",
         },
         {
-            "step": 13,
+            "step": 14,
             "command": synced["lane_proposals_command"],
             "purpose": "Turn unresolved new-lane decisions into grouped lane-expansion or dedicated-lane proposals.",
         },
         {
-            "step": 14,
+            "step": 15,
             "command": synced["tracker_edit_plan_command"],
             "purpose": "Convert proposals and owner reviews into exact tracker mutations for allowed_paths and scope updates.",
         },
         {
-            "step": 15,
+            "step": 16,
             "command": synced["choice_runbook_command"],
             "purpose": "Review remaining ambiguous ownership choices with live branch pressure and wave context.",
         },
         {
-            "step": 16,
+            "step": 17,
             "command": synced["apply_tracker_edit_plan_command"],
             "purpose": "Apply all non-ambiguous tracker scope mutations so later cleanup uses updated lane ownership.",
         },
         {
-            "step": 17,
+            "step": 18,
             "command": synced["apply_tracker_choice_command"],
             "purpose": "Apply a selected owner for a remaining ambiguous lane choice, then refresh the tracker snapshot.",
         },
         {
-            "step": 18,
+            "step": 19,
             "command": synced["cleanup_impact_command"],
             "purpose": "Rank branch cleanup batches by early-wave unblock value, owner wait reduction, and critical overlap relief.",
         },
         {
-            "step": 19,
+            "step": 20,
             "command": synced["cleanup_forecast_command"],
             "purpose": "Project how much the top cleanup batches reduce overlaps, lead-only blockers, and owner wait lists before running them.",
         },
         {
-            "step": 20,
+            "step": 21,
             "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.prioritized_actions",
             "purpose": "Get the current ordered cleanup queue for the integration lead.",
         },
         {
-            "step": 21,
+            "step": 22,
             "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.branch_batches",
             "purpose": "Use compact per-branch command batches when executing the cleanup queue.",
         },
         {
-            "step": 22,
+            "step": 23,
             "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.owner_runbook",
             "purpose": "Check which owner branches are waiting on releases and which owned paths are ready to receive.",
         },
         {
-            "step": 23,
+            "step": 24,
             "command": "python3 scripts/rust_port_status.py --select tracker_validation.merge_gates",
             "purpose": "Check which merge wave is blocked, why it is blocked, and which cleanup commands belong to that wave.",
         },
         {
-            "step": 24,
+            "step": 25,
             "command": synced["wave_unlock_forecast_command"],
             "purpose": "See when each merge wave becomes cleanup-ready under the current prioritized cleanup sequence and what manual blockers remain.",
         },
         {
-            "step": 25,
+            "step": 26,
             "command": synced["wave_critical_path_command"],
             "purpose": "Get the exact cleanup prefix and remaining manual gates required to unlock each merge wave.",
         },
         {
-            "step": 26,
+            "step": 27,
             "command": synced["unlock_ladder_command"],
             "purpose": "See the global stage transitions where cleanup batches newly make waves cleanup-ready or fully ready.",
         },
         {
-            "step": 27,
+            "step": 28,
             "command": synced["unlock_frontier_command"],
             "purpose": "Lift the current unlock frontier into one view: what to run now, which stage first yields a fully ready wave, and where the next manual gate appears.",
         },
         {
-            "step": 28,
+            "step": 29,
             "command": synced["next_unlock_batch_command"],
             "purpose": "Flatten the immediate unlock transition into one ordered command pack and preview the follow-up stage or manual gate.",
         },
         {
-            "step": 29,
+            "step": 30,
             "command": synced["next_unlock_brief_command"],
             "purpose": "Compress the next unlock batch into one operator brief: current commands, immediate payoff, follow-up wave effect, and the next manual gate.",
         },
         {
-            "step": 30,
+            "step": 31,
             "command": synced["stage_command_runbook_command"],
             "purpose": "Split the global unlock ladder into incremental branch command packs and carry forward the remaining manual gates at each stage.",
         },
         {
-            "step": 31,
+            "step": 32,
             "command": synced["wave_command_runbook_command"],
             "purpose": "Expand each wave critical path into ordered branch command batches plus the remaining manual gate commands.",
         },
@@ -4582,18 +4711,29 @@ def sync_tracker_file(
     tracker: dict,
     payload: dict,
     worktree_root: str,
+    repo_root: Path,
 ) -> dict:
     tracker = sync_tracker_state(tracker, payload)
     write_tracker(tracker_path, tracker)
-    populate_tracker_views(payload, tracker_path, tracker, worktree_root)
+    populate_tracker_views(payload, tracker_path, tracker, worktree_root, repo_root)
     tracker = sync_tracker_state(tracker, payload)
     write_tracker(tracker_path, tracker)
-    populate_tracker_views(payload, tracker_path, tracker, worktree_root)
+    populate_tracker_views(payload, tracker_path, tracker, worktree_root, repo_root)
     return tracker
 
 
-def populate_tracker_views(payload: dict, tracker_path: Path | None, tracker: dict | None, worktree_root: str) -> None:
+def populate_tracker_views(
+    payload: dict,
+    tracker_path: Path | None,
+    tracker: dict | None,
+    worktree_root: str,
+    repo_root: Path,
+) -> None:
     payload["tracker_validation"] = validate_tracker(payload, tracker_path, tracker, worktree_root)
+    payload["tracker_validation"]["published_head_coverage"] = build_published_head_coverage(
+        payload,
+        repo_root,
+    )
     payload["tracker_validation"]["merge_gates"] = build_merge_gates(payload, tracker)
     payload["tracker_validation"]["wave_unlock_forecast"] = build_wave_unlock_forecast(payload, tracker)
     payload["tracker_validation"]["wave_critical_path"] = build_wave_critical_path(
@@ -4926,10 +5066,11 @@ def main() -> int:
         },
         "shared_file_overlaps": build_overlap_map(worker_entries),
     }
-    populate_tracker_views(payload, tracker_path, tracker, str(root))
+    repo_root = Path.cwd()
+    populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
     if args.sync_tracker:
-        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root))
-        populate_tracker_views(payload, tracker_path, tracker, str(root))
+        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root), repo_root)
+        populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
     if args.apply_tracker_edit_plan:
         tracker = apply_tracker_edit_plan_to_tracker(
             tracker,
@@ -4937,9 +5078,9 @@ def main() -> int:
             payload["generated_at"],
         )
         write_tracker(tracker_path, tracker)
-        populate_tracker_views(payload, tracker_path, tracker, str(root))
-        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root))
-        populate_tracker_views(payload, tracker_path, tracker, str(root))
+        populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
+        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root), repo_root)
+        populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
     if args.apply_tracker_choice_path:
         tracker = apply_tracker_choice_to_tracker(
             tracker,
@@ -4949,9 +5090,9 @@ def main() -> int:
             payload["generated_at"],
         )
         write_tracker(tracker_path, tracker)
-        populate_tracker_views(payload, tracker_path, tracker, str(root))
-        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root))
-        populate_tracker_views(payload, tracker_path, tracker, str(root))
+        populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
+        tracker = sync_tracker_file(tracker_path, tracker, payload, str(root), repo_root)
+        populate_tracker_views(payload, tracker_path, tracker, str(root), repo_root)
     try:
         selected = select_payload(payload, args.select)
     except KeyError as exc:

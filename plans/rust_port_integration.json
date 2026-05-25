@@ -23,7 +23,7 @@
       "plans/rust_port_integration.json",
       "scripts/rust_port_status.py"
     ],
-    "state_fingerprint": "71c9eaa7cde0"
+    "state_fingerprint": "2399a80daa1a"
   },
   "merge_order": [
     {
@@ -236,6 +236,7 @@
       "observed_dirty_files": [
         "crates/hermes-core/src/agent.rs",
         "crates/hermes-core/src/auth.rs",
+        "crates/hermes-core/src/config.rs",
         "crates/hermes-core/src/lib.rs"
       ],
       "head": "632289b32",
@@ -252,8 +253,14 @@
         "crates/hermes-core/src/checkpoints.rs",
         "crates/hermes-core/src/context_engine.rs"
       ],
-      "status": "diverged",
-      "observed_dirty_files": [],
+      "status": "dirty",
+      "observed_dirty_files": [
+        "crates/hermes-core/src/agent.rs",
+        "crates/hermes-core/src/state.rs",
+        "crates/hermes-core/src/tools.rs",
+        "crates/hermes-core/src/turn_runner.rs",
+        "crates/hermes/src/gateway_native.rs"
+      ],
       "head": "5f5d0e4aa",
       "subject": "Add Rust session usage accounting"
     },
@@ -286,15 +293,10 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
-        "crates/hermes-core/src/lib.rs",
-        "crates/hermes-core/src/state.rs",
-        "crates/hermes/src/completion.rs",
-        "crates/hermes/src/gateway_cmd.rs",
-        "crates/hermes/src/main.rs",
-        "crates/hermes/src/profile_cmd.rs"
+        "crates/hermes/src/main.rs"
       ],
-      "head": "826155e02",
-      "subject": "Add explicit live-only slash command parity"
+      "head": "a9e6c01bf",
+      "subject": "WIP: extend Rust CLI parity and stabilize tests"
     },
     {
       "worktree": "agent-09",
@@ -309,12 +311,10 @@
         "ui-tui/package.json",
         "scripts/smoke_tui_rust_backend.py"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-agent/src/tui_gateway.rs"
-      ],
-      "head": "6c27e0529",
-      "subject": "WIP: move TUI ops RPCs into Rust gateway"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "febf01e7e",
+      "subject": "WIP: finish Rust ownership of TUI method catalog"
     },
     {
       "worktree": "agent-10",
@@ -362,11 +362,12 @@
       ],
       "status": "dirty",
       "observed_dirty_files": [
+        "crates/hermes-core/src/gateway.rs",
         "crates/hermes/src/backup.rs",
         "crates/hermes/src/webhook.rs"
       ],
-      "head": "01b9d35a0",
-      "subject": "WIP: port gateway approval command runtime"
+      "head": "0a1126395",
+      "subject": "WIP: port gateway approval prompt runtime"
     },
     {
       "worktree": "agent-13",
@@ -398,8 +399,8 @@
       "observed_dirty_files": [
         "crates/hermes/src/native_api_server.rs"
       ],
-      "head": "33c686c65",
-      "subject": "Fix native session-backed API streaming progress"
+      "head": "1061a0a03",
+      "subject": "Persist native response stream snapshots"
     },
     {
       "worktree": "agent-15",
@@ -447,18 +448,10 @@
         "crates/hermes-core/src/plugin_runtime.rs",
         "crates/hermes-core/src/cronjob.rs"
       ],
-      "status": "dirty",
-      "observed_dirty_files": [
-        "crates/hermes-acp/src/main.rs",
-        "crates/hermes-agent/src/main.rs",
-        "crates/hermes-core/src/agent.rs",
-        "crates/hermes-core/src/cronjob.rs",
-        "crates/hermes-core/src/plugin_runtime.rs",
-        "crates/hermes-core/src/tools.rs",
-        "crates/hermes/src/main.rs"
-      ],
-      "head": "dd7a174f9",
-      "subject": "WIP: port plugin image generation setup"
+      "status": "diverged",
+      "observed_dirty_files": [],
+      "head": "ee8dd8860",
+      "subject": "WIP: tighten Rust plugin runtime lifecycle hooks"
     },
     {
       "worktree": "agent-18",
@@ -550,7 +543,7 @@
     {
       "item": "Track all 21 worker branches",
       "status": "done",
-      "evidence": "worker_branches tracks 21 worktrees; 9 are currently dirty."
+      "evidence": "worker_branches tracks 21 worktrees; 8 are currently dirty."
     },
     {
       "item": "Define merge order",
@@ -580,7 +573,7 @@
     {
       "item": "Complete the Python/TS-to-Rust port",
       "status": "in_progress",
-      "evidence": "dirty_workers=9, blocked_waves=6, and compatibility lanes are still active."
+      "evidence": "dirty_workers=8, blocked_waves=6, and compatibility lanes are still active."
     }
   ],
   "execution_protocol": [
@@ -601,141 +594,146 @@
     },
     {
       "step": 4,
+      "command": "python3 scripts/rust_port_status.py --select tracker_validation.published_head_coverage",
+      "purpose": "Separate already-integrated published worker heads from residual local dirty work so post-merge blockers are not mistaken for missing merges."
+    },
+    {
+      "step": 5,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.objective_audit",
       "purpose": "Audit the live state against the actual integration objective so requirement status does not depend on stale tracker prose."
     },
     {
-      "step": 5,
+      "step": 6,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.objective_resolution_runbook",
       "purpose": "Map each incomplete objective requirement to the exact next tracker commands and current live blockers needed to move it forward."
     },
     {
-      "step": 6,
+      "step": 7,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.execution_queue.next_batch",
       "purpose": "Get the exact next branch-operation batch for the first blocked merge wave, including owner dependency releases."
     },
     {
-      "step": 7,
+      "step": 8,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.branch_triage",
       "purpose": "Classify branches as salvageable, release-only, or retask/stop before executing cleanup work."
     },
     {
-      "step": 8,
+      "step": 9,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.branch_lifecycle",
       "purpose": "Decide which branches should retire after cleanup versus remain alive to receive or keep lane-owned files."
     },
     {
-      "step": 9,
+      "step": 10,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.lane_gap_report",
       "purpose": "Resolve unowned paths by checking which ones fit existing lanes versus which ones need a new or expanded lane."
     },
     {
-      "step": 10,
+      "step": 11,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.tracker_realignments",
       "purpose": "Convert lane-gap findings into concrete tracker edits such as allowed_paths additions, owner reviews, or new-lane decisions."
     },
     {
-      "step": 11,
+      "step": 12,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
       "purpose": "Clear shared-file conflicts path-by-path using owner-specific releaser commands and wave ordering."
     },
     {
-      "step": 12,
+      "step": 13,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
       "purpose": "Resolve unresolved owner reviews and new-lane decisions in one prioritized queue before calling branches aligned."
     },
     {
-      "step": 13,
+      "step": 14,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.lane_proposals",
       "purpose": "Turn unresolved new-lane decisions into grouped lane-expansion or dedicated-lane proposals."
     },
     {
-      "step": 14,
+      "step": 15,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.tracker_edit_plan",
       "purpose": "Convert proposals and owner reviews into exact tracker mutations for allowed_paths and scope updates."
     },
     {
-      "step": 15,
+      "step": 16,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.choice_runbook",
       "purpose": "Review remaining ambiguous ownership choices with live branch pressure and wave context."
     },
     {
-      "step": 16,
+      "step": 17,
       "command": "python3 scripts/rust_port_status.py --apply-tracker-edit-plan",
       "purpose": "Apply all non-ambiguous tracker scope mutations so later cleanup uses updated lane ownership."
     },
     {
-      "step": 17,
+      "step": 18,
       "command": "python3 scripts/rust_port_status.py --apply-tracker-choice-path <path> --apply-tracker-choice-owner <worktree>",
       "purpose": "Apply a selected owner for a remaining ambiguous lane choice, then refresh the tracker snapshot."
     },
     {
-      "step": 18,
+      "step": 19,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.cleanup_impact_queue",
       "purpose": "Rank branch cleanup batches by early-wave unblock value, owner wait reduction, and critical overlap relief."
     },
     {
-      "step": 19,
+      "step": 20,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.cleanup_forecast",
       "purpose": "Project how much the top cleanup batches reduce overlaps, lead-only blockers, and owner wait lists before running them."
     },
     {
-      "step": 20,
+      "step": 21,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.prioritized_actions",
       "purpose": "Get the current ordered cleanup queue for the integration lead."
     },
     {
-      "step": 21,
+      "step": 22,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.branch_batches",
       "purpose": "Use compact per-branch command batches when executing the cleanup queue."
     },
     {
-      "step": 22,
+      "step": 23,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.owner_runbook",
       "purpose": "Check which owner branches are waiting on releases and which owned paths are ready to receive."
     },
     {
-      "step": 23,
+      "step": 24,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.merge_gates",
       "purpose": "Check which merge wave is blocked, why it is blocked, and which cleanup commands belong to that wave."
     },
     {
-      "step": 24,
+      "step": 25,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.wave_unlock_forecast",
       "purpose": "See when each merge wave becomes cleanup-ready under the current prioritized cleanup sequence and what manual blockers remain."
     },
     {
-      "step": 25,
+      "step": 26,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.wave_critical_path",
       "purpose": "Get the exact cleanup prefix and remaining manual gates required to unlock each merge wave."
     },
     {
-      "step": 26,
+      "step": 27,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.unlock_ladder",
       "purpose": "See the global stage transitions where cleanup batches newly make waves cleanup-ready or fully ready."
     },
     {
-      "step": 27,
+      "step": 28,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.unlock_frontier",
       "purpose": "Lift the current unlock frontier into one view: what to run now, which stage first yields a fully ready wave, and where the next manual gate appears."
     },
     {
-      "step": 28,
+      "step": 29,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.next_unlock_batch",
       "purpose": "Flatten the immediate unlock transition into one ordered command pack and preview the follow-up stage or manual gate."
     },
     {
-      "step": 29,
+      "step": 30,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.next_unlock_brief",
       "purpose": "Compress the next unlock batch into one operator brief: current commands, immediate payoff, follow-up wave effect, and the next manual gate."
     },
     {
-      "step": 30,
+      "step": 31,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.stage_command_runbook",
       "purpose": "Split the global unlock ladder into incremental branch command packs and carry forward the remaining manual gates at each stage."
     },
     {
-      "step": 31,
+      "step": 32,
       "command": "python3 scripts/rust_port_status.py --select tracker_validation.wave_command_runbook",
       "purpose": "Expand each wave critical path into ordered branch command batches plus the remaining manual gate commands."
     }
@@ -1218,8 +1216,8 @@
   "blockers": [
     {
       "severity": "high",
-      "summary": "9 of 21 worker branches are dirty.",
-      "evidence": "scripts/rust_port_status.py reports dirty_workers=9.",
+      "summary": "8 of 21 worker branches are dirty.",
+      "evidence": "scripts/rust_port_status.py reports dirty_workers=8.",
       "next_action": "Stop new edits and reduce each overlap cluster to one owner before merging."
     },
     {
@@ -1413,8 +1411,8 @@
       ]
     }
   ],
-  "last_synced_at": "2026-05-25T16:24:42+00:00",
-  "state_fingerprint": "71c9eaa7cde0",
+  "last_synced_at": "2026-05-25T16:33:19+00:00",
+  "state_fingerprint": "2399a80daa1a",
   "sync_drift_command": "python3 scripts/rust_port_status.py --select tracker_validation.sync_drift",
   "conflict_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.conflict_runbook",
   "decision_queue_command": "python3 scripts/rust_port_status.py --select tracker_validation.remediation.decision_queue",
@@ -1584,5 +1582,6 @@
   "next_unlock_batch_command": "python3 scripts/rust_port_status.py --select tracker_validation.next_unlock_batch",
   "next_unlock_brief_command": "python3 scripts/rust_port_status.py --select tracker_validation.next_unlock_brief",
   "objective_audit_command": "python3 scripts/rust_port_status.py --select tracker_validation.objective_audit",
-  "objective_resolution_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.objective_resolution_runbook"
+  "objective_resolution_runbook_command": "python3 scripts/rust_port_status.py --select tracker_validation.objective_resolution_runbook",
+  "published_head_coverage_command": "python3 scripts/rust_port_status.py --select tracker_validation.published_head_coverage"
 }
