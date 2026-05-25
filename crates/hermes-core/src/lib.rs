@@ -18,6 +18,7 @@ pub mod delegate;
 mod discord;
 pub mod env_loader;
 mod feishu;
+pub mod gateway;
 mod homeassistant;
 mod image_gen;
 mod kanban;
