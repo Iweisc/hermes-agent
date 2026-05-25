@@ -2399,7 +2399,7 @@ async fn pty_ws(
     if !state.embedded_chat {
         return ws
             .on_failed_upgrade(|_| {})
-            .on_upgrade(|socket| async move {
+            .on_upgrade(|mut socket| async move {
                 let _ = socket.close().await;
             });
     }
@@ -2511,7 +2511,7 @@ async fn handle_pty_ws(
 
     let send_task = tokio::spawn(async move {
         while let Some(chunk) = rx.recv().await {
-            if sender.send(Message::Binary(chunk)).await.is_err() {
+            if sender.send(Message::Binary(chunk.into())).await.is_err() {
                 break;
             }
         }
@@ -2588,7 +2588,7 @@ async fn handle_gateway_ws(state: Arc<DashboardState>, socket: WebSocket) {
     let read_task = tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if sender.send(Message::Text(line)).await.is_err() {
+            if sender.send(Message::Text(line.into())).await.is_err() {
                 break;
             }
         }
@@ -2629,7 +2629,7 @@ async fn handle_pub_ws(state: Arc<DashboardState>, socket: WebSocket, channel: S
     let (_, mut receiver) = socket.split();
     while let Some(Ok(message)) = receiver.next().await {
         if let Message::Text(text) = message {
-            let _ = sender.send(text);
+            let _ = sender.send(text.to_string());
         }
     }
 }
@@ -2641,7 +2641,7 @@ async fn handle_events_ws(state: Arc<DashboardState>, socket: WebSocket, channel
 
     let send_task = tokio::spawn(async move {
         while let Ok(payload) = receiver.recv().await {
-            if ws_sender.send(Message::Text(payload)).await.is_err() {
+            if ws_sender.send(Message::Text(payload.into())).await.is_err() {
                 break;
             }
         }
@@ -7100,7 +7100,7 @@ fn json_response(status: StatusCode, value: JsonValue) -> Response<Body> {
 }
 
 fn websocket_close(ws: WebSocketUpgrade, _status: StatusCode) -> Response<Body> {
-    ws.on_upgrade(|socket| async move {
+    ws.on_upgrade(|mut socket| async move {
         let _ = socket.close().await;
     })
 }
@@ -7108,7 +7108,7 @@ fn websocket_close(ws: WebSocketUpgrade, _status: StatusCode) -> Response<Body> 
 async fn send_ws_banner(socket: WebSocket, message: &str) -> Result<(), ()> {
     let mut socket = socket;
     socket
-        .send(Message::Text(format!("\r\n\x1b[31m{message}\x1b[0m\r\n")))
+        .send(Message::Text(format!("\r\n\x1b[31m{message}\x1b[0m\r\n").into()))
         .await
         .map_err(|_| ())?;
     let _ = socket.close().await;

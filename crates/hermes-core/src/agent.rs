@@ -32,7 +32,8 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     HermesContext, HermesError, LoadedConfig, MessageAppend, ModelOverrides, SessionCreate,
-    SessionStore, ToolRuntime, build_memory_context_block, get_tool_definitions_for_runtime,
+    SessionStore, ToolRuntime, build_memory_context_block, get_tool_definitions,
+    get_tool_definitions_for_runtime,
 };
 
 const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 300;
@@ -901,6 +902,130 @@ impl HermesContext {
         }
 
         turn_result
+    }
+
+    pub fn run_chat_turn_with_messages(
+        &self,
+        loaded: &LoadedConfig,
+        input_messages: &[Value],
+        runtime: &ToolRuntime,
+        enabled_toolsets: Option<&[String]>,
+        overrides: &ModelOverrides,
+    ) -> Result<AgentTurnResult, HermesError> {
+        if !input_messages.iter().any(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+                && content_has_meaningful_user_input(message.get("content").unwrap_or(&Value::Null))
+        }) {
+            return Err(HermesError::State {
+                action: "running agent turn",
+                detail: "Messages must include at least one non-empty user message.".to_string(),
+            });
+        }
+
+        let runtime_model = self.resolve_model_runtime(loaded, overrides)?;
+        let mut tool_runtime = runtime.clone();
+        if let Err(error) = tool_runtime.load_memory_store(&loaded.config.memory) {
+            log::warn!(target: "run_agent", "memory bootstrap skipped: {error}");
+        }
+        let disabled_toolsets =
+            (!loaded.config.memory.any_enabled()).then(|| vec![String::from("memory")]);
+        let tools = get_tool_definitions(enabled_toolsets, disabled_toolsets.as_deref());
+        tool_runtime = tool_runtime.with_available_tool_names(
+            tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        );
+        let system_prompt = build_system_prompt(&tool_runtime, &loaded.config.memory)?;
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": system_prompt,
+        })];
+        messages.extend(input_messages.iter().cloned());
+
+        let client = build_http_client()?;
+        let mut api_calls = 0_u64;
+        let mut tool_calls = 0_u64;
+
+        for _ in 0..loaded.config.agent.max_turns {
+            api_calls += 1;
+            let response = send_model_request(&client, &runtime_model, &messages, &tools, None)?;
+            let NormalizedAssistantResponse {
+                content: assistant_content,
+                tool_calls: pending_tool_calls,
+                finish_reason: _finish_reason,
+                reasoning,
+                reasoning_details: _reasoning_details,
+                codex_reasoning_items: _codex_reasoning_items,
+                codex_message_items: _codex_message_items,
+            } = response;
+
+            if pending_tool_calls.is_empty() {
+                let final_response = assistant_content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| HermesError::State {
+                        action: "parsing assistant response",
+                        detail: "Assistant response had no text content.".to_string(),
+                    })?
+                    .to_string();
+                return Ok(AgentTurnResult {
+                    final_response,
+                    reasoning,
+                    api_calls,
+                    tool_calls,
+                    model: runtime_model.model,
+                    provider: runtime_model.provider,
+                    base_url: runtime_model.base_url,
+                    session_id: None,
+                    completed: true,
+                    interrupted: false,
+                    turn_exit_reason: "completed".to_string(),
+                });
+            }
+
+            let normalized_tool_calls = pending_tool_calls
+                .iter()
+                .map(|tool_call| {
+                    json!({
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments_raw,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            messages.push(json!({
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": normalized_tool_calls,
+            }));
+
+            for tool_call in pending_tool_calls {
+                tool_calls += 1;
+                let result = crate::tools::dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }));
+            }
+        }
+
+        Err(HermesError::State {
+            action: "running agent turn",
+            detail: format!(
+                "Reached max_turns ({}) without a final assistant response.",
+                loaded.config.agent.max_turns
+            ),
+        })
     }
 }
 
@@ -6158,6 +6283,49 @@ for raw in sys.stdin:
             fs::read_to_string(temp.path().join("via_exec.txt")).unwrap(),
             "hello from execute_code"
         );
+    }
+
+    #[test]
+    fn chat_completion_turn_accepts_openai_style_messages() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "message-array ok"
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_turn_with_messages(
+                &loaded,
+                &[
+                    json!({"role": "system", "content": "be terse"}),
+                    json!({"role": "user", "content": "say hi"}),
+                ],
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "message-array ok");
+        assert!(result.session_id.is_none());
     }
 
     #[test]

@@ -22,6 +22,9 @@ use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 
 use crate::config_cmd::{read_raw_yaml_mapping, save_env_value};
+use crate::native_api_server::maybe_run_native_api_server;
+use crate::native_gateway_runtime::maybe_run_native_gateway_bundle;
+use crate::native_webhook_server::maybe_run_native_webhook_server;
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 const SERVICE_BASE: &str = "hermes-gateway";
@@ -204,6 +207,7 @@ struct GatewaySetupVarSpec {
 pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), Box<dyn Error>> {
     match args.command {
         None => print_gateway_run(
+            context,
             args.accept_hooks,
             GatewayRunArgs {
                 verbose: 0,
@@ -211,7 +215,7 @@ pub fn print_gateway(context: &HermesContext, args: GatewayArgs) -> Result<(), B
                 replace: false,
             },
         ),
-        Some(GatewayCommand::Run(run)) => print_gateway_run(args.accept_hooks, run),
+        Some(GatewayCommand::Run(run)) => print_gateway_run(context, args.accept_hooks, run),
         Some(GatewayCommand::Start(service)) => {
             print_gateway_start(context, args.accept_hooks, service)
         }
@@ -471,6 +475,7 @@ fn print_gateway_restart(
             return Ok(());
         }
         return print_gateway_run(
+            context,
             accept_hooks,
             GatewayRunArgs {
                 verbose: 0,
@@ -495,6 +500,7 @@ fn print_gateway_restart(
     let _ = stop_manual_gateway(context)?;
     println!("Starting gateway...");
     print_gateway_run(
+        context,
         accept_hooks,
         GatewayRunArgs {
             verbose: 0,
@@ -761,7 +767,20 @@ fn print_gateway_status(
     Ok(())
 }
 
-fn print_gateway_run(accept_hooks: bool, args: GatewayRunArgs) -> Result<(), Box<dyn Error>> {
+fn print_gateway_run(
+    context: &HermesContext,
+    accept_hooks: bool,
+    args: GatewayRunArgs,
+) -> Result<(), Box<dyn Error>> {
+    if maybe_run_native_gateway_bundle(context, &args)? {
+        return Ok(());
+    }
+    if maybe_run_native_webhook_server(context, &args)? {
+        return Ok(());
+    }
+    if maybe_run_native_api_server(context, &args)? {
+        return Ok(());
+    }
     let root = project_root();
     let python = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON"))
         .ok_or("could not find a Python interpreter for gateway launch")?;
@@ -1288,6 +1307,31 @@ const SMS_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
+const HOMEASSISTANT_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Create a Long-Lived Access Token in Home Assistant",
+    "   Profile → Security → Long-Lived Access Tokens",
+    "2. Enter the token below and confirm your Home Assistant URL",
+    "3. Hermes subscribes to Home Assistant state_changed events over WebSocket",
+    "4. Configure watch_domains / watch_entities in config.yaml to receive events",
+];
+
+const HOMEASSISTANT_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "HASS_TOKEN",
+        prompt: "Home Assistant Long-Lived Access Token",
+        password: true,
+        help: "Required. Create this in Profile → Security → Long-Lived Access Tokens.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "HASS_URL",
+        prompt: "Home Assistant URL (default: http://homeassistant.local:8123)",
+        password: false,
+        help: "Leave empty to use the default local URL.",
+        is_allowlist: false,
+    },
+];
+
 const MATTERMOST_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. In Mattermost: Integrations → Bot Accounts → Add Bot Account",
     "   (System Console → Integrations → Bot Accounts must be enabled)",
@@ -1378,6 +1422,90 @@ const BLUEBUBBLES_SETUP_VARS: &[GatewaySetupVarSpec] = &[
     },
 ];
 
+const WEBHOOK_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Enable the generic webhook adapter to receive external POST events",
+    "2. Hermes listens on 0.0.0.0:8644 by default and validates HMAC signatures",
+    "3. Define routes in config.yaml or create them dynamically with:",
+    "   hermes webhook subscribe <name>",
+    "4. Per-route secrets are preferred; WEBHOOK_SECRET sets a global fallback secret",
+];
+
+const WEBHOOK_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "WEBHOOK_ENABLED",
+        prompt: "Enable webhook adapter now? (true)",
+        password: false,
+        help: "Required. Enter true to start the webhook listener.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WEBHOOK_PORT",
+        prompt: "Webhook listen port (default: 8644)",
+        password: false,
+        help: "Optional. Leave empty to keep the default port.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "WEBHOOK_SECRET",
+        prompt: "Global HMAC secret (optional)",
+        password: true,
+        help: "Optional. Route-specific secrets can also be stored in config.yaml or webhook subscriptions.",
+        is_allowlist: false,
+    },
+];
+
+const API_SERVER_SETUP_INSTRUCTIONS: &[&str] = &[
+    "1. Enable the OpenAI-compatible API server for external chat clients and automation",
+    "2. By default it binds to 127.0.0.1:8642 and serves /v1 plus /health endpoints",
+    "3. Set API_SERVER_KEY when exposing it beyond localhost",
+    "4. Optional CORS origins let browser clients talk to the server directly",
+];
+
+const API_SERVER_SETUP_VARS: &[GatewaySetupVarSpec] = &[
+    GatewaySetupVarSpec {
+        name: "API_SERVER_ENABLED",
+        prompt: "Enable API server now? (true)",
+        password: false,
+        help: "Required. Enter true to expose the HTTP API server.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "API_SERVER_HOST",
+        prompt: "Bind host (default: 127.0.0.1)",
+        password: false,
+        help: "Leave empty to keep the safe localhost default.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "API_SERVER_PORT",
+        prompt: "API server port (default: 8642)",
+        password: false,
+        help: "Optional. Leave empty to keep the default port.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "API_SERVER_KEY",
+        prompt: "API key (optional, but recommended off localhost)",
+        password: true,
+        help: "Recommended whenever the host is reachable from other machines.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "API_SERVER_CORS_ORIGINS",
+        prompt: "Allowed CORS origins (comma-separated, optional)",
+        password: false,
+        help: "Example: https://chat.example.com,https://admin.example.com",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "API_SERVER_MODEL_NAME",
+        prompt: "Advertised model name (optional)",
+        password: false,
+        help: "Override the model name returned by /v1/models if desired.",
+        is_allowlist: false,
+    },
+];
+
 const WECOM_CALLBACK_SETUP_INSTRUCTIONS: &[&str] = &[
     "1. Go to WeCom Admin Console → Applications → Create Self-Built App",
     "2. Note the Corp ID (top of admin console) and create a Corp Secret",
@@ -1459,6 +1587,34 @@ const YUANBAO_SETUP_VARS: &[GatewaySetupVarSpec] = &[
         prompt: "App Secret",
         password: true,
         help: "The App Secret (used for HMAC signing) from your Yuanbao IM Bot.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "YUANBAO_BOT_ID",
+        prompt: "Bot ID (optional)",
+        password: false,
+        help: "Optional. If omitted, Hermes can resolve it during sign-token flows when supported.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "YUANBAO_HOME_CHANNEL",
+        prompt: "Home channel (optional, e.g. group:<group_code> or direct:<account_id>)",
+        password: false,
+        help: "Used for cron results and notifications.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "YUANBAO_API_DOMAIN",
+        prompt: "API domain (optional, default: https://bot.yuanbao.tencent.com)",
+        password: false,
+        help: "Optional override for the Yuanbao HTTPS API base URL.",
+        is_allowlist: false,
+    },
+    GatewaySetupVarSpec {
+        name: "YUANBAO_WS_URL",
+        prompt: "WebSocket URL (optional, default: wss://bot-wss.yuanbao.tencent.com/wss/connection)",
+        password: false,
+        help: "Optional override for the Yuanbao WebSocket endpoint.",
         is_allowlist: false,
     },
 ];
@@ -1549,6 +1705,15 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         vars: SMS_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
+        key: "homeassistant",
+        label: "Home Assistant",
+        emoji: "🏠",
+        token_var: "HASS_TOKEN",
+        has_builtin_setup: false,
+        setup_instructions: HOMEASSISTANT_SETUP_INSTRUCTIONS,
+        vars: HOMEASSISTANT_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
         key: "dingtalk",
         label: "DingTalk",
         emoji: "💬",
@@ -1603,6 +1768,15 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         vars: BLUEBUBBLES_SETUP_VARS,
     },
     GatewaySetupPlatformSpec {
+        key: "webhook",
+        label: "Webhook",
+        emoji: "🔗",
+        token_var: "WEBHOOK_ENABLED",
+        has_builtin_setup: false,
+        setup_instructions: WEBHOOK_SETUP_INSTRUCTIONS,
+        vars: WEBHOOK_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
         key: "qqbot",
         label: "QQ Bot",
         emoji: "🐧",
@@ -1619,6 +1793,15 @@ const GATEWAY_BUILTIN_PLATFORM_SPECS: &[GatewaySetupPlatformSpec] = &[
         has_builtin_setup: false,
         setup_instructions: YUANBAO_SETUP_INSTRUCTIONS,
         vars: YUANBAO_SETUP_VARS,
+    },
+    GatewaySetupPlatformSpec {
+        key: "api_server",
+        label: "API Server",
+        emoji: "🌐",
+        token_var: "API_SERVER_ENABLED",
+        has_builtin_setup: false,
+        setup_instructions: API_SERVER_SETUP_INSTRUCTIONS,
+        vars: API_SERVER_SETUP_VARS,
     },
 ];
 
@@ -1722,6 +1905,16 @@ fn native_gateway_platform_status(
                 "not configured".to_string()
             }
         }
+        "homeassistant" => {
+            let url = read_effective_env_value(context, "HASS_URL");
+            if val.is_some() {
+                "configured".to_string()
+            } else if url.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
         "matrix" => {
             let homeserver = read_effective_env_value(context, "MATRIX_HOMESERVER");
             let password = read_effective_env_value(context, "MATRIX_PASSWORD");
@@ -1780,11 +1973,51 @@ fn native_gateway_platform_status(
                 "not configured".to_string()
             }
         }
+        "webhook" => {
+            let port = read_effective_env_value(context, "WEBHOOK_PORT");
+            let secret = read_effective_env_value(context, "WEBHOOK_SECRET");
+            if val
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            {
+                "configured".to_string()
+            } else if port.is_some() || secret.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
         "qqbot" => {
             let secret = read_effective_env_value(context, "QQ_CLIENT_SECRET");
             if val.is_some() && secret.is_some() {
                 "configured".to_string()
             } else if val.is_some() || secret.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "yuanbao" => {
+            let secret = read_effective_env_value(context, "YUANBAO_APP_SECRET");
+            if val.is_some() && secret.is_some() {
+                "configured".to_string()
+            } else if val.is_some() || secret.is_some() {
+                "partially configured".to_string()
+            } else {
+                "not configured".to_string()
+            }
+        }
+        "api_server" => {
+            let key = read_effective_env_value(context, "API_SERVER_KEY");
+            let host = read_effective_env_value(context, "API_SERVER_HOST");
+            let port = read_effective_env_value(context, "API_SERVER_PORT");
+            if val
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                || key.is_some()
+            {
+                "configured".to_string()
+            } else if host.is_some() || port.is_some() {
                 "partially configured".to_string()
             } else {
                 "not configured".to_string()
@@ -2116,6 +2349,7 @@ fn configure_standard_gateway_platform_with_io(
 fn gateway_setup_var_is_required(platform: &GatewaySetupPlatform, var: &GatewaySetupVar) -> bool {
     var.name == platform.token_var
         || (platform.key == "bluebubbles" && var.name == "BLUEBUBBLES_PASSWORD")
+        || (platform.key == "yuanbao" && var.name == "YUANBAO_APP_SECRET")
 }
 
 fn configure_bluebubbles_advanced_settings(
@@ -2260,6 +2494,25 @@ fn validate_gateway_setup_value(
             "Invalid token format. Expected: <numeric_id>:<alphanumeric_hash> (for example, 123456789:ABCdefGHI-jklMNOpqrSTUvwxYZ).",
         );
     }
+    if matches!(var.name.as_str(), "WEBHOOK_ENABLED" | "API_SERVER_ENABLED")
+        && !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes"
+        )
+    {
+        return Err("Enter true, yes, or 1 to enable this platform.");
+    }
+    if matches!(
+        var.name.as_str(),
+        "WEBHOOK_PORT" | "API_SERVER_PORT" | "WECOM_CALLBACK_PORT"
+    ) {
+        let Ok(port) = value.trim().parse::<u16>() else {
+            return Err("Invalid port number. Enter an integer between 1 and 65535.");
+        };
+        if port == 0 {
+            return Err("Invalid port number. Enter an integer between 1 and 65535.");
+        }
+    }
     Ok(())
 }
 
@@ -2276,6 +2529,30 @@ fn normalize_gateway_setup_value(
         "BLUEBUBBLES_SERVER_URL" | "MATTERMOST_URL" | "MATRIX_HOMESERVER"
     ) {
         return value.trim_end_matches('/').to_string();
+    }
+    if matches!(var.name.as_str(), "WEBHOOK_ENABLED" | "API_SERVER_ENABLED") {
+        return String::from("true");
+    }
+    if matches!(
+        var.name.as_str(),
+        "WEBHOOK_PORT" | "API_SERVER_PORT" | "WECOM_CALLBACK_PORT"
+    ) {
+        return value
+            .trim()
+            .parse::<u16>()
+            .map(|port| port.to_string())
+            .unwrap_or_else(|_| value.trim().to_string());
+    }
+    if matches!(var.name.as_str(), "HASS_URL" | "YUANBAO_API_DOMAIN") {
+        return value.trim_end_matches('/').to_string();
+    }
+    if var.name == "API_SERVER_CORS_ORIGINS" {
+        return value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
     }
     value.to_string()
 }
@@ -6827,6 +7104,7 @@ mod tests {
 
         let _guard = test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
+        let context = HermesContext::new(temp.path());
         let fake_python = temp.path().join("python3");
         let log = temp.path().join("python.log");
         fs::write(
@@ -6850,6 +7128,7 @@ exit 9\n",
 
         set_env_var("HERMES_GATEWAY_PYTHON", &fake_python);
         print_gateway_run(
+            &context,
             true,
             GatewayRunArgs {
                 verbose: 2,
@@ -6935,6 +7214,18 @@ exit 9\n",
             .unwrap();
         assert!(gateway_platform_uses_native_standard_setup(bluebubbles));
 
+        let homeassistant = metadata
+            .iter()
+            .find(|platform| platform.key == "homeassistant")
+            .unwrap();
+        assert!(gateway_platform_uses_native_standard_setup(homeassistant));
+
+        let webhook = metadata
+            .iter()
+            .find(|platform| platform.key == "webhook")
+            .unwrap();
+        assert!(gateway_platform_uses_native_standard_setup(webhook));
+
         let whatsapp = metadata
             .iter()
             .find(|platform| platform.key == "whatsapp")
@@ -6997,6 +7288,13 @@ exit 9\n",
             .unwrap();
         assert_eq!(email.status, "not configured");
         assert!(gateway_platform_uses_native_standard_setup(email));
+
+        let api_server = metadata
+            .iter()
+            .find(|platform| platform.key == "api_server")
+            .unwrap();
+        assert_eq!(api_server.status, "not configured");
+        assert!(gateway_platform_uses_native_standard_setup(api_server));
 
         let irc = metadata
             .iter()
@@ -7102,11 +7400,19 @@ exit 9\n",
             "EMAIL_PASSWORD",
             "EMAIL_IMAP_HOST",
             "EMAIL_SMTP_HOST",
+            "HASS_TOKEN",
+            "HASS_URL",
             "IRC_SERVER",
             "IRC_CHANNEL",
             "TEAMS_CLIENT_ID",
             "TEAMS_CLIENT_SECRET",
             "TEAMS_TENANT_ID",
+            "API_SERVER_ENABLED",
+            "API_SERVER_HOST",
+            "API_SERVER_PORT",
+            "API_SERVER_KEY",
+            "API_SERVER_CORS_ORIGINS",
+            "API_SERVER_MODEL_NAME",
             "BLUEBUBBLES_SERVER_URL",
             "BLUEBUBBLES_PASSWORD",
             "MATRIX_ACCESS_TOKEN",
@@ -7144,6 +7450,9 @@ exit 9\n",
             "WECOM_ALLOWED_USERS",
             "WECOM_DM_POLICY",
             "WECOM_HOME_CHANNEL",
+            "WEBHOOK_ENABLED",
+            "WEBHOOK_PORT",
+            "WEBHOOK_SECRET",
             "WEIXIN_ACCOUNT_ID",
             "WEIXIN_TOKEN",
             "WEIXIN_BASE_URL",
@@ -7154,6 +7463,12 @@ exit 9\n",
             "WEIXIN_GROUP_POLICY",
             "WEIXIN_GROUP_ALLOWED_USERS",
             "WEIXIN_HOME_CHANNEL",
+            "YUANBAO_APP_ID",
+            "YUANBAO_APP_SECRET",
+            "YUANBAO_BOT_ID",
+            "YUANBAO_HOME_CHANNEL",
+            "YUANBAO_API_DOMAIN",
+            "YUANBAO_WS_URL",
         ] {
             remove_env_var(key);
         }
@@ -7167,7 +7482,12 @@ exit 9\n",
         save_env_value(context.env_path(), "EMAIL_PASSWORD", "app-password").unwrap();
         save_env_value(context.env_path(), "EMAIL_IMAP_HOST", "imap.example.com").unwrap();
         save_env_value(context.env_path(), "EMAIL_SMTP_HOST", "smtp.example.com").unwrap();
+        save_env_value(context.env_path(), "HASS_TOKEN", "ha-token").unwrap();
         save_env_value(context.env_path(), "WHATSAPP_ENABLED", "true").unwrap();
+        save_env_value(context.env_path(), "WEBHOOK_ENABLED", "true").unwrap();
+        save_env_value(context.env_path(), "API_SERVER_ENABLED", "true").unwrap();
+        save_env_value(context.env_path(), "YUANBAO_APP_ID", "yb-app").unwrap();
+        save_env_value(context.env_path(), "YUANBAO_APP_SECRET", "yb-secret").unwrap();
         fs::write(
             context.config_path(),
             "platforms:\n  irc:\n    extra:\n      server: irc.libera.chat\n      channel: '#hermes'\n",
@@ -7206,6 +7526,11 @@ exit 9\n",
             .find(|platform| platform.key == "signal")
             .unwrap();
         assert_eq!(signal.status, "not configured");
+        let homeassistant = metadata
+            .iter()
+            .find(|platform| platform.key == "homeassistant")
+            .unwrap();
+        assert_eq!(homeassistant.status, "configured");
         let dingtalk = metadata
             .iter()
             .find(|platform| platform.key == "dingtalk")
@@ -7231,6 +7556,21 @@ exit 9\n",
             .find(|platform| platform.key == "weixin")
             .unwrap();
         assert_eq!(weixin.status, "not configured");
+        let webhook = metadata
+            .iter()
+            .find(|platform| platform.key == "webhook")
+            .unwrap();
+        assert_eq!(webhook.status, "configured");
+        let yuanbao = metadata
+            .iter()
+            .find(|platform| platform.key == "yuanbao")
+            .unwrap();
+        assert_eq!(yuanbao.status, "configured");
+        let api_server = metadata
+            .iter()
+            .find(|platform| platform.key == "api_server")
+            .unwrap();
+        assert_eq!(api_server.status, "configured");
     }
 
     #[test]
@@ -8516,6 +8856,99 @@ exit 9\n",
             .unwrap()
             .status;
         assert_eq!(status, "configured");
+    }
+
+    #[test]
+    fn configure_homeassistant_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "homeassistant")
+            .unwrap();
+
+        let mut input = Cursor::new("ha-token\nhttp://ha.example.local:8123/\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("HASS_TOKEN=ha-token"));
+        assert!(env_text.contains("HASS_URL=http://ha.example.local:8123"));
+    }
+
+    #[test]
+    fn configure_webhook_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "webhook")
+            .unwrap();
+
+        let mut input = Cursor::new("yes\n8646\nshared-secret\n");
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("WEBHOOK_ENABLED=true"));
+        assert!(env_text.contains("WEBHOOK_PORT=8646"));
+        assert!(env_text.contains("WEBHOOK_SECRET=shared-secret"));
+    }
+
+    #[test]
+    fn configure_api_server_gateway_platform_writes_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "api_server")
+            .unwrap();
+
+        let mut input = Cursor::new(
+            "1\n0.0.0.0\n9000\nsuper-secret\nhttps://chat.example.com, https://admin.example.com\nhermes-edge\n",
+        );
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("API_SERVER_ENABLED=true"));
+        assert!(env_text.contains("API_SERVER_HOST=0.0.0.0"));
+        assert!(env_text.contains("API_SERVER_PORT=9000"));
+        assert!(env_text.contains("API_SERVER_KEY=super-secret"));
+        assert!(env_text.contains(
+            "API_SERVER_CORS_ORIGINS=https://chat.example.com,https://admin.example.com"
+        ));
+        assert!(env_text.contains("API_SERVER_MODEL_NAME=hermes-edge"));
+    }
+
+    #[test]
+    fn configure_yuanbao_gateway_platform_writes_extended_env_values() {
+        let (_temp, context) = test_context();
+        fs::create_dir_all(context.hermes_home()).unwrap();
+        let platform = native_gateway_setup_metadata(&context)
+            .into_iter()
+            .find(|platform| platform.key == "yuanbao")
+            .unwrap();
+
+        let mut input = Cursor::new(
+            "yb-app\nyb-secret\nyb-bot\ngroup:home123\nhttps://bot.yuanbao.tencent.com/\nwss://bot-wss.yuanbao.tencent.com/wss/connection\n",
+        );
+        let mut output = Vec::new();
+        configure_standard_gateway_platform_with_io(&context, &platform, &mut input, &mut output)
+            .unwrap();
+
+        let env_text = fs::read_to_string(context.env_path()).unwrap();
+        assert!(env_text.contains("YUANBAO_APP_ID=yb-app"));
+        assert!(env_text.contains("YUANBAO_APP_SECRET=yb-secret"));
+        assert!(env_text.contains("YUANBAO_BOT_ID=yb-bot"));
+        assert!(env_text.contains("YUANBAO_HOME_CHANNEL=group:home123"));
+        assert!(env_text.contains("YUANBAO_API_DOMAIN=https://bot.yuanbao.tencent.com"));
+        assert!(
+            env_text.contains("YUANBAO_WS_URL=wss://bot-wss.yuanbao.tencent.com/wss/connection")
+        );
     }
 
     #[test]
