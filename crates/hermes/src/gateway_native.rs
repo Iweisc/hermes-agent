@@ -15,7 +15,7 @@ use chrono::{Local, TimeZone};
 use hermes_core::{
     GatewaySessionPoll, GatewayTurnSession, HermesContext, LoadedConfig, MessageRecord,
     ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
-    shell_command_block_reason, spawn_chat_turn_with_events,
+    build_skill_invocation_message, shell_command_block_reason, spawn_chat_turn_with_events,
 };
 use regex::Regex;
 use serde_json::{Value, json};
@@ -247,6 +247,7 @@ impl<'a> NativeGatewayServer<'a> {
             "complete.path" => self.handle_complete_path(params),
             "complete.slash" => self.handle_complete_slash(params),
             "shell.exec" => self.handle_shell_exec(params),
+            "command.dispatch" => self.handle_command_dispatch(params),
             "slash.exec" => self.handle_slash_exec(params),
             "prompt.submit" => {
                 return match self.handle_prompt_submit(writer, params) {
@@ -746,6 +747,69 @@ impl<'a> NativeGatewayServer<'a> {
         run_shell_exec(command, &cwd)
     }
 
+    fn handle_command_dispatch(
+        &self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let raw_name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (4004, String::from("name required"), None))?;
+        let name = resolve_gateway_command_name(raw_name, &self.config.raw)
+            .map_err(|error| (5003, error, None))?;
+        if name != raw_name.trim_start_matches('/') {
+            return Ok(json!({"type": "alias", "target": name}));
+        }
+        let arg = params
+            .get("arg")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if let Some(result) = dispatch_quick_command(&self.config.raw, &name, &arg)? {
+            return Ok(result);
+        }
+
+        let session_id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some((skill_name, message)) =
+            build_skill_invocation_message(&self.context.hermes_home(), &name, &arg, session_id)
+                .map_err(|error| (5003, error, None))?
+        {
+            return Ok(json!({
+                "type": "skill",
+                "name": skill_name,
+                "message": message,
+            }));
+        }
+
+        if matches!(name.as_str(), "snapshot" | "snap") {
+            let subcommand = arg
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(subcommand.as_str(), "restore" | "rewind") {
+                return Ok(json!({
+                    "type": "exec",
+                    "output": "/snapshot restore is blocked in the TUI because it changes config/state on disk while the live agent has cached settings. Run it in the classic CLI, then restart the TUI."
+                }));
+            }
+        }
+
+        Err((
+            4018,
+            format!("not a quick/plugin/skill command: {name}"),
+            None,
+        ))
+    }
+
     fn handle_slash_exec(&mut self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
         let session_id = required_session_id(&params)?;
         let command = params
@@ -1100,6 +1164,104 @@ fn format_local_timestamp(timestamp: f64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| String::from("(unknown)"))
+}
+
+fn resolve_gateway_command_name(name: &str, raw_config: &YamlValue) -> Result<String, String> {
+    let needle = name.trim_start_matches('/').to_ascii_lowercase();
+    let commands = parse_gateway_commands(raw_config)?;
+    for command in commands {
+        if command.name.eq_ignore_ascii_case(&needle) {
+            return Ok(command.name);
+        }
+        if command
+            .aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(&needle))
+        {
+            return Ok(command.name);
+        }
+    }
+    Ok(needle)
+}
+
+fn dispatch_quick_command(
+    raw_config: &YamlValue,
+    name: &str,
+    arg: &str,
+) -> Result<Option<Value>, (i64, String, Option<Value>)> {
+    let Some(mapping) = raw_config.as_mapping() else {
+        return Ok(None);
+    };
+    let Some(commands) = mapping_value(mapping, "quick_commands").and_then(YamlValue::as_mapping)
+    else {
+        return Ok(None);
+    };
+    let Some(entry) = commands.get(YamlValue::String(name.to_string())) else {
+        return Ok(None);
+    };
+    let Some(command_map) = entry.as_mapping() else {
+        return Ok(None);
+    };
+    let command_type = mapping_value(command_map, "type")
+        .and_then(YamlValue::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match command_type.as_str() {
+        "alias" => Ok(Some(json!({
+            "type": "alias",
+            "target": mapping_value(command_map, "target").and_then(YamlValue::as_str).unwrap_or_default(),
+        }))),
+        "exec" => {
+            let command = mapping_value(command_map, "command")
+                .and_then(YamlValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| (4018, String::from("quick command missing command"), None))?;
+            let cwd = std::env::current_dir().map_err(|error| (5003, error.to_string(), None))?;
+            let result = run_shell_exec(command, &cwd)?;
+            let stdout = result
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stderr = result
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let code = result
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let output = [stdout, stderr]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if code != 0 {
+                return Err((
+                    4018,
+                    if output.is_empty() {
+                        format!("quick command failed with exit code {code}")
+                    } else {
+                        output
+                    },
+                    None,
+                ));
+            }
+            Ok(Some(json!({
+                "type": "exec",
+                "output": output,
+                "arg": arg,
+            })))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn mapping_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
 }
 
 fn required_session_id(params: &Value) -> Result<String, (i64, String, Option<Value>)> {
@@ -1779,6 +1941,24 @@ mod tests {
     static PYTHON_ENV_LOCK: Mutex<()> = Mutex::new(());
     static SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn pushd(path: &Path) -> CurrentDirGuard {
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        CurrentDirGuard(old)
+    }
+
     fn serve_chat_sequence(responses: Vec<String>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2205,10 +2385,9 @@ mod tests {
 
     #[test]
     fn native_gateway_session_management_rpcs_round_trip() {
-        let _guard = SESSION_ENV_LOCK.lock().unwrap();
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
         let temp = TempDir::new().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
+        let _cwd = pushd(temp.path());
 
         let context =
             HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
@@ -2367,14 +2546,73 @@ mod tests {
             delete_closed_frame["result"]["deleted"],
             json!("session-rpc-test")
         );
+    }
 
-        std::env::set_current_dir(old_cwd).unwrap();
+    #[test]
+    fn native_gateway_command_dispatch_handles_alias_quick_and_skill_paths() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let _cwd = pushd(temp.path());
+        fs::write(
+            temp.path().join("config.yaml"),
+            "quick_commands:\n  demoalias:\n    type: alias\n    target: help\n  demoexec:\n    type: exec\n    command: \"printf quick\"\n",
+        )
+        .unwrap();
+        let skill_dir = temp.path().join("skills").join("ops").join("deploy-agent");
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: deploy-agent\ndescription: deploy helper\n---\n\n# Deploy\n\nUse this flow.\n",
+        )
+        .unwrap();
+        fs::write(skill_dir.join("references").join("guide.md"), "guide").unwrap();
+
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let server = NativeGatewayServer::new(&context, &config, &store);
+
+        let quick_alias = server
+            .handle_command_dispatch(json!({"name":"demoalias","arg":"","session_id":null}))
+            .unwrap();
+        assert_eq!(quick_alias["type"], json!("alias"));
+        assert_eq!(quick_alias["target"], json!("help"));
+
+        let quick_exec = server
+            .handle_command_dispatch(json!({"name":"demoexec","arg":"","session_id":null}))
+            .unwrap();
+        assert_eq!(quick_exec["type"], json!("exec"));
+        assert_eq!(quick_exec["output"], json!("quick"));
+
+        let skill = server
+            .handle_command_dispatch(
+                json!({"name":"deploy_agent","arg":"use staging","session_id":"sess-1"}),
+            )
+            .unwrap();
+        assert_eq!(skill["type"], json!("skill"));
+        assert_eq!(skill["name"], json!("deploy-agent"));
+        assert!(skill["message"].as_str().unwrap().contains("use staging"));
+
+        let snapshot = server
+            .handle_command_dispatch(
+                json!({"name":"snapshot","arg":"restore abc","session_id":null}),
+            )
+            .unwrap();
+        assert_eq!(snapshot["type"], json!("exec"));
+        assert!(
+            snapshot["output"]
+                .as_str()
+                .unwrap()
+                .contains("blocked in the TUI")
+        );
     }
 
     #[cfg(not(windows))]
     #[test]
     fn native_gateway_slash_exec_reuses_worker_and_rejects_pending_input_commands() {
-        let _guard = PYTHON_ENV_LOCK.lock().unwrap();
+        let _guard = lock_mutex(&PYTHON_ENV_LOCK);
         let temp = TempDir::new().unwrap();
         let args_log = temp.path().join("worker-args.log");
         let request_log = temp.path().join("worker-requests.log");
