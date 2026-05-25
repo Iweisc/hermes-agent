@@ -306,6 +306,7 @@ pub struct ToolRuntime {
     todo_store: Arc<Mutex<TodoStore>>,
     memory_store: Option<Arc<Mutex<MemoryStore>>>,
     available_tool_names: Option<BTreeSet<String>>,
+    system_prompt_additions: Vec<String>,
     clarify_callback: Option<ClarifyCallback>,
     delegate_callback: Option<DelegateCallback>,
 }
@@ -319,6 +320,7 @@ impl ToolRuntime {
             todo_store: Arc::new(Mutex::new(TodoStore::default())),
             memory_store: None,
             available_tool_names: None,
+            system_prompt_additions: Vec::new(),
             clarify_callback: None,
             delegate_callback: None,
         }
@@ -429,6 +431,19 @@ impl ToolRuntime {
 
     pub fn available_tool_names(&self) -> Option<&BTreeSet<String>> {
         self.available_tool_names.as_ref()
+    }
+
+    pub fn with_system_prompt_addition(mut self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            self.system_prompt_additions.push(trimmed.to_string());
+        }
+        self
+    }
+
+    pub fn system_prompt_additions(&self) -> &[String] {
+        &self.system_prompt_additions
     }
 
     pub fn resolve_path(&self, raw: &str) -> Result<PathBuf, String> {

@@ -198,7 +198,10 @@ impl HermesContext {
                 let new_session_id = format!("rs_{:x}", unix_ts_nanos());
                 store.create_session(&SessionCreate {
                     id: new_session_id.clone(),
-                    source: "rust-agent".to_string(),
+                    source: env::var("HERMES_SESSION_SOURCE")
+                        .ok()
+                        .and_then(|value| non_empty_trimmed(&value))
+                        .unwrap_or_else(|| "cli".to_string()),
                     user_id: None,
                     model: Some(runtime_model.model.clone()),
                     model_config: Some(json!({
@@ -456,6 +459,7 @@ fn build_system_prompt(
     {
         sections.push(KANBAN_GUIDANCE.to_string());
     }
+    sections.extend(runtime.system_prompt_additions().iter().cloned());
     Ok(sections.join("\n\n"))
 }
 
