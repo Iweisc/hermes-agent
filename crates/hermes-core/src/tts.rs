@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 
 use crate::tools::{ToolRuntime, tool_error, tool_result};
-use crate::{HermesContext, HermesError};
+use crate::{HermesContext, HermesError, resolve_nous_access_token};
 
 const DEFAULT_PROVIDER: &str = "edge";
 const DEFAULT_EDGE_VOICE: &str = "en-US-AriaNeural";
@@ -63,6 +63,7 @@ const GEMINI_TTS_SAMPLE_WIDTH: u16 = 2;
 #[cfg(test)]
 thread_local! {
     static TEST_FFMPEG_BINARY: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static TEST_EDGE_TTS_AVAILABLE: RefCell<Option<bool>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,8 @@ struct CommandTtsProvider {
 struct TtsSettings {
     provider: String,
     output_dir: PathBuf,
+    use_gateway: bool,
+    provider_max_text_length: Option<usize>,
     edge_voice: String,
     elevenlabs_voice_id: String,
     elevenlabs_model_id: String,
@@ -179,7 +182,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         return tool_error(format!("creating {} failed: {error}", parent.display()));
     }
 
-    let provider = settings.provider.as_str();
+    let configured_provider = settings.provider.as_str();
     let max_len = provider_max_text_length(&settings);
     let truncated = if text.chars().count() > max_len {
         text.chars().take(max_len).collect::<String>()
@@ -188,7 +191,8 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
     };
 
     let mut effective_output_path = output_path.clone();
-    let result = match provider {
+    let mut effective_provider = configured_provider.to_string();
+    let result = match configured_provider {
         other if settings.command_provider.is_some() && !is_builtin_tts_provider(other) => {
             synthesize_command_provider(
                 settings.command_provider.as_ref().expect("checked is_some"),
@@ -196,11 +200,23 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
                 &effective_output_path,
             )
         }
-        "edge" => synthesize_edge(&settings, &truncated, &output_path),
+        "edge" => {
+            if edge_tts_available() {
+                synthesize_edge(&settings, &truncated, &output_path)
+            } else if neutts_backend_available(&settings) {
+                effective_provider = "neutts".to_string();
+                synthesize_neutts(&settings, &truncated, &output_path)
+            } else {
+                Err(
+                    "No TTS provider available. Install edge-tts (pip install edge-tts) or set up NeuTTS for local synthesis."
+                        .to_string(),
+                )
+            }
+        }
         "elevenlabs" => synthesize_elevenlabs(&settings, &truncated, &output_path),
         "kittentts" => synthesize_kittentts(&settings, &truncated, &output_path),
         "neutts" => synthesize_neutts(&settings, &truncated, &output_path),
-        "openai" => synthesize_openai(&settings, &truncated, &output_path),
+        "openai" => synthesize_openai(&settings, runtime.hermes_home(), &truncated, &output_path),
         "piper" => synthesize_piper(&settings, &truncated, &output_path),
         "minimax" => synthesize_minimax(&settings, &truncated, &output_path),
         "gemini" => synthesize_gemini(&settings, &truncated, &output_path),
@@ -225,7 +241,7 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         } else {
             false
         }
-    } else if auto_voice_media_provider(provider) {
+    } else if auto_voice_media_provider(&effective_provider) {
         if !path_is_voice_compatible(&effective_output_path)
             && let Some(converted) = convert_audio_to_opus(&effective_output_path)
         {
@@ -233,7 +249,8 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         }
         path_is_voice_compatible(&effective_output_path)
     } else {
-        native_voice_media_provider(provider) && path_is_voice_compatible(&effective_output_path)
+        native_voice_media_provider(&effective_provider)
+            && path_is_voice_compatible(&effective_output_path)
     };
 
     let file_path = effective_output_path.display().to_string();
@@ -246,9 +263,30 @@ pub fn handle_text_to_speech(args: &Value, runtime: &ToolRuntime) -> String {
         "success": true,
         "file_path": file_path,
         "media_tag": media_tag,
-        "provider": provider,
+        "provider": effective_provider,
         "voice_compatible": voice_compatible,
     }))
+}
+
+pub fn text_to_speech_available() -> bool {
+    let hermes_home = HermesContext::detect().hermes_home();
+    let root = load_tts_root(&hermes_home);
+    if has_any_command_tts_provider(root.as_ref()) {
+        return true;
+    }
+    let Ok(settings) = load_tts_settings(&hermes_home) else {
+        return false;
+    };
+    edge_tts_available()
+        || !settings.elevenlabs_api_key.trim().is_empty()
+        || resolve_openai_audio_backend(&settings, &hermes_home).is_ok()
+        || !settings.minimax_api_key.trim().is_empty()
+        || !settings.xai_api_key.trim().is_empty()
+        || !settings.gemini_api_key.trim().is_empty()
+        || !settings.mistral_api_key.trim().is_empty()
+        || kittentts_backend_available(&settings)
+        || neutts_backend_available(&settings)
+        || piper_backend_available(&settings)
 }
 
 fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
@@ -262,9 +300,13 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     let provider = yaml_mapping_value(root, &["provider"])
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
         .to_ascii_lowercase();
+    let provider_max_text_length = yaml_mapping_u32(root, &[provider.as_str(), "max_text_length"])
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
     let output_dir = yaml_mapping_value(root, &["output_dir"])
         .map(PathBuf::from)
         .unwrap_or_else(|| hermes_home.join("cache/audio"));
+    let use_gateway = yaml_mapping_bool(root, &["use_gateway"]).unwrap_or(false);
     let edge_voice = yaml_mapping_value(root, &["edge", "voice"])
         .unwrap_or_else(|| DEFAULT_EDGE_VOICE.to_string());
     let elevenlabs_voice_id = yaml_mapping_value(root, &["elevenlabs", "voice_id"])
@@ -379,6 +421,8 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     Ok(TtsSettings {
         provider,
         output_dir,
+        use_gateway,
+        provider_max_text_length,
         edge_voice,
         elevenlabs_voice_id,
         elevenlabs_model_id,
@@ -429,6 +473,13 @@ fn load_tts_settings(hermes_home: &Path) -> Result<TtsSettings, String> {
     })
 }
 
+fn load_tts_root(hermes_home: &Path) -> Option<YamlValue> {
+    let context =
+        HermesContext::new(hermes_home).with_hermes_home_env(Some(hermes_home.to_path_buf()));
+    let loaded = context.load_config_document().ok()?;
+    loaded.cfg_get(&["tts"]).cloned()
+}
+
 fn load_command_provider(root: Option<&YamlValue>, provider: &str) -> Option<CommandTtsProvider> {
     if provider.is_empty() || is_builtin_tts_provider(provider) {
         return None;
@@ -459,6 +510,62 @@ fn load_command_provider(root: Option<&YamlValue>, provider: &str) -> Option<Com
             .unwrap_or_default(),
         max_text_length,
     })
+}
+
+fn has_any_command_tts_provider(root: Option<&YamlValue>) -> bool {
+    let Some(root_mapping) = provider_root_mapping(root) else {
+        return false;
+    };
+    mapping_get_case_insensitive(root_mapping, "providers")
+        .and_then(YamlValue::as_mapping)
+        .is_some_and(|providers| {
+            providers.iter().any(|(name, value)| {
+                name.as_str()
+                    .filter(|name| !is_builtin_tts_provider(name))
+                    .is_some_and(|_| value.as_mapping().is_some_and(is_command_provider_config))
+            })
+        })
+}
+
+fn edge_tts_available() -> bool {
+    #[cfg(test)]
+    if let Some(available) = TEST_EDGE_TTS_AVAILABLE.with(|slot| *slot.borrow()) {
+        return available;
+    }
+    Command::new("edge-tts")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn python_module_available(module: &str, pythonpath: Option<&str>) -> bool {
+    let interpreter = resolve_python_interpreter();
+    let mut command = Command::new(&interpreter);
+    command
+        .arg("-c")
+        .arg("import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)")
+        .arg(module)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_pythonpath_override(&mut command, pythonpath);
+    command.status().is_ok_and(|status| status.success())
+}
+
+fn kittentts_backend_available(settings: &TtsSettings) -> bool {
+    python_module_available("kittentts", settings.kittentts_pythonpath.as_deref())
+}
+
+fn neutts_backend_available(settings: &TtsSettings) -> bool {
+    settings.neutts_ref_audio.exists()
+        && settings.neutts_ref_text.exists()
+        && repo_root().join("tools").join("neutts_synth.py").exists()
+        && python_module_available("neutts", settings.neutts_pythonpath.as_deref())
+}
+
+fn piper_backend_available(settings: &TtsSettings) -> bool {
+    python_module_available("piper", settings.piper_pythonpath.as_deref())
 }
 
 fn synthesize_edge(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
@@ -539,13 +646,13 @@ fn synthesize_elevenlabs(
     ensure_audio_file(output_path)
 }
 
-fn synthesize_openai(settings: &TtsSettings, text: &str, output_path: &Path) -> Result<(), String> {
-    if settings.openai_api_key.trim().is_empty() {
-        return Err(
-            "OpenAI TTS requires VOICE_TOOLS_OPENAI_KEY, OPENAI_API_KEY, or tts.openai.api_key."
-                .to_string(),
-        );
-    }
+fn synthesize_openai(
+    settings: &TtsSettings,
+    hermes_home: &Path,
+    text: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    let (api_key, base_url) = resolve_openai_audio_backend(settings, hermes_home)?;
     let response_format = match output_path
         .extension()
         .and_then(|value| value.to_str())
@@ -559,10 +666,10 @@ fn synthesize_openai(settings: &TtsSettings, text: &str, output_path: &Path) -> 
     let client = Client::builder()
         .build()
         .map_err(|error| format!("building HTTP client failed: {error}"))?;
-    let url = format!("{}/audio/speech", settings.openai_base_url);
+    let url = format!("{}/audio/speech", base_url);
     let response = client
         .post(&url)
-        .bearer_auth(&settings.openai_api_key)
+        .bearer_auth(&api_key)
         .json(&json!({
             "model": settings.openai_model,
             "voice": settings.openai_voice,
@@ -1144,6 +1251,62 @@ fn ensure_audio_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_openai_audio_backend(
+    settings: &TtsSettings,
+    hermes_home: &Path,
+) -> Result<(String, String), String> {
+    let direct_api_key = (!settings.openai_api_key.trim().is_empty())
+        .then(|| settings.openai_api_key.trim().to_string());
+    if let Some(api_key) = direct_api_key.clone()
+        && !settings.use_gateway
+    {
+        return Ok((api_key, settings.openai_base_url.clone()));
+    }
+    if let Some((gateway_base_url, gateway_token)) =
+        managed_openai_audio_gateway_config(hermes_home)
+    {
+        return Ok((gateway_token, gateway_base_url));
+    }
+    if let Some(api_key) = direct_api_key {
+        return Ok((api_key, settings.openai_base_url.clone()));
+    }
+    Err(
+        "OpenAI TTS requires VOICE_TOOLS_OPENAI_KEY, OPENAI_API_KEY, tts.openai.api_key, or a managed openai-audio gateway token."
+            .to_string(),
+    )
+}
+
+fn managed_openai_audio_gateway_config(hermes_home: &Path) -> Option<(String, String)> {
+    let token = std::env::var("TOOL_GATEWAY_USER_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| resolve_nous_access_token(hermes_home, 15.0).ok())?;
+    let origin = std::env::var("OPENAI_AUDIO_GATEWAY_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let domain = std::env::var("TOOL_GATEWAY_DOMAIN").ok()?;
+            let domain = domain.trim().trim_matches('/').to_string();
+            if domain.is_empty() {
+                return None;
+            }
+            let scheme = std::env::var("TOOL_GATEWAY_SCHEME")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| matches!(value.as_str(), "http" | "https"))
+                .unwrap_or_else(|| "https".to_string());
+            Some(format!("{scheme}://openai-audio-gateway.{domain}"))
+        })?;
+    let base_url = if origin.ends_with("/v1") {
+        origin
+    } else {
+        format!("{origin}/v1")
+    };
+    Some((base_url, token))
+}
+
 fn yaml_mapping_value(root: Option<&YamlValue>, path: &[&str]) -> Option<String> {
     let mut current = root?;
     for key in path {
@@ -1377,6 +1540,9 @@ fn get_command_tts_output_format_from_provider(
 }
 
 fn provider_max_text_length(settings: &TtsSettings) -> usize {
+    if let Some(override_value) = settings.provider_max_text_length {
+        return override_value;
+    }
     match settings.provider.as_str() {
         "edge" => EDGE_MAX_TEXT_LENGTH,
         "openai" => OPENAI_MAX_TEXT_LENGTH,
@@ -2116,6 +2282,13 @@ fn set_test_ffmpeg_binary(path: Option<PathBuf>) {
     });
 }
 
+#[cfg(test)]
+fn set_test_edge_tts_available(available: Option<bool>) {
+    TEST_EDGE_TTS_AVAILABLE.with(|slot| {
+        *slot.borrow_mut() = available;
+    });
+}
+
 fn unix_ts_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2141,6 +2314,18 @@ mod tests {
 
     fn env_lock() -> &'static Mutex<()> {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_env_var(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
     }
 
     fn serve_audio_once(body: Vec<u8>) -> String {
@@ -2188,8 +2373,276 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn serve_audio_with_request_capture(
+        body: Vec<u8>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(body);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let join = thread::spawn({
+            let body = Arc::clone(&body);
+            let captured = Arc::clone(&captured);
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut headers = Vec::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    }
+                    headers.push(trimmed);
+                }
+                let mut payload = vec![0_u8; content_length];
+                let _ = reader.read_exact(&mut payload);
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim_end().to_string());
+                captured.lock().unwrap().extend(headers);
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&payload).to_string());
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(http.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        (format!("http://{}", addr), captured, join)
+    }
+
     fn command_copy_command() -> &'static str {
         "cp {input_path} {output_path}"
+    }
+
+    #[test]
+    fn text_to_speech_available_is_false_without_any_backend() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let empty_bin = temp.path().join("empty-bin");
+        fs::create_dir_all(&empty_bin).unwrap();
+
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_path = env::var_os("PATH");
+        let previous_venv = env::var_os("VIRTUAL_ENV");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_voice_openai = env::var_os("VOICE_TOOLS_OPENAI_KEY");
+        let previous_elevenlabs = env::var_os("ELEVENLABS_API_KEY");
+        let previous_minimax = env::var_os("MINIMAX_API_KEY");
+        let previous_xai = env::var_os("XAI_API_KEY");
+        let previous_gemini = env::var_os("GEMINI_API_KEY");
+        let previous_google = env::var_os("GOOGLE_API_KEY");
+        let previous_mistral = env::var_os("MISTRAL_API_KEY");
+        let previous_gateway_token = env::var_os("TOOL_GATEWAY_USER_TOKEN");
+        let previous_gateway_domain = env::var_os("TOOL_GATEWAY_DOMAIN");
+        let previous_audio_gateway = env::var_os("OPENAI_AUDIO_GATEWAY_URL");
+
+        set_env_var("HERMES_HOME", temp.path());
+        set_env_var("PATH", &empty_bin);
+        remove_env_var("VIRTUAL_ENV");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("VOICE_TOOLS_OPENAI_KEY");
+        remove_env_var("ELEVENLABS_API_KEY");
+        remove_env_var("MINIMAX_API_KEY");
+        remove_env_var("XAI_API_KEY");
+        remove_env_var("GEMINI_API_KEY");
+        remove_env_var("GOOGLE_API_KEY");
+        remove_env_var("MISTRAL_API_KEY");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+        remove_env_var("TOOL_GATEWAY_DOMAIN");
+        remove_env_var("OPENAI_AUDIO_GATEWAY_URL");
+
+        fs::write(temp.path().join("config.yaml"), "").unwrap();
+        assert!(!text_to_speech_available());
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
+        match previous_venv {
+            Some(value) => set_env_var("VIRTUAL_ENV", value),
+            None => remove_env_var("VIRTUAL_ENV"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_voice_openai {
+            Some(value) => set_env_var("VOICE_TOOLS_OPENAI_KEY", value),
+            None => remove_env_var("VOICE_TOOLS_OPENAI_KEY"),
+        }
+        match previous_elevenlabs {
+            Some(value) => set_env_var("ELEVENLABS_API_KEY", value),
+            None => remove_env_var("ELEVENLABS_API_KEY"),
+        }
+        match previous_minimax {
+            Some(value) => set_env_var("MINIMAX_API_KEY", value),
+            None => remove_env_var("MINIMAX_API_KEY"),
+        }
+        match previous_xai {
+            Some(value) => set_env_var("XAI_API_KEY", value),
+            None => remove_env_var("XAI_API_KEY"),
+        }
+        match previous_gemini {
+            Some(value) => set_env_var("GEMINI_API_KEY", value),
+            None => remove_env_var("GEMINI_API_KEY"),
+        }
+        match previous_google {
+            Some(value) => set_env_var("GOOGLE_API_KEY", value),
+            None => remove_env_var("GOOGLE_API_KEY"),
+        }
+        match previous_mistral {
+            Some(value) => set_env_var("MISTRAL_API_KEY", value),
+            None => remove_env_var("MISTRAL_API_KEY"),
+        }
+        match previous_gateway_token {
+            Some(value) => set_env_var("TOOL_GATEWAY_USER_TOKEN", value),
+            None => remove_env_var("TOOL_GATEWAY_USER_TOKEN"),
+        }
+        match previous_gateway_domain {
+            Some(value) => set_env_var("TOOL_GATEWAY_DOMAIN", value),
+            None => remove_env_var("TOOL_GATEWAY_DOMAIN"),
+        }
+        match previous_audio_gateway {
+            Some(value) => set_env_var("OPENAI_AUDIO_GATEWAY_URL", value),
+            None => remove_env_var("OPENAI_AUDIO_GATEWAY_URL"),
+        }
+    }
+
+    #[test]
+    fn text_to_speech_available_counts_command_provider() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let empty_bin = temp.path().join("empty-bin");
+        fs::create_dir_all(&empty_bin).unwrap();
+
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_path = env::var_os("PATH");
+        let previous_venv = env::var_os("VIRTUAL_ENV");
+
+        set_env_var("HERMES_HOME", temp.path());
+        set_env_var("PATH", &empty_bin);
+        remove_env_var("VIRTUAL_ENV");
+        fs::write(
+            temp.path().join("config.yaml"),
+            "tts:\n  provider: edge\n  providers:\n    shell-copy:\n      type: command\n      command: \"cp {input_path} {output_path}\"\n",
+        )
+        .unwrap();
+
+        assert!(text_to_speech_available());
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
+        match previous_venv {
+            Some(value) => set_env_var("VIRTUAL_ENV", value),
+            None => remove_env_var("VIRTUAL_ENV"),
+        }
+    }
+
+    #[test]
+    fn text_to_speech_available_uses_managed_gateway_from_nous_auth_store() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let empty_bin = temp.path().join("empty-bin");
+        fs::create_dir_all(&empty_bin).unwrap();
+
+        let previous_home = env::var_os("HERMES_HOME");
+        let previous_path = env::var_os("PATH");
+        let previous_venv = env::var_os("VIRTUAL_ENV");
+        let previous_openai = env::var_os("OPENAI_API_KEY");
+        let previous_voice_openai = env::var_os("VOICE_TOOLS_OPENAI_KEY");
+        let previous_gateway_token = env::var_os("TOOL_GATEWAY_USER_TOKEN");
+        let previous_gateway_domain = env::var_os("TOOL_GATEWAY_DOMAIN");
+        let previous_audio_gateway = env::var_os("OPENAI_AUDIO_GATEWAY_URL");
+
+        set_env_var("HERMES_HOME", temp.path());
+        set_env_var("PATH", &empty_bin);
+        remove_env_var("VIRTUAL_ENV");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("VOICE_TOOLS_OPENAI_KEY");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+        remove_env_var("OPENAI_AUDIO_GATEWAY_URL");
+        set_env_var("TOOL_GATEWAY_DOMAIN", "example.test");
+
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-access-token",
+                        "refresh_token": "nous-refresh-token",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(text_to_speech_available());
+
+        match previous_home {
+            Some(value) => set_env_var("HERMES_HOME", value),
+            None => remove_env_var("HERMES_HOME"),
+        }
+        match previous_path {
+            Some(value) => set_env_var("PATH", value),
+            None => remove_env_var("PATH"),
+        }
+        match previous_venv {
+            Some(value) => set_env_var("VIRTUAL_ENV", value),
+            None => remove_env_var("VIRTUAL_ENV"),
+        }
+        match previous_openai {
+            Some(value) => set_env_var("OPENAI_API_KEY", value),
+            None => remove_env_var("OPENAI_API_KEY"),
+        }
+        match previous_voice_openai {
+            Some(value) => set_env_var("VOICE_TOOLS_OPENAI_KEY", value),
+            None => remove_env_var("VOICE_TOOLS_OPENAI_KEY"),
+        }
+        match previous_gateway_token {
+            Some(value) => set_env_var("TOOL_GATEWAY_USER_TOKEN", value),
+            None => remove_env_var("TOOL_GATEWAY_USER_TOKEN"),
+        }
+        match previous_gateway_domain {
+            Some(value) => set_env_var("TOOL_GATEWAY_DOMAIN", value),
+            None => remove_env_var("TOOL_GATEWAY_DOMAIN"),
+        }
+        match previous_audio_gateway {
+            Some(value) => set_env_var("OPENAI_AUDIO_GATEWAY_URL", value),
+            None => remove_env_var("OPENAI_AUDIO_GATEWAY_URL"),
+        }
     }
 
     fn install_fake_piper_package(root: &Path, broken: bool) {
@@ -2384,6 +2837,286 @@ def write(path, audio, samplerate):
         assert_eq!(file_path, output_path.display().to_string());
         assert_eq!(fs::read(file_path).unwrap(), b"fake-audio");
         assert_eq!(parsed["media_tag"], json!(format!("MEDIA:{file_path}")));
+    }
+
+    #[test]
+    fn openai_tts_uses_managed_audio_gateway_without_direct_key() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let (gateway_origin, captured, join) =
+            serve_audio_with_request_capture(b"gateway-audio".to_vec());
+        remove_env_var("VOICE_TOOLS_OPENAI_KEY");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("OPENAI_BASE_URL");
+        set_env_var("OPENAI_AUDIO_GATEWAY_URL", &gateway_origin);
+        set_env_var("TOOL_GATEWAY_USER_TOKEN", "nous-token");
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            "tts:\n  provider: openai\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("managed.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello gateway",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        remove_env_var("OPENAI_AUDIO_GATEWAY_URL");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(fs::read(&output_path).unwrap(), b"gateway-audio");
+
+        join.join().unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0], "POST /v1/audio/speech HTTP/1.1");
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer nous-token"))
+        );
+        let payload: Value = serde_json::from_str(captured.last().unwrap()).unwrap();
+        assert_eq!(payload["model"], json!("gpt-4o-mini-tts"));
+        assert_eq!(payload["voice"], json!("alloy"));
+        assert_eq!(payload["input"], json!("hello gateway"));
+    }
+
+    #[test]
+    fn openai_tts_uses_managed_audio_gateway_from_nous_auth_store() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let (gateway_origin, captured, join) =
+            serve_audio_with_request_capture(b"gateway-audio".to_vec());
+        remove_env_var("VOICE_TOOLS_OPENAI_KEY");
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("OPENAI_BASE_URL");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+        set_env_var("OPENAI_AUDIO_GATEWAY_URL", &gateway_origin);
+
+        fs::write(
+            temp.path().join("auth.json"),
+            json!({
+                "version": 1,
+                "providers": {
+                    "nous": {
+                        "access_token": "nous-auth-token",
+                        "refresh_token": "nous-refresh-token",
+                        "portal_base_url": "https://portal.nousresearch.com",
+                        "client_id": "hermes-cli",
+                        "expires_at": "2999-01-01T00:00:00Z"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "tts:\n  provider: openai\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("managed-from-auth.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello gateway",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        remove_env_var("OPENAI_AUDIO_GATEWAY_URL");
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(fs::read(&output_path).unwrap(), b"gateway-audio");
+
+        join.join().unwrap();
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer nous-auth-token"))
+        );
+    }
+
+    #[test]
+    fn openai_tts_use_gateway_prefers_managed_token_over_direct_key() {
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new().unwrap();
+        let (gateway_origin, captured, join) =
+            serve_audio_with_request_capture(b"prefer-gateway".to_vec());
+        set_env_var("OPENAI_API_KEY", "direct-openai-key");
+        remove_env_var("VOICE_TOOLS_OPENAI_KEY");
+        remove_env_var("OPENAI_BASE_URL");
+        set_env_var("OPENAI_AUDIO_GATEWAY_URL", &gateway_origin);
+        set_env_var("TOOL_GATEWAY_USER_TOKEN", "nous-token");
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            "tts:\n  provider: openai\n  use_gateway: true\n",
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("prefer-gateway.mp3");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"prefer gateway",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        remove_env_var("OPENAI_API_KEY");
+        remove_env_var("OPENAI_AUDIO_GATEWAY_URL");
+        remove_env_var("TOOL_GATEWAY_USER_TOKEN");
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(fs::read(&output_path).unwrap(), b"prefer-gateway");
+
+        join.join().unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0], "POST /v1/audio/speech HTTP/1.1");
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer nous-token"))
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer direct-openai-key"))
+        );
+    }
+
+    #[test]
+    fn openai_tts_honors_builtin_max_text_length_override() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /v1/audio/speech HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut payload = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut payload);
+            let body: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(body["input"], json!("abc"));
+
+            let audio = b"override-audio";
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                audio.len()
+            );
+            let _ = stream.write_all(http.as_bytes());
+            let _ = stream.write_all(audio);
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: openai\n  openai:\n    base_url: http://{}/v1\n    api_key: test-key\n    max_text_length: 3\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"abcdef",
+                "output_path": temp.path().join("override.mp3").display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn openai_tts_ignores_non_positive_max_text_length_override() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /v1/audio/speech HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut payload = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut payload);
+            let body: Value = serde_json::from_slice(&payload).unwrap();
+            let input = body["input"].as_str().unwrap();
+            assert_eq!(input.chars().count(), 4096);
+
+            let audio = b"default-cap-audio";
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                audio.len()
+            );
+            let _ = stream.write_all(http.as_bytes());
+            let _ = stream.write_all(audio);
+        });
+
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: openai\n  openai:\n    base_url: http://{}/v1\n    api_key: test-key\n    max_text_length: 0\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let long_text = "x".repeat(5000);
+        let result = handle_text_to_speech(
+            &json!({
+                "text": long_text,
+                "output_path": temp.path().join("default-cap.mp3").display().to_string(),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        join.join().unwrap();
     }
 
     #[test]
@@ -3182,6 +3915,70 @@ def write(path, audio, samplerate):
             json!(format!("[[audio_as_voice]]\nMEDIA:{file_path}"))
         );
         assert_eq!(fs::read(file_path).unwrap(), b"edge-audio");
+    }
+
+    #[test]
+    fn edge_tts_falls_back_to_neutts_when_edge_is_unavailable() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let pyroot = temp.path().join("pyroot");
+        fs::create_dir_all(&pyroot).unwrap();
+        install_fake_neutts_package(&pyroot, false);
+        let ref_audio = temp.path().join("voice.wav");
+        let ref_text = temp.path().join("voice.txt");
+        fs::write(&ref_audio, b"fake-reference").unwrap();
+        fs::write(&ref_text, "reference transcript").unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "tts:\n  provider: edge\n  neutts:\n    ref_audio: {}\n    ref_text: {}\n    pythonpath: {}\n",
+                ref_audio.display(),
+                ref_text.display(),
+                pyroot.display()
+            ),
+        )
+        .unwrap();
+
+        set_test_edge_tts_available(Some(false));
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let output_path = temp.path().join("fallback.wav");
+        let result = handle_text_to_speech(
+            &json!({
+                "text":"hello fallback",
+                "output_path": output_path.display().to_string(),
+            }),
+            &runtime,
+        );
+        set_test_edge_tts_available(None);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["provider"], json!("neutts"));
+        let audio = fs::read(&output_path).unwrap();
+        assert_eq!(&audio[..4], b"RIFF");
+        let rendered = String::from_utf8_lossy(&audio);
+        assert!(rendered.contains("hello fallback"));
+        assert!(rendered.contains("reference transcript"));
+    }
+
+    #[test]
+    fn edge_tts_reports_combined_unavailable_error_when_no_backend_exists() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("config.yaml"), "tts:\n  provider: edge\n").unwrap();
+
+        set_test_edge_tts_available(Some(false));
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = handle_text_to_speech(&json!({"text":"hello missing edge"}), &runtime);
+        set_test_edge_tts_available(None);
+
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("No TTS provider available")
+        );
     }
 
     #[test]

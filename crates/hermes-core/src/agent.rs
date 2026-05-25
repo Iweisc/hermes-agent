@@ -29,6 +29,7 @@ use base64::Engine as _;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use url::Url;
 
 use crate::{
     HermesContext, HermesError, LoadedConfig, MessageAppend, ModelOverrides, SessionCreate,
@@ -673,7 +674,7 @@ impl HermesContext {
                             token_count: None,
                             finish_reason: None,
                             reasoning: reasoning.clone(),
-                            reasoning_content: None,
+                            reasoning_content: reasoning.clone(),
                             reasoning_details: reasoning_details.clone(),
                             codex_reasoning_items: codex_reasoning_items.clone(),
                             codex_message_items: codex_message_items.clone(),
@@ -1187,6 +1188,12 @@ fn content_part_is_meaningful(part: &Value) -> bool {
             .get("image_url")
             .and_then(Value::as_str)
             .is_some_and(|url| !url.trim().is_empty()),
+        "input_audio" => object
+            .get("input_audio")
+            .and_then(Value::as_object)
+            .and_then(|audio| audio.get("data"))
+            .and_then(Value::as_str)
+            .is_some_and(|data| !data.trim().is_empty()),
         _ => false,
     }
 }
@@ -1451,14 +1458,15 @@ fn send_anthropic_message(
     messages: &[Value],
     tools: &[crate::ToolDefinition],
 ) -> Result<NormalizedAssistantResponse, HermesError> {
-    let (system_prompt, anthropic_messages) = convert_messages_to_anthropic(messages)?;
+    let (system_prompt, anthropic_messages) =
+        convert_messages_to_anthropic(messages, &runtime_model.base_url, &runtime_model.model)?;
     let mut payload = json!({
         "model": runtime_model.model,
         "messages": anthropic_messages,
         "max_tokens": 16_384,
     });
     if let Some(system_prompt) = system_prompt {
-        payload["system"] = Value::String(system_prompt);
+        payload["system"] = system_prompt;
     }
     if !tools.is_empty() {
         payload["tools"] = Value::Array(
@@ -1963,6 +1971,11 @@ fn bedrock_content_blocks(content: &Value) -> Result<Vec<BedrockContentBlock>, H
                             } else if !url.is_empty() {
                                 blocks.push(BedrockContentBlock::Text(format!("[Image: {url}]")));
                             }
+                        }
+                        Some("input_audio") => {
+                            blocks.push(BedrockContentBlock::Text(
+                                "[Audio attachment omitted]".to_string(),
+                            ));
                         }
                         _ => {}
                     },
@@ -3978,7 +3991,9 @@ fn chat_messages_to_responses_input(messages: &[Value]) -> Result<Value, HermesE
 
 fn convert_messages_to_anthropic(
     messages: &[Value],
-) -> Result<(Option<String>, Vec<Value>), HermesError> {
+    base_url: &str,
+    model: &str,
+) -> Result<(Option<Value>, Vec<Value>), HermesError> {
     let mut system_prompt = None;
     let mut converted = Vec::new();
 
@@ -3989,14 +4004,31 @@ fn convert_messages_to_anthropic(
             .unwrap_or("user");
         match role {
             "system" => {
-                system_prompt = extract_message_text(message.get("content"));
+                system_prompt = anthropic_system_prompt(message.get("content"));
             }
             "assistant" => {
-                let mut blocks = Vec::new();
-                if let Some(text) = extract_message_text(message.get("content"))
+                let mut blocks = extract_preserved_thinking_blocks(message);
+                let converted_content = anthropic_content_blocks(message.get("content"));
+                if !converted_content.is_empty() {
+                    blocks.extend(converted_content);
+                }
+                if blocks.is_empty()
+                    && let Some(text) = extract_message_text(message.get("content"))
                     && !text.trim().is_empty()
                 {
                     blocks.push(json!({"type": "text", "text": text}));
+                }
+                let already_has_thinking = blocks.iter().any(is_thinking_block);
+                if let Some(reasoning_content) = message
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    && !already_has_thinking
+                {
+                    blocks.insert(
+                        0,
+                        json!({"type": "thinking", "thinking": reasoning_content}),
+                    );
                 }
                 for tool_call in parse_tool_calls(message.get("tool_calls")) {
                     blocks.push(json!({
@@ -4047,25 +4079,307 @@ fn convert_messages_to_anthropic(
                     }));
                 }
             }
-            _ => {
-                let content = extract_message_text(message.get("content"))
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "(empty message)".to_string());
-                converted.push(json!({
-                    "role": "user",
-                    "content": content,
-                }));
-            }
+            _ => match message.get("content") {
+                Some(Value::Array(_)) => {
+                    let mut content = anthropic_content_blocks(message.get("content"));
+                    if !anthropic_blocks_have_meaningful_content(&content) {
+                        content = vec![json!({"type": "text", "text": "(empty message)"})];
+                    }
+                    converted.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+                _ => {
+                    let content = extract_message_text(message.get("content"))
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "(empty message)".to_string());
+                    converted.push(json!({
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+            },
         }
     }
 
-    if system_prompt
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
+    sanitize_anthropic_thinking_blocks(&mut converted, base_url, model);
+
+    if system_prompt.as_ref().is_some_and(|value| match value {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(blocks) => blocks.is_empty(),
+        _ => false,
+    }) {
         system_prompt = None;
     }
     Ok((system_prompt, converted))
+}
+
+fn anthropic_system_prompt(content: Option<&Value>) -> Option<Value> {
+    match content {
+        Some(Value::Array(parts)) => {
+            let has_cache = parts.iter().any(|part| {
+                part.as_object()
+                    .and_then(|object| object.get("cache_control"))
+                    .is_some()
+            });
+            if has_cache {
+                let preserved = parts
+                    .iter()
+                    .filter(|part| part.is_object())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if preserved.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(preserved))
+                }
+            } else {
+                extract_message_text(content).map(Value::String)
+            }
+        }
+        _ => extract_message_text(content).map(Value::String),
+    }
+}
+
+fn extract_preserved_thinking_blocks(message: &Value) -> Vec<Value> {
+    message
+        .get("reasoning_details")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_object()
+                        .filter(|object| {
+                            matches!(
+                                object.get("type").and_then(Value::as_str),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        })
+                        .map(|_| item.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn anthropic_content_blocks(content: Option<&Value>) -> Vec<Value> {
+    let Some(Value::Array(parts)) = content else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(anthropic_content_part)
+        .collect::<Vec<_>>()
+}
+
+fn anthropic_content_part(part: &Value) -> Option<Value> {
+    match part {
+        Value::Null => None,
+        Value::String(text) => Some(json!({"type": "text", "text": text})),
+        Value::Object(object) => {
+            let part_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut block = match part_type {
+                "input_text" => json!({
+                    "type": "text",
+                    "text": object.get("text").and_then(Value::as_str).unwrap_or_default(),
+                }),
+                "image_url" | "input_image" => {
+                    let url = object
+                        .get("image_url")
+                        .and_then(|value| match value {
+                            Value::String(url) => Some(url.as_str()),
+                            Value::Object(image) => image.get("url").and_then(Value::as_str),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "type": "image",
+                        "source": anthropic_image_source_from_openai_url(url),
+                    })
+                }
+                _ => Value::Object(object.clone()),
+            };
+            if let Some(cache_control) = object.get("cache_control").and_then(Value::as_object)
+                && block.get("cache_control").is_none()
+                && let Some(block_object) = block.as_object_mut()
+            {
+                block_object.insert(
+                    "cache_control".to_string(),
+                    Value::Object(cache_control.clone()),
+                );
+            }
+            Some(block)
+        }
+        other => Some(json!({"type": "text", "text": other.to_string()})),
+    }
+}
+
+fn anthropic_image_source_from_openai_url(url: &str) -> Value {
+    let trimmed = url.trim();
+    if let Some(data_url) = trimmed.strip_prefix("data:") {
+        let (header, data) = data_url.split_once(',').unwrap_or((data_url, ""));
+        let media_type = header
+            .split(';')
+            .next()
+            .map(str::trim)
+            .filter(|value| value.starts_with("image/"))
+            .unwrap_or("image/jpeg");
+        return json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        });
+    }
+    json!({
+        "type": "url",
+        "url": trimmed,
+    })
+}
+
+fn anthropic_blocks_have_meaningful_content(blocks: &[Value]) -> bool {
+    blocks.iter().any(|block| match block {
+        Value::Object(object) => match object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()),
+            "image" => true,
+            "input_audio" => object
+                .get("input_audio")
+                .and_then(Value::as_object)
+                .and_then(|audio| audio.get("data"))
+                .and_then(Value::as_str)
+                .is_some_and(|data| !data.trim().is_empty()),
+            _ => true,
+        },
+        _ => false,
+    })
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    )
+}
+
+fn sanitize_anthropic_thinking_blocks(messages: &mut [Value], base_url: &str, model: &str) {
+    let preserve_unsigned =
+        is_kimi_family_endpoint(base_url, model) || is_deepseek_anthropic_endpoint(base_url);
+    let is_third_party = is_third_party_anthropic_endpoint(base_url);
+    let last_assistant_idx = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+
+        let sanitized = if preserve_unsigned {
+            content
+                .iter()
+                .filter_map(|block| {
+                    if !is_thinking_block(block) {
+                        return Some(block.clone());
+                    }
+                    if block.get("signature").is_some() || block.get("data").is_some() {
+                        None
+                    } else {
+                        Some(block.clone())
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else if is_third_party || Some(index) != last_assistant_idx {
+            content
+                .iter()
+                .filter(|block| !is_thinking_block(block))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            let mut blocks = Vec::new();
+            for block in content.iter() {
+                if !is_thinking_block(block) {
+                    blocks.push(block.clone());
+                    continue;
+                }
+                if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
+                    if block.get("data").is_some() {
+                        blocks.push(block.clone());
+                    }
+                    continue;
+                }
+                if block.get("signature").is_some() {
+                    blocks.push(block.clone());
+                    continue;
+                }
+                if let Some(text) = block.get("thinking").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+            }
+            blocks
+        };
+
+        let mut sanitized = if sanitized.is_empty() {
+            vec![json!({
+                "type": "text",
+                "text": if preserve_unsigned || (is_third_party || Some(index) != last_assistant_idx) {
+                    "(thinking elided)"
+                } else {
+                    "(empty)"
+                }
+            })]
+        } else {
+            sanitized
+        };
+        for block in &mut sanitized {
+            if is_thinking_block(block)
+                && let Some(object) = block.as_object_mut()
+            {
+                object.remove("cache_control");
+            }
+        }
+        *content = sanitized;
+    }
+}
+
+fn is_kimi_family_endpoint(base_url: &str, model: &str) -> bool {
+    let base = base_url.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    base.contains("api.kimi.com")
+        || base.contains("moonshot.ai")
+        || base.contains("/coding")
+        || model.contains("kimi")
+        || model.contains("moonshot")
+}
+
+fn is_deepseek_anthropic_endpoint(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.contains("deepseek") && lower.contains("/anthropic")
+}
+
+fn is_third_party_anthropic_endpoint(base_url: &str) -> bool {
+    let Some(host) = Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host != "api.anthropic.com"
 }
 
 fn extract_message_text(content: Option<&Value>) -> Option<String> {
@@ -4125,6 +4439,26 @@ fn responses_content_parts(content: Option<&Value>, assistant: bool) -> Value {
                             normalized.push(json!({
                                 "type": "input_image",
                                 "image_url": url,
+                            }));
+                        }
+                    }
+                    "input_audio" => {
+                        if let Some(audio) = part.get("input_audio").and_then(Value::as_object)
+                            && let Some(data) = audio.get("data").and_then(Value::as_str)
+                            && !data.trim().is_empty()
+                        {
+                            let format = audio
+                                .get("format")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or("wav");
+                            normalized.push(json!({
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": data,
+                                    "format": format,
+                                },
                             }));
                         }
                     }
@@ -4536,6 +4870,12 @@ fn message_record_to_chat_message(message: crate::MessageRecord) -> Result<Value
     }
     if let Some(reasoning_details) = message.reasoning_details {
         map.insert("reasoning_details".to_string(), reasoning_details);
+    }
+    if let Some(reasoning_content) = message.reasoning_content {
+        map.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content),
+        );
     }
     if let Some(codex_reasoning_items) = message.codex_reasoning_items {
         map.insert("codex_reasoning_items".to_string(), codex_reasoning_items);
@@ -6221,6 +6561,313 @@ for raw in sys.stdin:
             ])
         );
         join.join().unwrap();
+    }
+
+    #[test]
+    fn chat_turn_with_user_content_sends_inline_audio_payload() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /chat/completions HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let messages = payload["messages"].as_array().unwrap();
+            let user = messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap();
+            let content = user["content"].as_array().unwrap();
+            assert_eq!(content[0]["type"], json!("text"));
+            assert_eq!(content[1]["type"], json!("input_audio"));
+            assert_eq!(content[1]["input_audio"]["data"], json!("aGVsbG8="));
+            assert_eq!(content[1]["input_audio"]["format"], json!("wav"));
+
+            let response = json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "The audio payload arrived."
+                    }
+                }]
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        fs::write(
+            context.config_path(),
+            format!(
+                "model:\n  default: test-model\n  provider: custom\n  base_url: http://{}\n  api_key: test-key\n  api_mode: chat_completions\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_turn_with_user_content(
+                &loaded,
+                json!([
+                    {"type": "text", "text": "Listen"},
+                    {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}}
+                ]),
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides::default(),
+                None,
+                Some(&store),
+            )
+            .unwrap();
+
+        assert_eq!(result.final_response, "The audio payload arrived.");
+        let session_id = result.session_id.as_deref().unwrap();
+        let messages = store.get_messages(session_id).unwrap();
+        assert_eq!(
+            messages[0].content.as_ref().unwrap(),
+            &json!([
+                {"type": "text", "text": "Listen"},
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}}
+            ])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn chat_turn_with_user_content_preserves_multimodal_blocks_for_anthropic_runtime() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            assert_eq!(request_line.trim_end(), "POST /v1/messages HTTP/1.1");
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or_default() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = trimmed.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                }
+            }
+            let mut body = vec![0_u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let messages = payload["messages"].as_array().unwrap();
+            let user = messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .unwrap();
+            let content = user["content"].as_array().unwrap();
+            assert_eq!(content[0]["type"], json!("text"));
+            assert_eq!(content[0]["text"], json!("Describe both attachments."));
+            assert_eq!(content[1]["type"], json!("image"));
+            assert_eq!(content[1]["source"]["type"], json!("base64"));
+            assert_eq!(content[1]["source"]["media_type"], json!("image/png"));
+            assert_eq!(content[1]["source"]["data"], json!("aGVsbG8="));
+            assert_eq!(content[2]["type"], json!("input_audio"));
+            assert_eq!(content[2]["input_audio"]["data"], json!("c29tZS1hdWRpbw=="));
+            assert_eq!(content[2]["input_audio"]["format"], json!("mp3"));
+
+            let response = json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Anthropic multimodal payload arrived."
+                }],
+                "stop_reason": "end_turn"
+            })
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = stream.write_all(http.as_bytes());
+        });
+
+        fs::write(
+            context.config_path(),
+            format!(
+                "model:\n  default: claude-sonnet-4.6\n  provider: custom\n  base_url: http://{}\n  api_key: test-key\n  api_mode: anthropic_messages\n",
+                addr
+            ),
+        )
+        .unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let result = context
+            .run_chat_turn_with_user_content(
+                &loaded,
+                json!([
+                    {"type": "text", "text": "Describe both attachments."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    {"type": "input_audio", "input_audio": {"data": "c29tZS1hdWRpbw==", "format": "mp3"}}
+                ]),
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides::default(),
+                None,
+                Some(&store),
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.final_response,
+            "Anthropic multimodal payload arrived."
+        );
+        let session_id = result.session_id.as_deref().unwrap();
+        let messages = store.get_messages(session_id).unwrap();
+        assert_eq!(
+            messages[0].content.as_ref().unwrap(),
+            &json!([
+                {"type": "text", "text": "Describe both attachments."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                {"type": "input_audio", "input_audio": {"data": "c29tZS1hdWRpbw==", "format": "mp3"}}
+            ])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn responses_content_parts_preserve_inline_audio() {
+        let parts = responses_content_parts(
+            Some(&json!([
+                {"type": "text", "text": "listen"},
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "mp3"}}
+            ])),
+            false,
+        );
+        assert_eq!(
+            parts,
+            json!([
+                {"type": "input_text", "text": "listen"},
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "mp3"}}
+            ])
+        );
+        assert!(content_has_meaningful_user_input(&json!([
+            {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}}
+        ])));
+    }
+
+    #[test]
+    fn convert_messages_to_anthropic_preserves_unsigned_reasoning_for_kimi_runtime() {
+        let (_system, converted) = convert_messages_to_anthropic(
+            &[json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_demo",
+                    "type": "function",
+                    "function": {
+                        "name": "demo_tool",
+                        "arguments": "{}"
+                    }
+                }],
+                "reasoning_content": ""
+            })],
+            "https://api.kimi.com/coding",
+            "kimi-k2.5",
+        )
+        .unwrap();
+
+        let content = converted[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], json!("thinking"));
+        assert_eq!(content[0]["thinking"], json!(""));
+        assert_eq!(content[1]["type"], json!("tool_use"));
+        assert_eq!(content[1]["name"], json!("demo_tool"));
+    }
+
+    #[test]
+    fn convert_messages_to_anthropic_strips_signed_thinking_for_third_party_endpoint() {
+        let (_system, converted) = convert_messages_to_anthropic(
+            &[json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "visible"}],
+                "reasoning_details": [{
+                    "type": "thinking",
+                    "thinking": "secret chain",
+                    "signature": "signed"
+                }]
+            })],
+            "https://proxy.example.test/anthropic",
+            "claude-sonnet-4.6",
+        )
+        .unwrap();
+
+        let content = converted[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], json!("text"));
+        assert_eq!(content[0]["text"], json!("visible"));
+    }
+
+    #[test]
+    fn message_record_to_chat_message_preserves_reasoning_content() {
+        let message = crate::MessageRecord {
+            id: 1,
+            session_id: "sess".to_string(),
+            role: "assistant".to_string(),
+            content: Some(json!("done")),
+            tool_call_id: None,
+            tool_calls: None,
+            tool_name: None,
+            timestamp: 1_767_225_600.0,
+            token_count: None,
+            finish_reason: None,
+            reasoning: Some("reasoned".to_string()),
+            reasoning_content: Some("reasoned".to_string()),
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+        };
+
+        let converted = message_record_to_chat_message(message).unwrap();
+        assert_eq!(converted["reasoning_content"], json!("reasoned"));
     }
 
     #[test]

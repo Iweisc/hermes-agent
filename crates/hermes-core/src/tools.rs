@@ -70,7 +70,7 @@ use crate::state::SessionStore;
 use crate::terminal::{
     handle_process, handle_terminal, process_schema, terminal_available, terminal_schema,
 };
-use crate::tts::{handle_text_to_speech, text_to_speech_schema};
+use crate::tts::{handle_text_to_speech, text_to_speech_available, text_to_speech_schema};
 use crate::video::{handle_video_analyze, video_analyze_schema};
 use crate::vision::{handle_vision_analyze, vision_analyze_schema};
 use crate::web::{
@@ -2182,7 +2182,7 @@ const TOOL_ENTRIES: &[ToolEntry] = &[
         emoji: "🔊",
         schema_fn: text_to_speech_schema,
         handler: handle_text_to_speech,
-        check_fn: None,
+        check_fn: Some(text_to_speech_available),
     },
     ToolEntry {
         name: "vision_analyze",
