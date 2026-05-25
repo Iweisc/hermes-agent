@@ -416,8 +416,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'gateway.start_timeout': {
-        const { cwd, python, stderr_tail: stderrTail } = ev.payload ?? {}
-        const trace = python || cwd ? ` · ${String(python || '')} ${String(cwd || '')}`.trim() : ''
+        const { command, cwd, python, stderr_tail: stderrTail } = ev.payload ?? {}
+        const backend = String(command || python || '').trim()
+        const trace = backend || cwd ? ` · ${backend} ${String(cwd || '')}`.trim() : ''
 
         setStatus('gateway startup timeout')
         turnController.pushActivity(`gateway startup timed out${trace} · /logs to inspect`, 'error')

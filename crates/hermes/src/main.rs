@@ -35,6 +35,7 @@ mod skills_guard;
 mod slack_cmd;
 mod snapshot_cmd;
 mod tools_cmd;
+mod tui_cmd;
 mod uninstall_cmd;
 mod update_cmd;
 mod webhook;
@@ -156,6 +157,28 @@ struct Cli {
     _profile: Option<String>,
     #[command(flatten)]
     chat: ChatArgs,
+    #[arg(long = "tui", global = true, default_value_t = false)]
+    tui: bool,
+    #[arg(long = "dev", global = true, default_value_t = false)]
+    tui_dev: bool,
+    #[arg(short = 'm', long = "model", global = true)]
+    model: Option<String>,
+    #[arg(long = "provider", global = true)]
+    provider: Option<String>,
+    #[arg(short = 't', long = "toolsets", global = true)]
+    toolsets: Option<String>,
+    #[arg(long = "resume", short = 'r', global = true)]
+    resume: Option<String>,
+    #[arg(
+        long = "continue",
+        short = 'c',
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "__latest__"
+    )]
+    continue_last: Option<String>,
+    #[arg(long = "query", short = 'q', global = true)]
+    query: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -319,6 +342,8 @@ enum Command {
         command: KanbanCommand,
     },
     Tools(tools_cmd::ToolsArgs),
+    #[command(hide = true)]
+    TuiGateway(tui_cmd::TuiGatewayArgs),
     Update(update_cmd::UpdateArgs),
     Whatsapp,
     Status,
@@ -782,6 +807,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         unsafe { std::env::set_var("HERMES_YOLO_MODE", "1") };
     }
 
+    if cli.tui {
+        return tui_cmd::launch_tui(
+            &context,
+            &session_store,
+            tui_cmd::TuiLaunchOptions {
+                continue_last: cli.continue_last.clone(),
+                model: cli.model.clone(),
+                provider: cli.provider.clone(),
+                query: cli.query.clone(),
+                resume: cli.resume.clone(),
+                toolsets: cli.toolsets.clone(),
+                tui_dev: cli.tui_dev,
+            },
+        );
+    }
+
     let default_chat = cli.command.is_none();
     match cli.command.unwrap_or(Command::Chat { prompt: Vec::new() }) {
         Command::Paths => print_paths(&context, &config, &logging),
@@ -882,6 +923,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { board, command } => print_kanban(&context, &config, board, command)?,
         Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
+        Command::TuiGateway(_args) => tui_cmd::run_tui_gateway(&context, &config)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
         Command::Whatsapp => whatsapp_cmd::print_whatsapp(&context)?,
         Command::Status => print_status(&context, &env_report, &config, &session_store),
@@ -4629,6 +4671,33 @@ mod tests {
             }) => assert_eq!(job_id, "cron_123"),
             other => panic!("unexpected parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn top_level_tui_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "hermes",
+            "--tui",
+            "--dev",
+            "--resume",
+            "session-123",
+            "--model",
+            "anthropic/claude-sonnet-4.6",
+            "--provider",
+            "anthropic",
+            "--toolsets",
+            "web,terminal",
+            "--query",
+            "hello",
+        ])
+        .unwrap();
+        assert!(cli.tui);
+        assert!(cli.tui_dev);
+        assert_eq!(cli.resume.as_deref(), Some("session-123"));
+        assert_eq!(cli.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
+        assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cli.toolsets.as_deref(), Some("web,terminal"));
+        assert_eq!(cli.query.as_deref(), Some("hello"));
     }
 
     #[test]
