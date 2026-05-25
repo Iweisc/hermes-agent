@@ -205,11 +205,14 @@ impl<'a> NativeGatewayServer<'a> {
             "setup.status" => Ok(json!({"provider_configured": true})),
             "session.create" => self.handle_session_create(params),
             "session.list" => self.handle_session_list(),
+            "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
             "input.detect_drop" => Ok(json!({
                 "matched": false,
                 "text": params.get("text").and_then(Value::as_str).unwrap_or_default(),
             })),
+            "commands.catalog" => self.handle_commands_catalog(),
+            "config.get" => self.handle_config_get(params),
             "complete.path" => self.handle_complete_path(params),
             "complete.slash" => self.handle_complete_slash(params),
             "prompt.submit" => {
@@ -283,6 +286,26 @@ impl<'a> NativeGatewayServer<'a> {
             })
             .collect::<Vec<_>>();
         Ok(json!({ "sessions": sessions }))
+    }
+
+    fn handle_session_most_recent(&self) -> Result<Value, (i64, String, Option<Value>)> {
+        let recent = self
+            .session_store
+            .list_sessions(200, 0)
+            .map_err(|error| (-32603, error.to_string(), None))?
+            .into_iter()
+            .find(|session| !session.source.eq_ignore_ascii_case("tool"));
+        Ok(match recent {
+            Some(session) => json!({
+                "session_id": session.id,
+                "source": session.source,
+                "started_at": session.started_at,
+                "title": session.title,
+            }),
+            None => json!({
+                "session_id": Value::Null,
+            }),
+        })
     }
 
     fn handle_session_resume(
@@ -498,6 +521,94 @@ impl<'a> NativeGatewayServer<'a> {
             "items": items,
             "replace_from": replace_from,
         }))
+    }
+
+    fn handle_commands_catalog(&self) -> Result<Value, (i64, String, Option<Value>)> {
+        let commands =
+            parse_gateway_commands(&self.config.raw).map_err(|error| (-32603, error, None))?;
+        let mut pairs = Vec::new();
+        let mut canon = serde_json::Map::new();
+        let mut grouped = HashMap::<String, Vec<Value>>::new();
+        let mut category_order = Vec::<String>::new();
+
+        for command in commands {
+            let text = format!("/{}", command.name);
+            pairs.push(json!([text, command.description]));
+            canon.insert(text.to_ascii_lowercase(), Value::String(text.clone()));
+            for alias in &command.aliases {
+                canon.insert(
+                    format!("/{}", alias).to_ascii_lowercase(),
+                    Value::String(text.clone()),
+                );
+            }
+            if !grouped.contains_key(&command.category) {
+                category_order.push(command.category.clone());
+            }
+            grouped
+                .entry(command.category)
+                .or_default()
+                .push(json!([text, command.description]));
+        }
+
+        for (name, description, category) in tui_extra_commands() {
+            let text = format!("/{}", name);
+            pairs.push(json!([text, description]));
+            canon.insert(text.to_ascii_lowercase(), Value::String(text.clone()));
+            if !grouped.contains_key(category) {
+                category_order.push(category.to_string());
+            }
+            grouped
+                .entry(category.to_string())
+                .or_default()
+                .push(json!([text, description]));
+        }
+
+        let categories = category_order
+            .into_iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "pairs": grouped.remove(&name).unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "pairs": pairs,
+            "canon": canon,
+            "categories": categories,
+            "sub": {},
+            "skill_count": 0,
+            "warning": "",
+        }))
+    }
+
+    fn handle_config_get(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match key {
+            "full" => Ok(json!({
+                "config": serde_json::to_value(&self.config.raw).unwrap_or_else(|_| json!({})),
+            })),
+            "mtime" => Ok(json!({
+                "mtime": self
+                    .context
+                    .config_path()
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs_f64())
+                    .unwrap_or(0.0),
+            })),
+            "profile" => Ok(json!({
+                "home": self.context.hermes_home(),
+                "display": self.context.display_hermes_home(),
+            })),
+            _ => Err((-32602, format!("unsupported config key: {key}"), None)),
+        }
     }
 }
 
@@ -921,6 +1032,7 @@ struct RegistryCommand {
     name: String,
     description: String,
     aliases: Vec<String>,
+    category: String,
 }
 
 fn parse_gateway_commands(raw_config: &YamlValue) -> Result<Vec<RegistryCommand>, String> {
@@ -952,6 +1064,7 @@ fn parse_gateway_commands(raw_config: &YamlValue) -> Result<Vec<RegistryCommand>
                     .and_then(|captures| captures.name("body"))
                     .map(|body| string_literals(body.as_str()))
                     .unwrap_or_default(),
+                category: strings[2].clone(),
             });
             continue;
         }
@@ -971,11 +1084,25 @@ fn parse_gateway_commands(raw_config: &YamlValue) -> Result<Vec<RegistryCommand>
                     .and_then(|captures| captures.name("body"))
                     .map(|body| string_literals(body.as_str()))
                     .unwrap_or_default(),
+                category: strings[2].clone(),
             });
         }
     }
 
     Ok(commands)
+}
+
+fn tui_extra_commands() -> [(&'static str, &'static str, &'static str); 4] {
+    [
+        ("compact", "Toggle compact display mode", "TUI"),
+        ("details", "Control agent detail visibility", "TUI"),
+        ("logs", "Show recent gateway log lines", "TUI"),
+        (
+            "mouse",
+            "Toggle mouse/wheel tracking [on|off|toggle]",
+            "TUI",
+        ),
+    ]
 }
 
 fn command_registry_path() -> PathBuf {
@@ -1431,5 +1558,72 @@ mod tests {
                 .iter()
                 .any(|item| item["text"] == json!(" hidden"))
         );
+    }
+
+    #[test]
+    fn native_gateway_startup_rpcs_return_catalog_config_and_recent_session() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            "display:\n  tui_auto_resume_recent: true\n  tui_compact: true\n",
+        )
+        .unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("recent-session"),
+                source: String::from("rust-agent"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let input = [
+            json!({"jsonrpc":"2.0","id":1,"method":"commands.catalog","params":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":2,"method":"config.get","params":{"key":"full"}})
+                .to_string(),
+            json!({"jsonrpc":"2.0","id":3,"method":"config.get","params":{"key":"mtime"}})
+                .to_string(),
+            json!({"jsonrpc":"2.0","id":4,"method":"session.most_recent","params":{}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        let mut output = Vec::new();
+        run_native_gateway_jsonrpc(
+            &context,
+            &config,
+            &store,
+            &mut Cursor::new(input),
+            &mut output,
+        )
+        .unwrap();
+
+        let frames = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames[1]["result"]["canon"]["/help"], json!("/help"));
+        assert!(
+            frames[1]["result"]["pairs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pair| pair[0] == json!("/compact"))
+        );
+        assert_eq!(
+            frames[2]["result"]["config"]["display"]["tui_compact"],
+            json!(true)
+        );
+        assert!(frames[3]["result"]["mtime"].as_f64().unwrap() > 0.0);
+        assert_eq!(frames[4]["result"]["session_id"], json!("recent-session"));
     }
 }
