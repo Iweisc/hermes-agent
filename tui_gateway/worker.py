@@ -11,6 +11,50 @@ from tui_gateway import server
 from tui_gateway.server import dispatch, write_json
 from tui_gateway.transport import TeeTransport
 
+_ALLOWED_METHODS = frozenset(
+    {
+        "agents.list",
+        "browser.manage",
+        "cli.exec",
+        "clarify.respond",
+        "config.get",
+        "config.set",
+        "cron.manage",
+        "delegation.pause",
+        "delegation.status",
+        "image.attach",
+        "model.disconnect",
+        "model.options",
+        "model.save_key",
+        "process.stop",
+        "prompt.submit",
+        "reload.env",
+        "reload.mcp",
+        "rollback.diff",
+        "rollback.list",
+        "rollback.restore",
+        "secret.respond",
+        "session.close",
+        "session.compress",
+        "session.interrupt",
+        "session.resume",
+        "session.steer",
+        "shell.exec",
+        "skills.manage",
+        "skills.reload",
+        "subagent.interrupt",
+        "sudo.respond",
+        "terminal.resize",
+        "tools.configure",
+        "tools.list",
+        "tools.show",
+        "toolsets.list",
+        "voice.record",
+        "voice.toggle",
+        "voice.tts",
+    }
+)
+
 
 def _install_sidecar_publisher() -> None:
     url = os.environ.get("HERMES_TUI_SIDECAR_URL")
@@ -59,6 +103,21 @@ def main() -> None:
                     "jsonrpc": "2.0",
                     "error": {"code": -32700, "message": "parse error"},
                     "id": None,
+                }
+            ):
+                sys.exit(0)
+            continue
+
+        method = req.get("method", "")
+        if method not in _ALLOWED_METHODS:
+            if not write_json(
+                {
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32601,
+                        "message": f"internal worker method not allowed: {method}",
+                    },
+                    "id": req.get("id"),
                 }
             ):
                 sys.exit(0)

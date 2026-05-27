@@ -696,6 +696,7 @@ fn handle_native_request(
         "session.save" => handle_session_save(id, &params, store, state)?,
         "session.undo" => handle_session_undo(id, &params, store, state, child_stdin)?,
         "session.compress" => handle_session_compress(id, &params, state, child_stdin)?,
+        "session.history" => handle_session_history(id, &params, store, state)?,
         "rollback.list" => {
             handle_session_bound_child_request(id, "rollback.list", &params, state, child_stdin)?
         }
@@ -704,6 +705,80 @@ fn handle_native_request(
         }
         "rollback.restore" => {
             handle_session_bound_child_request(id, "rollback.restore", &params, state, child_stdin)?
+        }
+        "reload.mcp" => forward_child_request(id, "reload.mcp", &params, state, child_stdin, true)?,
+        "browser.manage" => handle_browser_manage(id, &params, state, child_stdin)?,
+        "tools.configure" => {
+            forward_child_request(id, "tools.configure", &params, state, child_stdin, true)?
+        }
+        "skills.reload" => {
+            forward_child_request(id, "skills.reload", &params, state, child_stdin, false)?
+        }
+        "skills.manage" => forward_child_request_timeout(
+            id,
+            "skills.manage",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(45),
+        )?,
+        "voice.toggle" => forward_child_request_timeout(
+            id,
+            "voice.toggle",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "voice.record" => forward_child_request_timeout(
+            id,
+            "voice.record",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "voice.tts" => forward_child_request_timeout(
+            id,
+            "voice.tts",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(20),
+        )?,
+        "shell.exec" => forward_child_request_timeout(
+            id,
+            "shell.exec",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(35),
+        )?,
+        "cli.exec" => forward_child_request_timeout(
+            id,
+            "cli.exec",
+            &params,
+            state,
+            child_stdin,
+            false,
+            Duration::from_secs(240),
+        )?,
+        "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
+        "config.show" => handle_helper_dispatch(id, "config.show", &params, helper)?,
+        "insights.get" => handle_helper_dispatch(id, "insights.get", &params, helper)?,
+        "cron.manage" => handle_helper_dispatch(id, "cron.manage", &params, helper)?,
+        "tools.list" => forward_child_request(id, "tools.list", &params, state, child_stdin, true)?,
+        "tools.show" => forward_child_request(id, "tools.show", &params, state, child_stdin, true)?,
+        "toolsets.list" => {
+            forward_child_request(id, "toolsets.list", &params, state, child_stdin, true)?
+        }
+        "agents.list" => {
+            forward_child_request(id, "agents.list", &params, state, child_stdin, false)?
         }
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
@@ -1463,6 +1538,36 @@ fn handle_session_compress(
     Ok(Some(rebind_response_id(response, id)))
 }
 
+fn handle_session_history(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(store_session_id) = lookup_store_session_id(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(_) = store.get_session(&store_session_id)? else {
+        return Ok(Some(error_response(id, 4007, "session not found")));
+    };
+    let (count, messages) = history_messages(store, &store_session_id)?;
+    Ok(Some(ok_response(
+        id,
+        json!({
+            "count": count,
+            "messages": messages,
+        }),
+    )))
+}
+
 fn handle_session_bound_child_request(
     id: Value,
     method: &str,
@@ -1502,6 +1607,40 @@ fn handle_session_bound_child_request(
     Ok(Some(rebind_response_id(response, id)))
 }
 
+fn handle_browser_manage(
+    id: Value,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let mut forwarded_params = params.clone();
+    let local_session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(local_id) = local_session_id.as_deref()
+        && session_exists(state, local_id)?
+    {
+        ensure_child_session(child_stdin, state, local_id)?;
+        if let Some(child_id) = lookup_child_session_id(state, local_id)? {
+            forwarded_params.insert("session_id".to_string(), json!(child_id));
+        } else {
+            forwarded_params.remove("session_id");
+        }
+    }
+    let response = send_blocking_child_request_timeout(
+        child_stdin,
+        state,
+        "browser.manage",
+        Value::Object(forwarded_params),
+        local_session_id,
+        Duration::from_secs(20),
+    )?;
+    Ok(Some(rebind_response_id(response, id)))
+}
+
 fn handle_helper_dispatch(
     id: Value,
     method: &str,
@@ -1525,6 +1664,26 @@ fn forward_child_request(
     child_stdin: &Arc<Mutex<ChildStdin>>,
     map_session_id: bool,
 ) -> Result<Option<Value>, Box<dyn Error>> {
+    forward_child_request_timeout(
+        id,
+        method,
+        params,
+        state,
+        child_stdin,
+        map_session_id,
+        Duration::from_secs(5),
+    )
+}
+
+fn forward_child_request_timeout(
+    id: Value,
+    method: &str,
+    params: &Map<String, Value>,
+    state: &Arc<Mutex<ProxyState>>,
+    child_stdin: &Arc<Mutex<ChildStdin>>,
+    map_session_id: bool,
+    timeout: Duration,
+) -> Result<Option<Value>, Box<dyn Error>> {
     let mut forwarded_params = params.clone();
     if map_session_id
         && let Some(local_id) = params
@@ -1542,7 +1701,7 @@ fn forward_child_request(
             }
         }
     }
-    let response = send_blocking_child_request(
+    let response = send_blocking_child_request_timeout(
         child_stdin,
         state,
         method,
@@ -1557,6 +1716,7 @@ fn forward_child_request(
         } else {
             None
         },
+        timeout,
     )?;
     Ok(Some(rebind_response_id(response, id)))
 }
@@ -3184,6 +3344,24 @@ fn send_blocking_child_request(
     params: Value,
     local_session_id: Option<String>,
 ) -> Result<Value, Box<dyn Error>> {
+    send_blocking_child_request_timeout(
+        stdin,
+        state,
+        method,
+        params,
+        local_session_id,
+        Duration::from_secs(5),
+    )
+}
+
+fn send_blocking_child_request_timeout(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    state: &Arc<Mutex<ProxyState>>,
+    method: &str,
+    params: Value,
+    local_session_id: Option<String>,
+    timeout: Duration,
+) -> Result<Value, Box<dyn Error>> {
     let (response_tx, response_rx) = mpsc::channel();
     let request_id = {
         let mut guard = state
@@ -3218,7 +3396,7 @@ fn send_blocking_child_request(
         stdin.flush()?;
     }
 
-    match response_rx.recv_timeout(Duration::from_secs(5)) {
+    match response_rx.recv_timeout(timeout) {
         Ok(response) => Ok(response),
         Err(_) => {
             let mut guard = state
@@ -3233,11 +3411,20 @@ fn send_blocking_child_request(
 }
 
 fn resume_messages(store: &SessionStore, session_id: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    Ok(history_messages(store, session_id)?.1)
+}
+
+fn history_messages(
+    store: &SessionStore,
+    session_id: &str,
+) -> Result<(usize, Vec<Value>), Box<dyn Error>> {
     let lineage = session_lineage(store, session_id)?;
     let mut tool_call_args: HashMap<String, String> = HashMap::new();
+    let mut raw_count = 0_usize;
     let mut messages = Vec::new();
     for lineage_id in lineage {
         for message in store.get_messages(&lineage_id)? {
+            raw_count += 1;
             let role = message.role.trim();
             if !matches!(role, "user" | "assistant" | "tool" | "system") {
                 continue;
@@ -3282,7 +3469,7 @@ fn resume_messages(store: &SessionStore, session_id: &str) -> Result<Vec<Value>,
             messages.push(json!({"role": role, "text": content}));
         }
     }
-    Ok(messages)
+    Ok((raw_count, messages))
 }
 
 fn session_lineage(store: &SessionStore, session_id: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -5209,6 +5396,330 @@ mod tests {
         assert_eq!(response["result"]["success"], json!(true));
         assert_eq!(response["result"]["history_removed"], json!(2));
         assert_eq!(response["result"]["restored_to"], json!("abc123"));
+    }
+
+    #[test]
+    fn browser_manage_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let local_id =
+            create_local_session(&state, Some("stored-browser".to_string()), 80).unwrap();
+        attach_child_to_local(&state, &local_id, "child-browser", None).unwrap();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "browser.manage");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"connected\":true,\"url\":\"http://127.0.0.1:9222\"}}}}"
+                ),
+            );
+        });
+
+        let response = handle_browser_manage(
+            json!("r-browser-manage"),
+            json!({"action": "status", "session_id": local_id})
+                .as_object()
+                .unwrap(),
+            &state,
+            &child_stdin,
+        )
+        .unwrap()
+        .expect("browser.manage response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-browser-manage"));
+        assert_eq!(response["result"]["connected"], json!(true));
+        assert_eq!(response["result"]["url"], json!("http://127.0.0.1:9222"));
+    }
+
+    #[test]
+    fn skills_manage_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "skills.manage");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"skills\":{{\"Built-in\":[\"demo\"]}}}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-skills-manage"),
+            "skills.manage",
+            json!({"action": "list"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(45),
+        )
+        .unwrap()
+        .expect("skills.manage response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-skills-manage"));
+        assert_eq!(response["result"]["skills"]["Built-in"][0], json!("demo"));
+    }
+
+    #[test]
+    fn voice_toggle_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "voice.toggle");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"enabled\":true,\"tts\":false,\"record_key\":\"ctrl+b\"}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-voice-toggle"),
+            "voice.toggle",
+            json!({"action": "status"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("voice.toggle response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-voice-toggle"));
+        assert_eq!(response["result"]["enabled"], json!(true));
+        assert_eq!(response["result"]["record_key"], json!("ctrl+b"));
+    }
+
+    #[test]
+    fn voice_record_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "voice.record");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"status\":\"recording\"}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-voice-record"),
+            "voice.record",
+            json!({"action": "start"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(20),
+        )
+        .unwrap()
+        .expect("voice.record response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-voice-record"));
+        assert_eq!(response["result"]["status"], json!("recording"));
+    }
+
+    #[test]
+    fn shell_exec_with_child_round_trips_through_blocking_internal_request() {
+        let state = test_state();
+        let (mut child, child_stdin) = dummy_child_stdin();
+        let state_for_thread = Arc::clone(&state);
+        let responder = thread::spawn(move || {
+            let request_id = wait_for_pending_request_id(&state_for_thread, "shell.exec");
+            let _ = rewrite_child_line(
+                &state_for_thread,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"stdout\":\"hello\\n\",\"stderr\":\"\",\"code\":0}}}}"
+                ),
+            );
+        });
+
+        let response = forward_child_request_timeout(
+            json!("r-shell-exec"),
+            "shell.exec",
+            json!({"command": "echo hello"}).as_object().unwrap(),
+            &state,
+            &child_stdin,
+            false,
+            Duration::from_secs(35),
+        )
+        .unwrap()
+        .expect("shell.exec response");
+        responder.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(response["id"], json!("r-shell-exec"));
+        assert_eq!(response["result"]["stdout"], json!("hello\n"));
+        assert_eq!(response["result"]["code"], json!(0));
+    }
+
+    #[test]
+    fn session_history_is_native_and_includes_ancestors() {
+        let store = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: "parent-history".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-parent".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                "parent-history",
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(json!("from parent")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: "child-history".to_string(),
+                source: "tui".to_string(),
+                user_id: None,
+                model: Some("gpt-child".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: Some("parent-history".to_string()),
+            })
+            .unwrap();
+        store
+            .append_message(
+                "child-history",
+                &MessageAppend {
+                    role: "assistant".to_string(),
+                    content: Some(json!("")),
+                    tool_call_id: None,
+                    tool_calls: Some(json!([{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{}"
+                        }
+                    }])),
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                "child-history",
+                &MessageAppend {
+                    role: "tool".to_string(),
+                    content: Some(json!("{\"success\":true}")),
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                "child-history",
+                &MessageAppend {
+                    role: "assistant".to_string(),
+                    content: Some(json!("done")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let state = test_state();
+        let local_id = create_local_session(&state, Some("child-history".to_string()), 80).unwrap();
+        let response = handle_session_history(
+            json!("r-session-history"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+        )
+        .unwrap()
+        .expect("session.history response");
+
+        assert_eq!(response["id"], json!("r-session-history"));
+        assert_eq!(response["result"]["count"], json!(4));
+        assert_eq!(
+            response["result"]["messages"][0]["text"],
+            json!("from parent")
+        );
+        assert_eq!(response["result"]["messages"][1]["role"], json!("tool"));
+        assert_eq!(response["result"]["messages"][1]["name"], json!("terminal"));
+        assert_eq!(response["result"]["messages"][2]["text"], json!("done"));
+    }
+
+    #[test]
+    fn session_history_rejects_missing_store_session() {
+        let store = test_store();
+        let state = test_state();
+        let local_id = create_local_session(&state, None, 80).unwrap();
+
+        let response = handle_session_history(
+            json!("r-session-history-missing"),
+            json!({"session_id": local_id}).as_object().unwrap(),
+            &store,
+            &state,
+        )
+        .unwrap()
+        .expect("missing session.history response");
+
+        assert_eq!(response["error"]["code"], json!(4001));
     }
 
     #[test]
