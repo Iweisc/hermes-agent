@@ -163,12 +163,39 @@ impl GatewayHostActionHandler for NativeGatewayHostActionHandler<'_> {
         Err("native gateway host notifications are not implemented".to_string())
     }
 
-    fn schedule_restart(&mut self, _launch_mode: RestartLaunchMode) -> Result<(), String> {
-        Err("native gateway restart scheduling is not implemented".to_string())
+    fn schedule_restart(&mut self, launch_mode: RestartLaunchMode) -> Result<(), String> {
+        schedule_gateway_restart_native(self.context, launch_mode)
     }
 
     fn persist_config_value(&mut self, key: &str, value: &JsonValue) -> Result<(), String> {
         set_config_json_value(self.context, key, value).map_err(|error| error.to_string())
+    }
+}
+
+fn schedule_gateway_restart_native(
+    context: &HermesContext,
+    launch_mode: RestartLaunchMode,
+) -> Result<(), String> {
+    match launch_mode {
+        RestartLaunchMode::Detached => {
+            let profile = context.current_profile_name();
+            launch_detached_profile_gateway_after_update(context, &profile)
+                .map_err(|error| format!("launching detached gateway restart failed: {error}"))
+        }
+        RestartLaunchMode::Service => {
+            if has_any_systemd_unit(context) {
+                restart_systemd_service(context, false)
+                    .map_err(|error| format!("restarting gateway systemd service failed: {error}"))
+            } else if launchd_plist_path(context).exists() {
+                restart_launchd_service(context)
+                    .map_err(|error| format!("restarting gateway launchd service failed: {error}"))
+            } else {
+                Err(
+                    "service-managed restart requested but no gateway service is installed"
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -7130,6 +7157,92 @@ mod tests {
         .unwrap();
 
         assert_eq!(message, "Cancelled MCP reload.");
+    }
+
+    #[test]
+    fn native_gateway_host_handler_schedules_detached_restart_for_current_profile() {
+        let _guard = test_env_lock().lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let hermes_home = home.join(".hermes").join("profiles").join("coder");
+        fs::create_dir_all(&hermes_home).unwrap();
+        let context = HermesContext::new(&home).with_hermes_home_env(Some(hermes_home));
+        let fake_bin = home.join("bin");
+        let fake_gateway = fake_bin.join("hermes-gateway");
+        let log_path = home.join("gateway-restart.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        fs::write(
+            &fake_gateway,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fake_gateway).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_gateway, perms).unwrap();
+        }
+        set_env_var("HERMES_GATEWAY_BINARY", &fake_gateway);
+
+        let mut handler = NativeGatewayHostActionHandler::new(&context);
+        handler
+            .schedule_restart(RestartLaunchMode::Detached)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !log_path.exists() && Instant::now() < deadline {
+            sleep(Duration::from_millis(25));
+        }
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--profile coder gateway run --replace"));
+
+        remove_env_var("HERMES_GATEWAY_BINARY");
+    }
+
+    #[test]
+    fn native_gateway_host_handler_schedules_service_restart_via_systemctl() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (_temp, ctx) = test_context();
+        fs::create_dir_all(ctx.hermes_home()).unwrap();
+        let fake_bin = ctx.home_dir().join("bin");
+        let log_path = ctx.home_dir().join("systemctl-host-restart.log");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let script = fake_bin.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$*\" in\n  *is-system-running*) printf 'running\\n' ;;\nesac\nexit 0\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let original_path = env::var("PATH").unwrap_or_default();
+        set_env_var("PATH", format!("{}:{}", fake_bin.display(), original_path));
+        let unit_path = systemd_unit_path(&ctx, false);
+        fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+        fs::write(&unit_path, "unit").unwrap();
+
+        let mut handler = NativeGatewayHostActionHandler::new(&ctx);
+        handler
+            .schedule_restart(RestartLaunchMode::Service)
+            .unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("--user reset-failed hermes-gateway"));
+        assert!(log.contains("--user reload-or-restart hermes-gateway"));
+
+        set_env_var("PATH", original_path);
     }
 
     #[test]
