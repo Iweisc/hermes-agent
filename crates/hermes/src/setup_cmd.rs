@@ -5564,7 +5564,14 @@ exit 9\n",
             "platform_toolsets:\n  cli:\n    - file\n",
         )
         .unwrap();
-        let mut input = io::Cursor::new(b"1\n1,4\n3\n".to_vec());
+        let cli_choice =
+            crate::tools_cmd::interactive_tools_platform_choice(&context, "cli").unwrap();
+        let selection =
+            crate::tools_cmd::interactive_toolset_selection_for_names("cli", &["file", "web"])
+                .unwrap();
+        let done_choice = crate::tools_cmd::interactive_tools_menu_choice_count(&context).unwrap();
+        let mut input =
+            io::Cursor::new(format!("{cli_choice}\n{selection}\n{done_choice}\n").into_bytes());
         let mut output = Vec::new();
 
         run_native_tools_setup_with_io(&context, &mut input, &mut output).unwrap();
