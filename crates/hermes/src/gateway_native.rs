@@ -15,17 +15,21 @@ use chrono::{Local, TimeZone};
 use hermes_core::{
     GatewaySessionPoll, GatewayTurnSession, HermesContext, LoadedConfig, MessageRecord,
     ModelOverrides, SessionCreate, SessionRecord, SessionStore, ToolRuntime,
-    build_skill_invocation_message, shell_command_block_reason, spawn_chat_turn_with_events,
+    build_skill_invocation_message, parse_reasoning_effort, shell_command_block_reason,
+    spawn_chat_turn_with_events,
 };
 use regex::Regex;
 use serde_json::{Value, json};
-use serde_yaml::Value as YamlValue;
+use serde_yaml::{Mapping, Value as YamlValue};
 
+use crate::config_cmd::{read_raw_yaml_mapping, write_yaml_mapping};
 use crate::python_bridge::{project_root, resolve_repo_python};
 
 #[derive(Debug, Clone)]
 struct NativeGatewaySessionState {
     cwd: PathBuf,
+    cols: u16,
+    pending_steer: Option<String>,
     overrides: ModelOverrides,
 }
 
@@ -42,6 +46,7 @@ struct NativeGatewayServer<'a> {
 
 struct ActiveTurn {
     session_id: String,
+    runtime: ToolRuntime,
     turn: GatewayTurnSession,
 }
 
@@ -215,7 +220,7 @@ impl<'a> NativeGatewayServer<'a> {
         if prompt_active
             && !matches!(
                 method,
-                "clarify.respond" | "approval.respond" | "session.interrupt"
+                "clarify.respond" | "approval.respond" | "session.interrupt" | "session.steer"
             )
         {
             return write_jsonrpc_error(
@@ -233,17 +238,23 @@ impl<'a> NativeGatewayServer<'a> {
             "session.list" => self.handle_session_list(),
             "session.most_recent" => self.handle_session_most_recent(),
             "session.resume" => self.handle_session_resume(params),
+            "session.branch" => self.handle_session_branch(params),
+            "session.steer" => self.handle_session_steer(params),
+            "session.undo" => self.handle_session_undo(params),
+            "session.usage" => self.handle_session_usage(params),
             "session.delete" => self.handle_session_delete(params),
             "session.title" => self.handle_session_title(params),
             "session.status" => self.handle_session_status(params),
             "session.save" => self.handle_session_save(params),
             "session.close" => self.handle_session_close(params),
+            "terminal.resize" => self.handle_terminal_resize(params),
             "input.detect_drop" => Ok(json!({
                 "matched": false,
                 "text": params.get("text").and_then(Value::as_str).unwrap_or_default(),
             })),
             "commands.catalog" => self.handle_commands_catalog(),
             "config.get" => self.handle_config_get(params),
+            "config.set" => self.handle_config_set(params),
             "complete.path" => self.handle_complete_path(params),
             "complete.slash" => self.handle_complete_slash(params),
             "shell.exec" => self.handle_shell_exec(params),
@@ -275,9 +286,9 @@ impl<'a> NativeGatewayServer<'a> {
 
     fn handle_session_create(
         &mut self,
-        _params: Value,
+        params: Value,
     ) -> Result<Value, (i64, String, Option<Value>)> {
-        let session_id = format!("rust-gw-{:x}", unix_ts_nanos());
+        let session_id = next_gateway_session_id();
         self.session_store
             .create_session(&SessionCreate {
                 id: session_id.clone(),
@@ -293,6 +304,8 @@ impl<'a> NativeGatewayServer<'a> {
             session_id.clone(),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: parse_terminal_cols(params.get("cols"))?,
+                pending_steer: None,
                 overrides: ModelOverrides::default(),
             },
         );
@@ -365,6 +378,8 @@ impl<'a> NativeGatewayServer<'a> {
             resolved.clone(),
             NativeGatewaySessionState {
                 cwd: cwd_from_record(&record),
+                cols: 80,
+                pending_steer: None,
                 overrides: overrides_from_record(&record),
             },
         );
@@ -398,6 +413,167 @@ impl<'a> NativeGatewayServer<'a> {
             return Err((4007, String::from("session not found"), None));
         }
         Ok(json!({ "deleted": session_id }))
+    }
+
+    fn handle_session_undo(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        if !self.sessions.contains_key(&session_id) {
+            return Err((4007, String::from("session not found"), None));
+        }
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.session_id == session_id)
+        {
+            return Err((
+                4009,
+                String::from("session busy — /interrupt the current turn before /undo"),
+                None,
+            ));
+        }
+        let removed = self
+            .session_store
+            .trim_last_exchange(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    fn handle_session_branch(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let record = self
+            .session_store
+            .get_session(&session_id)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let messages = self
+            .session_store
+            .get_messages(&session_id)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        if messages.is_empty() {
+            return Err((
+                4008,
+                String::from("nothing to branch — send a message first"),
+                None,
+            ));
+        }
+
+        let new_session_id = next_gateway_session_id();
+        let title = resolved_branch_title(self.session_store, &record, &params)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        self.session_store
+            .create_session(&SessionCreate {
+                id: new_session_id.clone(),
+                source: record.source.clone(),
+                user_id: record.user_id.clone(),
+                model: state
+                    .overrides
+                    .model
+                    .clone()
+                    .or_else(|| record.model.clone()),
+                model_config: record.model_config.clone(),
+                system_prompt: record.system_prompt.clone(),
+                parent_session_id: Some(session_id.clone()),
+            })
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        for message in &messages {
+            self.session_store
+                .append_message(&new_session_id, &branch_message_append(message))
+                .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        }
+        self.session_store
+            .set_session_title(&new_session_id, &title)
+            .map_err(|error| (5008, format!("branch failed: {error}"), None))?;
+        let mut branched_state = state;
+        branched_state.pending_steer = None;
+        self.sessions.insert(new_session_id.clone(), branched_state);
+        Ok(json!({
+            "session_id": new_session_id,
+            "title": title,
+            "parent": session_id,
+        }))
+    }
+
+    fn handle_session_steer(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let text = params
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (4002, String::from("text is required"), None))?;
+        if let Some(active) = self.active_turn.as_ref()
+            && active.session_id == session_id
+        {
+            let accepted = active.runtime.steer(text);
+            return Ok(json!({
+                "status": if accepted { "queued" } else { "rejected" },
+                "text": text,
+            }));
+        }
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        if let Some(existing) = state.pending_steer.as_mut() {
+            existing.push('\n');
+            existing.push_str(text);
+        } else {
+            state.pending_steer = Some(text.to_string());
+        }
+        Ok(json!({
+            "status": "queued",
+            "text": text,
+        }))
+    }
+
+    fn handle_session_usage(&self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let usage = self
+            .session_store
+            .get_session_usage(&session_id)
+            .map_err(|error| (5007, error.to_string(), None))?
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        let model = state
+            .overrides
+            .model
+            .clone()
+            .or(usage.model.clone())
+            .unwrap_or_default();
+        let total = usage.input_tokens + usage.output_tokens;
+        let (cost_status, cost_usd) = if let Some(actual) = usage.actual_cost_usd {
+            (Some(String::from("exact")), Some(actual))
+        } else {
+            (usage.cost_status.clone(), usage.estimated_cost_usd)
+        };
+        Ok(json!({
+            "model": model,
+            "calls": usage.api_call_count,
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": total,
+            "cache_read": usage.cache_read_tokens,
+            "cache_write": usage.cache_write_tokens,
+            "cost_status": cost_status,
+            "cost_usd": cost_usd,
+        }))
     }
 
     fn handle_session_title(
@@ -551,6 +727,20 @@ impl<'a> NativeGatewayServer<'a> {
         Ok(json!({ "ok": existed, "closed": existed }))
     }
 
+    fn handle_terminal_resize(
+        &mut self,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
+        let session_id = required_session_id(&params)?;
+        let cols = parse_terminal_cols(params.get("cols"))?;
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| (4007, String::from("session not found"), None))?;
+        state.cols = cols;
+        Ok(json!({ "cols": cols }))
+    }
+
     fn handle_prompt_submit<W: Write>(
         &mut self,
         writer: &mut W,
@@ -567,19 +757,31 @@ impl<'a> NativeGatewayServer<'a> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| (-32602, String::from("text is required"), None))?
             .to_string();
-        let state = self
+        let mut state = self
             .sessions
             .get(&session_id)
             .cloned()
             .ok_or_else(|| (-32004, String::from("session not found"), None))?;
+        let loaded = self
+            .context
+            .load_config_document()
+            .map_err(|error| (-32603, error.to_string(), None))?;
+        let runtime = ToolRuntime::new(&state.cwd)
+            .with_hermes_home(self.context.hermes_home())
+            .with_current_session_id(Some(session_id.clone()));
+        if let Some(pending_steer) = state.pending_steer.take() {
+            let _ = runtime.steer(&pending_steer);
+            if let Some(saved_state) = self.sessions.get_mut(&session_id) {
+                saved_state.pending_steer = None;
+            }
+        }
+        let active_runtime = runtime.clone();
         let rx = spawn_chat_turn_with_events(
             self.context.clone(),
-            self.config.clone(),
+            loaded.clone(),
             Value::String(text),
-            ToolRuntime::new(&state.cwd)
-                .with_hermes_home(self.context.hermes_home())
-                .with_current_session_id(Some(session_id.clone())),
-            self.config.config.toolsets.clone(),
+            runtime,
+            loaded.config.toolsets.clone(),
             state.overrides.clone(),
             Some(session_id.clone()),
             hermes_core::InteractiveTurnOptions {
@@ -589,6 +791,7 @@ impl<'a> NativeGatewayServer<'a> {
         );
         self.active_turn = Some(ActiveTurn {
             session_id: session_id.clone(),
+            runtime: active_runtime,
             turn: GatewayTurnSession::new(rx),
         });
         write_jsonrpc_event(
@@ -940,9 +1143,13 @@ impl<'a> NativeGatewayServer<'a> {
             .get("key")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let loaded = self
+            .context
+            .load_config_document()
+            .map_err(|error| (-32603, error.to_string(), None))?;
         match key {
             "full" => Ok(json!({
-                "config": serde_json::to_value(&self.config.raw).unwrap_or_else(|_| json!({})),
+                "config": serde_json::to_value(&loaded.raw).unwrap_or_else(|_| json!({})),
             })),
             "mtime" => Ok(json!({
                 "mtime": self
@@ -959,9 +1166,403 @@ impl<'a> NativeGatewayServer<'a> {
                 "home": self.context.hermes_home(),
                 "display": self.context.display_hermes_home(),
             })),
+            "skin" => Ok(json!({
+                "value": config_string_value(loaded.cfg_get(&["display", "skin"]))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| String::from("default")),
+            })),
+            "indicator" => Ok(json!({
+                "value": normalize_indicator_value(loaded.cfg_get(&["display", "tui_status_indicator"])),
+            })),
+            "busy" => Ok(json!({
+                "value": normalize_busy_input_mode(loaded.cfg_get(&["display", "busy_input_mode"])),
+            })),
+            "details_mode" => Ok(json!({
+                "value": normalize_details_mode(loaded.cfg_get(&["display", "details_mode"])),
+            })),
+            "compact" => Ok(json!({
+                "value": if yaml_bool_with_default(loaded.cfg_get(&["display", "tui_compact"]), false) {
+                    "on"
+                } else {
+                    "off"
+                },
+            })),
+            "statusbar" => Ok(json!({
+                "value": coerce_statusbar_value(loaded.cfg_get(&["display", "tui_statusbar"])),
+            })),
+            "mouse" => Ok(json!({
+                "value": if display_mouse_tracking(
+                    loaded.cfg_get(&["display"]).and_then(YamlValue::as_mapping),
+                ) {
+                    "on"
+                } else {
+                    "off"
+                },
+            })),
+            "reasoning" => Ok(json!({
+                "value": config_string_value(loaded.cfg_get(&["agent", "reasoning_effort"]))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| String::from("medium")),
+                "display": if yaml_bool_with_default(
+                    loaded.cfg_get(&["display", "show_reasoning"]),
+                    false,
+                ) {
+                    "show"
+                } else {
+                    "hide"
+                },
+            })),
+            "fast" => Ok(json!({
+                "value": if is_fast_service_tier(loaded.cfg_get(&["agent", "service_tier"])) {
+                    "fast"
+                } else {
+                    "normal"
+                },
+            })),
             _ => Err((-32602, format!("unsupported config key: {key}"), None)),
         }
     }
+
+    fn handle_config_set(&mut self, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| (-32602, String::from("config key is required"), None))?;
+        let value = params
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let mut root = read_raw_yaml_mapping(&self.context.config_path())
+            .map_err(|error| (-32603, error.to_string(), None))?;
+
+        let result = match key {
+            "busy" => {
+                let current = normalize_busy_input_mode(raw_config_value(
+                    &root,
+                    &["display", "busy_input_mode"],
+                ));
+                if matches!(value, "" | "status") {
+                    json!({"key": key, "value": current})
+                } else {
+                    let next = match value {
+                        "queue" | "steer" | "interrupt" => value,
+                        _ => {
+                            return Err((-32602, format!("unknown busy mode: {value}"), None));
+                        }
+                    };
+                    ensure_mapping_child_mut(&mut root, "display").insert(
+                        yaml_key("busy_input_mode"),
+                        YamlValue::String(next.to_string()),
+                    );
+                    write_yaml_mapping(&self.context.config_path(), &root)
+                        .map_err(|error| (-32603, error.to_string(), None))?;
+                    json!({"key": key, "value": next})
+                }
+            }
+            "details_mode" => {
+                let next = validate_details_mode(value)?;
+                let display = ensure_mapping_child_mut(&mut root, "display");
+                display.insert(
+                    yaml_key("details_mode"),
+                    YamlValue::String(next.to_string()),
+                );
+                let sections = ensure_mapping_child_mut(display, "sections");
+                for section in detail_section_names() {
+                    sections.insert(yaml_key(section), YamlValue::String(next.to_string()));
+                }
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": next})
+            }
+            _ if key.starts_with("details_mode.") => {
+                let section = key.trim_start_matches("details_mode.");
+                if !detail_section_names().contains(&section) {
+                    return Err((-32602, format!("unknown section: {section}"), None));
+                }
+                let sections = ensure_mapping_child_mut(
+                    ensure_mapping_child_mut(&mut root, "display"),
+                    "sections",
+                );
+                if value.is_empty() {
+                    sections.remove(yaml_key(section));
+                    write_yaml_mapping(&self.context.config_path(), &root)
+                        .map_err(|error| (-32603, error.to_string(), None))?;
+                    json!({"key": key, "value": ""})
+                } else {
+                    let next = validate_details_mode(value)?;
+                    sections.insert(yaml_key(section), YamlValue::String(next.to_string()));
+                    write_yaml_mapping(&self.context.config_path(), &root)
+                        .map_err(|error| (-32603, error.to_string(), None))?;
+                    json!({"key": key, "value": next})
+                }
+            }
+            "compact" => {
+                let current = yaml_bool_with_default(
+                    raw_config_value(&root, &["display", "tui_compact"]),
+                    false,
+                );
+                let next = match value {
+                    "" | "toggle" => !current,
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err((-32602, format!("unknown compact value: {value}"), None));
+                    }
+                };
+                ensure_mapping_child_mut(&mut root, "display")
+                    .insert(yaml_key("tui_compact"), YamlValue::Bool(next));
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": if next { "on" } else { "off" }})
+            }
+            "statusbar" => {
+                let current =
+                    coerce_statusbar_value(raw_config_value(&root, &["display", "tui_statusbar"]));
+                let next = match value {
+                    "" | "toggle" => {
+                        if current == "off" {
+                            "top"
+                        } else {
+                            "off"
+                        }
+                    }
+                    "on" => "top",
+                    "off" | "top" | "bottom" => value,
+                    _ => {
+                        return Err((-32602, format!("unknown statusbar value: {value}"), None));
+                    }
+                };
+                ensure_mapping_child_mut(&mut root, "display").insert(
+                    yaml_key("tui_statusbar"),
+                    YamlValue::String(next.to_string()),
+                );
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": next})
+            }
+            "mouse" => {
+                let current = display_mouse_tracking(
+                    raw_config_value(&root, &["display"]).and_then(YamlValue::as_mapping),
+                );
+                let next = match value {
+                    "" | "toggle" => !current,
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err((-32602, format!("unknown mouse value: {value}"), None));
+                    }
+                };
+                ensure_mapping_child_mut(&mut root, "display")
+                    .insert(yaml_key("mouse_tracking"), YamlValue::Bool(next));
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": if next { "on" } else { "off" }})
+            }
+            "indicator" => {
+                let next = normalize_indicator_input(value)?;
+                ensure_mapping_child_mut(&mut root, "display").insert(
+                    yaml_key("tui_status_indicator"),
+                    YamlValue::String(next.to_string()),
+                );
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": next})
+            }
+            "skin" => {
+                if value.is_empty() {
+                    return Err((-32602, String::from("skin value required"), None));
+                }
+                ensure_mapping_child_mut(&mut root, "display")
+                    .insert(yaml_key("skin"), YamlValue::String(value.to_string()));
+                write_yaml_mapping(&self.context.config_path(), &root)
+                    .map_err(|error| (-32603, error.to_string(), None))?;
+                json!({"key": key, "value": value})
+            }
+            "reasoning" => {
+                if matches!(value, "show" | "on" | "hide" | "off") {
+                    let display = ensure_mapping_child_mut(&mut root, "display");
+                    let show = matches!(value, "show" | "on");
+                    display.insert(yaml_key("show_reasoning"), YamlValue::Bool(show));
+                    ensure_mapping_child_mut(display, "sections").insert(
+                        yaml_key("thinking"),
+                        YamlValue::String(if show { "expanded" } else { "hidden" }.to_string()),
+                    );
+                    write_yaml_mapping(&self.context.config_path(), &root)
+                        .map_err(|error| (-32603, error.to_string(), None))?;
+                    json!({"key": key, "value": if show { "show" } else { "hide" }})
+                } else {
+                    if parse_reasoning_effort(value).is_none() {
+                        return Err((-32602, format!("unknown reasoning value: {value}"), None));
+                    }
+                    ensure_mapping_child_mut(&mut root, "agent").insert(
+                        yaml_key("reasoning_effort"),
+                        YamlValue::String(value.to_string()),
+                    );
+                    write_yaml_mapping(&self.context.config_path(), &root)
+                        .map_err(|error| (-32603, error.to_string(), None))?;
+                    json!({"key": key, "value": value})
+                }
+            }
+            _ => return Err((-32602, format!("unknown config key: {key}"), None)),
+        };
+
+        Ok(result)
+    }
+}
+
+fn yaml_key(key: &str) -> YamlValue {
+    YamlValue::String(key.to_string())
+}
+
+fn raw_config_value<'a>(root: &'a Mapping, path: &[&str]) -> Option<&'a YamlValue> {
+    let mut current = root;
+    for (index, key) in path.iter().enumerate() {
+        let value = current.get(yaml_key(key))?;
+        if index == path.len() - 1 {
+            return Some(value);
+        }
+        current = value.as_mapping()?;
+    }
+    None
+}
+
+fn ensure_mapping_child_mut<'a>(mapping: &'a mut Mapping, key: &str) -> &'a mut Mapping {
+    let key_value = yaml_key(key);
+    let entry = mapping
+        .entry(key_value)
+        .or_insert_with(|| YamlValue::Mapping(Mapping::new()));
+    if !matches!(entry, YamlValue::Mapping(_)) {
+        *entry = YamlValue::Mapping(Mapping::new());
+    }
+    match entry {
+        YamlValue::Mapping(child) => child,
+        _ => unreachable!(),
+    }
+}
+
+fn config_string_value(value: Option<&YamlValue>) -> Option<String> {
+    match value {
+        Some(YamlValue::String(text)) => Some(text.trim().to_string()),
+        Some(YamlValue::Number(number)) => Some(number.to_string()),
+        Some(YamlValue::Bool(boolean)) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn yaml_bool_with_default(value: Option<&YamlValue>, default: bool) -> bool {
+    match value {
+        Some(YamlValue::Bool(boolean)) => *boolean,
+        Some(YamlValue::Number(number)) => {
+            number.as_i64().map(|value| value != 0).unwrap_or(default)
+        }
+        Some(YamlValue::String(text)) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                default
+            } else {
+                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+            }
+        }
+        _ => default,
+    }
+}
+
+fn normalize_indicator_value(value: Option<&YamlValue>) -> &'static str {
+    match config_string_value(value)
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ascii") => "ascii",
+        Some("emoji") => "emoji",
+        Some("unicode") => "unicode",
+        Some("kaomoji") => "kaomoji",
+        _ => "kaomoji",
+    }
+}
+
+fn normalize_indicator_input(value: &str) -> Result<&str, (i64, String, Option<Value>)> {
+    match value {
+        "ascii" | "emoji" | "kaomoji" | "unicode" => Ok(value),
+        _ => Err((
+            -32602,
+            format!("unknown indicator: {value:?}; pick one of ascii|emoji|kaomoji|unicode"),
+            None,
+        )),
+    }
+}
+
+fn normalize_busy_input_mode(value: Option<&YamlValue>) -> &'static str {
+    match config_string_value(value)
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("queue") => "queue",
+        Some("steer") => "steer",
+        Some("interrupt") => "interrupt",
+        _ => "queue",
+    }
+}
+
+fn normalize_details_mode(value: Option<&YamlValue>) -> &'static str {
+    match config_string_value(value)
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("hidden") => "hidden",
+        Some("expanded") => "expanded",
+        Some("collapsed") => "collapsed",
+        _ => "collapsed",
+    }
+}
+
+fn validate_details_mode(value: &str) -> Result<&str, (i64, String, Option<Value>)> {
+    match value {
+        "hidden" | "collapsed" | "expanded" => Ok(value),
+        _ => Err((-32602, format!("unknown details_mode: {value}"), None)),
+    }
+}
+
+fn detail_section_names() -> [&'static str; 4] {
+    ["thinking", "tools", "subagents", "activity"]
+}
+
+fn coerce_statusbar_value(value: Option<&YamlValue>) -> &'static str {
+    match value {
+        Some(YamlValue::Bool(false)) => "off",
+        Some(YamlValue::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "off" => "off",
+            "bottom" => "bottom",
+            "top" => "top",
+            _ => "top",
+        },
+        _ => "top",
+    }
+}
+
+fn display_mouse_tracking(display: Option<&Mapping>) -> bool {
+    let Some(display) = display else {
+        return true;
+    };
+    let raw = display
+        .get(yaml_key("mouse_tracking"))
+        .or_else(|| display.get(yaml_key("tui_mouse")));
+    yaml_bool_with_default(raw, true)
+}
+
+fn is_fast_service_tier(value: Option<&YamlValue>) -> bool {
+    matches!(
+        config_string_value(value)
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("fast" | "priority" | "on")
+    )
 }
 
 impl SlashWorker {
@@ -1164,6 +1765,57 @@ fn format_local_timestamp(timestamp: f64) -> String {
         .single()
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| String::from("(unknown)"))
+}
+
+fn next_gateway_session_id() -> String {
+    format!("rust-gw-{:x}", unix_ts_nanos())
+}
+
+fn parse_terminal_cols(value: Option<&Value>) -> Result<u16, (i64, String, Option<Value>)> {
+    let raw = value.and_then(Value::as_u64).unwrap_or(80);
+    let cols = u16::try_from(raw)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| (4004, String::from("cols must be a positive integer"), None))?;
+    Ok(cols)
+}
+
+fn resolved_branch_title(
+    session_store: &SessionStore,
+    record: &SessionRecord,
+    params: &Value,
+) -> Result<String, String> {
+    let requested = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(name) = requested {
+        return SessionStore::sanitize_title(Some(name))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| String::from("branch title required"));
+    }
+    let base = record.title.as_deref().unwrap_or("branch");
+    session_store
+        .get_next_title_in_lineage(base)
+        .map_err(|error| error.to_string())
+}
+
+fn branch_message_append(message: &MessageRecord) -> hermes_core::MessageAppend {
+    hermes_core::MessageAppend {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_name: message.tool_name.clone(),
+        token_count: message.token_count,
+        finish_reason: message.finish_reason.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning_details: message.reasoning_details.clone(),
+        codex_reasoning_items: message.codex_reasoning_items.clone(),
+        codex_message_items: message.codex_message_items.clone(),
+    }
 }
 
 fn resolve_gateway_command_name(name: &str, raw_config: &YamlValue) -> Result<String, String> {
@@ -1933,6 +2585,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    use hermes_core::{MessageAppend, SessionUsageDelta};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2169,6 +2822,8 @@ mod tests {
             String::from("rust-gw-direct"),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2339,6 +2994,202 @@ mod tests {
     }
 
     #[test]
+    fn native_gateway_config_get_normalizes_supported_values() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        fs::write(
+            context.config_path(),
+            concat!(
+                "display:\n",
+                "  skin: slate\n",
+                "  tui_status_indicator: \" Emoji \"\n",
+                "  busy_input_mode: drop\n",
+                "  details_mode: strange\n",
+                "  tui_compact: true\n",
+                "  tui_statusbar: false\n",
+                "  mouse_tracking: off\n",
+                "  show_reasoning: true\n",
+                "agent:\n",
+                "  reasoning_effort: high\n",
+                "  service_tier: priority\n",
+            ),
+        )
+        .unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let server = NativeGatewayServer::new(&context, &config, &store);
+
+        assert_eq!(
+            server.handle_config_get(json!({"key":"skin"})).unwrap()["value"],
+            json!("slate")
+        );
+        assert_eq!(
+            server
+                .handle_config_get(json!({"key":"indicator"}))
+                .unwrap()["value"],
+            json!("emoji")
+        );
+        assert_eq!(
+            server.handle_config_get(json!({"key":"busy"})).unwrap()["value"],
+            json!("queue")
+        );
+        assert_eq!(
+            server
+                .handle_config_get(json!({"key":"details_mode"}))
+                .unwrap()["value"],
+            json!("collapsed")
+        );
+        assert_eq!(
+            server.handle_config_get(json!({"key":"compact"})).unwrap()["value"],
+            json!("on")
+        );
+        assert_eq!(
+            server
+                .handle_config_get(json!({"key":"statusbar"}))
+                .unwrap()["value"],
+            json!("off")
+        );
+        assert_eq!(
+            server.handle_config_get(json!({"key":"mouse"})).unwrap()["value"],
+            json!("off")
+        );
+        let reasoning = server
+            .handle_config_get(json!({"key":"reasoning"}))
+            .unwrap();
+        assert_eq!(reasoning["value"], json!("high"));
+        assert_eq!(reasoning["display"], json!("show"));
+        assert_eq!(
+            server.handle_config_get(json!({"key":"fast"})).unwrap()["value"],
+            json!("fast")
+        );
+    }
+
+    #[test]
+    fn native_gateway_config_set_persists_supported_values() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"busy","value":"steer"}))
+                .unwrap()["value"],
+            json!("steer")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"details_mode","value":"expanded"}))
+                .unwrap()["value"],
+            json!("expanded")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"details_mode.tools","value":"hidden"}))
+                .unwrap()["value"],
+            json!("hidden")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"compact","value":"on"}))
+                .unwrap()["value"],
+            json!("on")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"statusbar","value":"bottom"}))
+                .unwrap()["value"],
+            json!("bottom")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"mouse","value":"off"}))
+                .unwrap()["value"],
+            json!("off")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"indicator","value":"unicode"}))
+                .unwrap()["value"],
+            json!("unicode")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"skin","value":"slate"}))
+                .unwrap()["value"],
+            json!("slate")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"reasoning","value":"hide"}))
+                .unwrap()["value"],
+            json!("hide")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"reasoning","value":"high"}))
+                .unwrap()["value"],
+            json!("high")
+        );
+        assert_eq!(
+            server
+                .handle_config_set(json!({"key":"details_mode.tools","value":""}))
+                .unwrap()["value"],
+            json!("")
+        );
+
+        let root = read_raw_yaml_mapping(&context.config_path()).unwrap();
+        assert_eq!(
+            raw_config_value(&root, &["display", "busy_input_mode"]).and_then(YamlValue::as_str),
+            Some("steer")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "details_mode"]).and_then(YamlValue::as_str),
+            Some("expanded")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "tui_compact"]).and_then(YamlValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "tui_statusbar"]).and_then(YamlValue::as_str),
+            Some("bottom")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "mouse_tracking"]).and_then(YamlValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "tui_status_indicator"])
+                .and_then(YamlValue::as_str),
+            Some("unicode")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "skin"]).and_then(YamlValue::as_str),
+            Some("slate")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "show_reasoning"]).and_then(YamlValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            raw_config_value(&root, &["display", "sections", "thinking"])
+                .and_then(YamlValue::as_str),
+            Some("hidden")
+        );
+        assert_eq!(
+            raw_config_value(&root, &["agent", "reasoning_effort"]).and_then(YamlValue::as_str),
+            Some("high")
+        );
+        assert!(raw_config_value(&root, &["display", "sections", "tools"]).is_none());
+    }
+
+    #[test]
     fn native_gateway_shell_exec_runs_command_and_blocks_dangerous_commands() {
         let temp = TempDir::new().unwrap();
         let context =
@@ -2434,6 +3285,8 @@ mod tests {
             String::from("session-rpc-test"),
             NativeGatewaySessionState {
                 cwd: temp.path().to_path_buf(),
+                cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     provider: Some(String::from("custom")),
@@ -2549,6 +3402,460 @@ mod tests {
     }
 
     #[test]
+    fn native_gateway_session_undo_removes_last_exchange() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("undo-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("keep")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("keep answer")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("remove")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("remove answer")),
+                tool_call_id: None,
+                tool_calls: Some(json!([{"name":"search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message("undo-session", &message).unwrap();
+        }
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("undo-session"),
+            NativeGatewaySessionState {
+                cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
+                pending_steer: None,
+                overrides: ModelOverrides::default(),
+            },
+        );
+
+        let mut undo = Vec::new();
+        server
+            .handle_request(
+                "session.undo",
+                json!(1),
+                json!({"session_id":"undo-session"}),
+                &mut undo,
+                false,
+            )
+            .unwrap();
+        let undo_frame = serde_json::from_slice::<Value>(&undo).unwrap();
+        assert_eq!(undo_frame["result"]["removed"], json!(2));
+
+        let messages = store.get_messages("undo-session").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, Some(json!("keep")));
+        assert_eq!(messages[1].content, Some(json!("keep answer")));
+    }
+
+    #[test]
+    fn native_gateway_session_branch_copies_history_and_lineage_title() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("branch-source"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store.set_session_title("branch-source", "Sprint").unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("branch-older"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: Some(String::from("branch-source")),
+            })
+            .unwrap();
+        store
+            .set_session_title("branch-older", "Sprint #2")
+            .unwrap();
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(json!("question")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: Some(3),
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(json!("answer")),
+                tool_call_id: None,
+                tool_calls: Some(json!([{"name":"search"}])),
+                tool_name: None,
+                token_count: Some(5),
+                finish_reason: Some(String::from("stop")),
+                reasoning: Some(String::from("brief")),
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store.append_message("branch-source", &message).unwrap();
+        }
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("branch-source"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("/tmp/demo"),
+                cols: 120,
+                pending_steer: None,
+                overrides: ModelOverrides {
+                    model: Some(String::from("override-model")),
+                    provider: Some(String::from("demo-provider")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut branch = Vec::new();
+        server
+            .handle_request(
+                "session.branch",
+                json!(1),
+                json!({"session_id":"branch-source"}),
+                &mut branch,
+                false,
+            )
+            .unwrap();
+        let branch_frame = serde_json::from_slice::<Value>(&branch).unwrap();
+        let new_session_id = branch_frame["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(new_session_id.starts_with("rust-gw-"));
+        assert_eq!(branch_frame["result"]["title"], json!("Sprint #3"));
+        assert_eq!(branch_frame["result"]["parent"], json!("branch-source"));
+
+        let branched_session = store.get_session(&new_session_id).unwrap().unwrap();
+        assert_eq!(
+            branched_session.parent_session_id,
+            Some(String::from("branch-source"))
+        );
+        assert_eq!(branched_session.title, Some(String::from("Sprint #3")));
+        assert_eq!(branched_session.model, Some(String::from("override-model")));
+
+        let branched_messages = store.get_messages(&new_session_id).unwrap();
+        assert_eq!(branched_messages.len(), 2);
+        assert_eq!(branched_messages[0].content, Some(json!("question")));
+        assert_eq!(branched_messages[1].content, Some(json!("answer")));
+        assert_eq!(
+            branched_messages[1].tool_calls,
+            Some(json!([{"name":"search"}]))
+        );
+        assert_eq!(branched_messages[1].reasoning, Some(String::from("brief")));
+
+        let state = server.sessions.get(&new_session_id).unwrap();
+        assert_eq!(state.cwd, PathBuf::from("/tmp/demo"));
+        assert_eq!(state.cols, 120);
+        assert_eq!(state.overrides.provider.as_deref(), Some("demo-provider"));
+    }
+
+    #[test]
+    fn native_gateway_terminal_resize_updates_session_columns() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("resize-session"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("."),
+                cols: 80,
+                pending_steer: None,
+                overrides: ModelOverrides::default(),
+            },
+        );
+
+        let mut resize = Vec::new();
+        server
+            .handle_request(
+                "terminal.resize",
+                json!(1),
+                json!({"session_id":"resize-session","cols":132}),
+                &mut resize,
+                false,
+            )
+            .unwrap();
+        let resize_frame = serde_json::from_slice::<Value>(&resize).unwrap();
+        assert_eq!(resize_frame["result"]["cols"], json!(132));
+        assert_eq!(server.sessions.get("resize-session").unwrap().cols, 132);
+    }
+
+    #[test]
+    fn native_gateway_session_usage_reads_persisted_counters() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("usage-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("stored-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .record_session_usage(
+                "usage-session",
+                &SessionUsageDelta {
+                    api_call_count: 3,
+                    input_tokens: 150,
+                    output_tokens: 55,
+                    cache_read_tokens: 13,
+                    cache_write_tokens: 7,
+                    reasoning_tokens: 10,
+                    estimated_cost_usd: Some(0.1334),
+                    actual_cost_usd: None,
+                    cost_status: Some(String::from("estimated")),
+                },
+            )
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("usage-session"),
+            NativeGatewaySessionState {
+                cwd: PathBuf::from("."),
+                cols: 80,
+                pending_steer: None,
+                overrides: ModelOverrides {
+                    model: Some(String::from("override-model")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut usage = Vec::new();
+        server
+            .handle_request(
+                "session.usage",
+                json!(1),
+                json!({"session_id":"usage-session"}),
+                &mut usage,
+                false,
+            )
+            .unwrap();
+        let usage_frame = serde_json::from_slice::<Value>(&usage).unwrap();
+        assert_eq!(usage_frame["result"]["model"], json!("override-model"));
+        assert_eq!(usage_frame["result"]["calls"], json!(3));
+        assert_eq!(usage_frame["result"]["input"], json!(150));
+        assert_eq!(usage_frame["result"]["output"], json!(55));
+        assert_eq!(usage_frame["result"]["total"], json!(205));
+        assert_eq!(usage_frame["result"]["cache_read"], json!(13));
+        assert_eq!(usage_frame["result"]["cache_write"], json!(7));
+        assert_eq!(usage_frame["result"]["cost_status"], json!("estimated"));
+        assert_eq!(usage_frame["result"]["cost_usd"], json!(0.1334));
+    }
+
+    #[test]
+    fn native_gateway_session_steer_queues_idle_guidance_for_next_prompt() {
+        let _guard = lock_mutex(&SESSION_ENV_LOCK);
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"steer.txt\",\"content\":\"hello\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Queued steer applied."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        store
+            .create_session(&SessionCreate {
+                id: String::from("steer-session"),
+                source: String::from("rust-gateway"),
+                user_id: None,
+                model: Some(String::from("test-model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let mut server = NativeGatewayServer::new(&context, &config, &store);
+        server.sessions.insert(
+            String::from("steer-session"),
+            NativeGatewaySessionState {
+                cwd: temp.path().to_path_buf(),
+                cols: 80,
+                pending_steer: None,
+                overrides: ModelOverrides {
+                    model: Some(String::from("test-model")),
+                    provider: Some(String::from("custom")),
+                    base_url: Some(base_url),
+                    api_key: Some(String::from("test-key")),
+                    api_mode: Some(String::from("chat_completions")),
+                    ..ModelOverrides::default()
+                },
+            },
+        );
+
+        let mut steer = Vec::new();
+        server
+            .handle_request(
+                "session.steer",
+                json!(1),
+                json!({"session_id":"steer-session","text":"Prefer concise tool output"}),
+                &mut steer,
+                false,
+            )
+            .unwrap();
+        let steer_frame = serde_json::from_slice::<Value>(&steer).unwrap();
+        assert_eq!(steer_frame["result"]["status"], json!("queued"));
+        assert_eq!(
+            server.sessions["steer-session"].pending_steer.as_deref(),
+            Some("Prefer concise tool output")
+        );
+
+        let mut output = Vec::new();
+        let result = server
+            .handle_prompt_submit(
+                &mut output,
+                json!({"session_id":"steer-session","text":"Write the file"}),
+            )
+            .unwrap();
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(server.sessions["steer-session"].pending_steer, None);
+
+        let tool_message = store
+            .get_messages("steer-session")
+            .unwrap()
+            .into_iter()
+            .find(|message| message.tool_name.as_deref() == Some("write_file"))
+            .unwrap();
+        assert!(
+            tool_message
+                .content
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("User guidance: Prefer concise tool output")
+        );
+    }
+
+    #[test]
     fn native_gateway_command_dispatch_handles_alias_quick_and_skill_paths() {
         let _guard = lock_mutex(&SESSION_ENV_LOCK);
         let temp = TempDir::new().unwrap();
@@ -2634,6 +3941,8 @@ mod tests {
             String::from("slash-session"),
             NativeGatewaySessionState {
                 cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cols: 80,
+                pending_steer: None,
                 overrides: ModelOverrides {
                     model: Some(String::from("test-model")),
                     ..ModelOverrides::default()

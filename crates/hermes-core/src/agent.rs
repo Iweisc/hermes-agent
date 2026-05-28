@@ -178,6 +178,15 @@ struct PendingToolCall {
     json: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResponseUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    reasoning_tokens: i64,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedAssistantResponse {
     content: Option<String>,
@@ -187,6 +196,7 @@ struct NormalizedAssistantResponse {
     reasoning_details: Option<Value>,
     codex_reasoning_items: Option<Value>,
     codex_message_items: Option<Value>,
+    usage: Option<ResponseUsage>,
 }
 
 impl HermesContext {
@@ -537,16 +547,17 @@ impl HermesContext {
                         grace: false,
                     },
                 );
-                if let Some(store) = session_store
-                    && let Some(session_id) = session_id.as_deref()
-                {
-                    let _ = store.increment_api_call_count(session_id, 1);
-                }
                 tool_runtime.begin_tool_turn();
                 tool_runtime.emit_step(crate::StepUpdate {
                     iteration: api_calls,
                     prev_tools: extract_prev_tools(&messages),
                 });
+                apply_pending_steer_before_api_call(
+                    &tool_runtime,
+                    &mut messages,
+                    session_store,
+                    session_id.as_deref(),
+                );
                 let request_messages =
                     build_request_messages(&messages, current_turn_user_idx, &external_prefetch);
                 let response = send_model_request(
@@ -564,7 +575,24 @@ impl HermesContext {
                     reasoning_details,
                     codex_reasoning_items,
                     codex_message_items,
+                    usage,
                 } = response;
+                if let Some(store) = session_store
+                    && let Some(session_id) = session_id.as_deref()
+                {
+                    let mut delta = crate::SessionUsageDelta {
+                        api_call_count: 1,
+                        ..crate::SessionUsageDelta::default()
+                    };
+                    if let Some(usage) = usage.as_ref() {
+                        delta.input_tokens = usage.input_tokens;
+                        delta.output_tokens = usage.output_tokens;
+                        delta.cache_read_tokens = usage.cache_read_tokens;
+                        delta.cache_write_tokens = usage.cache_write_tokens;
+                        delta.reasoning_tokens = usage.reasoning_tokens;
+                    }
+                    let _ = store.record_session_usage(session_id, &delta);
+                }
                 emit_turn_event(
                     options.event_callback,
                     AgentTurnEvent::AssistantResponse {
@@ -706,12 +734,15 @@ impl HermesContext {
                     },
                 );
                 tool_runtime.maybe_checkpoint_before_tool(&tool_call.name, &tool_call.json);
-                let result = crate::tools::dispatch_tool_with_messages(
+                let mut result = crate::tools::dispatch_tool_with_messages(
                     &tool_call.name,
                     tool_call.json.clone(),
                     &tool_runtime,
                     &messages,
                 );
+                if let Some(steer_text) = tool_runtime.drain_pending_steer() {
+                    result.push_str(&steer_marker(&steer_text));
+                }
                 tool_calls += 1;
                 emit_turn_event(
                     options.event_callback,
@@ -805,11 +836,6 @@ impl HermesContext {
                         grace: true,
                     },
                 );
-                if let Some(store) = session_store
-                    && let Some(session_id) = session_id.as_deref()
-                {
-                    let _ = store.increment_api_call_count(session_id, 1);
-                }
                 let response = send_model_request(
                     &client,
                     &runtime_model,
@@ -817,6 +843,22 @@ impl HermesContext {
                     &[],
                     session_id.as_deref(),
                 )?;
+                if let Some(store) = session_store
+                    && let Some(session_id) = session_id.as_deref()
+                {
+                    let mut delta = crate::SessionUsageDelta {
+                        api_call_count: 1,
+                        ..crate::SessionUsageDelta::default()
+                    };
+                    if let Some(usage) = response.usage.as_ref() {
+                        delta.input_tokens = usage.input_tokens;
+                        delta.output_tokens = usage.output_tokens;
+                        delta.cache_read_tokens = usage.cache_read_tokens;
+                        delta.cache_write_tokens = usage.cache_write_tokens;
+                        delta.reasoning_tokens = usage.reasoning_tokens;
+                    }
+                    let _ = store.record_session_usage(session_id, &delta);
+                }
                 emit_turn_event(
                     options.event_callback,
                     AgentTurnEvent::AssistantResponse {
@@ -962,6 +1004,7 @@ impl HermesContext {
                 reasoning_details: _reasoning_details,
                 codex_reasoning_items: _codex_reasoning_items,
                 codex_message_items: _codex_message_items,
+                usage: _usage,
             } = response;
 
             if pending_tool_calls.is_empty() {
@@ -1449,6 +1492,7 @@ fn send_chat_completion(
         reasoning_details: assistant_message.get("reasoning_details").cloned(),
         codex_reasoning_items: assistant_message.get("codex_reasoning_items").cloned(),
         codex_message_items: assistant_message.get("codex_message_items").cloned(),
+        usage: extract_openai_usage(parsed.get("usage")),
     })
 }
 
@@ -1513,6 +1557,7 @@ fn send_anthropic_message(
         reasoning_details: None,
         codex_reasoning_items: None,
         codex_message_items: None,
+        usage: extract_anthropic_usage(parsed.get("usage")),
     })
 }
 
@@ -2120,6 +2165,7 @@ fn normalize_bedrock_response(
         reasoning_details: None,
         codex_reasoning_items: None,
         codex_message_items: None,
+        usage: response.usage().map(extract_bedrock_usage),
     })
 }
 
@@ -2504,6 +2550,7 @@ fn send_copilot_acp_chat_completion(
             reasoning_details: None,
             codex_reasoning_items: None,
             codex_message_items: None,
+            usage: None,
         })
     })();
 
@@ -3818,6 +3865,7 @@ fn normalize_google_gemini_response(
         reasoning_details: None,
         codex_reasoning_items: None,
         codex_message_items: None,
+        usage: extract_google_usage(inner.get("usageMetadata")),
     })
 }
 
@@ -4705,7 +4753,80 @@ fn normalize_codex_response(response: &Value) -> Result<NormalizedAssistantRespo
         reasoning_details: None,
         codex_reasoning_items: (!reasoning_items.is_empty()).then(|| Value::Array(reasoning_items)),
         codex_message_items: (!message_items.is_empty()).then(|| Value::Array(message_items)),
+        usage: extract_responses_usage(response.get("usage")),
     })
+}
+
+fn extract_openai_usage(value: Option<&Value>) -> Option<ResponseUsage> {
+    let usage = value?.as_object()?;
+    Some(ResponseUsage {
+        input_tokens: value_i64(usage.get("prompt_tokens")),
+        output_tokens: value_i64(usage.get("completion_tokens")),
+        cache_read_tokens: usage
+            .get("prompt_tokens_details")
+            .and_then(Value::as_object)
+            .map_or(0, |details| value_i64(details.get("cached_tokens"))),
+        cache_write_tokens: 0,
+        reasoning_tokens: usage
+            .get("completion_tokens_details")
+            .and_then(Value::as_object)
+            .map_or(0, |details| value_i64(details.get("reasoning_tokens"))),
+    })
+}
+
+fn extract_anthropic_usage(value: Option<&Value>) -> Option<ResponseUsage> {
+    let usage = value?.as_object()?;
+    Some(ResponseUsage {
+        input_tokens: value_i64(usage.get("input_tokens")),
+        output_tokens: value_i64(usage.get("output_tokens")),
+        cache_read_tokens: value_i64(usage.get("cache_read_input_tokens")),
+        cache_write_tokens: value_i64(usage.get("cache_creation_input_tokens")),
+        reasoning_tokens: 0,
+    })
+}
+
+fn extract_google_usage(value: Option<&Value>) -> Option<ResponseUsage> {
+    let usage = value?.as_object()?;
+    Some(ResponseUsage {
+        input_tokens: value_i64(usage.get("promptTokenCount")),
+        output_tokens: value_i64(usage.get("candidatesTokenCount")),
+        cache_read_tokens: value_i64(usage.get("cachedContentTokenCount")),
+        cache_write_tokens: 0,
+        reasoning_tokens: value_i64(usage.get("thoughtsTokenCount")),
+    })
+}
+
+fn extract_responses_usage(value: Option<&Value>) -> Option<ResponseUsage> {
+    let usage = value?.as_object()?;
+    Some(ResponseUsage {
+        input_tokens: value_i64(usage.get("input_tokens")),
+        output_tokens: value_i64(usage.get("output_tokens")),
+        cache_read_tokens: value_i64(usage.get("input_tokens_details").and_then(|details| {
+            details
+                .as_object()
+                .and_then(|object| object.get("cached_tokens"))
+        })),
+        cache_write_tokens: 0,
+        reasoning_tokens: value_i64(usage.get("output_tokens_details").and_then(|details| {
+            details
+                .as_object()
+                .and_then(|object| object.get("reasoning_tokens"))
+        })),
+    })
+}
+
+fn extract_bedrock_usage(usage: &aws_sdk_bedrockruntime::types::TokenUsage) -> ResponseUsage {
+    ResponseUsage {
+        input_tokens: i64::from(usage.input_tokens()),
+        output_tokens: i64::from(usage.output_tokens()),
+        cache_read_tokens: i64::from(usage.cache_read_input_tokens().unwrap_or_default()),
+        cache_write_tokens: i64::from(usage.cache_write_input_tokens().unwrap_or_default()),
+        reasoning_tokens: 0,
+    }
+}
+
+fn value_i64(value: Option<&Value>) -> i64 {
+    value.and_then(Value::as_i64).unwrap_or_default()
 }
 
 fn parse_codex_tool_call(item: &Value, custom_input: bool) -> Option<PendingToolCall> {
@@ -4893,6 +5014,52 @@ fn non_empty_trimmed(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn steer_marker(text: &str) -> String {
+    format!("\n\nUser guidance: {}", text.trim())
+}
+
+fn apply_pending_steer_before_api_call(
+    runtime: &ToolRuntime,
+    messages: &mut [Value],
+    session_store: Option<&SessionStore>,
+    session_id: Option<&str>,
+) {
+    let Some(steer_text) = runtime.drain_pending_steer() else {
+        return;
+    };
+    let marker = steer_marker(&steer_text);
+    if append_steer_to_last_tool_message(messages, &marker) {
+        if let (Some(store), Some(session_id)) = (session_store, session_id) {
+            let _ = store.append_to_last_tool_message(session_id, &marker);
+        }
+        return;
+    }
+    runtime.restore_pending_steer(&steer_text);
+}
+
+fn append_steer_to_last_tool_message(messages: &mut [Value], marker: &str) -> bool {
+    for message in messages.iter_mut().rev() {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        match object.get_mut("content") {
+            Some(Value::String(content)) => content.push_str(marker),
+            Some(content) => {
+                let replacement = format!("{}{}", content, marker);
+                *content = Value::String(replacement);
+            }
+            None => {
+                object.insert("content".to_string(), Value::String(marker.to_string()));
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn unix_ts_nanos() -> u128 {
@@ -7302,6 +7469,45 @@ for raw in sys.stdin:
     }
 
     #[test]
+    fn normalize_codex_response_extracts_usage_counters() {
+        let normalized = normalize_codex_response(&json!({
+            "status": "completed",
+            "usage": {
+                "input_tokens": 90,
+                "output_tokens": 21,
+                "input_tokens_details": {
+                    "cached_tokens": 7
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 5
+                }
+            },
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Codex usage."
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(normalized.content.as_deref(), Some("Codex usage."));
+        assert_eq!(
+            normalized.usage,
+            Some(ResponseUsage {
+                input_tokens: 90,
+                output_tokens: 21,
+                cache_read_tokens: 7,
+                cache_write_tokens: 0,
+                reasoning_tokens: 5,
+            })
+        );
+    }
+
+    #[test]
     fn chat_completion_turn_can_resume_existing_session() {
         let temp = TempDir::new().unwrap();
         let context =
@@ -7373,6 +7579,67 @@ for raw in sys.stdin:
         assert_eq!(second.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(second.final_response, "Second turn.");
         assert_eq!(session_store.get_messages(&session_id).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn chat_completion_turn_persists_session_usage_counters() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 45,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 11
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 9
+                    }
+                },
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Tracked."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "hello usage",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&session_store),
+            )
+            .unwrap();
+
+        let usage = session_store
+            .get_session_usage(result.session_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.api_call_count, 1);
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cache_read_tokens, 11);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 9);
     }
 
     #[test]

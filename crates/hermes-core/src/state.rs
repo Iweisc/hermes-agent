@@ -131,6 +131,33 @@ pub struct SessionRecord {
     pub api_call_count: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionUsageRecord {
+    pub model: Option<String>,
+    pub api_call_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsageDelta {
+    pub api_call_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_status: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -405,6 +432,79 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(state_err("collecting session prefix matches"))?;
         Ok((matches.len() == 1).then(|| matches[0].clone()))
+    }
+
+    pub fn record_session_usage(
+        &self,
+        session_id: &str,
+        usage: &SessionUsageDelta,
+    ) -> Result<bool, HermesError> {
+        let rowcount = self
+            .connection
+            .execute(
+                "UPDATE sessions
+                 SET api_call_count = api_call_count + ?,
+                     input_tokens = input_tokens + ?,
+                     output_tokens = output_tokens + ?,
+                     cache_read_tokens = cache_read_tokens + ?,
+                     cache_write_tokens = cache_write_tokens + ?,
+                     reasoning_tokens = reasoning_tokens + ?,
+                     estimated_cost_usd = CASE
+                         WHEN ? IS NULL THEN estimated_cost_usd
+                         ELSE COALESCE(estimated_cost_usd, 0) + ?
+                     END,
+                     actual_cost_usd = CASE
+                         WHEN ? IS NULL THEN actual_cost_usd
+                         ELSE COALESCE(actual_cost_usd, 0) + ?
+                     END,
+                     cost_status = COALESCE(?, cost_status)
+                 WHERE id = ?",
+                params![
+                    usage.api_call_count,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                    usage.reasoning_tokens,
+                    usage.estimated_cost_usd,
+                    usage.estimated_cost_usd,
+                    usage.actual_cost_usd,
+                    usage.actual_cost_usd,
+                    usage.cost_status,
+                    session_id,
+                ],
+            )
+            .map_err(state_err("recording session usage"))?;
+        Ok(rowcount > 0)
+    }
+
+    pub fn get_session_usage(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionUsageRecord>, HermesError> {
+        self.connection
+            .query_row(
+                "SELECT model, api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status
+                 FROM sessions
+                 WHERE id = ?",
+                [session_id],
+                |row| {
+                    Ok(SessionUsageRecord {
+                        model: row.get(0)?,
+                        api_call_count: row.get(1)?,
+                        input_tokens: row.get(2)?,
+                        output_tokens: row.get(3)?,
+                        cache_read_tokens: row.get(4)?,
+                        cache_write_tokens: row.get(5)?,
+                        reasoning_tokens: row.get(6)?,
+                        estimated_cost_usd: row.get(7)?,
+                        actual_cost_usd: row.get(8)?,
+                        cost_status: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(state_err("loading session usage"))
     }
 
     pub fn sanitize_title(title: Option<&str>) -> Result<Option<String>, HermesError> {
@@ -1082,6 +1182,110 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn trim_last_exchange(&self, session_id: &str) -> Result<usize, HermesError> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(state_err("opening undo transaction"))?;
+        let mut statement = tx
+            .prepare(
+                "SELECT id, role, tool_calls
+                 FROM messages
+                 WHERE session_id = ?
+                 ORDER BY timestamp DESC, id DESC",
+            )
+            .map_err(state_err("preparing undo message query"))?;
+        let rows = statement
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(state_err("querying undo messages"))?;
+
+        let mut removed_ids = Vec::new();
+        let mut removed_tool_calls = 0_i64;
+        for row in rows {
+            let (message_id, role, tool_calls) = row.map_err(state_err("collecting undo rows"))?;
+            if matches!(role.as_str(), "assistant" | "tool") {
+                removed_ids.push(message_id);
+                removed_tool_calls += parse_tool_call_count(tool_calls.as_deref())?;
+                continue;
+            }
+            if role == "user" {
+                removed_ids.push(message_id);
+                removed_tool_calls += parse_tool_call_count(tool_calls.as_deref())?;
+            }
+            break;
+        }
+
+        drop(statement);
+
+        if removed_ids.is_empty() {
+            tx.rollback()
+                .map_err(state_err("rolling back empty undo transaction"))?;
+            return Ok(0);
+        }
+
+        for message_id in &removed_ids {
+            tx.execute("DELETE FROM messages WHERE id = ?", [message_id])
+                .map_err(state_err("deleting undone messages"))?;
+        }
+        tx.execute(
+            "UPDATE sessions
+             SET message_count = MAX(message_count - ?, 0),
+                 tool_call_count = MAX(tool_call_count - ?, 0)
+             WHERE id = ?",
+            params![removed_ids.len() as i64, removed_tool_calls, session_id],
+        )
+        .map_err(state_err("updating undo counters"))?;
+        tx.commit()
+            .map_err(state_err("committing undo transaction"))?;
+        Ok(removed_ids.len())
+    }
+
+    pub fn append_to_last_tool_message(
+        &self,
+        session_id: &str,
+        suffix: &str,
+    ) -> Result<bool, HermesError> {
+        if suffix.is_empty() {
+            return Ok(false);
+        }
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(state_err("opening steer update transaction"))?;
+        let row = tx
+            .query_row(
+                "SELECT id, content
+                 FROM messages
+                 WHERE session_id = ? AND role = 'tool'
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                [session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(state_err("loading last tool message"))?;
+        let Some((message_id, content)) = row else {
+            tx.rollback()
+                .map_err(state_err("rolling back steer update transaction"))?;
+            return Ok(false);
+        };
+        let updated_content = format!("{}{}", content.unwrap_or_default(), suffix);
+        tx.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            params![updated_content, message_id],
+        )
+        .map_err(state_err("updating last tool message"))?;
+        tx.commit()
+            .map_err(state_err("committing steer update transaction"))?;
+        Ok(true)
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<bool, HermesError> {
         let tx = self
             .connection
@@ -1274,6 +1478,17 @@ fn extract_message_text(content: Option<&Value>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn parse_tool_call_count(raw: Option<&str>) -> Result<i64, HermesError> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let parsed = serde_json::from_str::<Value>(raw).map_err(|source| HermesError::State {
+        action: "parsing stored tool_calls",
+        detail: source.to_string(),
+    })?;
+    Ok(count_tool_calls(&parsed))
 }
 
 fn escape_like(value: &str) -> String {
@@ -1859,6 +2074,308 @@ mod tests {
                 .truncate_last_user_turn("sess-no-user")
                 .expect("truncate"),
             None
+        );
+    }
+
+    #[test]
+    fn trim_last_exchange_removes_trailing_assistant_tool_and_user_messages() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-undo"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        for message in [
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!("keep me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("prior answer")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("user"),
+                content: Some(serde_json::json!("remove me")),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(serde_json::json!("thinking")),
+                tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{"name": "plan"}, {"name": "search"}])),
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(serde_json::json!("tool output")),
+                tool_call_id: Some(String::from("call-1")),
+                tool_calls: None,
+                tool_name: Some(String::from("search")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store
+                .append_message("sess-undo", &message)
+                .expect("append message");
+        }
+
+        let removed = store
+            .trim_last_exchange("sess-undo")
+            .expect("trim last exchange");
+        assert_eq!(removed, 3);
+
+        let messages = store.get_messages("sess-undo").expect("get messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, Some(serde_json::json!("keep me")));
+        assert_eq!(messages[1].content, Some(serde_json::json!("prior answer")));
+
+        let session = store
+            .get_session("sess-undo")
+            .expect("get session")
+            .expect("session");
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.tool_call_count, 1);
+    }
+
+    #[test]
+    fn trim_last_exchange_removes_single_trailing_user_message() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-undo-user"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        store
+            .append_message(
+                "sess-undo-user",
+                &MessageAppend {
+                    role: String::from("user"),
+                    content: Some(serde_json::json!("question")),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .expect("append message");
+
+        let removed = store
+            .trim_last_exchange("sess-undo-user")
+            .expect("trim last exchange");
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .get_messages("sess-undo-user")
+                .expect("get messages")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn record_and_load_session_usage_round_trips_counters() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-usage"),
+                source: String::from("cli"),
+                user_id: None,
+                model: Some(String::from("gpt-test")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+
+        let updated = store
+            .record_session_usage(
+                "sess-usage",
+                &SessionUsageDelta {
+                    api_call_count: 2,
+                    input_tokens: 120,
+                    output_tokens: 45,
+                    cache_read_tokens: 11,
+                    cache_write_tokens: 7,
+                    reasoning_tokens: 9,
+                    estimated_cost_usd: Some(0.1234),
+                    actual_cost_usd: None,
+                    cost_status: Some(String::from("estimated")),
+                },
+            )
+            .expect("record usage");
+        assert!(updated);
+
+        store
+            .record_session_usage(
+                "sess-usage",
+                &SessionUsageDelta {
+                    api_call_count: 1,
+                    input_tokens: 30,
+                    output_tokens: 10,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 0,
+                    reasoning_tokens: 1,
+                    estimated_cost_usd: Some(0.0100),
+                    actual_cost_usd: Some(0.0900),
+                    cost_status: Some(String::from("exact")),
+                },
+            )
+            .expect("record second usage");
+
+        let usage = store
+            .get_session_usage("sess-usage")
+            .expect("get usage")
+            .expect("usage");
+        assert_eq!(usage.model.as_deref(), Some("gpt-test"));
+        assert_eq!(usage.api_call_count, 3);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 55);
+        assert_eq!(usage.cache_read_tokens, 13);
+        assert_eq!(usage.cache_write_tokens, 7);
+        assert_eq!(usage.reasoning_tokens, 10);
+        assert_eq!(usage.estimated_cost_usd, Some(0.1334));
+        assert_eq!(usage.actual_cost_usd, Some(0.09));
+        assert_eq!(usage.cost_status.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn append_to_last_tool_message_updates_latest_tool_entry() {
+        let (_temp, store) = test_store();
+        store
+            .create_session(&SessionCreate {
+                id: String::from("sess-steer"),
+                source: String::from("cli"),
+                user_id: None,
+                model: None,
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .expect("create session");
+        for message in [
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(Value::String(String::from("{\"first\":true}"))),
+                tool_call_id: Some(String::from("call-1")),
+                tool_calls: None,
+                tool_name: Some(String::from("write_file")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("assistant"),
+                content: Some(Value::String(String::from("note"))),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            MessageAppend {
+                role: String::from("tool"),
+                content: Some(Value::String(String::from("{\"second\":true}"))),
+                tool_call_id: Some(String::from("call-2")),
+                tool_calls: None,
+                tool_name: Some(String::from("terminal")),
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ] {
+            store
+                .append_message("sess-steer", &message)
+                .expect("append message");
+        }
+
+        assert!(
+            store
+                .append_to_last_tool_message("sess-steer", "\n\nUser guidance: adjust")
+                .expect("append steer")
+        );
+        let messages = store.get_messages("sess-steer").expect("get messages");
+        assert_eq!(
+            messages[2].content,
+            Some(Value::String(String::from(
+                "{\"second\":true}\n\nUser guidance: adjust"
+            )))
+        );
+        assert_eq!(
+            messages[0].content,
+            Some(Value::String(String::from("{\"first\":true}")))
         );
     }
 

@@ -192,7 +192,9 @@ mod tests {
                         if trimmed.is_empty() {
                             break;
                         }
-                        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                        if let Some((name, value)) = trimmed.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("content-length")
+                        {
                             content_length = value.trim().parse::<usize>().unwrap_or_default();
                         }
                     }
@@ -462,6 +464,102 @@ mod tests {
         assert_eq!(
             final_response.as_deref(),
             Some("Terminal request was denied.")
+        );
+    }
+
+    #[test]
+    fn spawned_turn_applies_live_steer_to_next_model_iteration() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "{\"command\":\"sleep 0.2; printf tool-done\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Steer applied."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let runtime_control = runtime.clone();
+        let rx = spawn_chat_turn_with_events(
+            context.clone(),
+            loaded,
+            Value::String(String::from("Run a terminal command")),
+            runtime,
+            vec![String::from("hermes-cli")],
+            ModelOverrides {
+                model: Some(String::from("test-model")),
+                provider: Some(String::from("custom")),
+                base_url: Some(base_url),
+                api_key: Some(String::from("test-key")),
+                api_mode: Some(String::from("chat_completions")),
+            },
+            None,
+            InteractiveTurnOptions::default(),
+        );
+
+        let mut final_response = None;
+        let mut final_session_id = None;
+        while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+            match event {
+                InteractiveTurnEvent::ToolProgress(update)
+                    if update.event_type == "tool.started"
+                        && update.function_name.as_deref() == Some("terminal") =>
+                {
+                    assert!(runtime_control.steer("Prefer terse output"));
+                }
+                InteractiveTurnEvent::Final(result) => {
+                    let result = result.unwrap();
+                    final_session_id = result.session_id.clone();
+                    final_response = Some(result.final_response);
+                    break;
+                }
+                InteractiveTurnEvent::ToolProgress(_)
+                | InteractiveTurnEvent::Step(_)
+                | InteractiveTurnEvent::ClarifyRequest(_)
+                | InteractiveTurnEvent::ApprovalRequest(_) => {}
+            }
+        }
+
+        assert_eq!(final_response.as_deref(), Some("Steer applied."));
+        let session_id = final_session_id.expect("session id");
+        let session_store = context.open_session_store().unwrap();
+        let tool_message = session_store
+            .get_messages(&session_id)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.tool_name.as_deref() == Some("terminal"))
+            .unwrap();
+        assert!(
+            tool_message
+                .content
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("User guidance: Prefer terse output")
         );
     }
 }

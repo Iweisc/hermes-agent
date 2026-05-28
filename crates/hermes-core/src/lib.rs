@@ -130,7 +130,7 @@ pub use skills::build_skill_invocation_message;
 pub use state::{
     ExportedSession, MessageAppend, MessageRecord, MessageSearchRow, SearchContextMessage,
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,
-    SessionTruncateResult,
+    SessionTruncateResult, SessionUsageDelta, SessionUsageRecord,
 };
 pub use tools::{
     ClarifyRequest, StepToolRecord, StepUpdate, ToolDefinition, ToolProgressUpdate, ToolRuntime,
