@@ -555,7 +555,7 @@ impl<'a> NativeGatewayServer<'a> {
             .overrides
             .model
             .clone()
-            .or(usage.model.clone())
+            .or(usage.session.model.clone())
             .unwrap_or_default();
         let total = usage.input_tokens + usage.output_tokens;
         let (cost_status, cost_usd) = if let Some(actual) = usage.actual_cost_usd {
@@ -565,7 +565,7 @@ impl<'a> NativeGatewayServer<'a> {
         };
         Ok(json!({
             "model": model,
-            "calls": usage.api_call_count,
+            "calls": usage.session.api_call_count,
             "input": usage.input_tokens,
             "output": usage.output_tokens,
             "total": total,

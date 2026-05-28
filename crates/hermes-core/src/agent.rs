@@ -7634,7 +7634,7 @@ for raw in sys.stdin:
             .get_session_usage(result.session_id.as_deref().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(usage.api_call_count, 1);
+        assert_eq!(usage.session.api_call_count, 1);
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 45);
         assert_eq!(usage.cache_read_tokens, 11);

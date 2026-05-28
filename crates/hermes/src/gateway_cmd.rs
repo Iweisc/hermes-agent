@@ -92,7 +92,7 @@ pub struct GatewayServiceArgs {
     pub all: bool,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct GatewayStatusArgs {
     #[arg(long, default_value_t = false)]
     pub deep: bool,

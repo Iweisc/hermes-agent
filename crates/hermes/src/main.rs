@@ -48,17 +48,18 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use getrandom::fill as fill_random;
 use hermes_core::{
     DelegateExecutor, EnvLoadReport, HermesContext, KanbanCreateTaskInput, KanbanDispatchOptions,
     KanbanTaskQuery, LoadedConfig, LoggingMode, LoggingSetup, ModelOverrides, ToolRuntime,
@@ -73,9 +74,12 @@ use hermes_core::{
     open_kanban_db, read_worker_log, reassign_task, reclaim_task, release_stale_claims,
     remove_kanban_board, remove_notify_sub, rename_kanban_board, run_cron_job_now,
     run_due_cron_jobs, run_kanban_task, set_current_kanban_board, unblock_task, unlink_tasks,
+    get_all_toolsets, parse_reasoning_effort,
 };
+use regex::Regex;
 use rusqlite::Connection;
 use serde_json::{Value as JsonValue, json};
+use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 
 use crate::python_bridge::{project_root, resolve_repo_python};
 
@@ -151,6 +155,29 @@ struct ChatArgs {
     ignore_user_config: bool,
 }
 
+#[cfg(test)]
+struct TestPythonOverrideGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestPythonOverrideGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("HERMES_CLI_PYTHON");
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_python_override(path: &Path) -> TestPythonOverrideGuard {
+    let lock = cli_test_env_lock().lock().unwrap();
+    unsafe {
+        std::env::set_var("HERMES_CLI_PYTHON", path);
+    }
+    TestPythonOverrideGuard { _lock: lock }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hermes", version, about = "Hermes Rust bootstrap")]
 struct Cli {
@@ -199,8 +226,8 @@ enum Command {
         command: Option<hooks::HooksCommand>,
     },
     Login(login_cmd::LoginArgs),
-    Approve(SlashCompatArgs),
-    Deny(SlashCompatArgs),
+    Approve(ApproveArgs),
+    Deny(DenyArgs),
     Fallback {
         #[command(subcommand)]
         command: Option<fallback_cmd::FallbackCommand>,
@@ -243,12 +270,12 @@ enum Command {
     #[command(alias = "reload_skills")]
     ReloadSkills(SlashCompatArgs),
     Rollback(SlashCompatArgs),
-    Restart(gateway_cmd::GatewayServiceArgs),
+    Restart(RestartArgs),
     Resume(ResumeArgs),
     Retry(SlashCompatArgs),
     Save(SlashCompatArgs),
     #[command(alias = "set-home")]
-    Sethome(SlashCompatArgs),
+    Sethome(SethomeArgs),
     Skin(SlashCompatArgs),
     #[command(alias = "sb")]
     Statusbar(SlashCompatArgs),
@@ -271,8 +298,8 @@ enum Command {
     },
     Completion(completion::CompletionArgs),
     Dashboard(dashboard_cmd::DashboardArgs),
-    #[command(alias = "platforms")]
     Gateway(gateway_cmd::GatewayArgs),
+    Platforms(PlatformsArgs),
     Skills {
         #[command(subcommand)]
         command: Option<skills_cmd::SkillsCommand>,
@@ -329,7 +356,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<profile_cmd::ProfileCommand>,
     },
-    Topic(SlashCompatArgs),
+    Topic(TopicArgs),
     Chat {
         prompt: Vec<String>,
     },
@@ -432,6 +459,17 @@ enum CronCommand {
         job_id: String,
     },
     Status,
+}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct PlatformsArgs {
+    #[command(subcommand)]
+    command: Option<PlatformsCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum PlatformsCommand {
+    Status(gateway_cmd::GatewayStatusArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -728,6 +766,40 @@ struct SlashCompatArgs {
     args: Vec<String>,
 }
 
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct ApproveArgs {
+    #[arg(value_enum, num_args = 0..=2)]
+    args: Vec<ApproveArgToken>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ApproveArgToken {
+    All,
+    #[value(alias = "ses")]
+    Session,
+    #[value(alias = "permanent", alias = "permanently")]
+    Always,
+}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct DenyArgs {
+    #[arg(value_enum, num_args = 0..=1)]
+    args: Vec<DenyArgToken>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum DenyArgToken {
+    All,
+}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct SethomeArgs {}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct TopicArgs {
+    target: Option<String>,
+}
+
 #[derive(Args, Debug, Clone)]
 struct ResumeArgs {
     #[arg(long, default_value_t = 50)]
@@ -782,7 +854,12 @@ enum KanbanBoardsCommand {
 struct StatusArgs {
     #[arg(long)]
     session: Option<String>,
+    #[arg(long, default_value_t = false)]
+    bootstrap: bool,
 }
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+struct RestartArgs {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let detected = HermesContext::detect();
@@ -847,14 +924,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Debug { command } => debug::print_debug(&context, &config, command)?,
         Command::Hooks { command } => hooks::print_hooks(&context, &config, command)?,
         Command::Login(args) => login_cmd::print_login(args)?,
-        Command::Approve(args) => print_live_gateway_only_command(
-            "approve",
-            &args.args,
-            "approve is only available for live pending approvals in a running gateway or TUI session.",
-        )?,
-        Command::Deny(args) => print_live_gateway_only_command(
-            "deny",
-            &args.args,
+        Command::Approve(args) => print_approve_compat(args)?,
+        Command::Deny(_args) => print_live_gateway_only_command(
             "deny is only available for live pending approvals in a running gateway or TUI session.",
         )?,
         Command::Fallback { command } => {
@@ -862,19 +933,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Agents(args) => print_slash_compat(&session_store, "agents", args)?,
         Command::Background(args) => print_slash_compat(&session_store, "background", args)?,
-        Command::Branch(args) => print_slash_compat(&session_store, "branch", args)?,
-        Command::Busy(args) => print_slash_compat(&session_store, "busy", args)?,
+        Command::Branch(args) => print_branch(&session_store, args)?,
+        Command::Busy(args) => print_busy(&context, args)?,
         Command::Browser(args) => print_slash_compat(&session_store, "browser", args)?,
         Command::Clear(args) => print_no_arg_slash_compat(&session_store, "clear", args)?,
         Command::Compress(args) => print_compress_compat(&session_store, args)?,
         Command::Commands(args) => print_slash_compat(&session_store, "commands", args)?,
-        Command::Copy(args) => print_slash_compat(&session_store, "copy", args)?,
-        Command::Footer(args) => print_slash_compat(&session_store, "footer", args)?,
+        Command::Copy(args) => print_copy(&session_store, args)?,
+        Command::Footer(args) => print_footer(&context, args)?,
         Command::Model { command } => model_cmd::print_model(&context, &config, command)?,
-        Command::Fast(args) => print_slash_compat(&session_store, "fast", args)?,
+        Command::Fast(args) => print_fast(&context, args)?,
         Command::Gquota(args) => print_slash_compat(&session_store, "gquota", args)?,
         Command::Goal(args) => print_goal_compat(&session_store, args)?,
-        Command::History(args) => print_slash_compat(&session_store, "history", args)?,
+        Command::History(args) => print_history(&session_store, args)?,
         Command::Image(args) => print_image_compat(&session_store, args)?,
         Command::Indicator(args) => print_slash_compat(&session_store, "indicator", args)?,
         Command::New(args) => print_slash_compat(&session_store, "new", args)?,
@@ -882,39 +953,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Personality(args) => print_slash_compat(&session_store, "personality", args)?,
         Command::Queue(args) => print_send_turn_compat(&session_store, "queue", args)?,
         Command::Redraw(args) => print_no_arg_slash_compat(&session_store, "redraw", args)?,
-        Command::Reasoning(args) => print_slash_compat(&session_store, "reasoning", args)?,
+        Command::Reasoning(args) => print_reasoning(&context, args)?,
         Command::Reload(args) => print_slash_compat(&session_store, "reload", args)?,
         Command::ReloadMcp(args) => print_slash_compat(&session_store, "reload-mcp", args)?,
         Command::ReloadSkills(args) => print_slash_compat(&session_store, "reload-skills", args)?,
         Command::Rollback(args) => print_slash_compat(&session_store, "rollback", args)?,
-        Command::Restart(service) => gateway_cmd::print_gateway(
+        Command::Restart(_args) => gateway_cmd::print_gateway(
             &context,
             gateway_cmd::GatewayArgs {
                 accept_hooks: false,
-                command: Some(gateway_cmd::GatewayCommand::Restart(service)),
+                command: Some(gateway_cmd::GatewayCommand::Restart(
+                    gateway_cmd::GatewayServiceArgs {
+                        system: false,
+                        all: false,
+                    },
+                )),
             },
         )?,
         Command::Resume(args) => print_resume(&session_store, args)?,
         Command::Retry(args) => print_retry_compat(&session_store, args)?,
-        Command::Save(args) => print_slash_compat(&session_store, "save", args)?,
-        Command::Sethome(args) => print_live_gateway_only_command(
-            "sethome",
-            &args.args,
+        Command::Save(args) => print_save(&context, &session_store, args)?,
+        Command::Sethome(_args) => print_live_gateway_only_command(
             "sethome is only available from a running gateway chat context.",
         )?,
         Command::Skin(args) => print_slash_compat(&session_store, "skin", args)?,
         Command::Statusbar(args) => print_slash_compat(&session_store, "statusbar", args)?,
         Command::Steer(args) => print_send_turn_compat(&session_store, "steer", args)?,
         Command::Stop(args) => print_slash_compat(&session_store, "stop", args)?,
-        Command::Toolsets(args) => print_slash_compat(&session_store, "toolsets", args)?,
-        Command::Title(args) => print_slash_compat(&session_store, "title", args)?,
+        Command::Toolsets(args) => print_toolsets(&config, args)?,
+        Command::Title(args) => print_title(&session_store, args)?,
         Command::Undo(args) => print_undo_compat(&session_store, args)?,
-        Command::Usage(args) => print_slash_compat(&session_store, "usage", args)?,
+        Command::Usage(args) => print_usage(&session_store, args)?,
         Command::Verbose(args) => print_slash_compat(&session_store, "verbose", args)?,
         Command::Voice(args) => print_slash_compat(&session_store, "voice", args)?,
         Command::Yolo(args) => print_slash_compat(&session_store, "yolo", args)?,
         Command::Dashboard(args) => dashboard_cmd::print_dashboard(args)?,
-        Command::Gateway(args) => gateway_cmd::print_gateway(&context, args)?,
+        Command::Gateway(args) => print_gateway_entrypoint(&context, args)?,
         Command::Skills { command } => skills_cmd::print_skills(&context, command)?,
         Command::Checkpoints { command } => checkpoints_cmd::print_checkpoints(&context, command)?,
         Command::Snapshot { command } => snapshot_cmd::print_snapshot(&context, command)?,
@@ -939,9 +1013,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Backup(args) => backup::print_backup(&context, args)?,
         Command::Import(args) => backup::print_import(&context, args)?,
         Command::Profile { command } => profile_cmd::print_profile(&context, command)?,
-        Command::Topic(args) => print_live_gateway_only_command(
-            "topic",
-            &args.args,
+        Command::Topic(_args) => print_live_gateway_only_command(
             "topic is only available in Telegram private chats through the gateway.",
         )?,
         Command::Chat { prompt } => run_chat(
@@ -956,6 +1028,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Cron { command } => print_cron(&context, &config, &session_store, command)?,
         Command::Logs(args) => logs::print_logs(&context, args)?,
         Command::Kanban { board, command } => print_kanban(&context, &config, board, command)?,
+        Command::Platforms(args) => print_platforms(&context, args)?,
         Command::Tools(args) => tools_cmd::print_tools(&context, &config, args)?,
         Command::TuiGateway(_args) => tui_cmd::run_tui_gateway(&context, &config)?,
         Command::Update(args) => update_cmd::print_update(&context, args)?,
@@ -1152,6 +1225,19 @@ fn print_status(
     session_store: &hermes_core::SessionStore,
     args: StatusArgs,
 ) -> Result<(), Box<dyn Error>> {
+    if !args.bootstrap {
+        let session_id = if let Some(requested) = args.session.as_deref() {
+            Some(resolve_slash_compat_session_id(
+                session_store,
+                Some(requested),
+            )?)
+        } else {
+            latest_session_id(session_store)?
+        };
+        if let Some(session_id) = session_id {
+            return launch_python_slash_command(&session_id, "status", &[]);
+        }
+    }
     if let Some(requested) = args.session.as_deref() {
         let session_id = resolve_slash_compat_session_id(session_store, Some(requested))?;
         return launch_python_slash_command(&session_id, "status", &[]);
@@ -1191,6 +1277,58 @@ fn print_status(
     Ok(())
 }
 
+fn latest_session_id(
+    session_store: &hermes_core::SessionStore,
+) -> Result<Option<String>, Box<dyn Error>> {
+    Ok(session_store
+        .search_sessions(None, 1, 0)?
+        .into_iter()
+        .next()
+        .map(|row| row.id))
+}
+
+fn print_platforms(context: &HermesContext, args: PlatformsArgs) -> Result<(), Box<dyn Error>> {
+    let status = match args.command {
+        None => gateway_cmd::GatewayStatusArgs {
+            deep: false,
+            full: false,
+            system: false,
+        },
+        Some(PlatformsCommand::Status(status)) => status,
+    };
+    gateway_cmd::print_gateway(
+        context,
+        gateway_cmd::GatewayArgs {
+            accept_hooks: false,
+            command: Some(gateway_cmd::GatewayCommand::Status(status)),
+        },
+    )
+}
+
+fn print_gateway_entrypoint(
+    context: &HermesContext,
+    args: gateway_cmd::GatewayArgs,
+) -> Result<(), Box<dyn Error>> {
+    gateway_cmd::print_gateway(context, normalize_gateway_entrypoint_args(args))
+}
+
+fn normalize_gateway_entrypoint_args(args: gateway_cmd::GatewayArgs) -> gateway_cmd::GatewayArgs {
+    if args.command.is_some() {
+        return args;
+    }
+    gateway_cmd::GatewayArgs {
+        accept_hooks: args.accept_hooks,
+        command: Some(gateway_cmd::GatewayCommand::Status(
+            gateway_cmd::GatewayStatusArgs {
+                deep: false,
+                full: false,
+                system: false,
+            },
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_chat(
     context: &HermesContext,
     config: &LoadedConfig,
@@ -3882,11 +4020,49 @@ fn print_no_arg_slash_compat(
     launch_python_slash_command(&session_id, slash_name, &[])
 }
 
-fn print_live_gateway_only_command(
-    _command_name: &str,
-    _args: &[String],
-    message: &str,
-) -> Result<(), Box<dyn Error>> {
+fn print_approve_compat(args: ApproveArgs) -> Result<(), Box<dyn Error>> {
+    validate_approve_args(&args)?;
+    print_live_gateway_only_command(
+        "approve is only available for live pending approvals in a running gateway or TUI session.",
+    )
+}
+
+fn validate_approve_args(args: &ApproveArgs) -> Result<(), Box<dyn Error>> {
+    let mut saw_all = false;
+    let mut scope: Option<ApproveArgToken> = None;
+    for token in &args.args {
+        match token {
+            ApproveArgToken::All => {
+                if saw_all {
+                    return Err("approve accepts `all` at most once".into());
+                }
+                saw_all = true;
+            }
+            ApproveArgToken::Session | ApproveArgToken::Always => {
+                if let Some(existing) = scope {
+                    if existing == *token {
+                        return Err(match token {
+                            ApproveArgToken::Session => {
+                                "approve accepts `session` at most once".into()
+                            }
+                            ApproveArgToken::Always => {
+                                "approve accepts `always` at most once".into()
+                            }
+                            ApproveArgToken::All => unreachable!(),
+                        });
+                    }
+                    return Err(
+                        "approve accepts at most one approval scope: `session` or `always`".into(),
+                    );
+                }
+                scope = Some(*token);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_live_gateway_only_command(message: &str) -> Result<(), Box<dyn Error>> {
     Err(message.into())
 }
 
@@ -3901,6 +4077,721 @@ fn print_goal_compat(
     }
     launch_python_slash_command(&session_id, "goal", &args.args)?;
     launch_python_chat_query(&session_id, goal_text.trim())
+}
+
+fn print_copy(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let response_number = parse_copy_response_number(&args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let messages = session_store.get_messages(&session_id)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    copy_assistant_response_with_io(&messages, response_number, &mut output)?;
+    Ok(())
+}
+
+fn print_branch(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let session = session_store
+        .get_session(&session_id)?
+        .ok_or_else(|| format!("session '{session_id}' not found"))?;
+    let messages = session_store.get_messages(&session_id)?;
+    if messages.is_empty() {
+        println!("No conversation to branch — send a message first.");
+        return Ok(());
+    }
+
+    let new_session_id = generate_branch_session_id()?;
+    let branch_title = resolved_branch_title(session_store, &session_id, &args.args)?;
+    session_store.create_session(&hermes_core::SessionCreate {
+        id: new_session_id.clone(),
+        source: session.source.clone(),
+        user_id: session.user_id.clone(),
+        model: session.model.clone(),
+        model_config: session.model_config.clone(),
+        system_prompt: session.system_prompt.clone(),
+        parent_session_id: Some(session_id.clone()),
+    })?;
+
+    if let Err(error) = session_store.set_session_title(&new_session_id, &branch_title) {
+        let _ = session_store.delete_session(&new_session_id);
+        return Err(error.into());
+    }
+
+    for message in &messages {
+        if let Err(error) =
+            session_store.append_message(&new_session_id, &message_record_to_append(message))
+        {
+            let _ = session_store.delete_session(&new_session_id);
+            return Err(error.into());
+        }
+    }
+
+    let user_message_count = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
+    let noun = if user_message_count == 1 {
+        "message"
+    } else {
+        "messages"
+    };
+    println!("Branched to {branch_title} ({user_message_count} user {noun} copied).");
+    println!("Original: {session_id}");
+    println!("Branch: {new_session_id}");
+    println!("Resume branch with: hermes resume {new_session_id}");
+    Ok(())
+}
+
+fn print_history(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("history", &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let session = session_store
+        .get_session(&session_id)?
+        .ok_or_else(|| format!("session '{session_id}' not found"))?;
+    let messages = session_store.get_messages(&session_id)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    render_history_with_io(&session, &messages, &mut output)?;
+    Ok(())
+}
+
+fn print_usage(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("usage", &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let usage = session_store
+        .get_session_usage(&session_id)?
+        .ok_or_else(|| format!("session '{session_id}' not found"))?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    render_usage_with_io(&usage, &mut output)?;
+    Ok(())
+}
+
+fn print_save(
+    context: &HermesContext,
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("save", &args.args)?;
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    let session = session_store
+        .get_session(&session_id)?
+        .ok_or_else(|| format!("session '{session_id}' not found"))?;
+    let messages = session_store.get_messages(&session_id)?;
+    if messages.is_empty() {
+        println!("No conversation to save.");
+        return Ok(());
+    }
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    save_conversation_snapshot_with_io(context, &session, &messages, &mut output)?;
+    Ok(())
+}
+
+fn print_title(
+    session_store: &hermes_core::SessionStore,
+    args: SlashCompatArgs,
+) -> Result<(), Box<dyn Error>> {
+    let session_id = resolve_slash_compat_session_id(session_store, args.session.as_deref())?;
+    if args.args.is_empty() {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_title_with_io(
+            &session_id,
+            session_store.get_session_title(&session_id)?.as_deref(),
+            &mut output,
+        )?;
+        return Ok(());
+    }
+
+    let requested = args.args.join(" ");
+    let Some(title) = hermes_core::SessionStore::sanitize_title(Some(&requested))? else {
+        return Err("title is empty after cleanup; use printable characters".into());
+    };
+    session_store.set_session_title(&session_id, &title)?;
+    println!("Session title set: {title}");
+    Ok(())
+}
+
+fn print_footer(context: &HermesContext, args: SlashCompatArgs) -> Result<(), Box<dyn Error>> {
+    let mut root = config_cmd::read_raw_yaml_mapping(&context.config_path())?;
+    let arg = joined_optional_prompt(&args.args)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current = yaml_bool_path(&root, &["display", "runtime_footer", "enabled"]).unwrap_or(false);
+    let fields = yaml_string_list_path(&root, &["display", "runtime_footer", "fields"])
+        .unwrap_or_else(|| {
+            vec![
+                String::from("model"),
+                String::from("context_pct"),
+                String::from("cwd"),
+            ]
+        });
+
+    if arg == "status" || arg == "?" {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_footer_status_with_io(current, &fields, &mut output)?;
+        return Ok(());
+    }
+
+    let next = match arg.as_str() {
+        "" => !current,
+        "on" | "enable" | "true" | "1" => true,
+        "off" | "disable" | "false" | "0" => false,
+        _ => return Err("usage: hermes footer [on|off|status]".into()),
+    };
+
+    yaml_set_bool_path(&mut root, &["display", "runtime_footer", "enabled"], next);
+    config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+    println!("Runtime footer: {}", if next { "ON" } else { "OFF" });
+    Ok(())
+}
+
+fn print_busy(context: &HermesContext, args: SlashCompatArgs) -> Result<(), Box<dyn Error>> {
+    let mut root = config_cmd::read_raw_yaml_mapping(&context.config_path())?;
+    let arg = joined_optional_prompt(&args.args)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current = yaml_string_path(&root, &["display", "busy_input_mode"])
+        .unwrap_or_else(|| String::from("interrupt"));
+
+    if arg.is_empty() || arg == "status" {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_busy_status_with_io(&current, &mut output)?;
+        return Ok(());
+    }
+
+    if !matches!(arg.as_str(), "queue" | "steer" | "interrupt") {
+        return Err("usage: hermes busy [queue|steer|interrupt|status]".into());
+    }
+
+    yaml_set_string_path(&mut root, &["display", "busy_input_mode"], &arg);
+    config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+    println!("Busy input mode set to '{arg}'");
+    Ok(())
+}
+
+fn print_reasoning(context: &HermesContext, args: SlashCompatArgs) -> Result<(), Box<dyn Error>> {
+    let mut root = config_cmd::read_raw_yaml_mapping(&context.config_path())?;
+    let arg = joined_optional_prompt(&args.args)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let effort = yaml_string_path(&root, &["agent", "reasoning_effort"]).unwrap_or_default();
+    let show_reasoning = yaml_bool_path(&root, &["display", "show_reasoning"]).unwrap_or(false);
+
+    if arg.is_empty() {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_reasoning_status_with_io(&effort, show_reasoning, &mut output)?;
+        return Ok(());
+    }
+
+    match arg.as_str() {
+        "show" | "on" => {
+            yaml_set_bool_path(&mut root, &["display", "show_reasoning"], true);
+            config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+            println!("Reasoning display: ON");
+            return Ok(());
+        }
+        "hide" | "off" => {
+            yaml_set_bool_path(&mut root, &["display", "show_reasoning"], false);
+            config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+            println!("Reasoning display: OFF");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    if parse_reasoning_effort(&arg).is_none() {
+        return Err(
+            "usage: hermes reasoning [none|minimal|low|medium|high|xhigh|show|hide]".into(),
+        );
+    }
+    yaml_set_string_path(&mut root, &["agent", "reasoning_effort"], &arg);
+    config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+    println!("Reasoning effort set to '{arg}'");
+    Ok(())
+}
+
+fn print_fast(context: &HermesContext, args: SlashCompatArgs) -> Result<(), Box<dyn Error>> {
+    let mut root = config_cmd::read_raw_yaml_mapping(&context.config_path())?;
+    let arg = joined_optional_prompt(&args.args)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current = yaml_string_path(&root, &["agent", "service_tier"]).unwrap_or_default();
+    let current_status = if matches!(
+        current.trim().to_ascii_lowercase().as_str(),
+        "fast" | "priority" | "on"
+    ) {
+        "fast"
+    } else {
+        "normal"
+    };
+
+    if arg.is_empty() || arg == "status" {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        render_fast_status_with_io(current_status, &mut output)?;
+        return Ok(());
+    }
+
+    let (saved_value, label) = match arg.as_str() {
+        "fast" | "on" => ("fast", "FAST"),
+        "normal" | "off" => ("normal", "NORMAL"),
+        _ => return Err("usage: hermes fast [normal|fast|status]".into()),
+    };
+
+    yaml_set_string_path(&mut root, &["agent", "service_tier"], saved_value);
+    config_cmd::write_yaml_mapping(&context.config_path(), &root)?;
+    println!("Fast mode set to {label}");
+    Ok(())
+}
+
+fn print_toolsets(loaded: &LoadedConfig, args: SlashCompatArgs) -> Result<(), Box<dyn Error>> {
+    ensure_no_extra_args("toolsets", &args.args)?;
+    let toolsets = get_all_toolsets();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    render_toolsets_with_io(&toolsets, &loaded.config.toolsets, &mut output)?;
+    Ok(())
+}
+
+fn render_footer_status_with_io<W: Write>(
+    enabled: bool,
+    fields: &[String],
+    output: &mut W,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "Runtime footer: {}",
+        if enabled { "ON" } else { "OFF" }
+    )?;
+    writeln!(output, "Fields: {}", fields.join(", "))?;
+    Ok(())
+}
+
+fn render_busy_status_with_io<W: Write>(mode: &str, output: &mut W) -> io::Result<()> {
+    let behavior = match mode {
+        "queue" => "queues for next turn",
+        "steer" => "steers into current run (after next tool call)",
+        _ => "interrupts current run",
+    };
+    writeln!(output, "Busy input mode: {mode}")?;
+    writeln!(output, "Enter while busy: {behavior}")?;
+    Ok(())
+}
+
+fn render_reasoning_status_with_io<W: Write>(
+    effort: &str,
+    show_reasoning: bool,
+    output: &mut W,
+) -> io::Result<()> {
+    let level = match effort.trim() {
+        "" => "medium (default)",
+        "none" => "none (disabled)",
+        value => value,
+    };
+    writeln!(output, "Reasoning effort: {level}")?;
+    writeln!(
+        output,
+        "Reasoning display: {}",
+        if show_reasoning { "on" } else { "off" }
+    )?;
+    Ok(())
+}
+
+fn render_fast_status_with_io<W: Write>(status: &str, output: &mut W) -> io::Result<()> {
+    writeln!(output, "Fast mode: {status}")?;
+    writeln!(output, "Usage: hermes fast [normal|fast|status]")?;
+    Ok(())
+}
+
+fn render_toolsets_with_io<W: Write>(
+    toolsets: &std::collections::BTreeMap<String, hermes_core::ToolsetInfo>,
+    enabled_toolsets: &[String],
+    output: &mut W,
+) -> io::Result<()> {
+    writeln!(output, "Available Toolsets")?;
+    let enabled = enabled_toolsets
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (name, info) in toolsets {
+        let marker = if enabled.contains(name) { "*" } else { " " };
+        writeln!(
+            output,
+            "{marker} {name:<18} [{:>2} tools] - {}",
+            info.resolved_tools.len(),
+            info.description
+        )?;
+    }
+    Ok(())
+}
+
+fn yaml_key(key: &str) -> YamlValue {
+    YamlValue::String(key.to_string())
+}
+
+fn ensure_yaml_mapping<'a>(mapping: &'a mut YamlMapping, key: &str) -> &'a mut YamlMapping {
+    let key_value = yaml_key(key);
+    let entry = mapping
+        .entry(key_value)
+        .or_insert_with(|| YamlValue::Mapping(YamlMapping::new()));
+    if !entry.is_mapping() {
+        *entry = YamlValue::Mapping(YamlMapping::new());
+    }
+    entry.as_mapping_mut().expect("mapping")
+}
+
+fn yaml_value_path<'a>(mapping: &'a YamlMapping, path: &[&str]) -> Option<&'a YamlValue> {
+    let (last, parents) = path.split_last()?;
+    let mut current = mapping;
+    for segment in parents {
+        current = current.get(yaml_key(segment))?.as_mapping()?;
+    }
+    current.get(yaml_key(last))
+}
+
+fn yaml_string_path(mapping: &YamlMapping, path: &[&str]) -> Option<String> {
+    yaml_value_path(mapping, path)?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn yaml_bool_path(mapping: &YamlMapping, path: &[&str]) -> Option<bool> {
+    yaml_value_path(mapping, path)?.as_bool()
+}
+
+fn yaml_string_list_path(mapping: &YamlMapping, path: &[&str]) -> Option<Vec<String>> {
+    yaml_value_path(mapping, path)?.as_sequence().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn yaml_set_string_path(mapping: &mut YamlMapping, path: &[&str], value: &str) {
+    let (last, parents) = path.split_last().expect("path");
+    let mut current = mapping;
+    for segment in parents {
+        current = ensure_yaml_mapping(current, segment);
+    }
+    current.insert(yaml_key(last), YamlValue::String(value.to_string()));
+}
+
+fn yaml_set_bool_path(mapping: &mut YamlMapping, path: &[&str], value: bool) {
+    let (last, parents) = path.split_last().expect("path");
+    let mut current = mapping;
+    for segment in parents {
+        current = ensure_yaml_mapping(current, segment);
+    }
+    current.insert(yaml_key(last), YamlValue::Bool(value));
+}
+
+fn render_title_with_io<W: Write>(
+    session_id: &str,
+    title: Option<&str>,
+    output: &mut W,
+) -> io::Result<()> {
+    writeln!(output, "Session ID: {session_id}")?;
+    match title {
+        Some(title) => writeln!(output, "Title: {title}")?,
+        None => writeln!(
+            output,
+            "No title set. Usage: hermes title <your session title>"
+        )?,
+    }
+    Ok(())
+}
+
+fn copy_assistant_response_with_io<W: Write>(
+    messages: &[hermes_core::MessageRecord],
+    response_number: Option<usize>,
+    output: &mut W,
+) -> Result<(), Box<dyn Error>> {
+    let assistant = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .collect::<Vec<_>>();
+    if assistant.is_empty() {
+        writeln!(output, "Nothing to copy yet.")?;
+        return Ok(());
+    }
+
+    let index = match response_number {
+        Some(number) => {
+            if number == 0 {
+                return Err("usage: hermes copy [number] [--session SESSION]".into());
+            }
+            let index = number - 1;
+            if index >= assistant.len() {
+                return Err(format!("invalid response number. Use 1-{}.", assistant.len()).into());
+            }
+            index
+        }
+        None => {
+            let Some(index) = assistant
+                .iter()
+                .rposition(|message| assistant_copy_text(message.content.as_ref()).is_some())
+            else {
+                writeln!(output, "Nothing to copy in assistant responses yet.")?;
+                return Ok(());
+            };
+            index
+        }
+    };
+
+    let Some(text) = assistant_copy_text(assistant[index].content.as_ref()) else {
+        writeln!(output, "Nothing to copy in that assistant response.")?;
+        return Ok(());
+    };
+
+    write_osc52_clipboard(output, &text)?;
+    writeln!(
+        output,
+        "\nCopied assistant response #{} to clipboard",
+        index + 1
+    )?;
+    Ok(())
+}
+
+fn resolved_branch_title(
+    session_store: &hermes_core::SessionStore,
+    session_id: &str,
+    args: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let requested = args.join(" ");
+    let requested = requested.trim();
+    if !requested.is_empty() {
+        return Ok(requested.to_string());
+    }
+    let current_title = session_store.get_session_title(session_id)?;
+    let base = current_title.as_deref().unwrap_or("branch");
+    Ok(session_store.get_next_title_in_lineage(base)?)
+}
+
+fn generate_branch_session_id() -> Result<String, Box<dyn Error>> {
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let mut random_bytes = [0_u8; 3];
+    fill_random(&mut random_bytes)
+        .map_err(|error| format!("failed to generate branch session id: {error}"))?;
+    Ok(format!(
+        "{timestamp}_{:02x}{:02x}{:02x}",
+        random_bytes[0], random_bytes[1], random_bytes[2]
+    ))
+}
+
+fn message_record_to_append(message: &hermes_core::MessageRecord) -> hermes_core::MessageAppend {
+    hermes_core::MessageAppend {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_name: message.tool_name.clone(),
+        token_count: message.token_count,
+        finish_reason: message.finish_reason.clone(),
+        reasoning: message.reasoning.clone(),
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning_details: message.reasoning_details.clone(),
+        codex_reasoning_items: message.codex_reasoning_items.clone(),
+        codex_message_items: message.codex_message_items.clone(),
+    }
+}
+
+fn render_usage_with_io<W: Write>(
+    usage: &hermes_core::SessionUsageRecord,
+    output: &mut W,
+) -> io::Result<()> {
+    let prompt_tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+    let total_tokens = prompt_tokens + usage.output_tokens;
+    if usage.session.api_call_count <= 0 && total_tokens <= 0 {
+        if usage.session.message_count > 0 {
+            writeln!(output, "📊 Session Info")?;
+            writeln!(output, "Messages: {}", usage.session.message_count)?;
+            writeln!(
+                output,
+                "Detailed usage available after the first agent response."
+            )?;
+        } else {
+            writeln!(output, "No usage data available for this session.")?;
+        }
+        return Ok(());
+    }
+
+    let model = usage.session.model.as_deref().unwrap_or("unknown");
+    let elapsed = format_duration_compact(session_elapsed_seconds(usage));
+    let cost_status = usage.cost_status.as_deref().unwrap_or("unknown");
+    let cost_source = usage.cost_source.as_deref().unwrap_or("unknown");
+    let total_cost = if let Some(actual_cost) = usage.actual_cost_usd {
+        format!("${actual_cost:.4}")
+    } else if let Some(estimated_cost) = usage.estimated_cost_usd {
+        if cost_status == "estimated" {
+            format!("~${estimated_cost:.4}")
+        } else {
+            format!("${estimated_cost:.4}")
+        }
+    } else if usage.billing_mode.as_deref() == Some("subscription_included")
+        || cost_status == "included"
+    {
+        String::from("included")
+    } else {
+        String::from("n/a")
+    };
+
+    writeln!(output, "📊 Session Token Usage")?;
+    writeln!(output, "{}", "─".repeat(40))?;
+    writeln!(output, "Model:                     {model}")?;
+    writeln!(
+        output,
+        "Input tokens:              {:>10}",
+        usage.input_tokens
+    )?;
+    writeln!(
+        output,
+        "Cache read tokens:         {:>10}",
+        usage.cache_read_tokens
+    )?;
+    writeln!(
+        output,
+        "Cache write tokens:        {:>10}",
+        usage.cache_write_tokens
+    )?;
+    writeln!(
+        output,
+        "Output tokens:             {:>10}",
+        usage.output_tokens
+    )?;
+    if usage.reasoning_tokens > 0 {
+        writeln!(
+            output,
+            "Reasoning tokens:          {:>10}",
+            usage.reasoning_tokens
+        )?;
+    }
+    writeln!(output, "Prompt tokens (total):     {:>10}", prompt_tokens)?;
+    writeln!(
+        output,
+        "Completion tokens:         {:>10}",
+        usage.output_tokens
+    )?;
+    writeln!(output, "Total tokens:              {:>10}", total_tokens)?;
+    writeln!(
+        output,
+        "API calls:                 {:>10}",
+        usage.session.api_call_count
+    )?;
+    writeln!(output, "Session duration:          {:>10}", elapsed)?;
+    writeln!(output, "Cost status:              {:>10}", cost_status)?;
+    writeln!(output, "Cost source:              {:>10}", cost_source)?;
+    writeln!(output, "Total cost:               {:>10}", total_cost)?;
+    writeln!(output, "{}", "─".repeat(40))?;
+    writeln!(output, "Messages:         {}", usage.session.message_count)?;
+    if usage.billing_provider.is_none() && cost_status == "unknown" {
+        writeln!(output, "Note:             Pricing unknown for {model}")?;
+    }
+    Ok(())
+}
+
+fn build_saved_conversation_payload(
+    session: &hermes_core::SessionRecord,
+    messages: &[hermes_core::MessageRecord],
+) -> JsonValue {
+    json!({
+        "model": session.model,
+        "session_id": session.id,
+        "session_start": format_session_start_iso(session.started_at),
+        "messages": messages.iter().map(saved_message_json).collect::<Vec<_>>(),
+    })
+}
+
+fn save_conversation_snapshot_with_io<W: Write>(
+    context: &HermesContext,
+    session: &hermes_core::SessionRecord,
+    messages: &[hermes_core::MessageRecord],
+    output: &mut W,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let saved_dir = context.hermes_home().join("sessions").join("saved");
+    fs::create_dir_all(&saved_dir)?;
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let path = saved_dir.join(format!("hermes_conversation_{timestamp}.json"));
+    let payload = build_saved_conversation_payload(session, messages);
+    let file = File::create(&path)?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, &payload)?;
+    writeln!(output, "Conversation snapshot saved to: {}", path.display())?;
+    writeln!(
+        output,
+        "Resume the live session with: hermes resume {}",
+        session.id
+    )?;
+    Ok(path)
+}
+
+fn saved_message_json(message: &hermes_core::MessageRecord) -> JsonValue {
+    let mut map = serde_json::Map::new();
+    map.insert(String::from("role"), json!(message.role));
+    insert_optional_json(&mut map, "content", message.content.clone());
+    insert_optional_string(&mut map, "tool_call_id", message.tool_call_id.clone());
+    insert_optional_json(&mut map, "tool_calls", message.tool_calls.clone());
+    insert_optional_string(&mut map, "tool_name", message.tool_name.clone());
+    insert_optional_string(&mut map, "finish_reason", message.finish_reason.clone());
+    insert_optional_string(&mut map, "reasoning", message.reasoning.clone());
+    insert_optional_string(
+        &mut map,
+        "reasoning_content",
+        message.reasoning_content.clone(),
+    );
+    insert_optional_json(
+        &mut map,
+        "reasoning_details",
+        message.reasoning_details.clone(),
+    );
+    insert_optional_json(
+        &mut map,
+        "codex_reasoning_items",
+        message.codex_reasoning_items.clone(),
+    );
+    insert_optional_json(
+        &mut map,
+        "codex_message_items",
+        message.codex_message_items.clone(),
+    );
+    JsonValue::Object(map)
+}
+
+fn insert_optional_json(
+    map: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<JsonValue>,
+) {
+    if let Some(value) = value {
+        map.insert(String::from(key), value);
+    }
+}
+
+fn format_session_start_iso(timestamp: f64) -> String {
+    let secs = timestamp.floor() as i64;
+    let nanos = ((timestamp.fract() * 1_000_000_000.0).round() as u32).min(999_999_999);
+    chrono::Local
+        .timestamp_opt(secs, nanos)
+        .single()
+        .map(|value| value.naive_local().format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|| String::from("1970-01-01T00:00:00"))
 }
 
 fn print_compress_compat(
@@ -4086,12 +4977,9 @@ fn resolve_slash_compat_session_id(
     if let Some(session_id) = requested {
         return resolve_existing_session_id(session_store, session_id);
     }
-    Ok(session_store
-        .search_sessions(None, 1, 0)?
-        .into_iter()
-        .next()
-        .map(|row| row.id)
-        .unwrap_or_else(|| String::from("rust-cli-compat")))
+    latest_session_id(session_store)?.ok_or_else(|| {
+        "no sessions found; start one with `hermes chat` or resume one with `hermes resume`".into()
+    })
 }
 
 fn ensure_no_extra_args(command_name: &str, args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -4137,6 +5025,99 @@ fn is_goal_control_command(goal_text: &str) -> bool {
     )
 }
 
+fn render_history_with_io<W: Write>(
+    session: &hermes_core::SessionRecord,
+    messages: &[hermes_core::MessageRecord],
+    output: &mut W,
+) -> io::Result<()> {
+    if messages.is_empty() {
+        writeln!(output, "(._.) No conversation history yet.")?;
+        return Ok(());
+    }
+
+    const PREVIEW_LIMIT: usize = 400;
+
+    let mut visible_index = 0;
+    let mut hidden_tool_messages = 0;
+
+    writeln!(output)?;
+    writeln!(output, "+{}+", "-".repeat(50))?;
+    writeln!(output, "|{:^50}|", "(^_^) Conversation History")?;
+    writeln!(output, "+{}+", "-".repeat(50))?;
+    if let Some(title) = session
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        writeln!(output, "  Title: {title}")?;
+    }
+    writeln!(output, "  Session: {}", session.id)?;
+
+    let flush_tool_summary = |output: &mut W, hidden_tool_messages: &mut usize| -> io::Result<()> {
+        if *hidden_tool_messages == 0 {
+            return Ok(());
+        }
+        let noun = if *hidden_tool_messages == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        writeln!(output, "\n  [Tools]")?;
+        writeln!(
+            output,
+            "    ({} tool {} hidden)",
+            hidden_tool_messages, noun
+        )?;
+        *hidden_tool_messages = 0;
+        Ok(())
+    };
+
+    for message in messages {
+        let role = message.role.as_str();
+        if role == "tool" {
+            hidden_tool_messages += 1;
+            continue;
+        }
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+
+        flush_tool_summary(output, &mut hidden_tool_messages)?;
+        visible_index += 1;
+
+        if role == "user" {
+            writeln!(output, "\n  [You #{visible_index}]")?;
+            let preview = message_text_preview(message.content.as_ref(), PREVIEW_LIMIT)
+                .unwrap_or_else(|| String::from("(empty message)"));
+            writeln!(output, "    {preview}")?;
+            continue;
+        }
+
+        writeln!(output, "\n  [Hermes #{visible_index}]")?;
+        let preview = match message_text_preview(message.content.as_ref(), PREVIEW_LIMIT) {
+            Some(text) => text,
+            None => {
+                let tool_call_count = message.tool_calls.as_ref().map_or(0, count_tool_calls);
+                if tool_call_count > 0 {
+                    let noun = if tool_call_count == 1 {
+                        "call"
+                    } else {
+                        "calls"
+                    };
+                    format!("(requested {tool_call_count} tool {noun})")
+                } else {
+                    String::from("(no text response)")
+                }
+            }
+        };
+        writeln!(output, "    {preview}")?;
+    }
+
+    flush_tool_summary(output, &mut hidden_tool_messages)?;
+    writeln!(output)?;
+    Ok(())
+}
+
 fn truncate_preview(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -4145,6 +5126,193 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     let mut preview = text.chars().take(max_chars).collect::<String>();
     preview.push_str("...");
     preview
+}
+
+fn parse_copy_response_number(args: &[String]) -> Result<Option<usize>, Box<dyn Error>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.len() > 1 {
+        return Err("usage: hermes copy [number] [--session SESSION]".into());
+    }
+    let value = args[0].trim();
+    if value.is_empty() {
+        return Err("usage: hermes copy [number] [--session SESSION]".into());
+    }
+    let number = value
+        .parse::<usize>()
+        .map_err(|_| "usage: hermes copy [number] [--session SESSION]")?;
+    Ok(Some(number))
+}
+
+fn assistant_copy_text(content: Option<&JsonValue>) -> Option<String> {
+    let text = assistant_content_as_text(content);
+    let cleaned = strip_reasoning_and_tool_tags(&text);
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn assistant_content_as_text(content: Option<&JsonValue>) -> String {
+    match content {
+        None => String::new(),
+        Some(JsonValue::String(text)) => text.clone(),
+        Some(JsonValue::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                JsonValue::Object(map)
+                    if map.get("type").and_then(JsonValue::as_str) == Some("text") =>
+                {
+                    map.get("text")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned)
+                }
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn strip_reasoning_and_tool_tags(text: &str) -> String {
+    static TOOL_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+    static FUNCTION_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+    static TOOL_CLOSE_RE: OnceLock<Regex> = OnceLock::new();
+
+    let mut cleaned = text.to_string();
+    for tag in [
+        "REASONING_SCRATCHPAD",
+        "think",
+        "thinking",
+        "reasoning",
+        "thought",
+    ] {
+        cleaned = remove_tag_blocks_case_insensitive(cleaned, tag);
+        cleaned = remove_close_tag_case_insensitive(cleaned, tag);
+    }
+    let tool_block_re = TOOL_BLOCK_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:tool_call|tool_calls|tool_result|function_call|function_calls)\b[^>]*>.*?</(?:tool_call|tool_calls|tool_result|function_call|function_calls)>\s*").unwrap()
+    });
+    cleaned = tool_block_re.replace_all(&cleaned, "").into_owned();
+    let function_block_re = FUNCTION_BLOCK_RE.get_or_init(|| {
+        Regex::new(r#"(?is)<function\b[^>]*\bname\s*=[^>]*>.*?</function>\s*"#).unwrap()
+    });
+    cleaned = function_block_re.replace_all(&cleaned, "").into_owned();
+    let tool_close_re = TOOL_CLOSE_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*",
+        )
+        .unwrap()
+    });
+    tool_close_re.replace_all(&cleaned, "").trim().to_string()
+}
+
+fn remove_tag_blocks_case_insensitive(mut text: String, tag: &str) -> String {
+    let open = format!("<{}>", tag.to_ascii_lowercase());
+    let close = format!("</{}>", tag.to_ascii_lowercase());
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = lower.find(&open) else {
+            break;
+        };
+        let content_start = start + open.len();
+        let Some(close_offset) = lower[content_start..].find(&close) else {
+            text.truncate(start);
+            break;
+        };
+        let end = content_start + close_offset + close.len();
+        text.replace_range(start..end, "");
+    }
+    text
+}
+
+fn remove_close_tag_case_insensitive(mut text: String, tag: &str) -> String {
+    let close = format!("</{}>", tag.to_ascii_lowercase());
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = lower.find(&close) else {
+            break;
+        };
+        let end = start + close.len();
+        text.replace_range(start..end, "");
+    }
+    text
+}
+
+fn write_osc52_clipboard<W: Write>(output: &mut W, text: &str) -> io::Result<()> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+    let payload = BASE64_STANDARD.encode(text.as_bytes());
+    write!(output, "\x1b]52;c;{payload}\x07")?;
+    output.flush()
+}
+
+fn session_elapsed_seconds(usage: &hermes_core::SessionUsageRecord) -> f64 {
+    let end = usage.session.ended_at.unwrap_or_else(current_timestamp);
+    (end - usage.session.started_at).max(0.0)
+}
+
+fn current_timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn format_duration_compact(seconds: f64) -> String {
+    if seconds < 60.0 {
+        return format!("{seconds:.0}s");
+    }
+    let minutes = seconds / 60.0;
+    if minutes < 60.0 {
+        return format!("{minutes:.0}m");
+    }
+    let hours = minutes / 60.0;
+    if hours < 24.0 {
+        let remaining_min = (minutes as i64) % 60;
+        return if remaining_min > 0 {
+            format!("{}h {}m", hours as i64, remaining_min)
+        } else {
+            format!("{}h", hours as i64)
+        };
+    }
+    format!("{:.1}d", hours / 24.0)
+}
+
+fn message_text_preview(content: Option<&JsonValue>, max_chars: usize) -> Option<String> {
+    let text = match content {
+        Some(JsonValue::String(text)) => text.trim().to_string(),
+        Some(JsonValue::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                JsonValue::String(text) => {
+                    let trimmed = text.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+                JsonValue::Object(map) => map
+                    .get("text")
+                    .and_then(JsonValue::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => String::new(),
+    };
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| truncate_preview(trimmed, max_chars))
+}
+
+fn count_tool_calls(value: &JsonValue) -> usize {
+    match value {
+        JsonValue::Array(items) => items.len(),
+        JsonValue::Null => 0,
+        _ => 1,
+    }
 }
 
 fn launch_python_slash_command(
@@ -4808,7 +5976,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_model_and_snapshot_aliases_are_parseable() {
+    fn top_level_model_snapshot_and_platforms_commands_are_parseable() {
         let cli =
             Cli::try_parse_from(["hermes", "provider", "set", "gpt-5", "--provider", "openai"])
                 .unwrap();
@@ -4833,13 +6001,72 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["hermes", "platforms", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["hermes", "platforms"]).unwrap();
+        match cli.command {
+            Some(Command::Platforms(PlatformsArgs { command: None })) => {}
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "platforms", "status", "--full"]).unwrap();
+        match cli.command {
+            Some(Command::Platforms(PlatformsArgs {
+                command:
+                    Some(PlatformsCommand::Status(gateway_cmd::GatewayStatusArgs {
+                        deep,
+                        full,
+                        system,
+                    })),
+            })) => {
+                assert!(!deep);
+                assert!(full);
+                assert!(!system);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["hermes", "gateway", "status"]).unwrap();
         match cli.command {
             Some(Command::Gateway(gateway_cmd::GatewayArgs {
                 command: Some(gateway_cmd::GatewayCommand::Status(_)),
                 ..
             })) => {}
             other => panic!("unexpected parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_bare_command_normalizes_to_status() {
+        let normalized = normalize_gateway_entrypoint_args(gateway_cmd::GatewayArgs {
+            accept_hooks: true,
+            command: None,
+        });
+        match normalized.command {
+            Some(gateway_cmd::GatewayCommand::Status(gateway_cmd::GatewayStatusArgs {
+                deep,
+                full,
+                system,
+            })) => {
+                assert!(!deep);
+                assert!(!full);
+                assert!(!system);
+            }
+            other => panic!("unexpected normalized command: {other:?}"),
+        }
+        assert!(normalized.accept_hooks);
+
+        let passthrough = normalize_gateway_entrypoint_args(gateway_cmd::GatewayArgs {
+            accept_hooks: false,
+            command: Some(gateway_cmd::GatewayCommand::Run(
+                gateway_cmd::GatewayRunArgs {
+                    verbose: 0,
+                    quiet: false,
+                    replace: false,
+                },
+            )),
+        });
+        match passthrough.command {
+            Some(gateway_cmd::GatewayCommand::Run(_)) => {}
+            other => panic!("unexpected passthrough command: {other:?}"),
         }
     }
 
@@ -4877,8 +6104,8 @@ mod tests {
 
         let cli = Cli::try_parse_from(["hermes", "approve", "all", "session"]).unwrap();
         match cli.command {
-            Some(Command::Approve(SlashCompatArgs { args, .. })) => {
-                assert_eq!(args, vec![String::from("all"), String::from("session")])
+            Some(Command::Approve(ApproveArgs { args })) => {
+                assert_eq!(args, vec![ApproveArgToken::All, ApproveArgToken::Session])
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -4981,8 +6208,8 @@ mod tests {
 
         let cli = Cli::try_parse_from(["hermes", "deny", "all"]).unwrap();
         match cli.command {
-            Some(Command::Deny(SlashCompatArgs { args, .. })) => {
-                assert_eq!(args, vec![String::from("all")])
+            Some(Command::Deny(DenyArgs { args })) => {
+                assert_eq!(args, vec![DenyArgToken::All])
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -5009,10 +6236,12 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["hermes", "status", "--session", "sess-1"]).unwrap();
+        let cli = Cli::try_parse_from(["hermes", "status", "--session", "sess-1", "--bootstrap"])
+            .unwrap();
         match cli.command {
-            Some(Command::Status(StatusArgs { session })) => {
+            Some(Command::Status(StatusArgs { session, bootstrap })) => {
                 assert_eq!(session.as_deref(), Some("sess-1"));
+                assert!(bootstrap);
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
@@ -5033,7 +6262,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["hermes", "set-home"]).unwrap();
         match cli.command {
-            Some(Command::Sethome(SlashCompatArgs { args, .. })) => assert!(args.is_empty()),
+            Some(Command::Sethome(SethomeArgs {})) => {}
             other => panic!("unexpected parse result: {other:?}"),
         }
 
@@ -5101,23 +6330,31 @@ mod tests {
 
         let cli = Cli::try_parse_from(["hermes", "topic", "help"]).unwrap();
         match cli.command {
-            Some(Command::Topic(SlashCompatArgs { args, .. })) => {
-                assert_eq!(args, vec![String::from("help")]);
+            Some(Command::Topic(TopicArgs { target })) => {
+                assert_eq!(target.as_deref(), Some("help"));
             }
             other => panic!("unexpected parse result: {other:?}"),
         }
     }
 
     #[test]
-    fn restart_command_is_parseable_with_gateway_flags() {
-        let cli = Cli::try_parse_from(["hermes", "restart", "--system", "--all"]).unwrap();
+    fn live_gateway_only_command_parsers_reject_invalid_shapes() {
+        assert!(Cli::try_parse_from(["hermes", "approve", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["hermes", "deny", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["hermes", "set-home", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["hermes", "topic", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn restart_command_is_parseable_without_gateway_flags() {
+        let cli = Cli::try_parse_from(["hermes", "restart"]).unwrap();
         match cli.command {
-            Some(Command::Restart(gateway_cmd::GatewayServiceArgs { system, all })) => {
-                assert!(system);
-                assert!(all);
-            }
+            Some(Command::Restart(RestartArgs {})) => {}
             other => panic!("unexpected parse result: {other:?}"),
         }
+
+        assert!(Cli::try_parse_from(["hermes", "restart", "--system"]).is_err());
+        assert!(Cli::try_parse_from(["hermes", "restart", "--all"]).is_err());
     }
 
     #[test]
@@ -5223,6 +6460,944 @@ mod tests {
     }
 
     #[test]
+    fn render_history_with_io_displays_persisted_transcript() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "history-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(Value::String("hello from user".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "assistant".to_string(),
+                    content: Some(Value::String("assistant reply".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "tool".to_string(),
+                    content: Some(Value::String("hidden tool output".to_string())),
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_calls: None,
+                    tool_name: Some("shell".to_string()),
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_call_id: None,
+                    tool_calls: Some(json!([{ "id": "call-1" }])),
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let session = store.get_session(session_id).unwrap().unwrap();
+        let messages = store.get_messages(session_id).unwrap();
+        let mut output = Vec::new();
+        render_history_with_io(&session, &messages, &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Conversation History"));
+        assert!(rendered.contains("Session: history-session"));
+        assert!(rendered.contains("[You #1]"));
+        assert!(rendered.contains("hello from user"));
+        assert!(rendered.contains("[Hermes #2]"));
+        assert!(rendered.contains("assistant reply"));
+        assert!(rendered.contains("[Tools]"));
+        assert!(rendered.contains("(1 tool message hidden)"));
+        assert!(rendered.contains("(requested 1 tool call)"));
+    }
+
+    #[test]
+    fn copy_assistant_response_with_io_writes_osc52_for_last_nonempty_response() {
+        let messages = vec![
+            hermes_core::MessageRecord {
+                id: 1,
+                session_id: String::from("sess-1"),
+                role: String::from("assistant"),
+                content: Some(Value::String(String::from(
+                    "<think>secret</think>visible one",
+                ))),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                timestamp: 0.0,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageRecord {
+                id: 2,
+                session_id: String::from("sess-1"),
+                role: String::from("assistant"),
+                content: Some(json!([
+                    { "type": "text", "text": "" },
+                    { "type": "text", "text": "visible two" }
+                ])),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                timestamp: 1.0,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ];
+
+        let mut output = Vec::new();
+        copy_assistant_response_with_io(&messages, None, &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("\u{1b}]52;c;"));
+        assert!(rendered.contains("Copied assistant response #2 to clipboard"));
+        assert!(rendered.contains("dmlzaWJsZSB0d28="));
+    }
+
+    #[test]
+    fn copy_assistant_response_with_io_strips_reasoning_for_explicit_response() {
+        let messages = vec![hermes_core::MessageRecord {
+            id: 1,
+            session_id: String::from("sess-1"),
+            role: String::from("assistant"),
+            content: Some(Value::String(String::from(
+                "<think>hidden</think>visible<tool_call>hidden</tool_call>",
+            ))),
+            tool_call_id: None,
+            tool_calls: None,
+            tool_name: None,
+            timestamp: 0.0,
+            token_count: None,
+            finish_reason: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+        }];
+
+        let mut output = Vec::new();
+        copy_assistant_response_with_io(&messages, Some(1), &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Copied assistant response #1 to clipboard"));
+        assert!(rendered.contains("dmlzaWJsZQ=="));
+    }
+
+    #[test]
+    fn copy_assistant_response_with_io_validates_requested_number() {
+        let messages = vec![hermes_core::MessageRecord {
+            id: 1,
+            session_id: String::from("sess-1"),
+            role: String::from("assistant"),
+            content: Some(Value::String(String::from("visible"))),
+            tool_call_id: None,
+            tool_calls: None,
+            tool_name: None,
+            timestamp: 0.0,
+            token_count: None,
+            finish_reason: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            codex_reasoning_items: None,
+            codex_message_items: None,
+        }];
+
+        let err = copy_assistant_response_with_io(&messages, Some(2), &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "invalid response number. Use 1-1.");
+    }
+
+    #[test]
+    fn render_usage_with_io_reports_persisted_session_totals() {
+        let usage = hermes_core::SessionUsageRecord {
+            session: hermes_core::SessionRecord {
+                id: String::from("sess-usage"),
+                source: String::from("cli"),
+                user_id: None,
+                model: Some(String::from("test/model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+                started_at: 0.0,
+                ended_at: Some(7_500.0),
+                end_reason: Some(String::from("completed")),
+                message_count: 6,
+                tool_call_count: 2,
+                title: Some(String::from("Usage Test")),
+                api_call_count: 3,
+            },
+            input_tokens: 1200,
+            output_tokens: 450,
+            cache_read_tokens: 50,
+            cache_write_tokens: 25,
+            reasoning_tokens: 10,
+            billing_provider: Some(String::from("anthropic")),
+            billing_base_url: Some(String::from("https://api.anthropic.com")),
+            billing_mode: None,
+            estimated_cost_usd: Some(0.1234),
+            actual_cost_usd: None,
+            cost_status: Some(String::from("estimated")),
+            cost_source: Some(String::from("pricing-table")),
+            pricing_version: Some(String::from("test-pricing-v1")),
+        };
+
+        let mut output = Vec::new();
+        render_usage_with_io(&usage, &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Session Token Usage"));
+        assert!(rendered.contains("Model:"));
+        assert!(rendered.contains("test/model"));
+        assert!(rendered.contains("Input tokens:"));
+        assert!(rendered.contains("1200"));
+        assert!(rendered.contains("Reasoning tokens:"));
+        assert!(rendered.contains("Prompt tokens (total):"));
+        assert!(rendered.contains("1275"));
+        assert!(rendered.contains("Total tokens:"));
+        assert!(rendered.contains("1725"));
+        assert!(rendered.contains("API calls:"));
+        assert!(rendered.contains("Session duration:"));
+        assert!(rendered.contains("2h 5m"));
+        assert!(rendered.contains("Cost status:"));
+        assert!(rendered.contains("estimated"));
+        assert!(rendered.contains("Cost source:"));
+        assert!(rendered.contains("pricing-table"));
+        assert!(rendered.contains("Total cost:"));
+        assert!(rendered.contains("~$0.1234"));
+        assert!(rendered.contains("Messages:         6"));
+    }
+
+    #[test]
+    fn render_usage_with_io_falls_back_when_no_api_calls_are_recorded() {
+        let usage = hermes_core::SessionUsageRecord {
+            session: hermes_core::SessionRecord {
+                id: String::from("sess-empty"),
+                source: String::from("cli"),
+                user_id: None,
+                model: Some(String::from("test/model")),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+                started_at: 0.0,
+                ended_at: None,
+                end_reason: None,
+                message_count: 2,
+                tool_call_count: 0,
+                title: None,
+                api_call_count: 0,
+            },
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            billing_provider: None,
+            billing_base_url: None,
+            billing_mode: None,
+            estimated_cost_usd: None,
+            actual_cost_usd: None,
+            cost_status: None,
+            cost_source: None,
+            pricing_version: None,
+        };
+
+        let mut output = Vec::new();
+        render_usage_with_io(&usage, &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Session Info"));
+        assert!(rendered.contains("Messages: 2"));
+        assert!(rendered.contains("Detailed usage available after the first agent response."));
+    }
+
+    #[test]
+    fn save_conversation_snapshot_with_io_writes_under_hermes_home() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let session = hermes_core::SessionRecord {
+            id: String::from("20260101_120000_abc123"),
+            source: String::from("cli"),
+            user_id: None,
+            model: Some(String::from("test-model")),
+            model_config: None,
+            system_prompt: None,
+            parent_session_id: None,
+            started_at: 1_767_268_800.0,
+            ended_at: None,
+            end_reason: None,
+            message_count: 2,
+            tool_call_count: 0,
+            title: None,
+            api_call_count: 1,
+        };
+        let messages = vec![
+            hermes_core::MessageRecord {
+                id: 1,
+                session_id: session.id.clone(),
+                role: String::from("user"),
+                content: Some(Value::String(String::from("hi"))),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                timestamp: 0.0,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+            hermes_core::MessageRecord {
+                id: 2,
+                session_id: session.id.clone(),
+                role: String::from("assistant"),
+                content: Some(Value::String(String::from("hello"))),
+                tool_call_id: None,
+                tool_calls: None,
+                tool_name: None,
+                timestamp: 1.0,
+                token_count: None,
+                finish_reason: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
+                codex_reasoning_items: None,
+                codex_message_items: None,
+            },
+        ];
+
+        let mut output = Vec::new();
+        let path =
+            save_conversation_snapshot_with_io(&context, &session, &messages, &mut output).unwrap();
+        assert!(path.starts_with(home.join("sessions").join("saved")));
+        let payload =
+            serde_json::from_str::<JsonValue>(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(payload.get("model"), Some(&json!("test-model")));
+        assert_eq!(
+            payload.get("session_id"),
+            Some(&json!("20260101_120000_abc123"))
+        );
+        assert_eq!(
+            payload.get("messages"),
+            Some(&json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]))
+        );
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains(path.to_string_lossy().as_ref()));
+        assert!(rendered.contains("hermes resume 20260101_120000_abc123"));
+    }
+
+    #[test]
+    fn render_title_with_io_reports_current_and_missing_title() {
+        let mut titled = Vec::new();
+        render_title_with_io("sess-1", Some("Project Phoenix"), &mut titled).unwrap();
+        assert_eq!(
+            String::from_utf8(titled).unwrap(),
+            "Session ID: sess-1\nTitle: Project Phoenix\n"
+        );
+
+        let mut untitled = Vec::new();
+        render_title_with_io("sess-2", None, &mut untitled).unwrap();
+        assert_eq!(
+            String::from_utf8(untitled).unwrap(),
+            "Session ID: sess-2\nNo title set. Usage: hermes title <your session title>\n"
+        );
+    }
+
+    #[test]
+    fn render_reasoning_busy_and_footer_statuses_report_expected_defaults() {
+        let mut reasoning = Vec::new();
+        render_reasoning_status_with_io("", false, &mut reasoning).unwrap();
+        assert_eq!(
+            String::from_utf8(reasoning).unwrap(),
+            "Reasoning effort: medium (default)\nReasoning display: off\n"
+        );
+
+        let mut busy = Vec::new();
+        render_busy_status_with_io("interrupt", &mut busy).unwrap();
+        assert_eq!(
+            String::from_utf8(busy).unwrap(),
+            "Busy input mode: interrupt\nEnter while busy: interrupts current run\n"
+        );
+
+        let mut footer = Vec::new();
+        render_footer_status_with_io(
+            false,
+            &[
+                String::from("model"),
+                String::from("context_pct"),
+                String::from("cwd"),
+            ],
+            &mut footer,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(footer).unwrap(),
+            "Runtime footer: OFF\nFields: model, context_pct, cwd\n"
+        );
+    }
+
+    #[test]
+    fn render_fast_and_toolsets_statuses_report_expected_output() {
+        let mut fast = Vec::new();
+        render_fast_status_with_io("normal", &mut fast).unwrap();
+        assert_eq!(
+            String::from_utf8(fast).unwrap(),
+            "Fast mode: normal\nUsage: hermes fast [normal|fast|status]\n"
+        );
+
+        let mut toolsets = std::collections::BTreeMap::new();
+        toolsets.insert(
+            String::from("browser"),
+            hermes_core::ToolsetInfo {
+                name: String::from("browser"),
+                description: String::from("Browser Automation"),
+                direct_tools: Vec::new(),
+                includes: Vec::new(),
+                resolved_tools: vec![String::from("browser_click"), String::from("browser_back")],
+                implemented_tools: Vec::new(),
+                available: true,
+            },
+        );
+        toolsets.insert(
+            String::from("web"),
+            hermes_core::ToolsetInfo {
+                name: String::from("web"),
+                description: String::from("Web Search"),
+                direct_tools: Vec::new(),
+                includes: Vec::new(),
+                resolved_tools: vec![String::from("web_search")],
+                implemented_tools: Vec::new(),
+                available: true,
+            },
+        );
+        let mut rendered = Vec::new();
+        render_toolsets_with_io(&toolsets, &[String::from("web")], &mut rendered).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("Available Toolsets"));
+        assert!(text.contains("* web"));
+        assert!(text.contains("browser"));
+    }
+
+    #[test]
+    fn print_reasoning_busy_and_footer_update_config_without_python_bridge() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+
+        let bogus_python = temp.path().join("missing-python");
+        let _python_guard = test_python_override(&bogus_python);
+
+        print_reasoning(
+            &context,
+            SlashCompatArgs {
+                session: None,
+                args: vec![String::from("high")],
+            },
+        )
+        .unwrap();
+        print_reasoning(
+            &context,
+            SlashCompatArgs {
+                session: None,
+                args: vec![String::from("show")],
+            },
+        )
+        .unwrap();
+        print_busy(
+            &context,
+            SlashCompatArgs {
+                session: None,
+                args: vec![String::from("queue")],
+            },
+        )
+        .unwrap();
+        print_footer(
+            &context,
+            SlashCompatArgs {
+                session: None,
+                args: vec![String::from("on")],
+            },
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(context.config_path()).unwrap();
+        assert!(config.contains("reasoning_effort: high"));
+        assert!(config.contains("show_reasoning: true"));
+        assert!(config.contains("busy_input_mode: queue"));
+        assert!(config.contains("enabled: true"));
+    }
+
+    #[test]
+    fn print_fast_and_toolsets_use_native_config_and_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+
+        let bogus_python = temp.path().join("missing-python");
+        let _python_guard = test_python_override(&bogus_python);
+
+        print_fast(
+            &context,
+            SlashCompatArgs {
+                session: None,
+                args: vec![String::from("fast")],
+            },
+        )
+        .unwrap();
+
+        let loaded = context.load_config_document().unwrap();
+        print_toolsets(
+            &loaded,
+            SlashCompatArgs {
+                session: None,
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let config = fs::read_to_string(context.config_path()).unwrap();
+        assert!(config.contains("service_tier: fast"));
+    }
+
+    #[test]
+    fn print_title_reads_and_updates_store_without_python_bridge() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "native-title-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let bogus_python = temp.path().join("missing-python");
+        let _python_guard = test_python_override(&bogus_python);
+        print_title(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: vec![
+                    String::from("  Project"),
+                    String::from("Phoenix  "),
+                    String::from("  Plan "),
+                ],
+            },
+        )
+        .unwrap();
+        print_title(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_session_title(session_id).unwrap().as_deref(),
+            Some("Project Phoenix Plan")
+        );
+    }
+
+    #[test]
+    fn print_history_reads_store_without_python_bridge() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "native-history-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(Value::String("hi".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let bogus_python = temp.path().join("missing-python");
+        let _python_guard = test_python_override(&bogus_python);
+        let result = print_history(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        );
+        result.unwrap();
+    }
+
+    #[test]
+    fn print_save_empty_history_does_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "empty-save-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        print_save(
+            &context,
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+        let saved_dir = home.join("sessions").join("saved");
+        assert!(!saved_dir.exists() || fs::read_dir(saved_dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn print_branch_creates_child_session_with_copied_messages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "branch-parent";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: Some(json!({"max_iterations": 4})),
+                system_prompt: Some("system prompt".to_string()),
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .set_session_title(session_id, "Project Alpha")
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(Value::String("hi".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "assistant".to_string(),
+                    content: Some(Value::String("hello".to_string())),
+                    tool_call_id: None,
+                    tool_calls: Some(json!([{"name": "search"}])),
+                    tool_name: Some("search".to_string()),
+                    token_count: Some(12),
+                    finish_reason: Some("stop".to_string()),
+                    reasoning: Some("brief".to_string()),
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        print_branch(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let rows = store.search_sessions(Some("cli"), 10, 0).unwrap();
+        let branched = rows
+            .into_iter()
+            .find(|row| row.id != session_id)
+            .expect("branched session");
+        assert_eq!(branched.title.as_deref(), Some("Project Alpha #2"));
+        let branch_session = store.get_session(&branched.id).unwrap().unwrap();
+        assert_eq!(
+            branch_session.parent_session_id.as_deref(),
+            Some(session_id)
+        );
+        assert_eq!(branch_session.model.as_deref(), Some("test/model"));
+        assert_eq!(
+            branch_session.system_prompt.as_deref(),
+            Some("system prompt")
+        );
+        let copied = store.get_messages(&branched.id).unwrap();
+        assert_eq!(copied.len(), 2);
+        assert_eq!(copied[0].role, "user");
+        assert_eq!(copied[1].role, "assistant");
+        assert_eq!(copied[1].tool_calls, Some(json!([{"name": "search"}])));
+        assert_eq!(copied[1].reasoning.as_deref(), Some("brief"));
+    }
+
+    #[test]
+    fn print_branch_empty_history_reports_nothing_to_branch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "empty-branch-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        print_branch(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+        let rows = store.search_sessions(Some("cli"), 10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn print_usage_reads_store_without_python_bridge() {
+        let _guard = cli_test_env_lock().lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "native-usage-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET input_tokens = 100,
+                 output_tokens = 25,
+                 api_call_count = 1,
+                 estimated_cost_usd = 0.01,
+                 cost_status = 'estimated',
+                 cost_source = 'pricing-table'
+             WHERE id = ?1",
+            [session_id],
+        )
+        .unwrap();
+
+        let result = print_usage(
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        );
+        result.unwrap();
+    }
+
+    #[test]
+    fn print_save_reads_store_without_python_bridge() {
+        let _guard = cli_test_env_lock().lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "native-save-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                session_id,
+                &MessageAppend {
+                    role: "user".to_string(),
+                    content: Some(Value::String("hi".to_string())),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    tool_name: None,
+                    token_count: None,
+                    finish_reason: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
+                    codex_reasoning_items: None,
+                    codex_message_items: None,
+                },
+            )
+            .unwrap();
+
+        let result = print_save(
+            &context,
+            &store,
+            SlashCompatArgs {
+                session: Some(session_id.to_string()),
+                args: Vec::new(),
+            },
+        );
+        result.unwrap();
+        let saved_dir = home.join("sessions").join("saved");
+        let files = fs::read_dir(saved_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
     fn launch_python_resume_session_uses_python_override_and_resume_flag() {
         let temp = tempfile::TempDir::new().unwrap();
         let log_path = temp.path().join("argv.log");
@@ -5240,13 +7415,8 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_resume_session("sess-123");
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
         let logged = fs::read_to_string(&log_path).unwrap();
         assert!(logged.contains("-m"));
@@ -5273,13 +7443,8 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_kanban_command(&[String::from("boards"), String::from("list")]);
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
         let logged = fs::read_to_string(&log_path).unwrap();
         assert!(logged.contains("-m"));
@@ -5309,17 +7474,12 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_slash_command(
             "sess-compat",
             "reasoning",
             &[String::from("high"), String::from("show")],
         );
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -5370,9 +7530,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         print_no_arg_slash_compat(
             &store,
             "clear",
@@ -5391,9 +7549,6 @@ mod tests {
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
 
         let logged = fs::read_to_string(&argv_log).unwrap();
         assert_eq!(logged.matches("CALL").count(), 2);
@@ -5443,9 +7598,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         print_slash_compat(
             &store,
             "rollback",
@@ -5455,9 +7608,6 @@ mod tests {
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
 
         let logged = fs::read_to_string(&argv_log).unwrap();
         assert!(logged.contains("tui_gateway.slash_worker"));
@@ -5507,9 +7657,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         print_status(
             &context,
             &env_report,
@@ -5517,12 +7665,71 @@ mod tests {
             &store,
             StatusArgs {
                 session: Some(session_id.to_string()),
+                bootstrap: false,
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
+
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(logged.contains("tui_gateway.slash_worker"));
+        assert!(logged.contains("--session-key"));
+        assert!(logged.contains(session_id));
+
+        let payload = fs::read_to_string(&stdin_log).unwrap();
+        assert!(payload.contains("\"command\":\"/status\""));
+    }
+
+    #[test]
+    fn print_status_uses_worker_for_latest_session_by_default() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
+        context.ensure_hermes_home().unwrap();
+        let env_report = EnvLoadReport::default();
+        let config = context.load_config_document().unwrap();
+        let store = context.open_session_store().unwrap();
+        let session_id = "latest-status-session";
+        store
+            .create_session(&SessionCreate {
+                id: session_id.to_string(),
+                source: "cli".to_string(),
+                user_id: None,
+                model: Some("test/model".to_string()),
+                model_config: None,
+                system_prompt: None,
+                parent_session_id: None,
+            })
+            .unwrap();
+
+        let argv_log = temp.path().join("argv.log");
+        let stdin_log = temp.path().join("stdin.log");
+        let python = temp.path().join("fake-python");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{argv}\"\ncat > \"{stdin}\"\nprintf '%s\\n' '{{\"id\":1,\"ok\":true,\"output\":\"status ok\"}}'\n",
+            argv = argv_log.display(),
+            stdin = stdin_log.display(),
+        );
+        fs::write(&python, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&python).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&python, perms).unwrap();
         }
+
+        let _python_guard = test_python_override(&python);
+        print_status(
+            &context,
+            &env_report,
+            &config,
+            &store,
+            StatusArgs {
+                session: None,
+                bootstrap: false,
+            },
+        )
+        .unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
         assert!(logged.contains("tui_gateway.slash_worker"));
@@ -5535,11 +7742,9 @@ mod tests {
 
     #[test]
     fn live_gateway_only_commands_report_explicit_unavailable_errors() {
-        let approve = print_live_gateway_only_command(
-            "approve",
-            &[String::from("all")],
-            "approve is only available for live pending approvals in a running gateway or TUI session.",
-        )
+        let approve = print_approve_compat(ApproveArgs {
+            args: vec![ApproveArgToken::All],
+        })
         .unwrap_err();
         assert!(
             approve
@@ -5548,8 +7753,6 @@ mod tests {
         );
 
         let topic = print_live_gateway_only_command(
-            "topic",
-            &[String::from("help")],
             "topic is only available in Telegram private chats through the gateway.",
         )
         .unwrap_err();
@@ -5558,6 +7761,25 @@ mod tests {
                 .to_string()
                 .contains("topic is only available in Telegram private chats")
         );
+    }
+
+    #[test]
+    fn approve_compat_rejects_conflicting_or_duplicate_scopes() {
+        let conflict = print_approve_compat(ApproveArgs {
+            args: vec![ApproveArgToken::Session, ApproveArgToken::Always],
+        })
+        .unwrap_err();
+        assert!(
+            conflict
+                .to_string()
+                .contains("at most one approval scope: `session` or `always`")
+        );
+
+        let duplicate = print_approve_compat(ApproveArgs {
+            args: vec![ApproveArgToken::Session, ApproveArgToken::Session],
+        })
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("`session` at most once"));
     }
 
     #[test]
@@ -5578,13 +7800,8 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_chat_query("sess-chat", "Ship the fix");
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -5615,17 +7832,12 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_chat_turn(
             "sess-chat",
             Some("Describe the attachment"),
             Some(Path::new("/tmp/cat.png")),
         );
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -5658,13 +7870,8 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_session_bridge_compress("sess-compress", "database schema");
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         assert_eq!(
             result.unwrap().get("summary").and_then(JsonValue::as_str),
             Some("compressed ok")
@@ -5698,13 +7905,8 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = launch_python_session_bridge_clipboard_save();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         assert_eq!(result.unwrap(), PathBuf::from("/tmp/fake.png"));
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -5748,9 +7950,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         print_send_turn_compat(
             &store,
             "queue",
@@ -5769,9 +7969,6 @@ mod tests {
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
 
         let logged = fs::read_to_string(&argv_log).unwrap();
         assert_eq!(logged.matches("CALL").count(), 2);
@@ -5818,9 +8015,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         print_image_compat(
             &store,
             SlashCompatArgs {
@@ -5841,9 +8036,6 @@ mod tests {
             },
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
 
         let logged = fs::read_to_string(&argv_log).unwrap();
         assert_eq!(logged.matches("CALL").count(), 3);
@@ -5955,9 +8147,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = print_retry_compat(
             &store,
             SlashCompatArgs {
@@ -5965,9 +8155,6 @@ mod tests {
                 args: Vec::new(),
             },
         );
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -6115,9 +8302,7 @@ mod tests {
             fs::set_permissions(&python, perms).unwrap();
         }
 
-        unsafe {
-            std::env::set_var("HERMES_CLI_PYTHON", &python);
-        }
+        let _python_guard = test_python_override(&python);
         let result = print_goal_compat(
             &store,
             SlashCompatArgs {
@@ -6129,9 +8314,6 @@ mod tests {
                 ],
             },
         );
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
         result.unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
@@ -6166,9 +8348,11 @@ mod tests {
 
         let requested_error = resolve_slash_compat_session_id(&store, Some("missing"));
         assert!(requested_error.is_err());
-        assert_eq!(
-            resolve_slash_compat_session_id(&store, None).unwrap(),
-            "rust-cli-compat"
+        let missing_latest = resolve_slash_compat_session_id(&store, None).unwrap_err();
+        assert!(
+            missing_latest
+                .to_string()
+                .contains("no sessions found; start one with `hermes chat`")
         );
 
         let session_id = "20260525_000002_latest";
@@ -6190,6 +8374,30 @@ mod tests {
         assert_eq!(
             resolve_slash_compat_session_id(&store, Some(session_id)).unwrap(),
             session_id
+        );
+    }
+
+    #[test]
+    fn print_slash_compat_requires_existing_session_when_none_exist() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home));
+        context.ensure_hermes_home().unwrap();
+        let store = context.open_session_store().unwrap();
+
+        let error = print_slash_compat(
+            &store,
+            "history",
+            SlashCompatArgs {
+                session: None,
+                args: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no sessions found; start one with `hermes chat`")
         );
     }
 
