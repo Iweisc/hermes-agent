@@ -12,9 +12,9 @@ use clap::{Parser, Subcommand};
 use hermes_core::{
     ClarifyRequest, EnvLoadReport, HermesContext, InteractiveTurnEvent, InteractiveTurnOptions,
     InteractiveTurnRequest, LoadedConfig, LoggingMode, MessageAppend, MessageRecord,
-    attach_python_plugin_runtime, get_provider_profile, get_tool_definitions,
-    normalize_provider_alias, ModelOverrides, SessionCreate, SessionRecord, SessionStore,
-    StepUpdate, ToolProgressUpdate, ToolRuntime, spawn_chat_turn_with_events,
+    ModelOverrides, SessionCreate, SessionRecord, SessionStore, StepUpdate, ToolProgressUpdate,
+    ToolRuntime, attach_python_plugin_runtime, get_provider_profile, get_tool_definitions,
+    normalize_provider_alias, spawn_chat_turn_with_events,
 };
 use serde_json::{Value, json};
 
@@ -674,6 +674,7 @@ impl<'a> AcpServer<'a> {
             &self.context.hermes_home(),
             ToolRuntime::new(&state.cwd)
                 .with_hermes_home(self.context.hermes_home())
+                .with_platform("acp")
                 .with_current_session_id(Some(session_id.to_string())),
         );
         match runtime {
@@ -812,9 +813,14 @@ impl<'a> AcpServer<'a> {
         let approval_timeout = approval_timeout_seconds(self.config);
         let clarify_timeout = clarify_timeout_seconds(self.config);
         let interactive_client = self.input_rx.is_some();
-        let runtime = ToolRuntime::new(&state.cwd)
-            .with_hermes_home(self.context.hermes_home())
-            .with_current_session_id(Some(session_id.clone()));
+        let runtime = attach_python_plugin_runtime(
+            &self.context.hermes_home(),
+            ToolRuntime::new(&state.cwd)
+                .with_hermes_home(self.context.hermes_home())
+                .with_platform("acp")
+                .with_current_session_id(Some(session_id.clone())),
+        )
+        .map_err(|error| error.to_string())?;
         let rx = spawn_chat_turn_with_events(
             self.context.clone(),
             self.config.clone(),
@@ -1189,8 +1195,9 @@ impl<'a> AcpServer<'a> {
                     .and_then(non_empty_trimmed)
                     .or_else(|| self.config.configured_model_name())
             });
-        let tool_runtime =
-            hermes_core::ToolRuntime::new(&state.cwd).with_hermes_home(self.context.hermes_home());
+        let tool_runtime = hermes_core::ToolRuntime::new(&state.cwd)
+            .with_hermes_home(self.context.hermes_home())
+            .with_platform("acp");
         let system_prompt = self
             .context
             .render_system_prompt(&tool_runtime, &self.config.config.memory)

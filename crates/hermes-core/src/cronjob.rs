@@ -1278,6 +1278,7 @@ fn run_agent_cron_job(
     );
     let runtime = ToolRuntime::new(job_cwd)
         .with_hermes_home(context.hermes_home())
+        .with_platform("cron")
         .with_delegate_callback(move |request, parent_runtime| {
             delegate.execute(request, parent_runtime)
         });
@@ -1295,6 +1296,9 @@ fn run_agent_cron_job(
     ) {
         Ok(result) => {
             let silent = result.final_response.trim() == SILENT_MARKER;
+            if let Some(session_id) = result.session_id.as_deref() {
+                let _ = runtime.invoke_session_boundary_hook("on_session_finalize", session_id);
+            }
             let doc = format!(
                 "# Cron Job: {}\n\n**Job ID:** {}\n**Run Time:** {}\n**Mode:** agent\n**Session ID:** {}\n\n---\n\n{}\n",
                 job.name,
@@ -2495,6 +2499,100 @@ mod tests {
         let stored = store.get_job(&job.id).unwrap().unwrap();
         assert_eq!(stored.last_status.as_deref(), Some("ok"));
         assert_eq!(stored.repeat.completed, 1);
+    }
+
+    #[test]
+    fn run_cron_job_now_emits_finalize_hook_for_plugin_runtime() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+
+        let plugin_dir = context.hermes_home().join("plugins").join("cron-finalize");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: cron-finalize\nversion: 0.1.0\ndescription: Cron finalize hook test\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+import os
+
+def on_session_finalize(**kwargs):
+    path = (os.environ.get("FINALIZE_LOG_PATH") or "").strip()
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{kwargs.get('session_id', '')}|{kwargs.get('platform', '')}\n")
+
+def register(ctx):
+    ctx.register_hook("on_session_finalize", on_session_finalize)
+"#,
+        )
+        .unwrap();
+
+        let finalize_log = temp.path().join("finalize.log");
+        fs::write(
+            context.env_path(),
+            format!("FINALIZE_LOG_PATH={}\n", finalize_log.display()),
+        )
+        .unwrap();
+
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Cron finalize complete."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        fs::write(
+            context.config_path(),
+            format!(
+                "plugins:\n  enabled:\n    - cron-finalize\nmodel:\n  default: test-model\n  provider: custom\n  base_url: {}\n  api_key: test-key\n  api_mode: chat_completions\n",
+                base_url
+            ),
+        )
+        .unwrap();
+
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let store = CronStore::new(context.hermes_home());
+        let job = store
+            .create_job(CreateJobRequest {
+                prompt: "Summarize the cron finalize check".to_string(),
+                schedule: "every 5m".to_string(),
+                name: Some("Finalize Cron".to_string()),
+                repeat: None,
+                deliver: Some("local".to_string()),
+                origin: None,
+                skills: Vec::new(),
+                model: None,
+                provider: None,
+                base_url: None,
+                script: None,
+                no_agent: false,
+                context_from: None,
+                enabled_toolsets: Some(vec!["file".to_string()]),
+                workdir: None,
+            })
+            .unwrap();
+
+        let result =
+            run_cron_job_now(&context, &loaded, &session_store, temp.path(), &job.id).unwrap();
+        let session_id = result.session_id.clone().unwrap();
+
+        let logged = fs::read_to_string(finalize_log).unwrap();
+        assert!(
+            logged
+                .lines()
+                .any(|line| line == format!("{session_id}|cron"))
+        );
     }
 
     #[test]

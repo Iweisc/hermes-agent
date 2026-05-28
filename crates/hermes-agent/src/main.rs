@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use hermes_core::{
     ApprovalRequest, DelegateExecutor, EnvLoadReport, GatewayEventBridge, HermesContext,
     LoadedConfig, LoggingMode, ModelOverrides, StepUpdate, ToolProgressUpdate, ToolRuntime,
-    attach_gateway_event_callbacks,
+    attach_gateway_event_callbacks, attach_python_plugin_runtime,
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, json};
@@ -190,12 +190,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             let event_emitter = structured_events.then(ChatEventEmitter::stdout);
             let gateway_bridge =
                 gateway_events.then(|| Arc::new(Mutex::new(GatewayEventBridge::default())));
-            let mut runtime = ToolRuntime::default()
-                .with_hermes_home(context.hermes_home())
-                .with_delegate_callback(move |request, parent_runtime| {
-                    delegate.execute(request, parent_runtime)
-                });
-            let mut runtime = runtime;
+            let mut runtime = attach_python_plugin_runtime(
+                &context.hermes_home(),
+                ToolRuntime::default()
+                    .with_hermes_home(context.hermes_home())
+                    .with_platform("cli"),
+            )?;
+            let delegate = delegate.with_runtime_template(runtime.clone());
+            runtime = runtime.with_delegate_callback(move |request, parent_runtime| {
+                delegate.execute(request, parent_runtime)
+            });
             if let Some(emitter) = event_emitter.clone() {
                 if let Some(bridge) = gateway_bridge.clone() {
                     emitter.emit(&bridge.lock().unwrap().gateway_ready());
@@ -266,6 +270,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             } else {
                 println!("{}", result.final_response);
+            }
+            if let Some(session_id) = result.session_id.as_deref() {
+                let _ = runtime.invoke_session_boundary_hook("on_session_finalize", session_id);
             }
         }
         Command::Env => {

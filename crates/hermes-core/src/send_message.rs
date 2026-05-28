@@ -174,6 +174,7 @@ struct HomeTarget {
 struct TelegramConfig {
     token: String,
     base_url: String,
+    disable_link_previews: bool,
     home: Option<HomeTarget>,
 }
 
@@ -188,6 +189,7 @@ struct DiscordConfig {
 struct SlackConfig {
     token: String,
     base_url: String,
+    reply_broadcast: bool,
     home: Option<HomeTarget>,
 }
 
@@ -201,8 +203,11 @@ struct FeishuConfig {
 
 #[derive(Debug, Clone)]
 struct MatrixConfig {
-    token: String,
+    token: Option<String>,
     homeserver: String,
+    user_id: Option<String>,
+    password: Option<String>,
+    device_id: Option<String>,
     home: Option<HomeTarget>,
 }
 
@@ -324,6 +329,7 @@ struct SentMessage {
     message_id: Option<String>,
     thread_id: Option<String>,
     note: Option<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +619,7 @@ fn handle_send(args: &Value, runtime: &ToolRuntime) -> String {
             "message_id": sent.message_id,
             "thread_id": sent.thread_id,
             "note": sent.note,
+            "warnings": sent.warnings,
         })),
         Err(error) => tool_error(error.to_string()),
     }
@@ -1012,6 +1019,7 @@ fn load_telegram_config() -> Option<TelegramConfig> {
             env_trimmed("TELEGRAM_API_BASE_URL").as_deref(),
             TELEGRAM_DEFAULT_BASE_URL,
         ),
+        disable_link_previews: false,
         home: load_home_target(
             "TELEGRAM_HOME_CHANNEL",
             "TELEGRAM_HOME_CHANNEL_THREAD_ID",
@@ -1044,6 +1052,7 @@ fn load_slack_config() -> Option<SlackConfig> {
             env_trimmed("SLACK_API_BASE_URL").as_deref(),
             SLACK_DEFAULT_BASE_URL,
         ),
+        reply_broadcast: false,
         home: load_home_target(
             "SLACK_HOME_CHANNEL",
             "SLACK_HOME_CHANNEL_THREAD_ID",
@@ -1070,17 +1079,25 @@ fn load_feishu_config() -> Option<FeishuConfig> {
 }
 
 fn load_matrix_config() -> Option<MatrixConfig> {
-    let token = env_trimmed("MATRIX_ACCESS_TOKEN")?;
+    let token = env_trimmed("MATRIX_ACCESS_TOKEN");
+    let user_id = env_trimmed("MATRIX_USER_ID");
+    let password = env_trimmed("MATRIX_PASSWORD");
+    if token.is_none() && (user_id.is_none() || password.is_none()) {
+        return None;
+    }
     let homeserver = normalize_base_url(
         env_trimmed("MATRIX_HOMESERVER").as_deref(),
         MATRIX_DEFAULT_BASE_URL,
     );
-    if homeserver.is_empty() {
+    if homeserver.is_empty() || env_trimmed("MATRIX_HOMESERVER").is_none() {
         return None;
     }
     Some(MatrixConfig {
         token,
         homeserver,
+        user_id,
+        password,
+        device_id: env_trimmed("MATRIX_DEVICE_ID"),
         home: load_home_target(
             "MATRIX_HOME_ROOM",
             "MATRIX_HOME_ROOM_THREAD_ID",
@@ -4917,6 +4934,7 @@ fn send_mattermost(
                 target.chat_id
             )
         }),
+        warnings: Vec::new(),
     })
 }
 
@@ -4993,6 +5011,7 @@ fn send_wecom(
         note: target
             .used_home_channel
             .then(|| format!("Sent to wecom home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -5280,6 +5299,7 @@ fn send_weixin(
         note: target
             .used_home_channel
             .then(|| format!("Sent to weixin home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -5795,6 +5815,7 @@ fn send_email(
         note: target
             .used_home_channel
             .then(|| format!("Sent to email home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -5929,6 +5950,7 @@ fn send_whatsapp(
                 target.chat_id
             )
         }),
+        warnings: Vec::new(),
     })
 }
 
@@ -6012,6 +6034,7 @@ fn send_dingtalk(
                 target.chat_id
             )
         }),
+        warnings: Vec::new(),
     })
 }
 
@@ -6059,6 +6082,7 @@ fn send_qqbot(
         note: target
             .used_home_channel
             .then(|| format!("Sent to qqbot home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -6347,6 +6371,7 @@ fn send_sms(
         note: target
             .used_home_channel
             .then(|| format!("Sent to sms home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -6417,6 +6442,7 @@ fn send_homeassistant(
                 target.chat_id
             )
         }),
+        warnings: Vec::new(),
     })
 }
 
@@ -6443,6 +6469,7 @@ fn send_bluebubbles(
                     target.chat_id
                 )
             }),
+            warnings: Vec::new(),
         });
     } else {
         return Err(SendError(format!(
@@ -6490,6 +6517,7 @@ fn send_bluebubbles(
                 target.chat_id
             )
         }),
+        warnings: Vec::new(),
     })
 }
 
@@ -7170,6 +7198,10 @@ fn guess_matrix_mime_type(path: &Path, bytes: &[u8]) -> String {
         "txt" => "text/plain".to_string(),
         _ => "application/octet-stream".to_string(),
     }
+}
+
+fn guess_mime_type(path: &Path, bytes: &[u8]) -> String {
+    guess_matrix_mime_type(path, bytes)
 }
 
 fn send_signal(
@@ -8234,6 +8266,7 @@ fn send_yuanbao(
         note: target
             .used_home_channel
             .then(|| format!("Sent to yuanbao home channel (chat_id: {})", target.chat_id)),
+        warnings: Vec::new(),
     })
 }
 
@@ -13396,7 +13429,6 @@ mod tests {
         }
     }
 
-
     fn clear_signal_scheduler() {
         if let Some(scheduler) = SIGNAL_SCHEDULER.get() {
             let mut scheduler = scheduler.lock().unwrap_or_else(|error| error.into_inner());
@@ -13408,7 +13440,6 @@ mod tests {
         set_signal_batch_pacing_notice_threshold_override(None);
     }
 
-
     fn set_signal_batch_pacing_notice_threshold_override(value: Option<f64>) {
         let override_value =
             SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE.get_or_init(|| Mutex::new(None));
@@ -13416,7 +13447,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = value;
     }
-
 
     #[test]
     fn chunks_telegram_media_groups_above_ten_photos() {
@@ -13467,7 +13497,6 @@ mod tests {
         assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
-
 
     #[test]
     fn batches_telegram_photos_even_when_mixed_with_document_media() {
@@ -13538,7 +13567,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn falls_back_to_telegram_document_when_photo_upload_is_rejected() {
         let _guard = acquire_test_lock();
@@ -13592,7 +13620,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn falls_back_to_telegram_text_when_video_upload_is_rejected() {
         let _guard = acquire_test_lock();
@@ -13643,7 +13670,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn sends_telegram_long_text_in_multiple_chunks() {
         let _guard = acquire_test_lock();
@@ -13680,7 +13706,6 @@ mod tests {
         assert_eq!(parsed["message_id"], json!("91"));
         join.join().unwrap();
     }
-
 
     #[test]
     fn skips_missing_telegram_media_with_warning_after_text_delivery() {
@@ -13721,7 +13746,6 @@ mod tests {
         );
         join.join().unwrap();
     }
-
 
     #[test]
     fn sends_feishu_text_via_config_yaml_home_when_env_missing() {
@@ -13786,7 +13810,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn feishu_yaml_runtime_respects_env_domain_override() {
         let _guard = acquire_test_lock();
@@ -13848,7 +13871,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn sends_feishu_thread_text_via_reply_endpoint() {
         let _guard = acquire_test_lock();
@@ -13899,7 +13921,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn builds_feishu_post_payload_for_markdown_text() {
         let (msg_type, payload) = feishu_build_outbound_payload("可以用 **粗体** 和 *斜体*。");
@@ -13910,7 +13931,6 @@ mod tests {
             json!([[{ "tag": "md", "text": "可以用 **粗体** 和 *斜体*。" }]])
         );
     }
-
 
     #[test]
     fn builds_feishu_post_payload_with_separate_code_block_rows() {
@@ -13927,7 +13947,6 @@ mod tests {
             ])
         );
     }
-
 
     #[test]
     fn falls_back_to_feishu_text_when_post_payload_is_rejected() {
@@ -13991,7 +14010,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn sends_feishu_long_text_in_multiple_chunks() {
         let _guard = acquire_test_lock();
@@ -14044,7 +14062,6 @@ mod tests {
         assert_eq!(parsed["message_id"], json!("om_chunk_2"));
         join.join().unwrap();
     }
-
 
     #[test]
     fn keeps_feishu_text_success_when_media_upload_fails() {
@@ -14113,7 +14130,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn falls_back_to_feishu_text_when_media_only_upload_fails() {
         let _guard = acquire_test_lock();
@@ -14176,7 +14192,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn skips_missing_feishu_media_with_warning_after_text_delivery() {
         let _guard = acquire_test_lock();
@@ -14235,7 +14250,6 @@ mod tests {
         );
         join.join().unwrap();
     }
-
 
     #[test]
     fn sends_feishu_thread_image_via_reply_endpoint() {
@@ -14302,7 +14316,6 @@ mod tests {
         assert_eq!(parsed["message_id"], json!("om_thread_image_1"));
         join.join().unwrap();
     }
-
 
     #[test]
     fn sends_feishu_thread_file_via_reply_endpoint() {
@@ -14373,7 +14386,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn falls_back_to_matrix_text_when_media_file_is_missing() {
         let _guard = acquire_test_lock();
@@ -14415,7 +14427,6 @@ mod tests {
         assert_eq!(parsed["warnings"], json!([expected_warning]));
         join.join().unwrap();
     }
-
 
     #[test]
     fn keeps_matrix_text_success_when_media_upload_fails() {
@@ -14459,7 +14470,6 @@ mod tests {
         assert_eq!(parsed["warnings"], json!([expected_warning]));
         join.join().unwrap();
     }
-
 
     #[test]
     fn sends_matrix_audio_without_voice_flag_by_default() {
@@ -14509,7 +14519,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn formats_matrix_markdown_to_html() {
         assert_eq!(matrix_markdown_to_html("matrix hello"), "matrix hello");
@@ -14527,7 +14536,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn matrix_text_payload_adds_mentions_and_html_pills() {
         let payload = matrix_text_payload("Hello @alice:example.org, please check this.");
@@ -14543,7 +14551,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn matrix_text_payload_dedupes_mentions_and_ignores_code_spans() {
         let payload = matrix_text_payload(
@@ -14557,7 +14564,6 @@ mod tests {
         assert!(!formatted.contains("@code:example.org</a>"));
         assert!(formatted.contains("@alice:example.org</a>"));
     }
-
 
     #[test]
     fn sends_signal_pacing_notice_before_attachment_batch() {
@@ -14618,7 +14624,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn keeps_slack_text_success_when_media_upload_fails() {
         let _guard = acquire_test_lock();
@@ -14672,7 +14677,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn falls_back_to_slack_text_when_media_only_upload_fails() {
         let _guard = acquire_test_lock();
@@ -14723,7 +14727,6 @@ mod tests {
         join.join().unwrap();
     }
 
-
     #[test]
     fn skips_missing_slack_media_with_warning_after_text_delivery() {
         let _guard = acquire_test_lock();
@@ -14761,6 +14764,4 @@ mod tests {
         );
         join.join().unwrap();
     }
-
-
 }

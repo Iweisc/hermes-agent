@@ -18,15 +18,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermes_core::{
-    AgentProgressCallback, AgentProgressEvent, DelegateExecutor, HermesContext, LoadedConfig,
-    ModelOverrides, SessionCreate, ToolRuntime, get_tool_definitions,
+    AgentInterruptController, AgentTurnOptions, DelegateExecutor, HermesContext, LoadedConfig,
+    ModelOverrides, SessionCreate, ToolProgressUpdate, ToolRuntime, get_tool_definitions,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml::{Mapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::gateway_cmd::GatewayRunArgs;
@@ -92,6 +92,31 @@ struct PendingResponseToolCall {
     call_id: String,
     name: String,
     arguments: String,
+}
+
+type AgentProgressCallback = Arc<dyn Fn(AgentProgressEvent) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+enum AgentProgressEvent {
+    MessageDelta {
+        delta: String,
+    },
+    ToolStarted {
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+    },
+    ToolCompleted {
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+        result: String,
+        duration_secs: f64,
+        is_error: bool,
+    },
+    ReasoningAvailable {
+        text: String,
+    },
 }
 
 enum LiveResponseEvent {
@@ -1036,7 +1061,7 @@ async fn run_chat_session_messages_async(
             &messages,
             &session_id,
             interrupt_requested.as_ref(),
-            progress_callback.as_ref(),
+            progress_callback,
         )
         .map_err(|error| error.to_string())
     })
@@ -1059,6 +1084,86 @@ async fn handle_options(
         HeaderValue::from_static("authorization,content-type"),
     );
     response
+}
+
+fn with_progress_callback(
+    runtime: ToolRuntime,
+    progress_callback: Option<AgentProgressCallback>,
+) -> ToolRuntime {
+    if let Some(callback) = progress_callback {
+        runtime.with_tool_progress_callback(move |update| {
+            emit_agent_progress_from_tool_update(&callback, update)
+        })
+    } else {
+        runtime
+    }
+}
+
+fn emit_agent_progress_from_tool_update(
+    callback: &AgentProgressCallback,
+    update: &ToolProgressUpdate,
+) {
+    let tool_name = update.function_name.clone().unwrap_or_default();
+    if tool_name.trim().is_empty() {
+        return;
+    }
+    let tool_call_id = tool_name.clone();
+    let arguments = update
+        .function_args
+        .as_ref()
+        .map(Value::to_string)
+        .or_else(|| update.preview.clone())
+        .unwrap_or_default();
+    match update.event_type.as_str() {
+        "tool.started" => callback(AgentProgressEvent::ToolStarted {
+            tool_call_id,
+            tool_name,
+            arguments,
+        }),
+        "tool.completed" => callback(AgentProgressEvent::ToolCompleted {
+            tool_call_id,
+            tool_name,
+            arguments,
+            result: String::new(),
+            duration_secs: update.duration_ms.unwrap_or_default() as f64 / 1000.0,
+            is_error: update.is_error.unwrap_or(false),
+        }),
+        _ => {}
+    }
+}
+
+fn run_with_interrupt_controller<T>(
+    interrupt_requested: Option<&Arc<AtomicBool>>,
+    run: impl FnOnce(Option<&AgentInterruptController>) -> T,
+) -> T {
+    let Some(interrupt_requested) = interrupt_requested else {
+        return run(None);
+    };
+    let controller = Arc::new(AgentInterruptController::default());
+    if interrupt_requested.load(Ordering::SeqCst) {
+        controller.request(Some("Run interrupted."));
+        return run(Some(controller.as_ref()));
+    }
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let controller = Arc::clone(&controller);
+        let interrupt_requested = Arc::clone(interrupt_requested);
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            while !finished.load(Ordering::SeqCst) {
+                if interrupt_requested.load(Ordering::SeqCst) {
+                    controller.request(Some("Run interrupted."));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let result = run(Some(controller.as_ref()));
+    finished.store(true, Ordering::SeqCst);
+    let _ = monitor.join();
+    result
 }
 
 fn run_agent_for_messages(
@@ -1084,23 +1189,26 @@ fn run_agent_for_messages(
     .into_iter()
     .map(|tool| tool.name)
     .collect::<Vec<_>>();
-    let mut runtime = ToolRuntime::default()
+    let runtime = ToolRuntime::default()
         .with_hermes_home(state.context.hermes_home())
+        .with_platform("api_server")
         .with_available_tool_names(tool_names)
-        .with_delegate_callback(move |request| delegate.execute(request));
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
+    let mut runtime = with_progress_callback(runtime, progress_callback);
     let _ = runtime.load_memory_store(&state.loaded.config.memory);
     let overrides = ModelOverrides {
         model,
         ..ModelOverrides::default()
     };
-    Ok(state.context.run_chat_turn_with_messages_interruptible(
+    let _ = interrupt_requested;
+    Ok(state.context.run_chat_turn_with_messages(
         &state.loaded,
         messages,
         &runtime,
         Some(&enabled_toolsets),
         &overrides,
-        interrupt_requested.as_ref(),
-        progress_callback.as_ref(),
     )?)
 }
 
@@ -1110,7 +1218,7 @@ fn run_chat_session_messages(
     messages: &[Value],
     session_id: &str,
     interrupt_requested: Option<&Arc<AtomicBool>>,
-    progress_callback: Option<&AgentProgressCallback>,
+    progress_callback: Option<AgentProgressCallback>,
 ) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
     let user_content =
         extract_last_user_content(messages).map_err(|error| io::Error::other(error))?;
@@ -1131,10 +1239,14 @@ fn run_chat_session_messages(
     .into_iter()
     .map(|tool| tool.name)
     .collect::<Vec<_>>();
-    let mut runtime = ToolRuntime::default()
+    let runtime = ToolRuntime::default()
         .with_hermes_home(state.context.hermes_home())
+        .with_platform("api_server")
         .with_available_tool_names(tool_names)
-        .with_delegate_callback(move |request| delegate.execute(request));
+        .with_delegate_callback(move |request, parent_runtime| {
+            delegate.execute(request, parent_runtime)
+        });
+    let mut runtime = with_progress_callback(runtime, progress_callback);
     let _ = runtime.load_memory_store(&state.loaded.config.memory);
     let overrides = ModelOverrides {
         model,
@@ -1160,19 +1272,25 @@ fn run_chat_session_messages(
     if session_store.get_messages(session_id)?.is_empty() {
         seed_chat_completion_session_history(&session_store, session_id, messages)?;
     }
-    Ok(state
-        .context
-        .run_chat_turn_with_user_content_interruptible(
-            &state.loaded,
-            user_content,
-            &runtime,
-            Some(&enabled_toolsets),
-            &overrides,
-            Some(session_id),
-            Some(&session_store),
-            interrupt_requested,
-            progress_callback,
-        )?)
+    Ok(run_with_interrupt_controller(
+        interrupt_requested,
+        |interrupt| {
+            state.context.run_chat_turn_with_user_content_and_options(
+                &state.loaded,
+                user_content,
+                &runtime,
+                Some(&enabled_toolsets),
+                &overrides,
+                Some(session_id),
+                Some(&session_store),
+                AgentTurnOptions {
+                    event_callback: None,
+                    interrupt,
+                    allow_grace_turn: true,
+                },
+            )
+        },
+    )?)
 }
 
 fn normalize_responses_input(input: &Value) -> Result<Vec<Value>, String> {

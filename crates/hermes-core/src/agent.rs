@@ -401,6 +401,10 @@ impl HermesContext {
             }
         }
 
+        let mut session_hook_guard =
+            SessionHookGuard::new(tool_runtime.clone(), runtime_model.model.clone());
+        session_hook_guard.set_session_id(session_id.as_deref());
+
         let disabled_toolsets =
             (!loaded.config.memory.any_enabled()).then(|| vec![String::from("memory")]);
         let tools = get_tool_definitions_for_runtime(
@@ -426,9 +430,7 @@ impl HermesContext {
         for prior in prior_messages {
             messages.push(message_record_to_chat_message(prior)?);
         }
-        if resumed_session
-            && let Some(active_session_id) = session_id.as_ref()
-        {
+        if resumed_session && let Some(active_session_id) = session_id.as_ref() {
             emit_turn_event(
                 options.event_callback,
                 AgentTurnEvent::SessionResumed {
@@ -437,6 +439,43 @@ impl HermesContext {
                 },
             );
         }
+        let mut plugin_user_context = String::new();
+        let pre_llm_payload = json!({
+            "session_id": session_id.as_deref().unwrap_or_default(),
+            "user_message": extract_user_content_text(&user_content),
+            "conversation_history": messages.clone(),
+            "is_first_turn": !resumed_session,
+            "model": runtime_model.model.clone(),
+            "platform": tool_runtime.platform(),
+            "sender_id": "",
+        });
+        for hook_result in tool_runtime.invoke_hook("pre_llm_call", &pre_llm_payload) {
+            if let Some(context) = hook_result
+                .as_object()
+                .and_then(|object| object.get("context"))
+                .and_then(Value::as_str)
+            {
+                if !context.trim().is_empty() {
+                    if !plugin_user_context.is_empty() {
+                        plugin_user_context.push_str("\n\n");
+                    }
+                    plugin_user_context.push_str(context.trim());
+                }
+                continue;
+            }
+            if let Some(text) = hook_result
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                if !plugin_user_context.is_empty() {
+                    plugin_user_context.push_str("\n\n");
+                }
+                plugin_user_context.push_str(text);
+            }
+        }
+
+        let user_content = append_plugin_user_context(user_content, &plugin_user_context);
         let current_turn_user_idx = messages.len();
         messages.push(json!({
             "role": "user",
@@ -469,6 +508,7 @@ impl HermesContext {
                         session_id: session_id.to_string(),
                     },
                 );
+                session_hook_guard.invoke_start(session_id);
             }
             if let Some(session_id) = session_id.as_deref() {
                 let _ = store.append_message(
@@ -507,10 +547,7 @@ impl HermesContext {
         }
 
         let turn_number = prior_user_turns.saturating_add(1);
-        let user_text = match &user_content {
-            Value::String(text) => text.trim().to_string(),
-            _ => String::new(),
-        };
+        let user_text = extract_user_content_text(&user_content).trim().to_string();
         if let Err(error) = tool_runtime.external_memory_on_turn_start(turn_number, &user_text) {
             log::debug!(target: "run_agent", "memory on_turn_start failed: {error}");
         }
@@ -560,6 +597,27 @@ impl HermesContext {
                 );
                 let request_messages =
                     build_request_messages(&messages, current_turn_user_idx, &external_prefetch);
+                let approx_input_chars = serde_json::to_string(&request_messages)
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0);
+                let _ = tool_runtime.invoke_hook(
+                    "pre_api_request",
+                    &json!({
+                        "task_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "session_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "platform": tool_runtime.platform(),
+                        "model": runtime_model.model.clone(),
+                        "provider": runtime_model.provider.clone(),
+                        "base_url": runtime_model.base_url.clone(),
+                        "api_mode": runtime_model.api_mode.clone(),
+                        "api_call_count": api_calls,
+                        "message_count": request_messages.len(),
+                        "tool_count": tools.len(),
+                        "approx_input_tokens": approx_input_chars,
+                        "request_char_count": approx_input_chars,
+                        "max_tokens": Value::Null,
+                    }),
+                );
                 let response = send_model_request(
                     &client,
                     &runtime_model,
@@ -577,6 +635,25 @@ impl HermesContext {
                     codex_message_items,
                     usage,
                 } = response;
+                let assistant_text = assistant_content.clone().unwrap_or_default();
+                let _ = tool_runtime.invoke_hook(
+                    "post_api_request",
+                    &json!({
+                        "task_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "session_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "platform": tool_runtime.platform(),
+                        "model": runtime_model.model.clone(),
+                        "provider": runtime_model.provider.clone(),
+                        "base_url": runtime_model.base_url.clone(),
+                        "api_mode": runtime_model.api_mode.clone(),
+                        "api_call_count": api_calls,
+                        "finish_reason": finish_reason.clone(),
+                        "message_count": request_messages.len(),
+                        "response_model": runtime_model.model.clone(),
+                        "assistant_content_chars": assistant_text.len(),
+                        "assistant_tool_call_count": pending_tool_calls.len(),
+                    }),
+                );
                 if let Some(store) = session_store
                     && let Some(session_id) = session_id.as_deref()
                 {
@@ -633,6 +710,18 @@ impl HermesContext {
                             },
                         );
                     }
+                    let _ = tool_runtime.invoke_hook(
+                        "post_llm_call",
+                        &json!({
+                            "session_id": session_id.as_deref().unwrap_or_default(),
+                            "user_message": extract_user_content_text(&user_content),
+                            "assistant_response": final_response.clone(),
+                            "conversation_history": messages.clone(),
+                            "model": runtime_model.model.clone(),
+                            "platform": tool_runtime.platform(),
+                        }),
+                    );
+                    session_hook_guard.mark_completed();
                     if !user_text.is_empty() {
                         if let Err(error) =
                             tool_runtime.external_memory_sync_turn(&user_text, &final_response)
@@ -710,75 +799,75 @@ impl HermesContext {
                     );
                 }
                 for index in 0..pending_tool_calls.len() {
-                if let Some(result) = interrupt_before_tool_call(
-                    &runtime_model,
-                    &mut messages,
-                    session_store,
-                    session_id.as_deref(),
-                    &pending_tool_calls[index..],
-                    api_calls,
-                    tool_calls,
-                    options.interrupt,
-                    options.event_callback,
-                ) {
-                    return Ok(result);
-                }
+                    if let Some(result) = interrupt_before_tool_call(
+                        &runtime_model,
+                        &mut messages,
+                        session_store,
+                        session_id.as_deref(),
+                        &pending_tool_calls[index..],
+                        api_calls,
+                        tool_calls,
+                        options.interrupt,
+                        options.event_callback,
+                    ) {
+                        return Ok(result);
+                    }
 
-                let tool_call = pending_tool_calls[index].clone();
-                emit_turn_event(
-                    options.event_callback,
-                    AgentTurnEvent::ToolCallStarted {
-                        id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        arguments: tool_call.json.clone(),
-                    },
-                );
-                tool_runtime.maybe_checkpoint_before_tool(&tool_call.name, &tool_call.json);
-                let mut result = crate::tools::dispatch_tool_with_messages(
-                    &tool_call.name,
-                    tool_call.json.clone(),
-                    &tool_runtime,
-                    &messages,
-                );
-                if let Some(steer_text) = tool_runtime.drain_pending_steer() {
-                    result.push_str(&steer_marker(&steer_text));
-                }
-                tool_calls += 1;
-                emit_turn_event(
-                    options.event_callback,
-                    AgentTurnEvent::ToolCallCompleted {
-                        id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        result: result.clone(),
-                    },
-                );
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                }));
-                if let Some(store) = session_store
-                    && let Some(session_id) = session_id.as_deref()
-                {
-                    let _ = store.append_message(
-                        session_id,
-                        &MessageAppend {
-                            role: "tool".to_string(),
-                            content: Some(Value::String(result)),
-                            tool_call_id: Some(tool_call.id),
-                            tool_calls: None,
-                            tool_name: Some(tool_call.name),
-                            token_count: None,
-                            finish_reason: None,
-                            reasoning: None,
-                            reasoning_content: None,
-                            reasoning_details: None,
-                            codex_reasoning_items: None,
-                            codex_message_items: None,
+                    let tool_call = pending_tool_calls[index].clone();
+                    emit_turn_event(
+                        options.event_callback,
+                        AgentTurnEvent::ToolCallStarted {
+                            id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                            arguments: tool_call.json.clone(),
                         },
                     );
+                    tool_runtime.maybe_checkpoint_before_tool(&tool_call.name, &tool_call.json);
+                    let mut result = crate::tools::dispatch_tool_with_messages(
+                        &tool_call.name,
+                        tool_call.json.clone(),
+                        &tool_runtime,
+                        &messages,
+                    );
+                    if let Some(steer_text) = tool_runtime.drain_pending_steer() {
+                        result.push_str(&steer_marker(&steer_text));
+                    }
+                    tool_calls += 1;
+                    emit_turn_event(
+                        options.event_callback,
+                        AgentTurnEvent::ToolCallCompleted {
+                            id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                            result: result.clone(),
+                        },
+                    );
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    }));
+                    if let Some(store) = session_store
+                        && let Some(session_id) = session_id.as_deref()
+                    {
+                        let _ = store.append_message(
+                            session_id,
+                            &MessageAppend {
+                                role: "tool".to_string(),
+                                content: Some(Value::String(result)),
+                                tool_call_id: Some(tool_call.id),
+                                tool_calls: None,
+                                tool_name: Some(tool_call.name),
+                                token_count: None,
+                                finish_reason: None,
+                                reasoning: None,
+                                reasoning_content: None,
+                                reasoning_details: None,
+                                codex_reasoning_items: None,
+                                codex_message_items: None,
+                            },
+                        );
+                    }
                 }
-            }
             }
 
             if options.allow_grace_turn {
@@ -836,6 +925,27 @@ impl HermesContext {
                         grace: true,
                     },
                 );
+                let approx_input_chars = serde_json::to_string(&messages)
+                    .map(|body| body.len() as u64)
+                    .unwrap_or(0);
+                let _ = tool_runtime.invoke_hook(
+                    "pre_api_request",
+                    &json!({
+                        "task_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "session_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "platform": tool_runtime.platform(),
+                        "model": runtime_model.model.clone(),
+                        "provider": runtime_model.provider.clone(),
+                        "base_url": runtime_model.base_url.clone(),
+                        "api_mode": runtime_model.api_mode.clone(),
+                        "api_call_count": api_calls,
+                        "message_count": messages.len(),
+                        "tool_count": 0,
+                        "approx_input_tokens": approx_input_chars,
+                        "request_char_count": approx_input_chars,
+                        "max_tokens": Value::Null,
+                    }),
+                );
                 let response = send_model_request(
                     &client,
                     &runtime_model,
@@ -843,6 +953,25 @@ impl HermesContext {
                     &[],
                     session_id.as_deref(),
                 )?;
+                let assistant_text = response.content.clone().unwrap_or_default();
+                let _ = tool_runtime.invoke_hook(
+                    "post_api_request",
+                    &json!({
+                        "task_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "session_id": tool_runtime.current_session_id().unwrap_or_default(),
+                        "platform": tool_runtime.platform(),
+                        "model": runtime_model.model.clone(),
+                        "provider": runtime_model.provider.clone(),
+                        "base_url": runtime_model.base_url.clone(),
+                        "api_mode": runtime_model.api_mode.clone(),
+                        "api_call_count": api_calls,
+                        "finish_reason": response.finish_reason.clone(),
+                        "message_count": messages.len(),
+                        "response_model": runtime_model.model.clone(),
+                        "assistant_content_chars": assistant_text.len(),
+                        "assistant_tool_call_count": response.tool_calls.len(),
+                    }),
+                );
                 if let Some(store) = session_store
                     && let Some(session_id) = session_id.as_deref()
                 {
@@ -899,6 +1028,18 @@ impl HermesContext {
                         },
                     );
                 }
+                let _ = tool_runtime.invoke_hook(
+                    "post_llm_call",
+                    &json!({
+                        "session_id": session_id.as_deref().unwrap_or_default(),
+                        "user_message": extract_user_content_text(&user_content),
+                        "assistant_response": final_response.clone(),
+                        "conversation_history": messages.clone(),
+                        "model": runtime_model.model.clone(),
+                        "platform": tool_runtime.platform(),
+                    }),
+                );
+                session_hook_guard.mark_completed();
                 if !user_text.is_empty() {
                     if let Err(error) =
                         tool_runtime.external_memory_sync_turn(&user_text, &final_response)
@@ -942,6 +1083,15 @@ impl HermesContext {
 
         if let Err(error) = tool_runtime.external_memory_shutdown() {
             log::debug!(target: "run_agent", "memory shutdown failed: {error}");
+        }
+
+        if let Ok(result) = &turn_result {
+            if result.completed {
+                session_hook_guard.mark_completed();
+            }
+            if result.interrupted {
+                session_hook_guard.mark_interrupted();
+            }
         }
 
         turn_result
@@ -1054,7 +1204,8 @@ impl HermesContext {
 
             for tool_call in pending_tool_calls {
                 tool_calls += 1;
-                let result = crate::tools::dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
+                let result =
+                    crate::tools::dispatch_tool(&tool_call.name, tool_call.json, &tool_runtime);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -1203,6 +1354,46 @@ fn content_has_meaningful_user_input(content: &Value) -> bool {
         Value::Array(parts) => parts.iter().any(content_part_is_meaningful),
         Value::Object(object) => content_part_is_meaningful(&Value::Object(object.clone())),
         _ => false,
+    }
+}
+
+fn extract_user_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                let object = part.as_object()?;
+                match object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "text" | "input_text" | "output_text" => object
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn append_plugin_user_context(content: Value, plugin_context: &str) -> Value {
+    let trimmed = plugin_context.trim();
+    if trimmed.is_empty() {
+        return content;
+    }
+    match content {
+        Value::String(text) => Value::String(format!("{text}\n\n{trimmed}")),
+        Value::Array(mut parts) => {
+            parts.push(json!({"type": "text", "text": trimmed}));
+            Value::Array(parts)
+        }
+        other => other,
     }
 }
 
@@ -4969,6 +5160,75 @@ fn derive_responses_function_call_id(call_id: &str, response_item_id: Option<&st
     format!("fc_{:x}", unix_ts_nanos())
 }
 
+#[derive(Debug, Clone)]
+struct SessionHookGuard {
+    runtime: ToolRuntime,
+    session_id: Option<String>,
+    model: String,
+    platform: String,
+    completed: bool,
+    interrupted: bool,
+}
+
+impl SessionHookGuard {
+    fn new(runtime: ToolRuntime, model: String) -> Self {
+        Self {
+            session_id: runtime.current_session_id().map(ToOwned::to_owned),
+            platform: runtime.platform().to_string(),
+            runtime,
+            model,
+            completed: false,
+            interrupted: false,
+        }
+    }
+
+    fn set_session_id(&mut self, session_id: Option<&str>) {
+        self.session_id = session_id.map(ToOwned::to_owned);
+    }
+
+    fn invoke_start(&mut self, session_id: &str) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        self.session_id = Some(session_id.to_string());
+        let _ = self.runtime.invoke_hook(
+            "on_session_start",
+            &json!({
+                "session_id": session_id,
+                "model": self.model,
+                "platform": self.platform,
+            }),
+        );
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+
+    fn mark_interrupted(&mut self) {
+        self.interrupted = true;
+    }
+}
+
+impl Drop for SessionHookGuard {
+    fn drop(&mut self) {
+        let Some(session_id) = self.session_id.as_deref() else {
+            return;
+        };
+        let _ = self.runtime.invoke_hook(
+            "on_session_end",
+            &json!({
+                "session_id": session_id,
+                "completed": self.completed,
+                "interrupted": self.interrupted,
+                "model": self.model,
+                "platform": self.platform,
+            }),
+        );
+    }
+}
+
 fn message_record_to_chat_message(message: crate::MessageRecord) -> Result<Value, HermesError> {
     let mut map = Map::new();
     map.insert("role".to_string(), Value::String(message.role.clone()));
@@ -7372,6 +7632,301 @@ for raw in sys.stdin:
         assert_eq!(second.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(second.final_response, "Second codex turn.");
         assert_eq!(session_store.get_messages(&session_id).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn delegate_task_emits_subagent_stop_hook_with_parent_session() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_delegate_1",
+                            "type": "function",
+                            "function": {
+                                "name": "delegate_task",
+                                "arguments": "{\"goal\":\"Inspect src and summarize findings\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Child summary."
+                    }
+                }]
+            })
+            .to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Delegated."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let overrides = ModelOverrides {
+            model: Some("test-model".to_string()),
+            provider: Some("custom".to_string()),
+            base_url: Some(base_url),
+            api_key: Some("test-key".to_string()),
+            api_mode: Some("chat_completions".to_string()),
+        };
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let delegate = crate::DelegateExecutor::new(
+            context.clone(),
+            loaded.clone(),
+            "rust-delegate",
+            vec!["hermes-cli".to_string()],
+            overrides.clone(),
+            temp.path(),
+        );
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_hook_invoke_callback({
+                let events = Arc::clone(&events);
+                move |hook_name, payload, _runtime| {
+                    if hook_name == "subagent_stop" {
+                        events.lock().unwrap().push(payload.clone());
+                    }
+                    Vec::new()
+                }
+            })
+            .with_delegate_callback(move |request, parent_runtime| {
+                delegate.execute(request, parent_runtime)
+            });
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "Need a child summary",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &overrides,
+                None,
+                Some(&session_store),
+            )
+            .unwrap();
+
+        let session_id = result.session_id.unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("parent_session_id").and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            events[0].get("child_status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            events[0].get("child_summary").and_then(Value::as_str),
+            Some("Child summary.")
+        );
+        assert_eq!(
+            events[0].get("child_role").and_then(Value::as_str),
+            Some("leaf")
+        );
+    }
+
+    #[test]
+    fn lifecycle_hooks_fire_for_new_rust_sessions() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let events = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_platform("cli")
+            .with_hook_invoke_callback({
+                let events = Arc::clone(&events);
+                move |hook_name, payload, _runtime| {
+                    if matches!(hook_name, "on_session_start" | "on_session_end") {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push((hook_name.to_string(), payload.clone()));
+                    }
+                    Vec::new()
+                }
+            });
+        let base_url = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Lifecycle complete."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let result = context
+            .run_chat_completions_turn(
+                &loaded,
+                "hello lifecycle",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&session_store),
+            )
+            .unwrap();
+
+        let session_id = result.session_id.unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "on_session_start");
+        assert_eq!(
+            events[0].1.get("session_id").and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            events[0].1.get("model").and_then(Value::as_str),
+            Some("test-model")
+        );
+        assert_eq!(
+            events[0].1.get("platform").and_then(Value::as_str),
+            Some("cli")
+        );
+        assert_eq!(events[1].0, "on_session_end");
+        assert_eq!(
+            events[1].1.get("session_id").and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            events[1].1.get("completed").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            events[1].1.get("interrupted").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            events[1].1.get("platform").and_then(Value::as_str),
+            Some("cli")
+        );
+    }
+
+    #[test]
+    fn lifecycle_hooks_skip_session_start_when_resuming_existing_session() {
+        let temp = TempDir::new().unwrap();
+        let context =
+            HermesContext::new(temp.path()).with_hermes_home_env(Some(temp.path().into()));
+        context.ensure_hermes_home().unwrap();
+        let loaded = context.load_config_document().unwrap();
+        let session_store = context.open_session_store().unwrap();
+        let base_url_1 = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "First turn."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+        let seed_runtime = ToolRuntime::new(temp.path()).with_hermes_home(temp.path());
+        let first = context
+            .run_chat_completions_turn(
+                &loaded,
+                "hello lifecycle",
+                &seed_runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url_1),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                None,
+                Some(&session_store),
+            )
+            .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let runtime = ToolRuntime::new(temp.path())
+            .with_hermes_home(temp.path())
+            .with_platform("cli")
+            .with_hook_invoke_callback({
+                let events = Arc::clone(&events);
+                move |hook_name, payload, _runtime| {
+                    if matches!(hook_name, "on_session_start" | "on_session_end") {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push((hook_name.to_string(), payload.clone()));
+                    }
+                    Vec::new()
+                }
+            });
+        let base_url_2 = serve_chat_sequence(vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Second turn."
+                    }
+                }]
+            })
+            .to_string(),
+        ]);
+
+        let second = context
+            .run_chat_completions_turn(
+                &loaded,
+                "resume lifecycle",
+                &runtime,
+                Some(&["hermes-cli".to_string()]),
+                &ModelOverrides {
+                    model: Some("test-model".to_string()),
+                    provider: Some("custom".to_string()),
+                    base_url: Some(base_url_2),
+                    api_key: Some("test-key".to_string()),
+                    api_mode: Some("chat_completions".to_string()),
+                },
+                first.session_id.as_deref(),
+                Some(&session_store),
+            )
+            .unwrap();
+
+        let session_id = second.session_id.unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "on_session_end");
+        assert_eq!(
+            events[0].1.get("session_id").and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            events[0].1.get("platform").and_then(Value::as_str),
+            Some("cli")
+        );
     }
 
     #[test]

@@ -67,14 +67,14 @@ use hermes_core::{
     assign_task, block_task, board_stats, build_worker_context, claim_task, complete_task,
     create_kanban_board, create_task, current_kanban_board, dispatch_kanban_once,
     edit_completed_task_result, gc_events, gc_worker_logs, get_active_auth_provider,
-    get_auth_status_summary, get_task, get_tool_definitions, handle_cronjob, heartbeat_worker,
-    is_container, is_wsl, kanban_db_path_for_home, kanban_has_spawnable_ready,
+    get_all_toolsets, get_auth_status_summary, get_task, get_tool_definitions, handle_cronjob,
+    heartbeat_worker, is_container, is_wsl, kanban_db_path_for_home, kanban_has_spawnable_ready,
     kanban_task_detail, known_assignees, link_tasks, list_events, list_kanban_boards,
     list_notify_subs, list_provider_profiles, list_runs, list_tasks, load_skill_prompt_content,
-    open_kanban_db, read_worker_log, reassign_task, reclaim_task, release_stale_claims,
-    remove_kanban_board, remove_notify_sub, rename_kanban_board, run_cron_job_now,
-    run_due_cron_jobs, run_kanban_task, set_current_kanban_board, unblock_task, unlink_tasks,
-    get_all_toolsets, parse_reasoning_effort,
+    open_kanban_db, parse_reasoning_effort, read_worker_log, reassign_task, reclaim_task,
+    release_stale_claims, remove_kanban_board, remove_notify_sub, rename_kanban_board,
+    run_cron_job_now, run_due_cron_jobs, run_kanban_task, set_current_kanban_board, unblock_task,
+    unlink_tasks,
 };
 use regex::Regex;
 use rusqlite::Connection;
@@ -1500,7 +1500,7 @@ fn execute_chat_turn(
     prompt: &str,
     session_hint: Option<&str>,
 ) -> Result<hermes_core::AgentTurnResult, Box<dyn Error>> {
-    context
+    let result = context
         .run_chat_completions_turn(
             config,
             prompt,
@@ -1510,7 +1510,11 @@ fn execute_chat_turn(
             session_hint,
             Some(session_store),
         )
-        .map_err(Into::into)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    if let Some(session_id) = result.session_id.as_deref() {
+        let _ = runtime.invoke_session_boundary_hook("on_session_finalize", session_id);
+    }
+    Ok(result)
 }
 
 fn build_chat_runtime(
@@ -1535,13 +1539,16 @@ fn build_chat_runtime(
         overrides.clone(),
         cwd.to_path_buf(),
     );
-    let mut runtime = ToolRuntime::new(cwd)
+    let runtime = ToolRuntime::new(cwd)
         .with_hermes_home(context.hermes_home())
+        .with_platform("cli")
         .with_available_tool_names(tool_names)
-        .with_clarify_callback(run_clarify_prompt)
-        .with_delegate_callback(move |request, parent_runtime| {
-            delegate.execute(request, parent_runtime)
-        });
+        .with_clarify_callback(run_clarify_prompt);
+    let mut runtime = plugin_runtime::attach_python_plugin_runtime(context, runtime)?;
+    let delegate = delegate.with_runtime_template(runtime.clone());
+    runtime = runtime.with_delegate_callback(move |request, parent_runtime| {
+        delegate.execute(request, parent_runtime)
+    });
 
     let mut missing_skills = Vec::new();
     for skill in unique_cli_strings(skills) {

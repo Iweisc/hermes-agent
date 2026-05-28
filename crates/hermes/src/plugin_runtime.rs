@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fs;
 use std::path::PathBuf;
 
 pub(crate) use hermes_core::{
@@ -37,11 +38,27 @@ pub(crate) fn attach_python_plugin_runtime(
     runtime: ToolRuntime,
 ) -> Result<ToolRuntime, Box<dyn Error>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if core_discover_enabled_general_plugins(&context.hermes_home(), &cwd).is_empty() {
+    let has_general_plugins =
+        !core_discover_enabled_general_plugins(&context.hermes_home(), &cwd).is_empty();
+    if !has_general_plugins && selected_context_engine(context).is_none() {
         return Ok(runtime);
     }
     hermes_core::attach_python_plugin_runtime(&context.hermes_home(), runtime)
         .map_err(|error| -> Box<dyn Error> { error.into() })
+}
+
+fn selected_context_engine(context: &HermesContext) -> Option<String> {
+    let text = fs::read_to_string(context.config_path()).ok()?;
+    let yaml = serde_yaml::from_str::<serde_yaml::Value>(&text).ok()?;
+    let root = yaml.as_mapping()?;
+    let context_section = root
+        .get(&serde_yaml::Value::String("context".to_string()))?
+        .as_mapping()?;
+    let engine = context_section
+        .get(&serde_yaml::Value::String("engine".to_string()))?
+        .as_str()?
+        .trim();
+    (!engine.is_empty() && engine != "compressor").then(|| engine.to_string())
 }
 
 pub(crate) fn discover_plugin_catalog(
