@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -18,6 +19,7 @@ use lettre::message::{
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::Tls;
 use lettre::{Address, SmtpTransport, Transport};
+use regex::Regex;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::blocking::multipart::{Form, Part};
@@ -49,7 +51,19 @@ const TWILIO_DEFAULT_BASE_URL: &str = "https://api.twilio.com/2010-04-01/Account
 const HOMEASSISTANT_DEFAULT_BASE_URL: &str = "http://homeassistant.local:8123";
 const BLUEBUBBLES_DEFAULT_BASE_URL: &str = "";
 const YUANBAO_DEFAULT_BASE_URL: &str = "https://bot.yuanbao.tencent.com";
+const TELEGRAM_GENERAL_TOPIC_THREAD_ID: &str = "1";
+const TELEGRAM_SEND_MAX_ATTEMPTS: usize = 3;
+const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4_096;
+const DISCORD_MAX_MESSAGE_LENGTH: usize = 2_000;
+const SLACK_MAX_MESSAGE_LENGTH: usize = 39_000;
+const FEISHU_MAX_MESSAGE_LENGTH: usize = 8_000;
+const MATRIX_MAX_MESSAGE_LENGTH: usize = 4_000;
 const SIGNAL_MAX_ATTACHMENTS_PER_MSG: usize = 32;
+const SIGNAL_MAX_ATTACHMENT_SIZE: u64 = 100 * 1024 * 1024;
+const SIGNAL_RATE_LIMIT_BUCKET_CAPACITY: f64 = 50.0;
+const SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER: f64 = 4.0;
+const SIGNAL_RATE_LIMIT_MAX_ATTEMPTS: usize = 2;
+const SIGNAL_BATCH_PACING_NOTICE_THRESHOLD_SECS: f64 = 10.0;
 const WECOM_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const WECOM_VIDEO_MAX_BYTES: usize = 10 * 1024 * 1024;
 const WECOM_VOICE_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -346,6 +360,18 @@ impl Display for SendError {
 }
 
 static FEISHU_TOKEN_CACHE: OnceLock<Mutex<Option<FeishuTokenEntry>>> = OnceLock::new();
+static DISCORD_FORUM_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static SIGNAL_SCHEDULER: OnceLock<Mutex<SignalAttachmentScheduler>> = OnceLock::new();
+#[cfg(test)]
+static SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE: OnceLock<Mutex<Option<f64>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct SignalAttachmentScheduler {
+    capacity: f64,
+    tokens: f64,
+    refill_rate: f64,
+    last_refill: std::time::Instant,
+}
 
 pub fn send_message_available() -> bool {
     load_configs().has_any()
@@ -390,7 +416,8 @@ pub fn handle_send_message(args: &Value, runtime: &ToolRuntime) -> String {
 }
 
 fn handle_list_targets(runtime: &ToolRuntime) -> String {
-    let configs = load_configs();
+    let mut configs = load_configs();
+    apply_config_yaml_overrides(&mut configs, runtime.hermes_home());
     if !configs.has_any() {
         return tool_error(
             "No supported messaging platform is configured. Set TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, FEISHU_APP_ID/FEISHU_APP_SECRET, MATRIX_ACCESS_TOKEN/MATRIX_HOMESERVER, WHATSAPP_ENABLED, DINGTALK_WEBHOOK_URL, QQ_APP_ID/QQ_CLIENT_SECRET, MATTERMOST_TOKEN/MATTERMOST_URL, WECOM_BOT_ID/WECOM_SECRET, WEIXIN_TOKEN/WEIXIN_ACCOUNT_ID, EMAIL_ADDRESS/EMAIL_PASSWORD/EMAIL_SMTP_HOST, TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_NUMBER, HASS_TOKEN, BLUEBUBBLES_SERVER_URL/BLUEBUBBLES_PASSWORD, SIGNAL_HTTP_URL/SIGNAL_ACCOUNT, or YUANBAO_APP_ID/YUANBAO_APP_SECRET first.",
@@ -458,7 +485,8 @@ fn handle_send(args: &Value, runtime: &ToolRuntime) -> String {
         Err(error) => return tool_error(error),
     };
 
-    let configs = load_configs();
+    let mut configs = load_configs();
+    apply_config_yaml_overrides(&mut configs, runtime.hermes_home());
     if !configs.has_any() {
         return tool_error(
             "No supported messaging platform is configured. Set TELEGRAM_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, FEISHU_APP_ID/FEISHU_APP_SECRET, MATRIX_ACCESS_TOKEN/MATRIX_HOMESERVER, WHATSAPP_ENABLED, DINGTALK_WEBHOOK_URL, QQ_APP_ID/QQ_CLIENT_SECRET, MATTERMOST_TOKEN/MATTERMOST_URL, WECOM_BOT_ID/WECOM_SECRET, WEIXIN_TOKEN/WEIXIN_ACCOUNT_ID, EMAIL_ADDRESS/EMAIL_PASSWORD/EMAIL_SMTP_HOST, TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_NUMBER, HASS_TOKEN, BLUEBUBBLES_SERVER_URL/BLUEBUBBLES_PASSWORD, SIGNAL_HTTP_URL/SIGNAL_ACCOUNT, or YUANBAO_APP_ID/YUANBAO_APP_SECRET first.",
@@ -491,7 +519,15 @@ fn handle_send(args: &Value, runtime: &ToolRuntime) -> String {
             .discord
             .as_ref()
             .ok_or_else(|| SendError("Discord is not configured".to_string()))
-            .and_then(|config| send_discord(config, &resolved, &cleaned_message, &media)),
+            .and_then(|config| {
+                send_discord(
+                    runtime.hermes_home(),
+                    config,
+                    &resolved,
+                    &cleaned_message,
+                    &media,
+                )
+            }),
         PlatformKind::Slack => configs
             .slack
             .as_ref()
@@ -707,6 +743,265 @@ fn load_configs() -> ConfigSet {
         signal: load_signal_config(),
         yuanbao: load_yuanbao_config(),
     }
+}
+
+fn apply_config_yaml_overrides(configs: &mut ConfigSet, hermes_home: &Path) {
+    match (
+        configs.telegram.as_mut(),
+        load_telegram_config_from_yaml(hermes_home),
+    ) {
+        (Some(config), _) => {
+            if config.home.is_none() {
+                config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
+            }
+        }
+        (None, Some(yaml)) => configs.telegram = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.telegram.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("TELEGRAM_API_BASE_URL")
+                .or_else(|| load_telegram_base_url(hermes_home))
+                .as_deref(),
+            TELEGRAM_DEFAULT_BASE_URL,
+        );
+        if let Some(home) = load_home_target(
+            "TELEGRAM_HOME_CHANNEL",
+            "TELEGRAM_HOME_CHANNEL_THREAD_ID",
+            "TELEGRAM_HOME_CHANNEL_NAME",
+        ) {
+            config.home = Some(home);
+        } else if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "telegram", "Home");
+        }
+        config.disable_link_previews =
+            load_telegram_disable_link_previews(hermes_home).unwrap_or(false);
+    }
+
+    match (
+        configs.discord.as_mut(),
+        load_discord_config_from_yaml(hermes_home),
+    ) {
+        (Some(_config), _) => {}
+        (None, Some(yaml)) => configs.discord = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.discord.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("DISCORD_API_BASE_URL").as_deref(),
+            &config.base_url,
+        );
+        if let Some(home) = load_home_target(
+            "DISCORD_HOME_CHANNEL",
+            "DISCORD_HOME_CHANNEL_THREAD_ID",
+            "DISCORD_HOME_CHANNEL_NAME",
+        ) {
+            config.home = Some(home);
+        } else if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "discord", "Home");
+        }
+    }
+
+    match (
+        configs.slack.as_mut(),
+        load_slack_config_from_yaml(hermes_home),
+    ) {
+        (Some(_config), _) => {}
+        (None, Some(yaml)) => configs.slack = Some(yaml),
+        _ => {}
+    }
+    if load_platform_enabled_from_yaml(hermes_home, "slack") == Some(false) {
+        configs.slack = None;
+    }
+    if let Some(config) = configs.slack.as_mut() {
+        config.base_url = normalize_base_url(
+            env_trimmed("SLACK_API_BASE_URL").as_deref(),
+            &config.base_url,
+        );
+        if let Some(home) = load_home_target_with_default(
+            "SLACK_HOME_CHANNEL",
+            "SLACK_HOME_CHANNEL_THREAD_ID",
+            "SLACK_HOME_CHANNEL_NAME",
+            "",
+        ) {
+            config.home = Some(home);
+        } else if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "slack", "");
+        }
+        config.reply_broadcast = load_slack_reply_broadcast(hermes_home).unwrap_or(false);
+    }
+
+    match (
+        configs.feishu.as_mut(),
+        load_feishu_config_from_yaml(hermes_home),
+    ) {
+        (Some(_config), _) => {}
+        (None, Some(yaml)) => configs.feishu = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.feishu.as_mut() {
+        if let Ok(domain) = env::var("FEISHU_DOMAIN")
+            && let Ok(base_url) = normalize_feishu_base_url(&domain)
+        {
+            config.base_url = base_url;
+        }
+        if let Some(home) = load_home_target(
+            "FEISHU_HOME_CHANNEL",
+            "FEISHU_HOME_CHANNEL_THREAD_ID",
+            "FEISHU_HOME_CHANNEL_NAME",
+        ) {
+            config.home = Some(home);
+        } else if config.home.is_none() {
+            config.home = load_platform_home_target_from_yaml(hermes_home, "feishu", "Home");
+        }
+    }
+
+    let matrix_yaml = load_matrix_config_from_yaml(hermes_home);
+    match (configs.matrix.as_mut(), matrix_yaml) {
+        (Some(config), Some(yaml)) => {
+            if config.token.is_none() {
+                config.token = yaml.token;
+            }
+            if config.homeserver.is_empty() {
+                config.homeserver = yaml.homeserver;
+            }
+            if config.user_id.is_none() {
+                config.user_id = yaml.user_id;
+            }
+            if config.password.is_none() {
+                config.password = yaml.password;
+            }
+            if config.device_id.is_none() {
+                config.device_id = yaml.device_id;
+            }
+            if config.home.is_none() {
+                config.home = yaml.home;
+            }
+        }
+        (None, Some(yaml)) => configs.matrix = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.matrix.as_mut()
+        && let Some(home) = load_home_target(
+            "MATRIX_HOME_ROOM",
+            "MATRIX_HOME_ROOM_THREAD_ID",
+            "MATRIX_HOME_ROOM_NAME",
+        )
+    {
+        config.home = Some(home);
+    }
+
+    let signal_yaml = load_signal_config_from_yaml(hermes_home);
+    match (configs.signal.as_mut(), signal_yaml) {
+        (Some(config), Some(yaml)) => {
+            if config.http_url.is_empty() {
+                config.http_url = yaml.http_url;
+            }
+            if config.account.is_empty() {
+                config.account = yaml.account;
+            }
+            if config.home.is_none() {
+                config.home = yaml.home;
+            }
+        }
+        (None, Some(yaml)) => configs.signal = Some(yaml),
+        _ => {}
+    }
+    if let Some(config) = configs.signal.as_mut()
+        && let Some(home) = load_home_target(
+            "SIGNAL_HOME_CHANNEL",
+            "SIGNAL_HOME_CHANNEL_THREAD_ID",
+            "SIGNAL_HOME_CHANNEL_NAME",
+        )
+    {
+        config.home = Some(home);
+    }
+}
+
+fn load_telegram_config_from_yaml(hermes_home: &Path) -> Option<TelegramConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "telegram") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "telegram", "token"])?;
+    Some(TelegramConfig {
+        token,
+        base_url: load_telegram_base_url(hermes_home)
+            .unwrap_or_else(|| TELEGRAM_DEFAULT_BASE_URL.to_string()),
+        disable_link_previews: false,
+        home: load_platform_home_target_from_yaml(hermes_home, "telegram", "Home"),
+    })
+}
+
+fn load_discord_config_from_yaml(hermes_home: &Path) -> Option<DiscordConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "discord") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "discord", "token"])?;
+    Some(DiscordConfig {
+        token,
+        base_url: DISCORD_DEFAULT_BASE_URL.to_string(),
+        home: load_platform_home_target_from_yaml(hermes_home, "discord", "Home"),
+    })
+}
+
+fn load_slack_config_from_yaml(hermes_home: &Path) -> Option<SlackConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "slack") != Some(true) {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "slack", "token"])?;
+    Some(SlackConfig {
+        token,
+        base_url: SLACK_DEFAULT_BASE_URL.to_string(),
+        reply_broadcast: false,
+        home: load_platform_home_target_from_yaml(hermes_home, "slack", ""),
+    })
+}
+
+fn load_feishu_config_from_yaml(hermes_home: &Path) -> Option<FeishuConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "feishu") != Some(true) {
+        return None;
+    }
+    let app_id = load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "app_id"])?;
+    let app_secret =
+        load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "app_secret"])?;
+    let domain = load_config_yaml_string(hermes_home, &["platforms", "feishu", "extra", "domain"])
+        .unwrap_or_else(|| "feishu".to_string());
+    let base_url = normalize_feishu_base_url(&domain).ok()?;
+    Some(FeishuConfig {
+        app_id,
+        app_secret,
+        base_url,
+        home: load_platform_home_target_from_yaml(hermes_home, "feishu", "Home"),
+    })
+}
+
+fn load_home_target_with_default(
+    chat_key: &str,
+    thread_key: &str,
+    name_key: &str,
+    default_name: &str,
+) -> Option<HomeTarget> {
+    let chat_id = env_trimmed(chat_key)?;
+    Some(HomeTarget {
+        chat_id,
+        thread_id: env_trimmed(thread_key),
+        name: env_trimmed(name_key).unwrap_or_else(|| default_name.to_string()),
+    })
+}
+
+fn lookup_channel_type(hermes_home: &Path, platform_name: &str, chat_id: &str) -> Option<String> {
+    let directory = load_channel_directory(hermes_home);
+    let channels = directory
+        .get("platforms")
+        .and_then(Value::as_object)?
+        .get(platform_name)?
+        .as_array()?;
+    channels
+        .iter()
+        .find(|channel| channel.get("id").and_then(Value::as_str) == Some(chat_id))
+        .and_then(|channel| channel.get("type").and_then(Value::as_str))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
 }
 
 fn load_telegram_config() -> Option<TelegramConfig> {
@@ -1223,7 +1518,11 @@ fn resolve_target(
             };
             Ok(ResolvedTarget {
                 chat_id: home.chat_id,
-                thread_id: home.thread_id,
+                thread_id: if kind == PlatformKind::Signal {
+                    None
+                } else {
+                    home.thread_id
+                },
                 used_home_channel: true,
             })
         }
@@ -1922,73 +2221,150 @@ fn send_telegram(
 ) -> Result<SentMessage, SendError> {
     let client = http_client()?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
 
     if !message.is_empty() {
-        let url = format!("{}/bot{}/sendMessage", config.base_url, config.token);
-        let mut payload = serde_json::Map::new();
-        payload.insert("chat_id".to_string(), Value::String(target.chat_id.clone()));
-        payload.insert("text".to_string(), Value::String(message.to_string()));
-        if let Some(thread_id) = target.thread_id.as_ref() {
-            payload.insert(
-                "message_thread_id".to_string(),
-                Value::String(thread_id.clone()),
-            );
-        }
-        let response = client
-            .post(url)
-            .json(&Value::Object(payload))
-            .send()
-            .map_err(|error| SendError(format!("Telegram send failed: {error}")))?;
-        let body = parse_json_response(response, "Telegram send failed")?;
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(SendError(format!(
-                "Telegram send failed: {}",
-                body.get("description")
+        for chunk in truncate_message_with_len(message, TELEGRAM_MAX_MESSAGE_LENGTH, true) {
+            let has_html = telegram_has_html(&chunk);
+            let formatted = if has_html {
+                chunk.clone()
+            } else {
+                telegram_format_message(&chunk)
+            };
+            let fallback_text = if has_html {
+                chunk.clone()
+            } else {
+                telegram_strip_mdv2(&formatted)
+            };
+            let mut active_text = formatted;
+            let mut active_parse_mode = Some(if has_html { "HTML" } else { "MarkdownV2" });
+            let mut active_thread_id = telegram_message_thread_id(target.thread_id.as_deref());
+            let mut parse_fallback_used = false;
+            let mut thread_fallback_used = false;
+
+            loop {
+                let body = telegram_send_text_request(
+                    &client,
+                    config,
+                    &target.chat_id,
+                    &active_text,
+                    active_parse_mode,
+                    active_thread_id.as_deref(),
+                )?;
+                if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    last_message_id = body.pointer("/result/message_id").and_then(value_as_string);
+                    delivered_any = true;
+                    break;
+                }
+
+                let description = body
+                    .get("description")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            )));
+                    .unwrap_or("unknown error");
+                if telegram_is_parse_error(description)
+                    && active_parse_mode.is_some()
+                    && !parse_fallback_used
+                {
+                    active_text = fallback_text.clone();
+                    active_parse_mode = None;
+                    parse_fallback_used = true;
+                    continue;
+                }
+                if telegram_is_thread_not_found_error(description)
+                    && active_thread_id.is_some()
+                    && !thread_fallback_used
+                {
+                    active_thread_id = None;
+                    thread_fallback_used = true;
+                    continue;
+                }
+
+                return Err(SendError(format!("Telegram send failed: {description}")));
+            }
         }
-        last_message_id = body.pointer("/result/message_id").and_then(value_as_string);
     }
 
+    let mut pending_photo_group = Vec::new();
+    let flush_pending_photo_group =
+        |pending: &mut Vec<MediaAttachment>,
+         last_message_id: &mut Option<String>,
+         delivered_any: &mut bool,
+         warnings: &mut Vec<String>| {
+            if pending.is_empty() {
+                return;
+            }
+            if pending.len() == 1 {
+                match telegram_send_single_media(&client, config, target, &pending[0]) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(error) => warnings.push(error),
+                }
+                pending.clear();
+                return;
+            }
+            for batch in pending.chunks(10) {
+                match telegram_send_media_group_photos(&client, config, target, batch) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(_error) => {
+                        for attachment in batch {
+                            match telegram_send_single_media(&client, config, target, attachment) {
+                                Ok(message_id) => {
+                                    *last_message_id = message_id;
+                                    *delivered_any = true;
+                                }
+                                Err(error) => warnings.push(error),
+                            }
+                        }
+                    }
+                }
+            }
+            pending.clear();
+        };
+
     for attachment in media {
-        let (method, field) = telegram_upload_endpoint(attachment);
-        let url = format!("{}/bot{}/{}", config.base_url, config.token, method);
-        let file_name = attachment
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
-        let part = Part::bytes(bytes).file_name(file_name);
-        let mut form = Form::new()
-            .text("chat_id", target.chat_id.clone())
-            .part(field.to_string(), part);
-        if let Some(thread_id) = target.thread_id.as_ref() {
-            form = form.text("message_thread_id", thread_id.clone());
+        if telegram_can_media_group_photo(attachment) {
+            if !attachment.path.is_file() {
+                warnings.push(format!(
+                    "Media file not found, skipping: {}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+            pending_photo_group.push(attachment.clone());
+            continue;
         }
 
-        let response = client
-            .post(url)
-            .multipart(form)
-            .send()
-            .map_err(|error| SendError(format!("Telegram media send failed: {error}")))?;
-        let body = parse_json_response(response, "Telegram media send failed")?;
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(SendError(format!(
-                "Telegram media send failed: {}",
-                body.get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            )));
+        flush_pending_photo_group(
+            &mut pending_photo_group,
+            &mut last_message_id,
+            &mut delivered_any,
+            &mut warnings,
+        );
+        match telegram_send_single_media(&client, config, target, attachment) {
+            Ok(message_id) => {
+                last_message_id = message_id;
+                delivered_any = true;
+            }
+            Err(error) => warnings.push(error),
         }
-        last_message_id = body.pointer("/result/message_id").and_then(value_as_string);
+    }
+    flush_pending_photo_group(
+        &mut pending_photo_group,
+        &mut last_message_id,
+        &mut delivered_any,
+        &mut warnings,
+    );
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2002,7 +2378,305 @@ fn send_telegram(
                 target.chat_id
             )
         }),
+        warnings,
     })
+}
+
+fn telegram_send_text_request(
+    client: &Client,
+    config: &TelegramConfig,
+    chat_id: &str,
+    text: &str,
+    parse_mode: Option<&str>,
+    thread_id: Option<&str>,
+) -> Result<Value, SendError> {
+    let url = format!("{}/bot{}/sendMessage", config.base_url, config.token);
+
+    for attempt in 0..TELEGRAM_SEND_MAX_ATTEMPTS {
+        let mut payload = serde_json::Map::new();
+        payload.insert("chat_id".to_string(), Value::String(chat_id.to_string()));
+        payload.insert("text".to_string(), Value::String(text.to_string()));
+        if let Some(parse_mode) = parse_mode {
+            payload.insert(
+                "parse_mode".to_string(),
+                Value::String(parse_mode.to_string()),
+            );
+        }
+        if let Some(thread_id) = thread_id {
+            payload.insert(
+                "message_thread_id".to_string(),
+                Value::String(thread_id.to_string()),
+            );
+        }
+        if config.disable_link_previews {
+            payload.insert("disable_web_page_preview".to_string(), Value::Bool(true));
+        }
+
+        let response = match client.post(&url).json(&Value::Object(payload)).send() {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(delay) = telegram_retry_delay(None, None, &error.to_string(), attempt)
+                    && attempt + 1 < TELEGRAM_SEND_MAX_ATTEMPTS
+                {
+                    std::thread::sleep(Duration::from_secs_f64(delay));
+                    continue;
+                }
+                return Err(SendError(format!("Telegram send failed: {error}")));
+            }
+        };
+
+        let status = response.status();
+        let raw = response.text().map_err(|error| {
+            SendError(format!(
+                "Telegram send failed: failed to read response body: {error}"
+            ))
+        })?;
+        let parsed = serde_json::from_str::<Value>(&raw).ok();
+
+        if !status.is_success() {
+            let description = parsed
+                .as_ref()
+                .and_then(|body| body.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or(&raw);
+            if let Some(delay) =
+                telegram_retry_delay(Some(status.as_u16()), parsed.as_ref(), description, attempt)
+                && attempt + 1 < TELEGRAM_SEND_MAX_ATTEMPTS
+            {
+                std::thread::sleep(Duration::from_secs_f64(delay));
+                continue;
+            }
+            return Err(SendError(format!(
+                "Telegram send failed: HTTP {}: {}",
+                status.as_u16(),
+                raw
+            )));
+        }
+
+        let body = parsed
+            .ok_or_else(|| SendError("Telegram send failed: invalid JSON response".to_string()))?;
+        let description = body
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false)
+            && let Some(delay) =
+                telegram_retry_delay(Some(status.as_u16()), Some(&body), description, attempt)
+            && attempt + 1 < TELEGRAM_SEND_MAX_ATTEMPTS
+        {
+            std::thread::sleep(Duration::from_secs_f64(delay));
+            continue;
+        }
+        return Ok(body);
+    }
+
+    Err(SendError(
+        "Telegram send failed after exhausting retry attempts".to_string(),
+    ))
+}
+
+fn telegram_send_single_media(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Result<Option<String>, String> {
+    if !attachment.path.is_file() {
+        return Err(format!(
+            "Media file not found, skipping: {}",
+            attachment.path.display()
+        ));
+    }
+    let file_name = attachment
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = fs::read(&attachment.path).map_err(|error| {
+        format!(
+            "Failed to send media {}: {error}",
+            attachment.path.display()
+        )
+    })?;
+    let display_path = attachment.path.display().to_string();
+    let (method, field) = telegram_upload_endpoint(attachment);
+    match telegram_send_single_media_request(
+        client,
+        config,
+        target,
+        method,
+        field,
+        &file_name,
+        bytes.clone(),
+        &display_path,
+    ) {
+        Ok(message_id) => Ok(message_id),
+        Err(_error) if method == "sendPhoto" => match telegram_send_single_media_request(
+            client,
+            config,
+            target,
+            "sendDocument",
+            "document",
+            &file_name,
+            bytes,
+            &display_path,
+        ) {
+            Ok(message_id) => Ok(message_id),
+            Err(error) => {
+                telegram_send_media_text_fallback(client, config, target, attachment, &display_path)
+                    .map_err(|fallback_error| format!("{error}; {fallback_error}"))
+            }
+        },
+        Err(error) => {
+            telegram_send_media_text_fallback(client, config, target, attachment, &display_path)
+                .map_err(|fallback_error| format!("{error}; {fallback_error}"))
+        }
+    }
+}
+
+fn telegram_send_media_text_fallback(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+    display_path: &str,
+) -> Result<Option<String>, String> {
+    let fallback_text = telegram_media_text_fallback(attachment);
+    let mut active_thread_id = telegram_message_thread_id(target.thread_id.as_deref());
+    let mut thread_fallback_used = false;
+
+    loop {
+        let body = telegram_send_text_request(
+            client,
+            config,
+            &target.chat_id,
+            &fallback_text,
+            None,
+            active_thread_id.as_deref(),
+        )
+        .map_err(|error| {
+            format!(
+                "Failed to send fallback text for media {display_path}: {}",
+                error.0
+            )
+        })?;
+
+        if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(body.pointer("/result/message_id").and_then(value_as_string));
+        }
+
+        let description = body
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if telegram_is_thread_not_found_error(description)
+            && active_thread_id.is_some()
+            && !thread_fallback_used
+        {
+            active_thread_id = None;
+            thread_fallback_used = true;
+            continue;
+        }
+
+        return Err(format!(
+            "Failed to send fallback text for media {display_path}: {description}"
+        ));
+    }
+}
+
+fn telegram_send_single_media_request(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    method: &str,
+    field: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+    display_path: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("{}/bot{}/{}", config.base_url, config.token, method);
+    let part = Part::bytes(bytes).file_name(file_name.to_string());
+    let mut form = Form::new()
+        .text("chat_id", target.chat_id.clone())
+        .part(field.to_string(), part);
+    if let Some(thread_id) = telegram_message_thread_id(target.thread_id.as_deref()) {
+        form = form.text("message_thread_id", thread_id);
+    }
+
+    let response = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("Failed to send media {display_path}: {error}"))?;
+    let body = parse_json_response(response, "Telegram media send failed")
+        .map_err(|error| format!("Failed to send media {display_path}: {}", error.0))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!(
+            "Failed to send media {display_path}: {}",
+            body.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+    Ok(body.pointer("/result/message_id").and_then(value_as_string))
+}
+
+fn telegram_send_media_group_photos(
+    client: &Client,
+    config: &TelegramConfig,
+    target: &ResolvedTarget,
+    attachments: &[MediaAttachment],
+) -> Result<Option<String>, String> {
+    let url = format!("{}/bot{}/sendMediaGroup", config.base_url, config.token);
+    let mut media = Vec::new();
+    let mut form = Form::new().text("chat_id", target.chat_id.clone());
+    if let Some(thread_id) = telegram_message_thread_id(target.thread_id.as_deref()) {
+        form = form.text("message_thread_id", thread_id);
+    }
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let file_name = attachment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let bytes = fs::read(&attachment.path).map_err(|error| {
+            format!(
+                "Failed to send media {}: {error}",
+                attachment.path.display()
+            )
+        })?;
+        let field_name = format!("file{index}");
+        media.push(json!({
+            "type": "photo",
+            "media": format!("attach://{field_name}"),
+        }));
+        form = form.part(field_name, Part::bytes(bytes).file_name(file_name));
+    }
+    form = form.text("media", Value::Array(media).to_string());
+
+    let response = client
+        .post(url)
+        .multipart(form)
+        .send()
+        .map_err(|error| format!("Telegram media group send failed: {error}"))?;
+    let body = parse_json_response(response, "Telegram media group send failed")
+        .map_err(|error| error.0)?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(body
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_string());
+    }
+    Ok(body
+        .get("result")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("message_id"))
+        .and_then(value_as_string))
 }
 
 fn telegram_upload_endpoint(attachment: &MediaAttachment) -> (&'static str, &'static str) {
@@ -2022,54 +2696,541 @@ fn telegram_upload_endpoint(attachment: &MediaAttachment) -> (&'static str, &'st
     ("sendDocument", "document")
 }
 
+fn telegram_can_media_group_photo(attachment: &MediaAttachment) -> bool {
+    if attachment.is_voice {
+        return false;
+    }
+    matches!(
+        file_extension(&attachment.path).as_str(),
+        "png" | "jpg" | "jpeg" | "webp"
+    )
+}
+
+fn telegram_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice
+        || TELEGRAM_SEND_AUDIO_EXTS.contains(&ext.as_str())
+        || TELEGRAM_VOICE_EXTS.contains(&ext.as_str())
+    {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
+}
+
+fn telegram_has_html(content: &str) -> bool {
+    Regex::new(r"<[a-zA-Z/][^>]*>")
+        .expect("valid telegram html detection regex")
+        .is_match(content)
+}
+
+fn telegram_message_thread_id(thread_id: Option<&str>) -> Option<String> {
+    thread_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != TELEGRAM_GENERAL_TOPIC_THREAD_ID)
+        .map(str::to_string)
+}
+
+fn telegram_is_parse_error(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    lower.contains("parse") || lower.contains("markdown") || lower.contains("html")
+}
+
+fn telegram_is_thread_not_found_error(description: &str) -> bool {
+    description
+        .to_ascii_lowercase()
+        .contains("message thread not found")
+}
+
+fn telegram_retry_delay(
+    status: Option<u16>,
+    body: Option<&Value>,
+    error_text: &str,
+    attempt: usize,
+) -> Option<f64> {
+    if let Some(retry_after) = body
+        .and_then(|value| value.pointer("/parameters/retry_after"))
+        .and_then(value_as_f64)
+    {
+        return Some(retry_after.max(0.0));
+    }
+
+    let lower = error_text.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return None;
+    }
+    if matches!(status, Some(429 | 502 | 503 | 504))
+        || lower.contains("too many requests")
+        || lower.contains("429")
+        || lower.contains("bad gateway")
+        || lower.contains("502")
+        || lower.contains("service unavailable")
+        || lower.contains("503")
+        || lower.contains("gateway timeout")
+        || lower.contains("504")
+    {
+        return Some(2_u64.pow(attempt as u32) as f64);
+    }
+    None
+}
+
+fn load_config_yaml_bool(hermes_home: &Path, path: &[&str]) -> Option<bool> {
+    let contents = fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let mut value = &parsed;
+    for segment in path {
+        value = value
+            .as_mapping()?
+            .get(serde_yaml::Value::String((*segment).to_string()))?;
+    }
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn load_config_yaml_string(hermes_home: &Path, path: &[&str]) -> Option<String> {
+    let contents = fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let mut value = &parsed;
+    for segment in path {
+        value = value
+            .as_mapping()?
+            .get(serde_yaml::Value::String((*segment).to_string()))?;
+    }
+    yaml_scalar_to_string(value)
+}
+
+fn load_platform_enabled_from_yaml(hermes_home: &Path, platform: &str) -> Option<bool> {
+    load_config_yaml_bool(hermes_home, &["platforms", platform, "enabled"])
+}
+
+fn load_telegram_base_url(hermes_home: &Path) -> Option<String> {
+    load_config_yaml_string(hermes_home, &["platforms", "telegram", "extra", "base_url"])
+        .map(|value| normalize_base_url(Some(value.as_str()), TELEGRAM_DEFAULT_BASE_URL))
+}
+
+fn load_matrix_config_from_yaml(hermes_home: &Path) -> Option<MatrixConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "matrix") != Some(true) {
+        return None;
+    }
+    let homeserver =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "homeserver"])
+            .map(|value| normalize_base_url(Some(value.as_str()), MATRIX_DEFAULT_BASE_URL))
+            .unwrap_or_default();
+    if homeserver.is_empty() {
+        return None;
+    }
+    let token = load_config_yaml_string(hermes_home, &["platforms", "matrix", "token"]);
+    let user_id =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "user_id"]);
+    let password =
+        load_config_yaml_string(hermes_home, &["platforms", "matrix", "extra", "password"]);
+    if token.is_none() && (user_id.is_none() || password.is_none()) {
+        return None;
+    }
+    Some(MatrixConfig {
+        token,
+        homeserver,
+        user_id,
+        password,
+        device_id: load_config_yaml_string(
+            hermes_home,
+            &["platforms", "matrix", "extra", "device_id"],
+        ),
+        home: load_platform_home_target_from_yaml(hermes_home, "matrix", "Home"),
+    })
+}
+
+fn load_signal_config_from_yaml(hermes_home: &Path) -> Option<SignalConfig> {
+    if load_platform_enabled_from_yaml(hermes_home, "signal") != Some(true) {
+        return None;
+    }
+    let http_url =
+        load_config_yaml_string(hermes_home, &["platforms", "signal", "extra", "http_url"])
+            .map(|value| normalize_base_url(Some(value.as_str()), ""))
+            .unwrap_or_default();
+    let account =
+        load_config_yaml_string(hermes_home, &["platforms", "signal", "extra", "account"])
+            .unwrap_or_default();
+    if http_url.is_empty() || account.is_empty() {
+        return None;
+    }
+    Some(SignalConfig {
+        http_url,
+        account,
+        home: load_platform_home_target_from_yaml(hermes_home, "signal", "Home"),
+    })
+}
+
+fn load_platform_home_target_from_yaml(
+    hermes_home: &Path,
+    platform: &str,
+    default_name: &str,
+) -> Option<HomeTarget> {
+    let contents = fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    let home = parsed
+        .as_mapping()?
+        .get(serde_yaml::Value::String("platforms".to_string()))?
+        .as_mapping()?
+        .get(serde_yaml::Value::String(platform.to_string()))?
+        .as_mapping()?
+        .get(serde_yaml::Value::String("home_channel".to_string()))?
+        .as_mapping()?;
+    let chat_id = home
+        .get(serde_yaml::Value::String("chat_id".to_string()))
+        .and_then(yaml_scalar_to_string)?;
+    let thread_id = home
+        .get(serde_yaml::Value::String("thread_id".to_string()))
+        .and_then(yaml_scalar_to_string);
+    let name = home
+        .get(serde_yaml::Value::String("name".to_string()))
+        .and_then(yaml_scalar_to_string)
+        .unwrap_or_else(|| default_name.to_string());
+    Some(HomeTarget {
+        chat_id,
+        thread_id,
+        name,
+    })
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn load_telegram_disable_link_previews(hermes_home: &Path) -> Option<bool> {
+    load_config_yaml_bool(hermes_home, &["telegram", "disable_link_previews"]).or_else(|| {
+        load_config_yaml_bool(
+            hermes_home,
+            &["platforms", "telegram", "extra", "disable_link_previews"],
+        )
+    })
+}
+
+fn load_slack_reply_broadcast(hermes_home: &Path) -> Option<bool> {
+    load_config_yaml_bool(
+        hermes_home,
+        &["platforms", "slack", "extra", "reply_broadcast"],
+    )
+}
+
+fn telegram_strip_mdv2(text: &str) -> String {
+    static ESCAPED_RE: OnceLock<Regex> = OnceLock::new();
+    static BOLD_RE: OnceLock<Regex> = OnceLock::new();
+    static ITALIC_RE: OnceLock<Regex> = OnceLock::new();
+    static STRIKE_RE: OnceLock<Regex> = OnceLock::new();
+    static SPOILER_RE: OnceLock<Regex> = OnceLock::new();
+
+    let escaped = ESCAPED_RE.get_or_init(|| {
+        Regex::new(r#"\\([_*\[\]()~`>#\+\-=|{}.!\\])"#).expect("valid telegram escape regex")
+    });
+    let bold =
+        BOLD_RE.get_or_init(|| Regex::new(r"\*([^*]+)\*").expect("valid telegram bold regex"));
+    let italic = ITALIC_RE.get_or_init(|| {
+        Regex::new(r"(^|[^\w])_([^_]+)_([^\w]|$)").expect("valid telegram italic regex")
+    });
+    let strike =
+        STRIKE_RE.get_or_init(|| Regex::new(r"~([^~]+)~").expect("valid telegram strike regex"));
+    let spoiler = SPOILER_RE
+        .get_or_init(|| Regex::new(r"\|\|([^|]+)\|\|").expect("valid telegram spoiler regex"));
+
+    let mut cleaned = escaped.replace_all(text, "$1").into_owned();
+    cleaned = bold.replace_all(&cleaned, "$1").into_owned();
+    loop {
+        let updated = italic.replace_all(&cleaned, "$1$2$3").into_owned();
+        if updated == cleaned {
+            break;
+        }
+        cleaned = updated;
+    }
+    cleaned = strike.replace_all(&cleaned, "$1").into_owned();
+    spoiler.replace_all(&cleaned, "$1").into_owned()
+}
+
+fn telegram_escape_mdv2(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '_' | '*'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '~'
+                | '`'
+                | '>'
+                | '#'
+                | '+'
+                | '-'
+                | '='
+                | '|'
+                | '{'
+                | '}'
+                | '.'
+                | '!'
+                | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn telegram_format_message(content: &str) -> String {
+    if content.is_empty() {
+        return content.to_string();
+    }
+
+    let mut placeholders = Vec::new();
+    let mut text = content.to_string();
+
+    text = replace_with_placeholders(
+        &text,
+        r"(?s)(```(?:[^\n]*\n)?.*?```)",
+        &mut placeholders,
+        |captures| protect_telegram_fenced_code(&captures[1]),
+    );
+    text = replace_with_placeholders(&text, r"(`[^`]+`)", &mut placeholders, |captures| {
+        captures[1].replace('\\', "\\\\")
+    });
+    text = protect_telegram_markdown_links(&text, &mut placeholders);
+
+    let strip_header_bold = Regex::new(r"\*\*(.+?)\*\*").expect("valid telegram header bold regex");
+    text = replace_with_placeholders(
+        &text,
+        r"(?m)^#{1,6}\s+(.+)$",
+        &mut placeholders,
+        |captures| {
+            let inner = strip_header_bold
+                .replace_all(captures[1].trim(), "$1")
+                .into_owned();
+            format!("*{}*", telegram_escape_mdv2(&inner))
+        },
+    );
+    text = replace_with_placeholders(&text, r"\*\*(.+?)\*\*", &mut placeholders, |captures| {
+        format!("*{}*", telegram_escape_mdv2(&captures[1]))
+    });
+    text = replace_with_placeholders(&text, r"\*([^*\n]+)\*", &mut placeholders, |captures| {
+        format!("_{}_", telegram_escape_mdv2(&captures[1]))
+    });
+    text = replace_with_placeholders(&text, r"~~(.+?)~~", &mut placeholders, |captures| {
+        format!("~{}~", telegram_escape_mdv2(&captures[1]))
+    });
+    text = replace_with_placeholders(&text, r"\|\|(.+?)\|\|", &mut placeholders, |captures| {
+        format!("||{}||", telegram_escape_mdv2(&captures[1]))
+    });
+    text = replace_with_placeholders(
+        &text,
+        r"(?m)^((?:\*\*)?>{1,3}) (.+)$",
+        &mut placeholders,
+        |captures| {
+            let prefix = &captures[1];
+            let body = &captures[2];
+            if prefix.starts_with("**") && body.ends_with("||") {
+                let trimmed = &body[..body.len().saturating_sub(2)];
+                return format!("{prefix} {}||", telegram_escape_mdv2(trimmed));
+            }
+            format!("{prefix} {}", telegram_escape_mdv2(body))
+        },
+    );
+
+    text = telegram_escape_mdv2(&text);
+    restore_placeholders(text, &placeholders)
+}
+
+fn protect_telegram_fenced_code(raw: &str) -> String {
+    let open_end = raw[3..].find('\n').map(|index| index + 4).unwrap_or(3);
+    let opening = &raw[..open_end];
+    let body = &raw[open_end..raw.len().saturating_sub(3)];
+    let escaped = body.replace('\\', "\\\\").replace('`', "\\`");
+    format!("{opening}{escaped}```")
+}
+
+fn protect_telegram_markdown_links(text: &str, placeholders: &mut Vec<(String, String)>) -> String {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if ch != '[' {
+            index += 1;
+            continue;
+        }
+
+        let mut label_end = None;
+        for (relative_index, (offset, candidate)) in chars[index + 1..].iter().enumerate() {
+            if *candidate == ']' {
+                label_end = Some((index + 1 + relative_index, *offset));
+                break;
+            }
+        }
+        let Some((label_end_index, label_end_offset)) = label_end else {
+            break;
+        };
+        if text[label_end_offset..].chars().nth(1) != Some('(') {
+            index = label_end_index + 1;
+            continue;
+        }
+
+        let mut depth = 1;
+        let mut url_end = None;
+        let mut url_index = label_end_index + 2;
+        while url_index < chars.len() {
+            let (offset, candidate) = chars[url_index];
+            if candidate == '\n' {
+                break;
+            }
+            match candidate {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        url_end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            url_index += 1;
+        }
+
+        let Some(url_end_offset) = url_end else {
+            index += 1;
+            continue;
+        };
+        let after_url = url_end_offset + ')'.len_utf8();
+        let label = &text[start + '['.len_utf8()..label_end_offset];
+        let raw_url = text[label_end_offset + "](".len()..url_end_offset].trim();
+        let url = raw_url.replace('\\', "\\\\").replace(')', "\\)");
+
+        output.push_str(&text[cursor..start]);
+        output.push_str(&stash_placeholder(
+            placeholders,
+            format!("[{}]({url})", telegram_escape_mdv2(label)),
+        ));
+        cursor = after_url;
+        index = chars.partition_point(|(offset, _)| *offset < after_url);
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
 fn send_discord(
+    hermes_home: &Path,
     config: &DiscordConfig,
     target: &ResolvedTarget,
     message: &str,
     media: &[MediaAttachment],
 ) -> Result<SentMessage, SendError> {
     let client = http_client()?;
-    let destination = target
-        .thread_id
-        .as_deref()
-        .unwrap_or(target.chat_id.as_str());
-    let url = format!("{}/channels/{destination}/messages", config.base_url);
-    let mut last_message_id = None;
 
-    if !message.is_empty() {
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", config.token))
-            .header("Content-Type", "application/json")
-            .json(&json!({ "content": message }))
-            .send()
-            .map_err(|error| SendError(format!("Discord send failed: {error}")))?;
-        let body = parse_json_response(response, "Discord send failed")?;
-        last_message_id = body.get("id").and_then(value_as_string);
+    if let Some(thread_id) = target.thread_id.as_deref() {
+        let url = format!("{}/channels/{thread_id}/messages", config.base_url);
+        return send_discord_standard_channel(&client, config, target, message, media, &url);
     }
 
+    if discord_channel_is_forum(hermes_home, &client, config, &target.chat_id) {
+        return send_discord_forum_channel(&client, config, target, message, media);
+    }
+
+    let url = format!("{}/channels/{}/messages", config.base_url, target.chat_id);
+    send_discord_standard_channel(&client, config, target, message, media, &url)
+}
+
+fn send_discord_standard_channel(
+    client: &Client,
+    config: &DiscordConfig,
+    target: &ResolvedTarget,
+    message: &str,
+    media: &[MediaAttachment],
+    url: &str,
+) -> Result<SentMessage, SendError> {
+    let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
+
+    if !message.is_empty() {
+        for chunk in truncate_message(message, DISCORD_MAX_MESSAGE_LENGTH) {
+            last_message_id = send_discord_text_message(client, config, url, &chunk)?;
+            delivered_any = true;
+        }
+    }
+
+    let mut pending_images = Vec::new();
     for attachment in media {
-        let file_name = attachment
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
-        let form = Form::new().part("files[0]", Part::bytes(bytes).file_name(file_name));
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bot {}", config.token))
-            .multipart(form)
-            .send()
-            .map_err(|error| SendError(format!("Discord media send failed: {error}")))?;
-        let body = parse_json_response(response, "Discord media send failed")?;
-        last_message_id = body.get("id").and_then(value_as_string);
+        if discord_can_batch_image(attachment) {
+            if !attachment.path.is_file() {
+                warnings.push(format!(
+                    "Media file not found, skipping: {}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+            pending_images.push(attachment.clone());
+            continue;
+        }
+
+        flush_pending_discord_images(
+            client,
+            config,
+            url,
+            &mut pending_images,
+            message.is_empty(),
+            &mut last_message_id,
+            &mut delivered_any,
+            &mut warnings,
+        );
+        send_discord_single_media(
+            client,
+            config,
+            url,
+            attachment,
+            message.is_empty(),
+            &mut last_message_id,
+            &mut delivered_any,
+            &mut warnings,
+        );
+    }
+    flush_pending_discord_images(
+        client,
+        config,
+        url,
+        &mut pending_images,
+        message.is_empty(),
+        &mut last_message_id,
+        &mut delivered_any,
+        &mut warnings,
+    );
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2080,7 +3241,758 @@ fn send_discord(
         note: target
             .used_home_channel
             .then(|| format!("Sent to discord home channel (chat_id: {})", target.chat_id)),
+        warnings,
     })
+}
+
+fn flush_pending_discord_images(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    pending_images: &mut Vec<MediaAttachment>,
+    allow_text_fallback: bool,
+    last_message_id: &mut Option<String>,
+    delivered_any: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    if pending_images.is_empty() {
+        return;
+    }
+    if pending_images.len() == 1 {
+        send_discord_single_media(
+            client,
+            config,
+            url,
+            &pending_images[0],
+            allow_text_fallback,
+            last_message_id,
+            delivered_any,
+            warnings,
+        );
+        pending_images.clear();
+        return;
+    }
+
+    for batch in pending_images.chunks(10) {
+        match send_discord_image_batch(client, config, url, batch) {
+            Ok(message_id) => {
+                *last_message_id = message_id;
+                *delivered_any = true;
+            }
+            Err(_error) => {
+                for attachment in batch {
+                    send_discord_single_media(
+                        client,
+                        config,
+                        url,
+                        attachment,
+                        allow_text_fallback,
+                        last_message_id,
+                        delivered_any,
+                        warnings,
+                    );
+                }
+            }
+        }
+    }
+    pending_images.clear();
+}
+
+fn send_discord_single_media(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    attachment: &MediaAttachment,
+    allow_text_fallback: bool,
+    last_message_id: &mut Option<String>,
+    delivered_any: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    if !attachment.path.is_file() {
+        warnings.push(format!(
+            "Media file not found, skipping: {}",
+            attachment.path.display()
+        ));
+        return;
+    }
+    let file_name = attachment
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment.bin")
+        .to_string();
+    let bytes = match fs::read(&attachment.path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if allow_text_fallback {
+                match send_discord_media_text_fallback(client, config, url, attachment) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(fallback_error) => warnings.push(format!(
+                        "Failed to send media {}: {error}; {fallback_error}",
+                        attachment.path.display()
+                    )),
+                }
+            } else {
+                warnings.push(format!(
+                    "Failed to send media {}: {error}",
+                    attachment.path.display()
+                ));
+            }
+            return;
+        }
+    };
+    if discord_can_send_native_voice(attachment)
+        && let Ok(message_id) = send_discord_voice_media(client, config, url, &bytes)
+    {
+        *last_message_id = message_id;
+        *delivered_any = true;
+        return;
+    }
+    let form = Form::new().part("files[0]", Part::bytes(bytes).file_name(file_name));
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bot {}", config.token))
+        .multipart(form)
+        .send();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            if allow_text_fallback {
+                match send_discord_media_text_fallback(client, config, url, attachment) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(fallback_error) => warnings.push(format!(
+                        "Failed to send media {}: {error}; {fallback_error}",
+                        attachment.path.display()
+                    )),
+                }
+            } else {
+                warnings.push(format!(
+                    "Failed to send media {}: {error}",
+                    attachment.path.display()
+                ));
+            }
+            return;
+        }
+    };
+    let body = match parse_json_response(response, "Discord media send failed") {
+        Ok(body) => body,
+        Err(error) => {
+            if allow_text_fallback {
+                match send_discord_media_text_fallback(client, config, url, attachment) {
+                    Ok(message_id) => {
+                        *last_message_id = message_id;
+                        *delivered_any = true;
+                    }
+                    Err(fallback_error) => warnings.push(format!(
+                        "Failed to send media {}: {}; {fallback_error}",
+                        attachment.path.display(),
+                        error.0
+                    )),
+                }
+            } else {
+                warnings.push(format!(
+                    "Failed to send media {}: {}",
+                    attachment.path.display(),
+                    error.0
+                ));
+            }
+            return;
+        }
+    };
+    *last_message_id = body.get("id").and_then(value_as_string);
+    *delivered_any = true;
+}
+
+fn send_discord_image_batch(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    attachments: &[MediaAttachment],
+) -> Result<Option<String>, SendError> {
+    let mut form = Form::new();
+    for (index, attachment) in attachments.iter().enumerate() {
+        let file_name = attachment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let bytes = fs::read(&attachment.path).map_err(|error| {
+            SendError(format!(
+                "Failed to read Discord image {}: {error}",
+                attachment.path.display()
+            ))
+        })?;
+        form = form.part(
+            format!("files[{index}]"),
+            Part::bytes(bytes).file_name(file_name),
+        );
+    }
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bot {}", config.token))
+        .multipart(form)
+        .send()
+        .map_err(|error| SendError(format!("Discord media send failed: {error}")))?;
+    let body = parse_json_response(response, "Discord media send failed")?;
+    Ok(body.get("id").and_then(value_as_string))
+}
+
+fn discord_can_batch_image(attachment: &MediaAttachment) -> bool {
+    !attachment.is_voice && IMAGE_EXTS.contains(&file_extension(&attachment.path).as_str())
+}
+
+fn discord_can_send_native_voice(attachment: &MediaAttachment) -> bool {
+    attachment.is_voice && matches!(file_extension(&attachment.path).as_str(), "ogg" | "opus")
+}
+
+fn send_discord_voice_media(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    bytes: &[u8],
+) -> Result<Option<String>, SendError> {
+    let form = discord_voice_form(bytes).map_err(SendError)?;
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bot {}", config.token))
+        .multipart(form)
+        .send()
+        .map_err(|error| SendError(format!("Discord media send failed: {error}")))?;
+    let body = parse_json_response(response, "Discord media send failed")?;
+    Ok(body.get("id").and_then(value_as_string))
+}
+
+fn discord_voice_form(bytes: &[u8]) -> Result<Form, String> {
+    let waveform = BASE64_STANDARD.encode(vec![128u8; 256]);
+    let duration_secs = ((bytes.len() as f64) / 2000.0).max(1.0);
+    let payload = json!({
+        "flags": 8192,
+        "attachments": [{
+            "id": "0",
+            "filename": "voice-message.ogg",
+            "duration_secs": (duration_secs * 100.0).round() / 100.0,
+            "waveform": waveform,
+        }],
+    })
+    .to_string();
+    Ok(Form::new().text("payload_json", payload).part(
+        "files[0]",
+        Part::bytes(bytes.to_vec())
+            .file_name("voice-message.ogg".to_string())
+            .mime_str("audio/ogg")
+            .map_err(|error| format!("invalid Discord voice mime type: {error}"))?,
+    ))
+}
+
+fn send_discord_text_message(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    content: &str,
+) -> Result<Option<String>, SendError> {
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bot {}", config.token))
+        .header("Content-Type", "application/json")
+        .json(&json!({ "content": content }))
+        .send()
+        .map_err(|error| SendError(format!("Discord send failed: {error}")))?;
+    let body = parse_json_response(response, "Discord send failed")?;
+    Ok(body.get("id").and_then(value_as_string))
+}
+
+fn send_discord_media_text_fallback(
+    client: &Client,
+    config: &DiscordConfig,
+    url: &str,
+    attachment: &MediaAttachment,
+) -> Result<Option<String>, String> {
+    let mut last_message_id = None;
+    for chunk in truncate_message(
+        &discord_media_text_fallback(attachment),
+        DISCORD_MAX_MESSAGE_LENGTH,
+    ) {
+        last_message_id = send_discord_text_message(client, config, url, &chunk)
+            .map_err(|error| format!("Failed to send fallback text for media: {}", error.0))?;
+    }
+    Ok(last_message_id)
+}
+
+fn discord_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
+}
+
+fn send_discord_forum_channel(
+    client: &Client,
+    config: &DiscordConfig,
+    target: &ResolvedTarget,
+    message: &str,
+    media: &[MediaAttachment],
+) -> Result<SentMessage, SendError> {
+    let url = format!("{}/channels/{}/threads", config.base_url, target.chat_id);
+    let mut warnings = Vec::new();
+    let mut text_chunks = if message.is_empty() {
+        Vec::new()
+    } else {
+        truncate_message(message, DISCORD_MAX_MESSAGE_LENGTH)
+    };
+
+    let valid_media = media
+        .iter()
+        .filter_map(|attachment| {
+            if !attachment.path.is_file() {
+                warnings.push(format!(
+                    "Media file not found, skipping: {}",
+                    attachment.path.display()
+                ));
+                return None;
+            }
+            let file_name = attachment
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment.bin")
+                .to_string();
+            match fs::read(&attachment.path) {
+                Ok(bytes) => Some((file_name, bytes)),
+                Err(error) => {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let thread_name_hint = if message.trim().is_empty() {
+        valid_media
+            .first()
+            .map(|(file_name, _bytes)| file_name.as_str())
+            .unwrap_or("")
+    } else {
+        message
+    };
+    let thread_name = derive_discord_forum_thread_name(thread_name_hint);
+
+    let body = if valid_media.is_empty() {
+        if text_chunks.is_empty() {
+            return Err(SendError(
+                "No deliverable text or media remained after processing MEDIA tags".to_string(),
+            ));
+        }
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", config.token))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "name": thread_name,
+                "message": { "content": text_chunks[0] },
+            }))
+            .send()
+            .map_err(|error| SendError(format!("Discord forum thread creation failed: {error}")))?;
+        parse_json_response(response, "Discord forum thread creation failed")?
+    } else {
+        let mut attachments = Vec::new();
+        let mut form = Form::new();
+        for (index, (file_name, bytes)) in valid_media.iter().enumerate() {
+            attachments.push(json!({
+                "id": index.to_string(),
+                "filename": file_name,
+            }));
+            form = form.part(
+                format!("files[{index}]"),
+                Part::bytes(bytes.clone()).file_name(
+                    attachments[index]["filename"]
+                        .as_str()
+                        .unwrap_or("attachment.bin")
+                        .to_string(),
+                ),
+            );
+        }
+        let payload_json = json!({
+            "name": thread_name,
+            "message": {
+                "content": text_chunks.first().cloned().unwrap_or_else(String::new),
+                "attachments": attachments,
+            }
+        })
+        .to_string();
+        form = form.text("payload_json", payload_json);
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", config.token))
+            .multipart(form)
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if text_chunks.is_empty() => {
+                let fallback = discord_forum_media_text_fallback_chunks(media);
+                if fallback.is_empty() {
+                    return Err(SendError(format!(
+                        "Discord forum thread creation failed: {error}"
+                    )));
+                }
+                text_chunks = fallback;
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", config.token))
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "name": thread_name,
+                        "message": { "content": text_chunks[0] },
+                    }))
+                    .send()
+                    .map_err(|fallback_error| {
+                        SendError(format!(
+                            "Discord forum thread creation failed: {error}; fallback text thread creation failed: {fallback_error}"
+                        ))
+                    })?
+            }
+            Err(error) => {
+                return Err(SendError(format!(
+                    "Discord forum thread creation failed: {error}"
+                )));
+            }
+        };
+        match parse_json_response(response, "Discord forum thread creation failed") {
+            Ok(body) => body,
+            Err(error) if text_chunks.is_empty() => {
+                let fallback = discord_forum_media_text_fallback_chunks(media);
+                if fallback.is_empty() {
+                    return Err(error);
+                }
+                text_chunks = fallback;
+                let fallback_response = client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", config.token))
+                    .header("Content-Type", "application/json")
+                    .json(&json!({
+                        "name": thread_name,
+                        "message": { "content": text_chunks[0] },
+                    }))
+                    .send()
+                    .map_err(|fallback_error| {
+                        SendError(format!(
+                            "{}; fallback text thread creation failed: {fallback_error}",
+                            error.0
+                        ))
+                    })?;
+                parse_json_response(fallback_response, "Discord forum thread creation failed")?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let thread_id = body.get("id").and_then(value_as_string);
+    let message_id = body
+        .pointer("/message/id")
+        .and_then(value_as_string)
+        .or_else(|| thread_id.clone());
+
+    if let Some(thread_id) = thread_id.as_deref() {
+        let url = format!("{}/channels/{thread_id}/messages", config.base_url);
+        for chunk in text_chunks.iter().skip(1) {
+            let response = client
+                .post(&url)
+                .header("Authorization", format!("Bot {}", config.token))
+                .header("Content-Type", "application/json")
+                .json(&json!({ "content": chunk }))
+                .send();
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Failed to send follow-up chunk to forum thread {thread_id}: {error}"
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = parse_json_response(response, "Discord send failed") {
+                warnings.push(format!(
+                    "Failed to send follow-up chunk to forum thread {thread_id}: {}",
+                    error.0
+                ));
+            }
+        }
+    }
+
+    Ok(SentMessage {
+        platform: PlatformKind::Discord,
+        chat_id: target.chat_id.clone(),
+        message_id,
+        thread_id,
+        note: target
+            .used_home_channel
+            .then(|| format!("Sent to discord home channel (chat_id: {})", target.chat_id)),
+        warnings,
+    })
+}
+
+fn discord_forum_media_text_fallback_chunks(media: &[MediaAttachment]) -> Vec<String> {
+    let fallback = media
+        .iter()
+        .filter(|attachment| attachment.path.is_file())
+        .map(discord_media_text_fallback)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if fallback.is_empty() {
+        Vec::new()
+    } else {
+        truncate_message(&fallback, DISCORD_MAX_MESSAGE_LENGTH)
+    }
+}
+
+fn derive_discord_forum_thread_name(message: &str) -> String {
+    let first_line = message
+        .trim()
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('#')
+        .trim();
+    let trimmed = if first_line.is_empty() {
+        "New Post"
+    } else {
+        first_line
+    };
+    trimmed.chars().take(100).collect()
+}
+
+fn discord_forum_cache() -> &'static Mutex<HashMap<String, bool>> {
+    DISCORD_FORUM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn discord_channel_is_forum(
+    hermes_home: &Path,
+    client: &Client,
+    config: &DiscordConfig,
+    chat_id: &str,
+) -> bool {
+    if let Some(kind) = lookup_channel_type(hermes_home, "discord", chat_id) {
+        return kind == "forum";
+    }
+    if let Some(cached) = discord_forum_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(chat_id)
+        .copied()
+    {
+        return cached;
+    }
+
+    let response = match client
+        .get(format!("{}/channels/{chat_id}", config.base_url))
+        .header("Authorization", format!("Bot {}", config.token))
+        .send()
+    {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+    let body = match parse_json_response(response, "Discord channel probe failed") {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    let is_forum = body.get("type").and_then(value_as_i64) == Some(15);
+    discord_forum_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(chat_id.to_string(), is_forum);
+    is_forum
+}
+
+fn slack_format_message(content: &str) -> String {
+    if content.is_empty() {
+        return content.to_string();
+    }
+
+    let mut placeholders = Vec::new();
+    let mut text = content.to_string();
+
+    text = replace_with_placeholders(
+        &text,
+        r"(?s)(```(?:[^\n]*\n)?.*?```)",
+        &mut placeholders,
+        |captures| captures[1].to_string(),
+    );
+    text = replace_with_placeholders(&text, r"(`[^`]+`)", &mut placeholders, |captures| {
+        captures[1].to_string()
+    });
+    text = protect_slack_markdown_links(&text, &mut placeholders);
+    text = replace_with_placeholders(
+        &text,
+        r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)",
+        &mut placeholders,
+        |captures| captures[1].to_string(),
+    );
+    text = replace_with_placeholders(&text, r"(?m)^(>+\s)", &mut placeholders, |captures| {
+        captures[1].to_string()
+    });
+
+    text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
+    let strip_header_bold = Regex::new(r"\*\*(.+?)\*\*").expect("valid slack header bold regex");
+    text = replace_with_placeholders(
+        &text,
+        r"(?m)^#{1,6}\s+(.+)$",
+        &mut placeholders,
+        |captures| {
+            let inner = strip_header_bold
+                .replace_all(captures[1].trim(), "$1")
+                .into_owned();
+            format!("*{inner}*")
+        },
+    );
+    text = replace_with_placeholders(&text, r"\*\*\*(.+?)\*\*\*", &mut placeholders, |captures| {
+        format!("*_{}_*", &captures[1])
+    });
+    text = replace_with_placeholders(&text, r"\*\*(.+?)\*\*", &mut placeholders, |captures| {
+        format!("*{}*", &captures[1])
+    });
+    text = replace_with_placeholders(
+        &text,
+        r"\*(\S(?:[^*\n]*\S)?)\*",
+        &mut placeholders,
+        |captures| format!("_{}_", &captures[1]),
+    );
+    text = replace_with_placeholders(&text, r"~~(.+?)~~", &mut placeholders, |captures| {
+        format!("~{}~", &captures[1])
+    });
+
+    restore_placeholders(text, &placeholders)
+}
+
+fn replace_with_placeholders<F>(
+    text: &str,
+    pattern: &str,
+    placeholders: &mut Vec<(String, String)>,
+    replacement: F,
+) -> String
+where
+    F: Fn(&regex::Captures<'_>) -> String,
+{
+    let regex = Regex::new(pattern).expect("valid slack formatting regex");
+    regex
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let value = replacement(captures);
+            stash_placeholder(placeholders, value)
+        })
+        .into_owned()
+}
+
+fn protect_slack_markdown_links(text: &str, placeholders: &mut Vec<(String, String)>) -> String {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if ch != '[' {
+            index += 1;
+            continue;
+        }
+        if start > 0 && text[..start].ends_with('!') {
+            index += 1;
+            continue;
+        }
+
+        let mut label_end = None;
+        for (relative_index, (offset, candidate)) in chars[index + 1..].iter().enumerate() {
+            if *candidate == ']' {
+                label_end = Some((index + 1 + relative_index, *offset));
+                break;
+            }
+        }
+        let Some((label_end_index, label_end_offset)) = label_end else {
+            break;
+        };
+        if text[label_end_offset..].chars().nth(1) != Some('(') {
+            index = label_end_index + 1;
+            continue;
+        }
+
+        let mut depth = 1;
+        let mut url_end = None;
+        let mut url_index = label_end_index + 2;
+        while url_index < chars.len() {
+            let (offset, candidate) = chars[url_index];
+            if candidate == '\n' {
+                break;
+            }
+            match candidate {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        url_end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            url_index += 1;
+        }
+
+        let Some(url_end_offset) = url_end else {
+            index += 1;
+            continue;
+        };
+        let after_url = url_end_offset + ')'.len_utf8();
+        let label = &text[start + '['.len_utf8()..label_end_offset];
+        let raw_url = text[label_end_offset + "](".len()..url_end_offset].trim();
+        let url = raw_url
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .map(str::trim)
+            .unwrap_or(raw_url);
+
+        output.push_str(&text[cursor..start]);
+        output.push_str(&stash_placeholder(placeholders, format!("<{url}|{label}>")));
+        cursor = after_url;
+        index = chars.partition_point(|(offset, _)| *offset < after_url);
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn stash_placeholder(placeholders: &mut Vec<(String, String)>, value: String) -> String {
+    let key = format!("\0SL{}\0", placeholders.len());
+    placeholders.push((key.clone(), value));
+    key
+}
+
+fn restore_placeholders(mut text: String, placeholders: &[(String, String)]) -> String {
+    for (key, value) in placeholders.iter().rev() {
+        text = text.replace(key, value);
+    }
+    text
 }
 
 fn send_slack(
@@ -2091,33 +4003,24 @@ fn send_slack(
 ) -> Result<SentMessage, SendError> {
     let client = http_client()?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
+    let formatted_message = slack_format_message(message);
 
-    if !message.is_empty() {
-        let url = format!("{}/chat.postMessage", config.base_url);
-        let mut payload = serde_json::Map::new();
-        payload.insert("channel".to_string(), Value::String(target.chat_id.clone()));
-        payload.insert("text".to_string(), Value::String(message.to_string()));
-        payload.insert("mrkdwn".to_string(), Value::Bool(true));
-        if let Some(thread_id) = target.thread_id.as_ref() {
-            payload.insert("thread_ts".to_string(), Value::String(thread_id.clone()));
+    if !formatted_message.is_empty() {
+        for (index, chunk) in truncate_message(&formatted_message, SLACK_MAX_MESSAGE_LENGTH)
+            .into_iter()
+            .enumerate()
+        {
+            last_message_id = Some(send_slack_text_message(
+                &client,
+                config,
+                target,
+                &chunk,
+                index == 0,
+            )?);
+            delivered_any = true;
         }
-        let response = client
-            .post(url)
-            .bearer_auth(&config.token)
-            .header("Content-Type", "application/json")
-            .json(&Value::Object(payload))
-            .send()
-            .map_err(|error| SendError(format!("Slack send failed: {error}")))?;
-        let body = parse_json_response(response, "Slack send failed")?;
-        if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Err(SendError(format!(
-                "Slack send failed: {}",
-                body.get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-            )));
-        }
-        last_message_id = body.get("ts").and_then(value_as_string);
     }
 
     for attachment in media {
@@ -2127,15 +4030,71 @@ fn send_slack(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
-        last_message_id = Some(slack_upload_file(
-            &client, config, target, &file_name, &bytes,
-        )?);
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if message.is_empty() {
+                    match send_slack_media_text_fallback(&client, config, target, attachment) {
+                        Some(Ok(message_id)) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Some(Err(fallback_error)) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                        None => warnings.push(format!(
+                            "Failed to send media {}: {error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
+                continue;
+            }
+        };
+        match slack_upload_file(&client, config, target, &file_name, &bytes) {
+            Ok(message_id) => {
+                last_message_id = Some(message_id);
+                delivered_any = true;
+            }
+            Err(error) => {
+                if message.is_empty() {
+                    match send_slack_media_text_fallback(&client, config, target, attachment) {
+                        Some(Ok(message_id)) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Some(Err(fallback_error)) => warnings.push(format!(
+                            "Failed to send media {}: {}; {fallback_error}",
+                            attachment.path.display(),
+                            error.0
+                        )),
+                        None => warnings.push(format!(
+                            "Failed to send media {}: {}",
+                            attachment.path.display(),
+                            error.0
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    ));
+                }
+            }
+        }
+    }
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2146,7 +4105,47 @@ fn send_slack(
         note: target
             .used_home_channel
             .then(|| format!("Sent to slack home channel (chat_id: {})", target.chat_id)),
+        warnings,
     })
+}
+
+fn send_slack_text_message(
+    client: &Client,
+    config: &SlackConfig,
+    target: &ResolvedTarget,
+    text: &str,
+    first_thread_chunk: bool,
+) -> Result<String, SendError> {
+    let url = format!("{}/chat.postMessage", config.base_url);
+    let mut payload = serde_json::Map::new();
+    payload.insert("channel".to_string(), Value::String(target.chat_id.clone()));
+    payload.insert("text".to_string(), Value::String(text.to_string()));
+    payload.insert("mrkdwn".to_string(), Value::Bool(true));
+    if let Some(thread_id) = target.thread_id.as_ref() {
+        payload.insert("thread_ts".to_string(), Value::String(thread_id.clone()));
+        if config.reply_broadcast && first_thread_chunk {
+            payload.insert("reply_broadcast".to_string(), Value::Bool(true));
+        }
+    }
+    let response = client
+        .post(&url)
+        .bearer_auth(&config.token)
+        .header("Content-Type", "application/json")
+        .json(&Value::Object(payload))
+        .send()
+        .map_err(|error| SendError(format!("Slack send failed: {error}")))?;
+    let body = parse_json_response(response, "Slack send failed")?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(SendError(format!(
+            "Slack send failed: {}",
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        )));
+    }
+    body.get("ts")
+        .and_then(value_as_string)
+        .ok_or_else(|| SendError("Slack send failed: missing ts".to_string()))
 }
 
 fn slack_upload_file(
@@ -2241,6 +4240,28 @@ fn slack_upload_file(
         .unwrap_or(file_id))
 }
 
+fn send_slack_media_text_fallback(
+    client: &Client,
+    config: &SlackConfig,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Option<Result<String, String>> {
+    let ext = file_extension(&attachment.path);
+    let text = if IMAGE_EXTS.contains(&ext.as_str()) {
+        Some(format!("🖼️ Image: {}", attachment.path.display()))
+    } else if VIDEO_EXTS.contains(&ext.as_str()) {
+        Some(format!("🎬 Video: {}", attachment.path.display()))
+    } else if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        None
+    } else {
+        Some(format!("📎 File: {}", attachment.path.display()))
+    }?;
+    Some(
+        send_slack_text_message(client, config, target, &text, true)
+            .map_err(|error| format!("Failed to send fallback text for media: {}", error.0)),
+    )
+}
+
 fn send_feishu(
     config: &FeishuConfig,
     target: &ResolvedTarget,
@@ -2250,17 +4271,45 @@ fn send_feishu(
     let token = feishu_access_token(config)?;
     let client = http_client()?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
 
     if !message.is_empty() {
-        last_message_id = Some(feishu_send_message(
-            &client,
-            config,
-            &token,
-            target,
-            "text",
-            json!({ "text": message }).to_string(),
-            "Feishu send failed",
-        )?);
+        for chunk in truncate_message(message, FEISHU_MAX_MESSAGE_LENGTH) {
+            let (msg_type, payload) = feishu_build_outbound_payload(&chunk);
+            let plain_text_payload =
+                json!({ "text": feishu_strip_markdown_to_plain_text(&chunk) }).to_string();
+            match feishu_send_message(
+                &client,
+                config,
+                &token,
+                target,
+                &msg_type,
+                payload.clone(),
+                "Feishu send failed",
+            ) {
+                Ok(message_id) => {
+                    last_message_id = Some(message_id);
+                    delivered_any = true;
+                }
+                Err(error)
+                    if msg_type == "post"
+                        && feishu_is_invalid_post_error(error.to_string().as_str()) =>
+                {
+                    last_message_id = Some(feishu_send_message(
+                        &client,
+                        config,
+                        &token,
+                        target,
+                        "text",
+                        plain_text_payload,
+                        "Feishu send failed",
+                    )?);
+                    delivered_any = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     for attachment in media {
@@ -2271,16 +4320,62 @@ fn send_feishu(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if message.is_empty() {
+                    match send_feishu_media_text_fallback(
+                        &client, config, &token, target, attachment,
+                    ) {
+                        Ok(message_id) => {
+                            last_message_id = Some(message_id);
+                            delivered_any = true;
+                        }
+                        Err(fallback_error) => warnings.push(format!(
+                            "Failed to send media {}: {error}; {fallback_error}",
+                            attachment.path.display()
+                        )),
+                    }
+                } else {
+                    warnings.push(format!(
+                        "Failed to send media {}: {error}",
+                        attachment.path.display()
+                    ));
+                }
+                continue;
+            }
+        };
         let message_id = match route {
             FeishuMediaRoute::Image => {
-                let image_key = feishu_upload_image(&client, config, &token, &file_name, &bytes)?;
-                feishu_send_message(
+                let image_key =
+                    match feishu_upload_image(&client, config, &token, &file_name, &bytes) {
+                        Ok(image_key) => image_key,
+                        Err(error) => {
+                            if message.is_empty() {
+                                match send_feishu_media_text_fallback(
+                                    &client, config, &token, target, attachment,
+                                ) {
+                                    Ok(message_id) => {
+                                        last_message_id = Some(message_id);
+                                        delivered_any = true;
+                                    }
+                                    Err(fallback_error) => warnings.push(format!(
+                                        "Failed to send media {}: {}; {fallback_error}",
+                                        attachment.path.display(),
+                                        error.0
+                                    )),
+                                }
+                            } else {
+                                warnings.push(format!(
+                                    "Failed to send media {}: {}",
+                                    attachment.path.display(),
+                                    error.0
+                                ));
+                            }
+                            continue;
+                        }
+                    };
+                match feishu_send_message(
                     &client,
                     config,
                     &token,
@@ -2288,15 +4383,73 @@ fn send_feishu(
                     "image",
                     json!({ "image_key": image_key }).to_string(),
                     "Feishu media send failed",
-                )?
+                ) {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
+                        continue;
+                    }
+                }
             }
             FeishuMediaRoute::File {
                 upload_type,
                 msg_type,
             } => {
-                let file_key =
-                    feishu_upload_file(&client, config, &token, upload_type, &file_name, &bytes)?;
-                feishu_send_message(
+                let file_key = match feishu_upload_file(
+                    &client,
+                    config,
+                    &token,
+                    upload_type,
+                    &file_name,
+                    &bytes,
+                ) {
+                    Ok(file_key) => file_key,
+                    Err(error) => {
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                match feishu_send_message(
                     &client,
                     config,
                     &token,
@@ -2304,10 +4457,43 @@ fn send_feishu(
                     msg_type,
                     json!({ "file_key": file_key }).to_string(),
                     "Feishu media send failed",
-                )?
+                ) {
+                    Ok(message_id) => message_id,
+                    Err(error) => {
+                        if message.is_empty() {
+                            match send_feishu_media_text_fallback(
+                                &client, config, &token, target, attachment,
+                            ) {
+                                Ok(message_id) => {
+                                    last_message_id = Some(message_id);
+                                    delivered_any = true;
+                                }
+                                Err(fallback_error) => warnings.push(format!(
+                                    "Failed to send media {}: {}; {fallback_error}",
+                                    attachment.path.display(),
+                                    error.0
+                                )),
+                            }
+                        } else {
+                            warnings.push(format!(
+                                "Failed to send media {}: {}",
+                                attachment.path.display(),
+                                error.0
+                            ));
+                        }
+                        continue;
+                    }
+                }
             }
         };
         last_message_id = Some(message_id);
+        delivered_any = true;
+    }
+
+    if !delivered_any {
+        return Err(SendError(
+            "No deliverable text or media remained after processing MEDIA tags".to_string(),
+        ));
     }
 
     Ok(SentMessage {
@@ -2318,7 +4504,206 @@ fn send_feishu(
         note: target
             .used_home_channel
             .then(|| format!("Sent to feishu home channel (chat_id: {})", target.chat_id)),
+        warnings,
     })
+}
+
+fn feishu_build_outbound_payload(content: &str) -> (String, String) {
+    if feishu_contains_markdown_table(content) {
+        return ("text".to_string(), json!({ "text": content }).to_string());
+    }
+    if feishu_has_markdown_hints(content) {
+        return (
+            "post".to_string(),
+            feishu_build_markdown_post_payload(content),
+        );
+    }
+    ("text".to_string(), json!({ "text": content }).to_string())
+}
+
+fn send_feishu_media_text_fallback(
+    client: &Client,
+    config: &FeishuConfig,
+    token: &str,
+    target: &ResolvedTarget,
+    attachment: &MediaAttachment,
+) -> Result<String, String> {
+    feishu_send_message(
+        client,
+        config,
+        token,
+        target,
+        "text",
+        json!({ "text": feishu_media_text_fallback(attachment) }).to_string(),
+        "Feishu send failed",
+    )
+    .map_err(|error| format!("Failed to send fallback text for media: {}", error.0))
+}
+
+fn feishu_media_text_fallback(attachment: &MediaAttachment) -> String {
+    let path = attachment.path.display();
+    let ext = file_extension(&attachment.path);
+    if IMAGE_EXTS.contains(&ext.as_str()) {
+        return format!("🖼️ Image: {path}");
+    }
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        return format!("🎬 Video: {path}");
+    }
+    if attachment.is_voice || MATRIX_AUDIO_EXTS.contains(&ext.as_str()) {
+        return format!("🔊 Audio: {path}");
+    }
+    format!("📎 File: {path}")
+}
+
+fn feishu_contains_markdown_table(content: &str) -> bool {
+    let lines = content.lines().collect::<Vec<_>>();
+    lines.windows(2).any(|window| {
+        let first = window[0].trim();
+        let second = window[1].trim();
+        first.starts_with('|')
+            && first.ends_with('|')
+            && second.starts_with('|')
+            && second.ends_with('|')
+            && second
+                .trim_matches('|')
+                .chars()
+                .all(|ch| matches!(ch, '-' | '|' | ':' | ' '))
+    })
+}
+
+fn feishu_has_markdown_hints(content: &str) -> bool {
+    let inline_patterns = [
+        "```", "~~", "<u>", "</u>", "`", "**", "](", "\n> ", "\n- ", "\n* ", "\n1. ",
+    ];
+    if inline_patterns
+        .iter()
+        .any(|pattern| content.contains(pattern))
+    {
+        return true;
+    }
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('#')
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("> ")
+            || trimmed
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit() && trimmed.contains(". "))
+            || trimmed.chars().all(|ch| ch == '-') && trimmed.len() >= 3
+    })
+}
+
+fn feishu_build_markdown_post_payload(content: &str) -> String {
+    let rows = feishu_build_markdown_post_rows(content);
+    json!({
+        "zh_cn": {
+            "content": rows,
+        }
+    })
+    .to_string()
+}
+
+fn feishu_build_markdown_post_rows(content: &str) -> Value {
+    if content.is_empty() {
+        return json!([[{ "tag": "md", "text": "" }]]);
+    }
+    if !content.contains("```") {
+        return json!([[{ "tag": "md", "text": content }]]);
+    }
+
+    let mut rows = Vec::new();
+    let mut current = Vec::new();
+    let mut in_code_block = false;
+
+    let flush_current = |rows: &mut Vec<Value>, current: &mut Vec<String>| {
+        if current.is_empty() {
+            return;
+        }
+        let segment = current.join("\n");
+        if !segment.trim().is_empty() {
+            rows.push(json!([{ "tag": "md", "text": segment }]));
+        }
+        current.clear();
+    };
+
+    for raw_line in content.lines() {
+        let stripped = raw_line.trim();
+        let is_fence = if in_code_block {
+            stripped == "```"
+        } else {
+            stripped.starts_with("```") && !stripped[3..].contains('`')
+        };
+
+        if is_fence {
+            if !in_code_block {
+                flush_current(&mut rows, &mut current);
+            }
+            current.push(raw_line.to_string());
+            in_code_block = !in_code_block;
+            if !in_code_block {
+                flush_current(&mut rows, &mut current);
+            }
+            continue;
+        }
+
+        current.push(raw_line.to_string());
+    }
+
+    flush_current(&mut rows, &mut current);
+    if rows.is_empty() {
+        json!([[{ "tag": "md", "text": content }]])
+    } else {
+        Value::Array(rows)
+    }
+}
+
+fn feishu_strip_markdown_to_plain_text(text: &str) -> String {
+    let mut plain = text.replace("\r\n", "\n");
+    plain = Regex::new(r"\[([^\]]+)\]\(([^)]+)\)")
+        .expect("valid feishu markdown link regex")
+        .replace_all(&plain, "$1 ($2)")
+        .into_owned();
+    plain = Regex::new(r"(?m)^>\s?")
+        .expect("valid feishu blockquote regex")
+        .replace_all(&plain, "")
+        .into_owned();
+    plain = Regex::new(r"(?m)^\s*---+\s*$")
+        .expect("valid feishu rule regex")
+        .replace_all(&plain, "---")
+        .into_owned();
+    plain = Regex::new(r"~~([^~\n]+)~~")
+        .expect("valid feishu strikethrough regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain = Regex::new(r"<u>([\s\S]*?)</u>")
+        .expect("valid feishu underline regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain = Regex::new(r"\*\*([^*\n]+)\*\*")
+        .expect("valid feishu bold regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain = Regex::new(r"\*([^*\n]+)\*")
+        .expect("valid feishu italic regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain = Regex::new(r"`([^`\n]+)`")
+        .expect("valid feishu inline code regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain = Regex::new(r"(?s)```[^\n`]*\n(.*?)```")
+        .expect("valid feishu fenced code regex")
+        .replace_all(&plain, "$1")
+        .into_owned();
+    plain.trim().to_string()
+}
+
+fn feishu_is_invalid_post_error(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("content format of the post type is incorrect")
 }
 
 fn send_matrix(
@@ -2328,19 +4713,23 @@ fn send_matrix(
     media: &[MediaAttachment],
 ) -> Result<SentMessage, SendError> {
     let client = http_client()?;
+    let token = matrix_access_token(&client, config)?;
     let mut last_message_id = None;
+    let mut delivered_any = false;
+    let mut warnings = Vec::new();
 
     if !message.is_empty() {
-        last_message_id = Some(send_matrix_message(
-            &client,
-            config,
-            target,
-            json!({
-                "msgtype": "m.text",
-                "body": message,
-            }),
-            "Matrix send failed",
-        )?);
+        for chunk in truncate_message(message, MATRIX_MAX_MESSAGE_LENGTH) {
+            last_message_id = Some(send_matrix_message(
+                &client,
+                &token,
+                &config.homeserver,
+                target,
+                matrix_text_payload(&chunk),
+                "Matrix send failed",
+            )?);
+            delivered_any = true;
+        }
     }
 
     for attachment in media {
@@ -2350,28 +4739,86 @@ fn send_matrix(
             .and_then(|name| name.to_str())
             .unwrap_or("attachment.bin")
             .to_string();
-        let bytes = fs::read(&attachment.path).map_err(|error| {
-            SendError(format!(
-                "Reading media {} failed: {error}",
-                attachment.path.display()
-            ))
-        })?;
-        let mime_type = guess_mime_type(&attachment.path, &bytes);
-        let content_uri = matrix_upload_media(&client, config, &file_name, &mime_type, &bytes)?;
-        let message_id = send_matrix_message(
+        let bytes = match fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let fallback = format!("(file not found: {})", attachment.path.display());
+                match send_matrix_message(
+                    &client,
+                    &token,
+                    &config.homeserver,
+                    target,
+                    matrix_text_payload(&fallback),
+                    "Matrix send failed",
+                ) {
+                    Ok(message_id) => {
+                        last_message_id = Some(message_id);
+                        delivered_any = true;
+                        warnings.push(format!(
+                            "Matrix attachment missing, sent fallback text instead: {}",
+                            attachment.path.display()
+                        ));
+                    }
+                    Err(error) => warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    )),
+                }
+                continue;
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "Failed to send media {}: {error}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+        };
+        let mime_type = guess_matrix_mime_type(&attachment.path, &bytes);
+        let content_uri =
+            match matrix_upload_media(&client, &token, config, &file_name, &mime_type, &bytes) {
+                Ok(content_uri) => content_uri,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Failed to send media {}: {}",
+                        attachment.path.display(),
+                        error.0
+                    ));
+                    continue;
+                }
+            };
+        match send_matrix_message(
             &client,
-            config,
+            &token,
+            &config.homeserver,
             target,
             matrix_media_payload(
                 matrix_media_kind(attachment),
+                attachment.is_voice,
                 &file_name,
                 &mime_type,
                 bytes.len(),
                 &content_uri,
             ),
             "Matrix media send failed",
-        )?;
-        last_message_id = Some(message_id);
+        ) {
+            Ok(message_id) => {
+                last_message_id = Some(message_id);
+                delivered_any = true;
+            }
+            Err(error) => warnings.push(format!(
+                "Failed to send media {}: {}",
+                attachment.path.display(),
+                error.0
+            )),
+        }
+    }
+
+    if !delivered_any {
+        return Err(SendError(warnings.first().cloned().unwrap_or_else(|| {
+            "No deliverable text or media remained after processing MEDIA tags".to_string()
+        })));
     }
 
     Ok(SentMessage {
@@ -2382,6 +4829,7 @@ fn send_matrix(
         note: target
             .used_home_channel
             .then(|| format!("Sent to matrix home room (chat_id: {})", target.chat_id)),
+        warnings,
     })
 }
 
@@ -4197,7 +6645,8 @@ fn is_bluebubbles_address(value: &str) -> bool {
 
 fn send_matrix_message(
     client: &Client,
-    config: &MatrixConfig,
+    token: &str,
+    homeserver: &str,
     target: &ResolvedTarget,
     mut payload: Value,
     context: &str,
@@ -4214,11 +6663,11 @@ fn send_matrix_message(
         url::form_urlencoded::byte_serialize(target.chat_id.as_bytes()).collect();
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-        config.homeserver, encoded_room, txn_id
+        homeserver, encoded_room, txn_id
     );
     let response = client
         .put(url)
-        .bearer_auth(&config.token)
+        .bearer_auth(token)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
@@ -4231,6 +6680,7 @@ fn send_matrix_message(
 
 fn matrix_upload_media(
     client: &Client,
+    token: &str,
     config: &MatrixConfig,
     file_name: &str,
     mime_type: &str,
@@ -4245,7 +6695,7 @@ fn matrix_upload_media(
     url.query_pairs_mut().append_pair("filename", file_name);
     let response = client
         .post(url)
-        .bearer_auth(&config.token)
+        .bearer_auth(token)
         .header("Content-Type", mime_type)
         .body(bytes.to_vec())
         .send()
@@ -4258,6 +6708,7 @@ fn matrix_upload_media(
 
 fn matrix_media_payload(
     kind: MatrixMediaKind,
+    is_voice: bool,
     file_name: &str,
     mime_type: &str,
     size: usize,
@@ -4278,10 +6729,385 @@ fn matrix_media_payload(
             "size": size,
         },
     });
-    if kind == MatrixMediaKind::Audio {
+    if kind == MatrixMediaKind::Audio && is_voice {
         payload["org.matrix.msc3245.voice"] = json!({});
     }
     payload
+}
+
+fn matrix_text_payload(message: &str) -> Value {
+    let mut payload = json!({
+        "msgtype": "m.text",
+        "body": message,
+    });
+    let mention_user_ids = matrix_extract_outbound_mentions(message);
+    if !mention_user_ids.is_empty() {
+        payload["m.mentions"] = json!({ "user_ids": mention_user_ids });
+    }
+    let html_source = matrix_inject_outbound_mention_links(message);
+    let html = matrix_markdown_to_html(&html_source);
+    if !html.is_empty() {
+        payload["format"] = json!("org.matrix.custom.html");
+        payload["formatted_body"] = json!(html);
+    }
+    payload
+}
+
+fn matrix_extract_outbound_mentions(text: &str) -> Vec<String> {
+    let protected = matrix_protect_outbound_mention_regions(text);
+    let regex = Regex::new(r"(^|[^\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
+        .expect("valid matrix outbound mention regex");
+    let mut seen = std::collections::HashSet::new();
+    let mut mentions = Vec::new();
+    for captures in regex.captures_iter(&protected) {
+        let Some(user_id) = captures.get(2).map(|value| value.as_str()) else {
+            continue;
+        };
+        if seen.insert(user_id.to_string()) {
+            mentions.push(user_id.to_string());
+        }
+    }
+    mentions
+}
+
+fn matrix_inject_outbound_mention_links(text: &str) -> String {
+    if text.is_empty() {
+        return text.to_string();
+    }
+    let mut placeholders = Vec::new();
+    let protected =
+        matrix_protect_outbound_mention_regions_with_placeholders(text, &mut placeholders);
+    let regex = Regex::new(r"(^|[^\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
+        .expect("valid matrix outbound mention regex");
+    let linked = regex
+        .replace_all(&protected, |captures: &regex::Captures<'_>| {
+            let prefix = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let user_id = captures
+                .get(2)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            format!("{prefix}[{user_id}](https://matrix.to/#/{user_id})")
+        })
+        .into_owned();
+    restore_placeholders(linked, &placeholders)
+}
+
+fn matrix_protect_outbound_mention_regions(text: &str) -> String {
+    let mut placeholders = Vec::new();
+    matrix_protect_outbound_mention_regions_with_placeholders(text, &mut placeholders)
+}
+
+fn matrix_protect_outbound_mention_regions_with_placeholders(
+    text: &str,
+    placeholders: &mut Vec<(String, String)>,
+) -> String {
+    let mut protected = text.to_string();
+    protected = replace_with_placeholders(&protected, r"(?s)```.*?```", placeholders, |captures| {
+        captures[0].to_string()
+    });
+    protected = replace_with_placeholders(&protected, r"`[^`\n]+`", placeholders, |captures| {
+        captures[0].to_string()
+    });
+    replace_with_placeholders(
+        &protected,
+        r"\[[^\]]+\]\([^)]+\)",
+        placeholders,
+        |captures| captures[0].to_string(),
+    )
+}
+
+fn matrix_markdown_to_html(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut placeholders = Vec::new();
+    let mut result = text.to_string();
+
+    result = replace_with_placeholders(
+        &result,
+        r"(?s)```(\w*)\n(.*?)```",
+        &mut placeholders,
+        |captures| {
+            let lang = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let body = captures
+                .get(2)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            if lang.is_empty() {
+                format!("<pre><code>{}</code></pre>", matrix_escape_html(body))
+            } else {
+                format!(
+                    "<pre><code class=\"language-{}\">{}</code></pre>",
+                    matrix_escape_html(lang),
+                    matrix_escape_html(body)
+                )
+            }
+        },
+    );
+    result = replace_with_placeholders(&result, r"`([^`\n]+)`", &mut placeholders, |captures| {
+        format!(
+            "<code>{}</code>",
+            matrix_escape_html(
+                captures
+                    .get(1)
+                    .map(|value| value.as_str())
+                    .unwrap_or_default()
+            )
+        )
+    });
+    result = replace_with_placeholders(
+        &result,
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        &mut placeholders,
+        |captures| {
+            let label = captures
+                .get(1)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            let url = captures
+                .get(2)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            format!(
+                "<a href=\"{}\">{}</a>",
+                matrix_sanitize_link_url(url),
+                matrix_escape_html(label)
+            )
+        },
+    );
+
+    let parts = result
+        .split_inclusive('\n')
+        .map(|part| part.strip_suffix('\n').unwrap_or(part))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut rendered_lines = Vec::new();
+    let mut index = 0;
+    while index < parts.len() {
+        let line = &parts[index];
+
+        if is_matrix_horizontal_rule(line) {
+            rendered_lines.push("<hr>".to_string());
+            index += 1;
+            continue;
+        }
+
+        if let Some(header) = Regex::new(r"^(#{1,6})\s+(.+)$")
+            .expect("valid matrix header regex")
+            .captures(line)
+        {
+            let level = header.get(1).map(|value| value.as_str().len()).unwrap_or(1);
+            let content = header
+                .get(2)
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            rendered_lines.push(format!(
+                "<h{level}>{}</h{level}>",
+                matrix_escape_html(content)
+            ));
+            index += 1;
+            continue;
+        }
+
+        if line.starts_with("> ") || line == ">" {
+            let mut quote_lines = Vec::new();
+            while index < parts.len() && (parts[index].starts_with("> ") || parts[index] == ">") {
+                quote_lines.push(
+                    parts[index]
+                        .strip_prefix("> ")
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                index += 1;
+            }
+            rendered_lines.push(format!(
+                "<blockquote>{}</blockquote>",
+                quote_lines.join("<br>")
+            ));
+            continue;
+        }
+
+        if Regex::new(r"^[\s]*[-*+]\s+(.+)$")
+            .expect("valid matrix ul regex")
+            .is_match(line)
+        {
+            let regex = Regex::new(r"^[\s]*[-*+]\s+(.+)$").expect("valid matrix ul item regex");
+            let mut items = Vec::new();
+            while index < parts.len() {
+                let Some(captures) = regex.captures(&parts[index]) else {
+                    break;
+                };
+                items.push(format!(
+                    "<li>{}</li>",
+                    captures
+                        .get(1)
+                        .map(|value| value.as_str())
+                        .unwrap_or_default()
+                ));
+                index += 1;
+            }
+            rendered_lines.push(format!("<ul>{}</ul>", items.join("")));
+            continue;
+        }
+
+        if Regex::new(r"^[\s]*\d+[.)]\s+(.+)$")
+            .expect("valid matrix ol regex")
+            .is_match(line)
+        {
+            let regex = Regex::new(r"^[\s]*\d+[.)]\s+(.+)$").expect("valid matrix ol item regex");
+            let mut items = Vec::new();
+            while index < parts.len() {
+                let Some(captures) = regex.captures(&parts[index]) else {
+                    break;
+                };
+                items.push(format!(
+                    "<li>{}</li>",
+                    captures
+                        .get(1)
+                        .map(|value| value.as_str())
+                        .unwrap_or_default()
+                ));
+                index += 1;
+            }
+            rendered_lines.push(format!("<ol>{}</ol>", items.join("")));
+            continue;
+        }
+
+        rendered_lines.push(matrix_escape_html(line));
+        index += 1;
+    }
+
+    result = rendered_lines.join("\n");
+    result = Regex::new(r"\*\*(.+?)\*\*")
+        .expect("valid matrix bold regex")
+        .replace_all(&result, "<strong>$1</strong>")
+        .into_owned();
+    result = Regex::new(r"__(.+?)__")
+        .expect("valid matrix bold underscore regex")
+        .replace_all(&result, "<strong>$1</strong>")
+        .into_owned();
+    result = Regex::new(r"\*(.+?)\*")
+        .expect("valid matrix italic regex")
+        .replace_all(&result, "<em>$1</em>")
+        .into_owned();
+    result = Regex::new(r"(^|[^\w])_(.+?)_([^\w]|$)")
+        .expect("valid matrix italic underscore regex")
+        .replace_all(&result, "$1<em>$2</em>$3")
+        .into_owned();
+    result = Regex::new(r"~~(.+?)~~")
+        .expect("valid matrix strikethrough regex")
+        .replace_all(&result, "<del>$1</del>")
+        .into_owned();
+    result = result.replace('\n', "<br>\n");
+    result = Regex::new(r"<br>\n(</?(?:pre|blockquote|h[1-6]|ul|ol|li|hr))")
+        .expect("valid matrix block break regex")
+        .replace_all(&result, "\n$1")
+        .into_owned();
+    result = Regex::new(r"(</(?:pre|blockquote|h[1-6]|ul|ol|li)>)<br>")
+        .expect("valid matrix trailing block break regex")
+        .replace_all(&result, "$1")
+        .into_owned();
+
+    restore_placeholders(result, &placeholders)
+}
+
+fn is_matrix_horizontal_rule(line: &str) -> bool {
+    let compact = line
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if compact.len() < 3 {
+        return false;
+    }
+    let Some(first) = compact.chars().next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_') && compact.chars().all(|ch| ch == first)
+}
+
+fn matrix_escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn matrix_sanitize_link_url(url: &str) -> String {
+    let stripped = url.trim();
+    let scheme = stripped
+        .split_once(':')
+        .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(scheme.as_str(), "javascript" | "data" | "vbscript") {
+        return String::new();
+    }
+    stripped.replace('"', "&quot;")
+}
+
+fn matrix_access_token(client: &Client, config: &MatrixConfig) -> Result<String, SendError> {
+    if let Some(token) = config.token.as_deref() {
+        return Ok(token.to_string());
+    }
+
+    let user_id = config
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SendError(
+                "Matrix is configured for password login but MATRIX_USER_ID is missing".to_string(),
+            )
+        })?;
+    let password = config
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            SendError(
+                "Matrix is configured for password login but MATRIX_PASSWORD is missing"
+                    .to_string(),
+            )
+        })?;
+
+    let mut payload = json!({
+        "type": "m.login.password",
+        "identifier": {
+            "type": "m.id.user",
+            "user": user_id,
+        },
+        "password": password,
+    });
+    if let Some(device_id) = config
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["device_id"] = json!(device_id);
+    }
+
+    let response = client
+        .post(format!("{}/_matrix/client/v3/login", config.homeserver))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .map_err(|error| SendError(format!("Matrix login failed: {error}")))?;
+    let body = parse_json_response(response, "Matrix login failed")?;
+    body.get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| SendError("Matrix login failed: missing access_token".to_string()))
 }
 
 fn matrix_media_kind(attachment: &MediaAttachment) -> MatrixMediaKind {
@@ -4298,7 +7124,7 @@ fn matrix_media_kind(attachment: &MediaAttachment) -> MatrixMediaKind {
     MatrixMediaKind::File
 }
 
-fn guess_mime_type(path: &Path, bytes: &[u8]) -> String {
+fn guess_matrix_mime_type(path: &Path, bytes: &[u8]) -> String {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return "image/png".to_string();
     }
@@ -4329,7 +7155,6 @@ fn guess_mime_type(path: &Path, bytes: &[u8]) -> String {
         "mp3" => "audio/mpeg".to_string(),
         "wav" => "audio/wav".to_string(),
         "m4a" => "audio/mp4".to_string(),
-        "amr" => "audio/amr".to_string(),
         "flac" => "audio/flac".to_string(),
         "pdf" => "application/pdf".to_string(),
         "doc" => "application/msword".to_string(),
@@ -4359,10 +7184,38 @@ fn send_signal(
         ));
     }
 
-    let attachment_paths = media
-        .iter()
-        .map(|attachment| attachment.path.display().to_string())
-        .collect::<Vec<_>>();
+    let mut attachment_paths = Vec::new();
+    let mut warnings = Vec::new();
+    for attachment in media {
+        let metadata = match fs::metadata(&attachment.path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => {
+                warnings.push(format!(
+                    "Signal attachment file not found, skipping: {}",
+                    attachment.path.display()
+                ));
+                continue;
+            }
+        };
+        let size = metadata.len();
+        if size > SIGNAL_MAX_ATTACHMENT_SIZE {
+            warnings.push(format!(
+                "Signal attachment too large ({} bytes), skipping: {}",
+                size,
+                attachment.path.display()
+            ));
+            continue;
+        }
+        attachment_paths.push(attachment.path.display().to_string());
+    }
+    let (plain_message, text_styles) = signal_format_message(message);
+    if attachment_paths.is_empty() && plain_message.is_empty() {
+        let reason = warnings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "No deliverable Signal text or attachments remained".to_string());
+        return Err(SendError(reason));
+    }
     let attachment_batches = if attachment_paths.is_empty() {
         vec![Vec::new()]
     } else {
@@ -4371,28 +7224,110 @@ fn send_signal(
             .map(|chunk| chunk.to_vec())
             .collect::<Vec<_>>()
     };
+    let mut failed_batches = Vec::new();
+    let mut delivered_batches = 0usize;
 
     for (index, batch) in attachment_batches.iter().enumerate() {
-        let batch_message = if index == 0 { message } else { "" };
-        let client =
-            http_client_with_timeout(Duration::from_secs(signal_batch_timeout_secs(batch.len())))?;
-        let body = signal_send_batch(
-            &client,
-            config,
-            target,
-            batch_message,
-            batch,
-            index + 1,
-            attachment_batches.len(),
-        )?;
-        if let Some(error) = body.get("error").filter(|value| !value.is_null()) {
-            return Err(SendError(format!(
-                "Signal RPC error on batch {}/{}: {}",
-                index + 1,
-                attachment_batches.len(),
-                signal_error_text(error)
-            )));
+        let batch_message = if index == 0 {
+            plain_message.as_str()
+        } else {
+            ""
+        };
+        let attachment_count = batch.len();
+        let batch_number = index + 1;
+        let mut delivered = false;
+        let batch_styles = if index == 0 {
+            text_styles.as_slice()
+        } else {
+            &[]
+        };
+        if attachment_count > 0 {
+            let estimated = signal_scheduler_estimate_wait(attachment_count);
+            if estimated >= signal_batch_pacing_notice_threshold_secs() {
+                let _ = signal_send_notice(
+                    config,
+                    target,
+                    &format!(
+                        "(More images coming — pausing ~{} for Signal rate limit, batch {}/{})",
+                        signal_format_wait(estimated),
+                        batch_number,
+                        attachment_batches.len()
+                    ),
+                );
+            }
         }
+
+        for attempt in 1..=SIGNAL_RATE_LIMIT_MAX_ATTEMPTS {
+            signal_scheduler_acquire(attachment_count)?;
+            let client = http_client_with_timeout(Duration::from_secs(signal_batch_timeout_secs(
+                attachment_count,
+            )))?;
+            let rpc_started_at = std::time::Instant::now();
+            let body = match signal_send_batch(
+                &client,
+                config,
+                target,
+                batch_message,
+                batch_styles,
+                batch,
+                batch_number,
+                attachment_batches.len(),
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS {
+                        failed_batches.push(batch_number);
+                        break;
+                    }
+                    let _ = error;
+                    continue;
+                }
+            };
+            if let Some(error) = body.get("error").filter(|value| !value.is_null()) {
+                if !is_signal_rate_limit_error(error) {
+                    return Err(SendError(format!(
+                        "Signal RPC error on batch {}/{}: {}",
+                        batch_number,
+                        attachment_batches.len(),
+                        signal_error_text(error)
+                    )));
+                }
+
+                let retry_after = extract_signal_retry_after_seconds(error);
+                signal_scheduler_feedback(retry_after);
+                if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS {
+                    failed_batches.push(batch_number);
+                    break;
+                }
+                continue;
+            }
+
+            signal_scheduler_report_rpc_duration(rpc_started_at.elapsed(), attachment_count);
+            delivered = true;
+            delivered_batches += 1;
+            break;
+        }
+
+        let _ = delivered;
+    }
+
+    if delivered_batches == 0 && !failed_batches.is_empty() {
+        return Err(SendError(format!(
+            "Signal: every batch ({}) failed after exhausting retries; nothing was delivered",
+            attachment_batches.len()
+        )));
+    }
+
+    if !failed_batches.is_empty() {
+        warnings.push(format!(
+            "Signal dropped {} batch(es) after exhausting retries (#{})",
+            failed_batches.len(),
+            failed_batches
+                .iter()
+                .map(|batch| batch.to_string())
+                .collect::<Vec<_>>()
+                .join(", #")
+        ));
     }
 
     Ok(SentMessage {
@@ -4403,6 +7338,7 @@ fn send_signal(
         note: target
             .used_home_channel
             .then(|| format!("Sent to signal home channel (chat_id: {})", target.chat_id)),
+        warnings,
     })
 }
 
@@ -4411,6 +7347,7 @@ fn signal_send_batch(
     config: &SignalConfig,
     target: &ResolvedTarget,
     message: &str,
+    text_styles: &[String],
     attachments: &[String],
     batch_index: usize,
     batch_total: usize,
@@ -4423,6 +7360,11 @@ fn signal_send_batch(
         params["groupId"] = json!(target.chat_id.trim_start_matches("group:"));
     } else {
         params["recipient"] = json!([target.chat_id]);
+    }
+    match text_styles {
+        [style] => params["textStyle"] = json!(style),
+        styles if !styles.is_empty() => params["textStyles"] = json!(styles),
+        _ => {}
     }
     if !attachments.is_empty() {
         params["attachments"] = json!(attachments);
@@ -4456,6 +7398,182 @@ fn signal_batch_timeout_secs(attachment_count: usize) -> u64 {
     (attachment_count as u64 * 5).max(60)
 }
 
+fn signal_batch_pacing_notice_threshold_secs() -> f64 {
+    #[cfg(test)]
+    if let Some(override_value) = SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE.get() {
+        if let Some(value) = *override_value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            return value;
+        }
+    }
+    SIGNAL_BATCH_PACING_NOTICE_THRESHOLD_SECS
+}
+
+fn signal_scheduler() -> &'static Mutex<SignalAttachmentScheduler> {
+    SIGNAL_SCHEDULER.get_or_init(|| {
+        Mutex::new(SignalAttachmentScheduler {
+            capacity: SIGNAL_RATE_LIMIT_BUCKET_CAPACITY,
+            tokens: SIGNAL_RATE_LIMIT_BUCKET_CAPACITY,
+            refill_rate: 1.0 / SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER,
+            last_refill: std::time::Instant::now(),
+        })
+    })
+}
+
+fn signal_scheduler_acquire(n: usize) -> Result<f64, SendError> {
+    if n == 0 {
+        return Ok(0.0);
+    }
+    if n as f64 > SIGNAL_RATE_LIMIT_BUCKET_CAPACITY {
+        return Err(SendError(format!(
+            "Signal scheduler cannot acquire {n} attachment tokens (capacity={SIGNAL_RATE_LIMIT_BUCKET_CAPACITY})"
+        )));
+    }
+
+    let mut total_slept = 0.0;
+    loop {
+        let wait = {
+            let mut scheduler = signal_scheduler()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            scheduler_refill(&mut scheduler);
+            if scheduler.tokens >= n as f64 {
+                return Ok(total_slept);
+            }
+            let deficit = n as f64 - scheduler.tokens;
+            deficit / scheduler.refill_rate
+        };
+        std::thread::sleep(Duration::from_secs_f64(wait));
+        total_slept += wait;
+    }
+}
+
+fn signal_scheduler_estimate_wait(n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let scheduler = signal_scheduler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let elapsed = std::time::Instant::now()
+        .duration_since(scheduler.last_refill)
+        .as_secs_f64();
+    let mut projected = scheduler.tokens;
+    if elapsed > 0.0 && projected < scheduler.capacity {
+        projected = (projected + elapsed * scheduler.refill_rate).min(scheduler.capacity);
+    }
+    let deficit = n as f64 - projected;
+    if deficit <= 0.0 {
+        0.0
+    } else {
+        deficit / scheduler.refill_rate
+    }
+}
+
+fn signal_scheduler_report_rpc_duration(rpc_duration: Duration, n_attachments: usize) {
+    if n_attachments == 0 {
+        return;
+    }
+    let mut scheduler = signal_scheduler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    scheduler.tokens = (scheduler.tokens - n_attachments as f64).max(0.0);
+    let _ = rpc_duration;
+    scheduler.last_refill = std::time::Instant::now();
+}
+
+fn signal_scheduler_feedback(retry_after: Option<f64>) {
+    let mut scheduler = signal_scheduler()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(retry_after) = retry_after.filter(|value| *value > 0.0) {
+        scheduler.refill_rate = 1.0 / retry_after;
+    }
+    scheduler.tokens = 0.0;
+    scheduler.last_refill = std::time::Instant::now();
+}
+
+fn scheduler_refill(scheduler: &mut SignalAttachmentScheduler) {
+    let now = std::time::Instant::now();
+    let elapsed = now.duration_since(scheduler.last_refill).as_secs_f64();
+    if elapsed > 0.0 && scheduler.tokens < scheduler.capacity {
+        scheduler.tokens =
+            (scheduler.tokens + elapsed * scheduler.refill_rate).min(scheduler.capacity);
+    }
+    scheduler.last_refill = now;
+}
+
+fn signal_format_wait(seconds: f64) -> String {
+    let seconds = seconds.max(0.0);
+    if seconds < 90.0 {
+        format!("{}s", seconds.round() as i64)
+    } else {
+        format!("{} min", ((seconds / 60.0).round() as i64).max(1))
+    }
+}
+
+fn signal_send_notice(
+    config: &SignalConfig,
+    target: &ResolvedTarget,
+    message: &str,
+) -> Result<(), SendError> {
+    let client = http_client_with_timeout(Duration::from_secs(30))?;
+    let body = signal_send_batch(&client, config, target, message, &[], &[], 0, 0)?;
+    if let Some(error) = body.get("error").filter(|value| !value.is_null()) {
+        return Err(SendError(format!(
+            "Signal pacing notice failed: {}",
+            signal_error_text(error)
+        )));
+    }
+    Ok(())
+}
+
+fn extract_signal_retry_after_seconds(error: &Value) -> Option<f64> {
+    let candidates = error
+        .get("data")
+        .and_then(|value| value.get("response"))
+        .and_then(|value| value.get("results"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| result.get("retryAfterSeconds"))
+        .filter_map(value_as_f64)
+        .collect::<Vec<_>>();
+    if let Some(value) = candidates.into_iter().reduce(f64::max) {
+        return Some(value);
+    }
+
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let marker = "retry after ";
+    let start = message.find(marker)? + marker.len();
+    let digits = message[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    digits.parse::<f64>().ok()
+}
+
+fn is_signal_rate_limit_error(error: &Value) -> bool {
+    if error.get("code").and_then(value_as_i64) == Some(-5) {
+        return true;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("[429]")
+        || message.contains("ratelimit")
+        || message.contains("retrylaterexception")
+        || message.contains("retry after")
+}
+
 fn signal_error_text(error: &Value) -> String {
     if let Some(message) = error.get("message").and_then(Value::as_str) {
         let code = error.get("code").and_then(value_as_i64);
@@ -4468,6 +7586,449 @@ fn signal_error_text(error: &Value) -> String {
         return text.to_string();
     }
     error.to_string()
+}
+
+#[derive(Clone, Copy)]
+enum SignalTextStyleKind {
+    Bold,
+    Italic,
+    Strikethrough,
+    Monospace,
+}
+
+impl SignalTextStyleKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bold => "BOLD",
+            Self::Italic => "ITALIC",
+            Self::Strikethrough => "STRIKETHROUGH",
+            Self::Monospace => "MONOSPACE",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SignalTextStyleRange {
+    start: usize,
+    len: usize,
+    kind: SignalTextStyleKind,
+}
+
+#[derive(Clone, Copy)]
+struct SignalInlineMatch {
+    start: usize,
+    end: usize,
+    inner_start: usize,
+    inner_end: usize,
+    kind: SignalTextStyleKind,
+}
+
+fn signal_format_message(content: &str) -> (String, Vec<String>) {
+    let normalized = Regex::new(r"\n{3,}")
+        .expect("valid signal newline normalization regex")
+        .replace_all(content, "\n\n")
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        return (normalized, Vec::new());
+    }
+
+    let (preprocessed, prior_styles) = signal_preprocess_blocks(&normalized);
+    let (plain_text, styles) = signal_apply_inline_styles(&preprocessed, &prior_styles);
+    let style_strings = signal_style_strings(&plain_text, &styles);
+    (plain_text, style_strings)
+}
+
+fn signal_preprocess_blocks(text: &str) -> (String, Vec<SignalTextStyleRange>) {
+    let mut output = String::new();
+    let mut styles = Vec::new();
+    let mut index = 0usize;
+    let mut line_start = true;
+
+    while index < text.len() {
+        if text[index..].starts_with("```")
+            && let Some((consumed, inner)) = signal_extract_fenced_code(&text[index..])
+        {
+            let start = output.chars().count();
+            output.push_str(&inner);
+            let len = inner.chars().count();
+            if len > 0 {
+                styles.push(SignalTextStyleRange {
+                    start,
+                    len,
+                    kind: SignalTextStyleKind::Monospace,
+                });
+            }
+            line_start = output.ends_with('\n');
+            index += consumed;
+            continue;
+        }
+
+        if line_start
+            && let Some((consumed, heading_text, has_newline)) =
+                signal_extract_heading(&text[index..])
+        {
+            let start = output.chars().count();
+            output.push_str(&heading_text);
+            let len = heading_text.chars().count();
+            if len > 0 {
+                styles.push(SignalTextStyleRange {
+                    start,
+                    len,
+                    kind: SignalTextStyleKind::Bold,
+                });
+            }
+            if has_newline {
+                output.push('\n');
+            }
+            line_start = has_newline;
+            index += consumed;
+            continue;
+        }
+
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("signal block preprocessing should have a char");
+        output.push(ch);
+        line_start = ch == '\n';
+        index += ch.len_utf8();
+    }
+
+    (output, styles)
+}
+
+fn signal_extract_fenced_code(segment: &str) -> Option<(usize, String)> {
+    if !segment.starts_with("```") {
+        return None;
+    }
+    let after_ticks = 3;
+    let mut inner_start = after_ticks;
+
+    while inner_start < segment.len() {
+        let ch = segment[inner_start..].chars().next()?;
+        if ch == '\n' {
+            inner_start += ch.len_utf8();
+            break;
+        }
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '-')) {
+            break;
+        }
+        inner_start += ch.len_utf8();
+    }
+
+    let closing = segment[inner_start..].find("```")?;
+    let closing_index = inner_start + closing;
+    let inner = segment[inner_start..closing_index]
+        .strip_suffix('\n')
+        .unwrap_or(&segment[inner_start..closing_index])
+        .to_string();
+    Some((closing_index + 3, inner))
+}
+
+fn signal_extract_heading(segment: &str) -> Option<(usize, String, bool)> {
+    let mut hashes = 0usize;
+    let mut byte_index = 0usize;
+    while hashes < 6 {
+        let ch = segment[byte_index..].chars().next()?;
+        if ch != '#' {
+            break;
+        }
+        hashes += 1;
+        byte_index += ch.len_utf8();
+    }
+    if hashes == 0 {
+        return None;
+    }
+
+    let whitespace_len = segment[byte_index..]
+        .chars()
+        .take_while(|ch| ch.is_whitespace() && *ch != '\n')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if whitespace_len == 0 {
+        return None;
+    }
+    byte_index += whitespace_len;
+
+    let line_end = segment[byte_index..]
+        .find('\n')
+        .map(|offset| byte_index + offset)
+        .unwrap_or(segment.len());
+    let heading_text = segment[byte_index..line_end].to_string();
+    if line_end < segment.len() {
+        return Some((line_end + 1, heading_text, true));
+    }
+    Some((line_end, heading_text, false))
+}
+
+fn signal_apply_inline_styles(
+    text: &str,
+    prior_styles: &[SignalTextStyleRange],
+) -> (String, Vec<SignalTextStyleRange>) {
+    let matches = signal_collect_inline_matches(text);
+    if matches.is_empty() {
+        return (text.to_string(), prior_styles.to_vec());
+    }
+
+    let removals = matches
+        .iter()
+        .flat_map(|matched| {
+            [
+                (
+                    matched.start,
+                    matched.inner_start.saturating_sub(matched.start),
+                ),
+                (
+                    matched.inner_end,
+                    matched.end.saturating_sub(matched.inner_end),
+                ),
+            ]
+        })
+        .filter(|(_, len)| *len > 0)
+        .collect::<Vec<_>>();
+    let adjusted_prior = prior_styles
+        .iter()
+        .filter_map(|style| {
+            let start = signal_adjust_cp_position(style.start, &removals);
+            let end = signal_adjust_cp_position(style.start + style.len, &removals);
+            (end > start).then_some(SignalTextStyleRange {
+                start,
+                len: end - start,
+                kind: style.kind,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let offsets = char_offsets(text);
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    let mut inline_styles = Vec::new();
+    for matched in &matches {
+        output.push_str(
+            &text[cp_index_to_byte(&offsets, cursor)..cp_index_to_byte(&offsets, matched.start)],
+        );
+        let inner = &text[cp_index_to_byte(&offsets, matched.inner_start)
+            ..cp_index_to_byte(&offsets, matched.inner_end)];
+        let start = output.chars().count();
+        output.push_str(inner);
+        let len = inner.chars().count();
+        if len > 0 {
+            inline_styles.push(SignalTextStyleRange {
+                start,
+                len,
+                kind: matched.kind,
+            });
+        }
+        cursor = matched.end;
+    }
+    output.push_str(&text[cp_index_to_byte(&offsets, cursor)..]);
+
+    let mut styles = adjusted_prior;
+    styles.extend(inline_styles);
+    styles.sort_by_key(|style| (style.start, style.len));
+    (output, styles)
+}
+
+fn signal_collect_inline_matches(text: &str) -> Vec<SignalInlineMatch> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let matched = signal_match_double_marker(&chars, index, "**", SignalTextStyleKind::Bold)
+            .or_else(|| signal_match_double_marker(&chars, index, "__", SignalTextStyleKind::Bold))
+            .or_else(|| {
+                signal_match_double_marker(&chars, index, "~~", SignalTextStyleKind::Strikethrough)
+            })
+            .or_else(|| signal_match_backticks(&chars, index))
+            .or_else(|| signal_match_italic_star(&chars, index))
+            .or_else(|| signal_match_italic_underscore(&chars, index));
+
+        if let Some(found) = matched {
+            matches.push(found);
+            index = found.end;
+        } else {
+            index += 1;
+        }
+    }
+
+    matches
+}
+
+fn signal_match_double_marker(
+    chars: &[char],
+    start: usize,
+    marker: &str,
+    kind: SignalTextStyleKind,
+) -> Option<SignalInlineMatch> {
+    let marker_chars = marker.chars().collect::<Vec<_>>();
+    if chars.get(start..start + marker_chars.len())? != marker_chars.as_slice() {
+        return None;
+    }
+    let mut end = start + marker_chars.len();
+    while end + marker_chars.len() <= chars.len() {
+        if chars[end..end + marker_chars.len()] == marker_chars[..] {
+            if end == start + marker_chars.len() {
+                return None;
+            }
+            return Some(SignalInlineMatch {
+                start,
+                end: end + marker_chars.len(),
+                inner_start: start + marker_chars.len(),
+                inner_end: end,
+                kind,
+            });
+        }
+        end += 1;
+    }
+    None
+}
+
+fn signal_match_backticks(chars: &[char], start: usize) -> Option<SignalInlineMatch> {
+    if chars.get(start).copied()? != '`' {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < chars.len() {
+        if chars[end] == '\n' {
+            return None;
+        }
+        if chars[end] == '`' {
+            if end == start + 1 {
+                return None;
+            }
+            return Some(SignalInlineMatch {
+                start,
+                end: end + 1,
+                inner_start: start + 1,
+                inner_end: end,
+                kind: SignalTextStyleKind::Monospace,
+            });
+        }
+        end += 1;
+    }
+    None
+}
+
+fn signal_match_italic_star(chars: &[char], start: usize) -> Option<SignalInlineMatch> {
+    if chars.get(start).copied()? != '*' {
+        return None;
+    }
+    if start > 0 && chars[start - 1] == '*' {
+        return None;
+    }
+    let next = chars.get(start + 1).copied()?;
+    if next == '*' || next == ' ' {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < chars.len() {
+        let ch = chars[end];
+        if ch == '\n' {
+            return None;
+        }
+        if ch == '*'
+            && chars.get(end.wrapping_sub(1)).copied() != Some('*')
+            && chars.get(end + 1).copied() != Some('*')
+            && end > start + 1
+        {
+            return Some(SignalInlineMatch {
+                start,
+                end: end + 1,
+                inner_start: start + 1,
+                inner_end: end,
+                kind: SignalTextStyleKind::Italic,
+            });
+        }
+        end += 1;
+    }
+    None
+}
+
+fn signal_match_italic_underscore(chars: &[char], start: usize) -> Option<SignalInlineMatch> {
+    if chars.get(start).copied()? != '_' {
+        return None;
+    }
+    if start > 0 && signal_is_word_char(chars[start - 1]) {
+        return None;
+    }
+    let next = chars.get(start + 1).copied()?;
+    if next == '_' {
+        return None;
+    }
+
+    let mut end = start + 1;
+    while end < chars.len() {
+        let ch = chars[end];
+        if ch == '\n' {
+            return None;
+        }
+        if ch == '_'
+            && chars.get(end.wrapping_sub(1)).copied() != Some('_')
+            && !chars.get(end + 1).copied().is_some_and(signal_is_word_char)
+            && end > start + 1
+        {
+            return Some(SignalInlineMatch {
+                start,
+                end: end + 1,
+                inner_start: start + 1,
+                inner_end: end,
+                kind: SignalTextStyleKind::Italic,
+            });
+        }
+        end += 1;
+    }
+    None
+}
+
+fn signal_is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn signal_adjust_cp_position(position: usize, removals: &[(usize, usize)]) -> usize {
+    let mut shift = 0usize;
+    for (remove_at, remove_len) in removals {
+        if *remove_at < position {
+            shift += (*remove_len).min(position - *remove_at);
+        } else {
+            break;
+        }
+    }
+    position.saturating_sub(shift)
+}
+
+fn signal_style_strings(text: &str, styles: &[SignalTextStyleRange]) -> Vec<String> {
+    let offsets = char_offsets(text);
+    styles
+        .iter()
+        .filter_map(|style| {
+            let start_byte = cp_index_to_byte(&offsets, style.start);
+            let end_byte = cp_index_to_byte(&offsets, style.start + style.len);
+            if end_byte <= start_byte {
+                return None;
+            }
+            let start = text[..start_byte].encode_utf16().count();
+            let len = text[start_byte..end_byte].encode_utf16().count();
+            Some(format!("{start}:{len}:{}", style.kind.as_str()))
+        })
+        .collect()
+}
+
+fn char_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    offsets.push(text.len());
+    offsets
+}
+
+fn cp_index_to_byte(offsets: &[usize], cp_index: usize) -> usize {
+    offsets
+        .get(cp_index)
+        .copied()
+        .unwrap_or_else(|| *offsets.last().unwrap_or(&0))
 }
 
 fn feishu_send_message(
@@ -4775,8 +8336,155 @@ fn file_extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn truncate_message(content: &str, max_length: usize) -> Vec<String> {
+    truncate_message_with_len(content, max_length, false)
+}
+
+fn truncate_message_with_len(content: &str, max_length: usize, utf16_units: bool) -> Vec<String> {
+    let measure = |text: &str| {
+        if utf16_units {
+            text.encode_utf16().count()
+        } else {
+            text.chars().count()
+        }
+    };
+
+    if measure(content) <= max_length {
+        return vec![content.to_string()];
+    }
+
+    const INDICATOR_RESERVE: usize = 10;
+    const FENCE_CLOSE: &str = "\n```";
+
+    let mut chunks = Vec::new();
+    let mut remaining = content.to_string();
+    let mut carry_lang: Option<String> = None;
+
+    while !remaining.is_empty() {
+        let prefix = carry_lang
+            .as_deref()
+            .map(|lang| format!("```{lang}\n"))
+            .unwrap_or_default();
+        let mut headroom = max_length
+            .saturating_sub(INDICATOR_RESERVE)
+            .saturating_sub(measure(&prefix))
+            .saturating_sub(measure(FENCE_CLOSE));
+        if headroom < 1 {
+            headroom = max_length / 2;
+        }
+
+        if measure(&prefix) + measure(&remaining) <= max_length - INDICATOR_RESERVE {
+            chunks.push(format!("{prefix}{remaining}"));
+            break;
+        }
+
+        let region_end = if utf16_units {
+            byte_index_for_utf16_limit(&remaining, headroom)
+        } else {
+            let cp_limit = headroom.min(remaining.chars().count());
+            byte_index_for_char_limit(&remaining, cp_limit)
+        };
+        let region = &remaining[..region_end];
+        let mut split_at = region.rfind('\n');
+        if split_at.is_none_or(|index| index < region_end / 2) {
+            split_at = region.rfind(' ');
+        }
+        let mut split_byte = split_at.filter(|index| *index > 0).unwrap_or(region_end);
+
+        let candidate = &remaining[..split_byte];
+        let backtick_count = candidate.matches('`').count() - candidate.matches("\\`").count();
+        if backtick_count % 2 == 1 {
+            let mut last_bt = candidate.rfind('`');
+            while let Some(index) = last_bt {
+                if index > 0 && candidate.as_bytes()[index - 1] == b'\\' {
+                    last_bt = candidate[..index].rfind('`');
+                    continue;
+                }
+                let safe_split = candidate[..index]
+                    .rfind(' ')
+                    .into_iter()
+                    .chain(candidate[..index].rfind('\n'))
+                    .max();
+                if let Some(safe_split) = safe_split.filter(|safe| *safe > region_end / 4) {
+                    split_byte = safe_split;
+                }
+                break;
+            }
+        }
+
+        let chunk_body = remaining[..split_byte].to_string();
+        remaining = remaining[split_byte..].trim_start().to_string();
+        let mut full_chunk = format!("{prefix}{chunk_body}");
+
+        let mut in_code = carry_lang.is_some();
+        let mut lang = carry_lang.clone().unwrap_or_default();
+        for line in chunk_body.split('\n') {
+            let stripped = line.trim();
+            if let Some(rest) = stripped.strip_prefix("```") {
+                if in_code {
+                    in_code = false;
+                    lang.clear();
+                } else {
+                    in_code = true;
+                    lang = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+        }
+
+        if in_code {
+            full_chunk.push_str(FENCE_CLOSE);
+            carry_lang = Some(lang);
+        } else {
+            carry_lang = None;
+        }
+
+        chunks.push(full_chunk);
+    }
+
+    if chunks.len() > 1 {
+        let total = chunks.len();
+        chunks = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| format!("{chunk} ({}/{})", index + 1, total))
+            .collect();
+    }
+
+    chunks
+}
+
+fn byte_index_for_char_limit(text: &str, cp_limit: usize) -> usize {
+    if cp_limit == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(cp_limit)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn byte_index_for_utf16_limit(text: &str, unit_limit: usize) -> usize {
+    if unit_limit == 0 {
+        return 0;
+    }
+
+    let mut used = 0usize;
+    for (index, ch) in text.char_indices() {
+        let units = ch.len_utf16();
+        if used + units > unit_limit {
+            return index;
+        }
+        used += units;
+    }
+    text.len()
+}
+
 fn format_target(kind: PlatformKind, chat_id: &str, thread_id: Option<&str>) -> String {
-    if kind == PlatformKind::Matrix {
+    if matches!(kind, PlatformKind::Matrix | PlatformKind::Signal) {
         return format!("{}:{}", kind.as_str(), chat_id);
     }
     match thread_id {
@@ -4802,6 +8510,14 @@ fn value_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64(),
         Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
         _ => None,
     }
 }
@@ -5223,13 +8939,20 @@ mod tests {
         let runtime = runtime_for(&temp);
         with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
         with_env_var("DISCORD_HOME_CHANNEL", Some("12345"));
+        with_env_var("DISCORD_HOME_CHANNEL_THREAD_ID", None);
         with_env_var("DISCORD_HOME_CHANNEL_NAME", Some("Ops"));
         with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
         with_env_var("SLACK_HOME_CHANNEL", None);
         let result = handle_list_targets(&runtime);
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], json!(true));
-        assert_eq!(parsed["targets"][0]["target"], json!("discord:12345"));
+        let discord = parsed["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["platform"] == "discord")
+            .unwrap();
+        assert_eq!(discord["target"], json!("discord:12345"));
         assert!(
             parsed["platforms"]
                 .as_array()
@@ -5485,6 +9208,180 @@ mod tests {
     }
 
     #[test]
+    fn list_targets_preserves_priority_platform_home_metadata() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+
+        with_env_var(
+            "TELEGRAM_BOT_TOKEN",
+            Some("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"),
+        );
+        with_env_var("TELEGRAM_HOME_CHANNEL", Some("-100123"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_THREAD_ID", Some("77"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_NAME", Some("Telegram Ops"));
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_HOME_CHANNEL", Some("123456789"));
+        with_env_var("DISCORD_HOME_CHANNEL_THREAD_ID", Some("555666777"));
+        with_env_var("DISCORD_HOME_CHANNEL_NAME", Some("Discord Ops"));
+
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_HOME_CHANNEL", Some("CENG12345"));
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", Some("1710000000.000100"));
+        with_env_var("SLACK_HOME_CHANNEL_NAME", None);
+
+        with_env_var("FEISHU_APP_ID", Some("cli_a1"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret"));
+        with_env_var("FEISHU_HOME_CHANNEL", Some("oc_feedbeef"));
+        with_env_var("FEISHU_HOME_CHANNEL_THREAD_ID", Some("om_thread"));
+        with_env_var("FEISHU_HOME_CHANNEL_NAME", Some("Feishu Ops"));
+
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some("https://matrix.example"));
+        with_env_var("MATRIX_HOME_ROOM", Some("!roomid:example.org"));
+        with_env_var(
+            "MATRIX_HOME_ROOM_THREAD_ID",
+            Some("$thread_root:example.org"),
+        );
+        with_env_var("MATRIX_HOME_ROOM_NAME", Some("Matrix Ops"));
+
+        with_env_var("SIGNAL_HTTP_URL", Some("http://127.0.0.1:8080"));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15551234567"));
+        with_env_var("SIGNAL_HOME_CHANNEL", Some("group:signal-home"));
+        with_env_var("SIGNAL_HOME_CHANNEL_THREAD_ID", Some("signal-thread"));
+        with_env_var("SIGNAL_HOME_CHANNEL_NAME", None);
+
+        let result = handle_list_targets(&runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let targets = parsed["targets"].as_array().unwrap();
+        let find = |platform: &str| {
+            targets
+                .iter()
+                .find(|item| item["platform"] == platform)
+                .unwrap()
+        };
+
+        let telegram = find("telegram");
+        assert_eq!(telegram["target"], json!("telegram:-100123:77"));
+        assert_eq!(telegram["thread_id"], json!("77"));
+        assert_eq!(telegram["name"], json!("Telegram Ops"));
+
+        let discord = find("discord");
+        assert_eq!(discord["target"], json!("discord:123456789:555666777"));
+        assert_eq!(discord["thread_id"], json!("555666777"));
+        assert_eq!(discord["name"], json!("Discord Ops"));
+
+        let slack = find("slack");
+        assert_eq!(slack["target"], json!("slack:CENG12345:1710000000.000100"));
+        assert_eq!(slack["thread_id"], json!("1710000000.000100"));
+        assert_eq!(slack["name"], json!(""));
+
+        let feishu = find("feishu");
+        assert_eq!(feishu["target"], json!("feishu:oc_feedbeef:om_thread"));
+        assert_eq!(feishu["thread_id"], json!("om_thread"));
+        assert_eq!(feishu["name"], json!("Feishu Ops"));
+
+        let matrix = find("matrix");
+        assert_eq!(matrix["target"], json!("matrix:!roomid:example.org"));
+        assert_eq!(matrix["thread_id"], json!("$thread_root:example.org"));
+        assert_eq!(matrix["name"], json!("Matrix Ops"));
+
+        let signal = find("signal");
+        assert_eq!(signal["target"], json!("signal:group:signal-home"));
+        assert_eq!(signal["thread_id"], json!("signal-thread"));
+        assert_eq!(signal["name"], json!("Home"));
+    }
+
+    #[test]
+    fn list_targets_prefers_env_home_over_yaml_for_priority_platforms() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    home_channel:\n      chat_id: '-100yaml'\n      thread_id: '10'\n      name: Telegram YAML\n  discord:\n    enabled: true\n    token: discord-token\n    home_channel:\n      chat_id: '111111111'\n      thread_id: '222222222'\n      name: Discord YAML\n  slack:\n    enabled: true\n    token: slack-token\n    home_channel:\n      chat_id: CYAMLHOME\n      thread_id: '1710000000.000001'\n      name: Slack YAML\n  feishu:\n    enabled: true\n    extra:\n      app_id: cli_yaml\n      app_secret: secret_yaml\n    home_channel:\n      chat_id: oc_yaml_home\n      thread_id: om_yaml_thread\n      name: Feishu YAML\n  matrix:\n    enabled: true\n    token: matrix-yaml-token\n    extra:\n      homeserver: https://matrix.example.org\n    home_channel:\n      chat_id: '!yaml:example.org'\n      thread_id: '$yamlroot:example.org'\n      name: Matrix YAML\n  signal:\n    enabled: true\n    extra:\n      http_url: http://127.0.0.1:8080\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:yaml-home'\n      thread_id: signal-yaml-thread\n      name: Signal YAML\n",
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_HOME_CHANNEL", Some("-100env"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_THREAD_ID", Some("77"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_NAME", Some("Telegram Env"));
+
+        with_env_var("DISCORD_BOT_TOKEN", None);
+        with_env_var("DISCORD_HOME_CHANNEL", Some("123456789"));
+        with_env_var("DISCORD_HOME_CHANNEL_THREAD_ID", Some("555666777"));
+        with_env_var("DISCORD_HOME_CHANNEL_NAME", Some("Discord Env"));
+
+        with_env_var("SLACK_BOT_TOKEN", None);
+        with_env_var("SLACK_HOME_CHANNEL", Some("CENVHOME"));
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", Some("1710000000.000100"));
+        with_env_var("SLACK_HOME_CHANNEL_NAME", Some("Slack Env"));
+
+        with_env_var("FEISHU_APP_ID", None);
+        with_env_var("FEISHU_APP_SECRET", None);
+        with_env_var("FEISHU_HOME_CHANNEL", Some("oc_env_home"));
+        with_env_var("FEISHU_HOME_CHANNEL_THREAD_ID", Some("om_env_thread"));
+        with_env_var("FEISHU_HOME_CHANNEL_NAME", Some("Feishu Env"));
+
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        with_env_var("MATRIX_HOME_ROOM", Some("!env:example.org"));
+        with_env_var("MATRIX_HOME_ROOM_THREAD_ID", Some("$envroot:example.org"));
+        with_env_var("MATRIX_HOME_ROOM_NAME", Some("Matrix Env"));
+
+        with_env_var("SIGNAL_HTTP_URL", None);
+        with_env_var("SIGNAL_ACCOUNT", None);
+        with_env_var("SIGNAL_HOME_CHANNEL", Some("group:env-home"));
+        with_env_var("SIGNAL_HOME_CHANNEL_THREAD_ID", Some("signal-env-thread"));
+        with_env_var("SIGNAL_HOME_CHANNEL_NAME", Some("Signal Env"));
+
+        let result = handle_list_targets(&runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let targets = parsed["targets"].as_array().unwrap();
+        let find = |platform: &str| {
+            targets
+                .iter()
+                .find(|item| item["platform"] == platform)
+                .unwrap()
+        };
+
+        let telegram = find("telegram");
+        assert_eq!(telegram["target"], json!("telegram:-100env:77"));
+        assert_eq!(telegram["thread_id"], json!("77"));
+        assert_eq!(telegram["name"], json!("Telegram Env"));
+
+        let discord = find("discord");
+        assert_eq!(discord["target"], json!("discord:123456789:555666777"));
+        assert_eq!(discord["thread_id"], json!("555666777"));
+        assert_eq!(discord["name"], json!("Discord Env"));
+
+        let slack = find("slack");
+        assert_eq!(slack["target"], json!("slack:CENVHOME:1710000000.000100"));
+        assert_eq!(slack["thread_id"], json!("1710000000.000100"));
+        assert_eq!(slack["name"], json!("Slack Env"));
+
+        let feishu = find("feishu");
+        assert_eq!(feishu["target"], json!("feishu:oc_env_home:om_env_thread"));
+        assert_eq!(feishu["thread_id"], json!("om_env_thread"));
+        assert_eq!(feishu["name"], json!("Feishu Env"));
+
+        let matrix = find("matrix");
+        assert_eq!(matrix["target"], json!("matrix:!env:example.org"));
+        assert_eq!(matrix["thread_id"], json!("$envroot:example.org"));
+        assert_eq!(matrix["name"], json!("Matrix Env"));
+
+        let signal = find("signal");
+        assert_eq!(signal["target"], json!("signal:group:env-home"));
+        assert_eq!(signal["thread_id"], json!("signal-env-thread"));
+        assert_eq!(signal["name"], json!("Signal Env"));
+    }
+
+    #[test]
     fn resolves_slack_named_target_from_channel_directory() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -5542,6 +9439,67 @@ mod tests {
     }
 
     #[test]
+    fn sends_discord_voice_media_with_native_voice_flags() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.ogg");
+        fs::write(&media_path, b"voice-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/messages "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("name=\"payload_json\""));
+            assert!(body.contains("\"flags\":8192"));
+            assert!(body.contains("\"filename\":\"voice-message.ogg\""));
+            assert!(body.contains("\"duration_secs\":"));
+            assert!(body.contains("\"waveform\":"));
+            assert!(body.contains("name=\"files[0]\""));
+            assert!(body.contains("filename=\"voice-message.ogg\""));
+            assert!(body.contains("voice-bytes"));
+            (200, json!({ "id": "msg-voice" }).to_string())
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("[[audio_as_voice]]\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["message_id"], json!("msg-voice"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_discord_text_and_media() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -5580,6 +9538,1245 @@ mod tests {
         assert_eq!(parsed["success"], json!(true));
         assert_eq!(parsed["platform"], json!("discord"));
         assert_eq!(parsed["message_id"], json!("msg-2"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_multiple_images_in_single_batch_message() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/messages "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("name=\"files[0]\""));
+            assert!(body.contains("filename=\"one.png\""));
+            assert!(body.contains("png-one"));
+            assert!(body.contains("name=\"files[1]\""));
+            assert!(body.contains("filename=\"two.png\""));
+            assert!(body.contains("png-two"));
+            (200, json!({ "id": "msg-batch" }).to_string())
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("MEDIA:{}\nMEDIA:{}", first.display(), second.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["message_id"], json!("msg-batch"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123456789",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123456789/messages "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bot discord-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["content"], json!("discord yaml hello"));
+            (200, json!({ "id": "msg-yaml-1" }).to_string())
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  discord:\n    enabled: true\n    token: discord-token\n    home_channel:\n      chat_id: '123456789'\n      name: Bot Home\n",
+        )
+        .unwrap();
+
+        with_env_var("DISCORD_BOT_TOKEN", None);
+        with_env_var("DISCORD_HOME_CHANNEL", None);
+        with_env_var("DISCORD_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("DISCORD_HOME_CHANNEL_NAME", None);
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord",
+                "message": "discord yaml hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("123456789"));
+        assert_eq!(parsed["message_id"], json!("msg-yaml-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn keeps_discord_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("image.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let media_path_for_assert = media_path.clone();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["content"], json!("hello"));
+                (200, json!({ "id": "msg-1" }).to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                (500, "upload exploded".to_string())
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("hello\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["message_id"], json!("msg-1"));
+        let warnings = parsed["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0],
+            json!(format!(
+                "Failed to send media {}: Discord media send failed: HTTP 500: upload exploded",
+                media_path_for_assert.display()
+            ))
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_discord_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                (500, "upload exploded".to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/123/messages "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["content"], json!(expected_fallback));
+                (200, json!({ "id": "msg-fallback" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["message_id"], json!("msg-fallback"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_long_text_in_multiple_chunks() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(DISCORD_MAX_MESSAGE_LENGTH + 200);
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "bot-home",
+                            "guild": "Nous",
+                            "type": "channel"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/messages "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            let text = payload["content"].as_str().unwrap();
+            assert!(text.ends_with(if index == 0 { " (1/2)" } else { " (2/2)" }));
+            (
+                200,
+                json!({ "id": format!("msg-{}", index + 1) }).to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("msg-2"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_forum_post_from_channel_directory() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/threads "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["name"], json!("Launch plan"));
+            assert_eq!(
+                payload["message"]["content"],
+                json!("## Launch plan\nBody text")
+            );
+            (
+                200,
+                json!({
+                    "id": "thread-1",
+                    "message": { "id": "starter-1" }
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": "## Launch plan\nBody text",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["chat_id"], json!("123"));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_forum_post_with_starter_attachment() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("launch.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/threads "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("\"name\":\"Launch plan\""));
+            assert!(body.contains("\"content\":\"## Launch plan\\nBody text\""));
+            assert!(body.contains("\"attachments\""));
+            assert!(body.contains("\"id\":\"0\""));
+            assert!(body.contains("\"filename\":\"launch.png\""));
+            assert!(body.contains("name=\"files[0]\""));
+            assert!(body.contains("filename=\"launch.png\""));
+            assert!(body.contains("png-bytes"));
+            (
+                200,
+                json!({
+                    "id": "thread-1",
+                    "message": { "id": "starter-1" }
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("## Launch plan\nBody text\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["chat_id"], json!("123"));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_discord_forum_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "456",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/456/threads "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                (500, "upload exploded".to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/456/threads "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["name"], json!("clip.mp4"));
+                assert_eq!(payload["message"]["content"], json!(expected_fallback));
+                (
+                    200,
+                    json!({
+                        "id": "thread-fallback",
+                        "message": { "id": "msg-fallback" }
+                    })
+                    .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:456",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("discord"));
+        assert_eq!(parsed["thread_id"], json!("thread-fallback"));
+        assert_eq!(parsed["message_id"], json!("msg-fallback"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn names_media_only_discord_forum_post_from_attachment_filename() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("quarterly-results.pdf");
+        fs::write(&media_path, b"pdf-bytes").unwrap();
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /channels/123/threads "));
+            assert!(body.contains("\"name\":\"quarterly-results.pdf\""));
+            assert!(body.contains("\"content\":\"\""));
+            assert!(body.contains("\"filename\":\"quarterly-results.pdf\""));
+            (
+                200,
+                json!({
+                    "id": "thread-1",
+                    "message": { "id": "starter-1" }
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_forum_long_text_in_single_thread() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(DISCORD_MAX_MESSAGE_LENGTH + 200);
+        fs::write(
+            temp.path().join("channel_directory.json"),
+            json!({
+                "updated_at": "2026-05-07T12:00:00",
+                "platforms": {
+                    "discord": [
+                        {
+                            "id": "123",
+                            "name": "announcements",
+                            "guild": "Nous",
+                            "type": "forum"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /channels/123/threads "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert!(
+                    payload["message"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(" (1/2)")
+                );
+                (
+                    200,
+                    json!({
+                        "id": "thread-1",
+                        "message": { "id": "starter-1" }
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/thread-1/messages "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert!(payload["content"].as_str().unwrap().ends_with(" (2/2)"));
+                (200, json!({ "id": "followup-1" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:123",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("thread-1"));
+        assert_eq!(parsed["message_id"], json!("starter-1"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_discord_forum_post_after_live_probe() {
+        let _guard = acquire_test_lock();
+        clear_discord_forum_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("GET /channels/321 "));
+                (200, json!({ "id": "321", "type": 15 }).to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /channels/321/threads "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["name"], json!("Forum launch"));
+                assert_eq!(payload["message"]["content"], json!("Forum launch"));
+                (
+                    200,
+                    json!({
+                        "id": "thread-321",
+                        "message": { "id": "starter-321" }
+                    })
+                    .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("DISCORD_BOT_TOKEN", Some("discord-token"));
+        with_env_var("DISCORD_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "discord:321",
+                "message": "Forum launch",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("thread-321"));
+        assert_eq!(parsed["message_id"], json!("starter-321"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn formats_telegram_message_like_gateway_adapter() {
+        assert_eq!(telegram_format_message("**bold**"), "*bold*");
+        assert_eq!(telegram_format_message("*italic*"), "_italic_");
+        assert_eq!(telegram_format_message("## **Title**"), "*Title*");
+        assert_eq!(
+            telegram_format_message("[Click!](https://example.com/path_(1))"),
+            "[Click\\!](https://example.com/path_(1\\))"
+        );
+        assert_eq!(
+            telegram_format_message("Use `C:\\Program Files\\`"),
+            "Use `C:\\\\Program Files\\\\`"
+        );
+        assert_eq!(
+            telegram_format_message("> quoted **text**"),
+            "> quoted *text*"
+        );
+        assert_eq!(telegram_format_message("AT&T < 5 > 3"), "AT&T < 5 \\> 3");
+    }
+
+    #[test]
+    fn strips_telegram_markdownv2_to_plain_text_for_fallback() {
+        assert_eq!(
+            telegram_strip_mdv2(r"*bold* _italic_ ~gone~ ||secret|| snake_case bad \- dash"),
+            "bold italic gone secret snake_case bad - dash"
+        );
+    }
+
+    #[test]
+    fn sends_telegram_text_with_markdownv2_and_general_topic_fallback() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+            assert_eq!(
+                payload["text"],
+                json!("*Launch*\n*bold* and [link](https://example.com?a=1&b=2)")
+            );
+            assert!(payload.get("message_thread_id").is_none());
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 41 } }).to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:1",
+                "message": "## Launch\n**bold** and [link](https://example.com?a=1&b=2)",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("1"));
+        assert_eq!(parsed["message_id"], json!("41"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_html_without_markdownv2() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["parse_mode"], json!("HTML"));
+            assert_eq!(payload["text"], json!("<b>Hello</b> <i>world</i>"));
+            assert_eq!(payload["message_thread_id"], json!("12"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 51 } }).to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": "<b>Hello</b> <i>world</i>",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("51"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn telegram_send_honors_disable_link_previews_from_config_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("config.yaml"),
+            "telegram:\n  disable_link_previews: true\n",
+        )
+        .unwrap();
+        assert_eq!(load_telegram_disable_link_previews(temp.path()), Some(true));
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["disable_web_page_preview"], json!(true));
+            assert_eq!(payload["text"], json!("https://example\\.com"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 55 } }).to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": "https://example.com",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("55"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn telegram_send_honors_custom_base_url_from_config_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["text"], json!("hello"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 57 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!("platforms:\n  telegram:\n    extra:\n      base_url: {base_url}\n"),
+        )
+        .unwrap();
+        assert_eq!(load_telegram_base_url(temp.path()), Some(base_url.clone()));
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", None);
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": "hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("57"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["text"], json!("hello from yaml"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 58 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    extra:\n      base_url: {base_url}\n    home_channel:\n      chat_id: '98765'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_API_BASE_URL", None);
+        let result = handle_send(
+            &json!({
+                "target": "telegram",
+                "message": "hello from yaml",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("98765"));
+        assert_eq!(parsed["message_id"], json!("58"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_text_to_env_home_over_yaml_home_when_auth_comes_from_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["message_thread_id"], json!("22"));
+            assert_eq!(payload["text"], json!("hello from env home"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 58 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    extra:\n      base_url: {base_url}\n    home_channel:\n      chat_id: '-100yaml'\n      thread_id: '10'\n      name: YAML Home\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_API_BASE_URL", None);
+        with_env_var("TELEGRAM_HOME_CHANNEL", Some("98765"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_THREAD_ID", Some("22"));
+        with_env_var("TELEGRAM_HOME_CHANNEL_NAME", Some("Env Home"));
+        let result = handle_send(
+            &json!({
+                "target": "telegram",
+                "message": "hello from env home",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("98765"));
+        assert_eq!(parsed["thread_id"], json!("22"));
+        assert_eq!(parsed["message_id"], json!("58"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn telegram_yaml_runtime_respects_env_base_url_override() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (yaml_base_url, yaml_join) =
+            mock_server(0, move |_index, _headers, _body| unreachable!());
+        let (env_base_url, env_join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["chat_id"], json!("98765"));
+            assert_eq!(payload["text"], json!("env wins"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 59 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  telegram:\n    enabled: true\n    token: telegram-token\n    extra:\n      base_url: {yaml_base_url}\n    home_channel:\n      chat_id: '98765'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("TELEGRAM_BOT_TOKEN", None);
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&env_base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram",
+                "message": "env wins",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("98765"));
+        assert_eq!(parsed["message_id"], json!("59"));
+        env_join.join().unwrap();
+        yaml_join.join().unwrap();
+    }
+
+    #[test]
+    fn retries_telegram_text_after_parse_mode_failure() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+                assert_eq!(payload["text"], json!("*bold* and bad \\- markdown"));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "description": "Bad Request: can't parse entities: Character '-' is reserved in MarkdownV2"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert!(payload.get("parse_mode").is_none());
+                assert_eq!(payload["text"], json!("bold and bad - markdown"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 61 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": "**bold** and bad - markdown",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("61"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn retries_telegram_text_after_retry_after_response() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+                (
+                    429,
+                    json!({
+                        "ok": false,
+                        "description": "Too Many Requests: retry later",
+                        "parameters": { "retry_after": 0 }
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+                assert_eq!(payload["text"], json!("retry now"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 66 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": "retry now",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("66"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn retries_telegram_text_without_thread_after_thread_not_found() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, _headers, body| match index {
+            0 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["message_thread_id"], json!("22182"));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "description": "Bad Request: Message thread not found"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert!(payload.get("message_thread_id").is_none());
+                assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+                assert_eq!(payload["text"], json!("hello topic"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 71 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:22182",
+                "message": "hello topic",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("22182"));
+        assert_eq!(parsed["message_id"], json!("71"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_telegram_multiple_photos_via_media_group() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: multipart/form-data;")
+            );
+            assert!(body.contains("name=\"media\""));
+            assert!(body.contains("\"type\":\"photo\""));
+            assert!(body.contains("attach://file0"));
+            assert!(body.contains("attach://file1"));
+            assert!(body.contains("name=\"message_thread_id\""));
+            assert!(body.contains("\r\n12\r\n"));
+            assert!(body.contains("filename=\"one.png\""));
+            assert!(body.contains("filename=\"two.png\""));
+            assert!(body.contains("png-one"));
+            assert!(body.contains("png-two"));
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "result": [
+                        { "message_id": 81 },
+                        { "message_id": 82 }
+                    ]
+                })
+                .to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}\nMEDIA:{}", first.display(), second.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("82"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_from_telegram_media_group_to_individual_uploads() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+                (
+                    500,
+                    json!({
+                        "ok": false,
+                        "description": "media group exploded"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"one.png\""));
+                assert!(body.contains("png-one"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 91 } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"two.png\""));
+                assert!(body.contains("png-two"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 92 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}\nMEDIA:{}", first.display(), second.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("92"));
+        assert_eq!(parsed["warnings"], json!([]));
         join.join().unwrap();
     }
 
@@ -6669,6 +11866,284 @@ mod tests {
     }
 
     #[test]
+    fn sends_matrix_long_text_in_multiple_chunks() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(MATRIX_MAX_MESSAGE_LENGTH + 200);
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with(
+                "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+            ));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            let text = payload["body"].as_str().unwrap();
+            assert!(text.ends_with(if index == 0 { " (1/2)" } else { " (2/2)" }));
+            (
+                200,
+                json!({ "event_id": format!("$event{}", index + 1) }).to_string(),
+            )
+        });
+
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("$event2"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn formats_signal_message_like_gateway_adapter() {
+        let (plain, styles) =
+            signal_format_message("## Heading\n**bold** _italic_ ~~strike~~ `code`");
+        assert_eq!(plain, "Heading\nbold italic strike code");
+        assert_eq!(
+            styles,
+            vec![
+                "0:7:BOLD".to_string(),
+                "8:4:BOLD".to_string(),
+                "13:6:ITALIC".to_string(),
+                "20:6:STRIKETHROUGH".to_string(),
+                "27:4:MONOSPACE".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn formats_signal_message_uses_utf16_offsets() {
+        let (plain, styles) = signal_format_message("😄 **bold**");
+        assert_eq!(plain, "😄 bold");
+        assert_eq!(styles, vec!["3:4:BOLD".to_string()]);
+    }
+
+    #[test]
+    fn list_targets_includes_matrix_password_login_config() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", Some("https://matrix.example"));
+        with_env_var("MATRIX_USER_ID", Some("@bot:example.org"));
+        with_env_var("MATRIX_PASSWORD", Some("matrix-pass"));
+        with_env_var("MATRIX_HOME_ROOM", Some("!roomid:example.org"));
+        with_env_var("MATRIX_HOME_ROOM_NAME", Some("Ops"));
+
+        let result = handle_list_targets(&runtime);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let matrix = parsed["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["platform"] == "matrix")
+            .unwrap();
+        assert_eq!(matrix["target"], json!("matrix:!roomid:example.org"));
+        assert_eq!(matrix["name"], json!("Ops"));
+        assert!(
+            parsed["platforms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["platform"] == "matrix" && item["has_home_channel"] == json!(true))
+        );
+    }
+
+    #[test]
+    fn sends_matrix_text_via_password_login_when_no_access_token() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /_matrix/client/v3/login "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["type"], json!("m.login.password"));
+                assert_eq!(payload["identifier"]["type"], json!("m.id.user"));
+                assert_eq!(payload["identifier"]["user"], json!("@bot:example.org"));
+                assert_eq!(payload["password"], json!("matrix-pass"));
+                assert_eq!(payload["device_id"], json!("HERMES-RUST"));
+                (
+                    200,
+                    json!({
+                        "access_token": "matrix-login-token",
+                        "device_id": "HERMES-RUST",
+                        "user_id": "@bot:example.org"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with(
+                    "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+                ));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer matrix-login-token")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.text"));
+                assert_eq!(payload["body"], json!("matrix via login"));
+                assert_eq!(payload["format"], json!("org.matrix.custom.html"));
+                assert_eq!(payload["formatted_body"], json!("matrix via login"));
+                (200, json!({ "event_id": "$event-login" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        with_env_var("MATRIX_USER_ID", Some("@bot:example.org"));
+        with_env_var("MATRIX_PASSWORD", Some("matrix-pass"));
+        with_env_var("MATRIX_DEVICE_ID", Some("HERMES-RUST"));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": "matrix via login",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("matrix"));
+        assert_eq!(parsed["message_id"], json!("$event-login"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_matrix_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with(
+                "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+            ));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer matrix-config-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["msgtype"], json!("m.text"));
+            assert_eq!(payload["body"], json!("matrix config hello"));
+            (200, json!({ "event_id": "$event-config" }).to_string())
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  matrix:\n    enabled: true\n    token: matrix-config-token\n    extra:\n      homeserver: {base_url}\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        with_env_var("MATRIX_HOME_ROOM", None);
+        with_env_var("MATRIX_HOME_ROOM_THREAD_ID", None);
+        with_env_var("MATRIX_HOME_ROOM_NAME", None);
+        let result = handle_send(
+            &json!({
+                "target": "matrix",
+                "message": "matrix config hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("!roomid:example.org"));
+        assert_eq!(parsed["message_id"], json!("$event-config"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_matrix_text_to_env_home_over_yaml_home_when_auth_comes_from_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with(
+                "PUT /_matrix/client/v3/rooms/%21envroom%3Aexample.org/send/m.room.message/"
+            ));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer matrix-config-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["msgtype"], json!("m.text"));
+            assert_eq!(payload["body"], json!("matrix env home hello"));
+            assert_eq!(payload["m.relates_to"]["rel_type"], json!("m.thread"));
+            assert_eq!(
+                payload["m.relates_to"]["event_id"],
+                json!("$envroot:example.org")
+            );
+            (200, json!({ "event_id": "$event-env-home" }).to_string())
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  matrix:\n    enabled: true\n    token: matrix-config-token\n    extra:\n      homeserver: {base_url}\n    home_channel:\n      chat_id: '!yamlroom:example.org'\n      thread_id: '$yamlroot:example.org'\n      name: YAML Home\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("MATRIX_ACCESS_TOKEN", None);
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        with_env_var("MATRIX_HOME_ROOM", Some("!envroom:example.org"));
+        with_env_var("MATRIX_HOME_ROOM_THREAD_ID", Some("$envroot:example.org"));
+        with_env_var("MATRIX_HOME_ROOM_NAME", Some("Env Home"));
+        let result = handle_send(
+            &json!({
+                "target": "matrix",
+                "message": "matrix env home hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("!envroom:example.org"));
+        assert_eq!(parsed["thread_id"], json!("$envroot:example.org"));
+        assert_eq!(parsed["message_id"], json!("$event-env-home"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn matrix_env_runtime_requires_homeserver() {
+        let _guard = acquire_test_lock();
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", None);
+        with_env_var("MATRIX_USER_ID", None);
+        with_env_var("MATRIX_PASSWORD", None);
+        with_env_var("MATRIX_DEVICE_ID", None);
+        assert!(load_matrix_config().is_none());
+    }
+
+    #[test]
+    fn matrix_yaml_runtime_config_requires_enabled_flag() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  matrix:\n    token: matrix-config-token\n    extra:\n      homeserver: https://matrix.example.org\n    home_channel:\n      chat_id: '!roomid:example.org'\n      name: Ops\n",
+        )
+        .unwrap();
+        assert_eq!(load_platform_enabled_from_yaml(temp.path(), "matrix"), None);
+        assert!(load_matrix_config_from_yaml(temp.path()).is_none());
+    }
+
+    #[test]
     fn matrix_media_routing_matches_python_adapter() {
         let image = MediaAttachment {
             path: PathBuf::from("proof.png"),
@@ -6919,6 +12394,408 @@ mod tests {
     }
 
     #[test]
+    fn sends_signal_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["params"]["account"], json!("+15550009999"));
+            assert_eq!(payload["params"]["message"], json!("signal config hello"));
+            assert_eq!(payload["params"]["groupId"], json!("group-123"));
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000099 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  signal:\n    enabled: true\n    extra:\n      http_url: {base_url}\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:group-123'\n      name: Alerts\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("SIGNAL_HTTP_URL", None);
+        with_env_var("SIGNAL_ACCOUNT", None);
+        let result = handle_send(
+            &json!({
+                "target": "signal",
+                "message": "signal config hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("group:group-123"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_signal_text_via_home_target_even_when_thread_metadata_is_configured() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["params"]["account"], json!("+15550009999"));
+            assert_eq!(payload["params"]["message"], json!("signal home hello"));
+            assert_eq!(payload["params"]["groupId"], json!("group-123"));
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000199 } }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  signal:\n    enabled: true\n    extra:\n      http_url: {base_url}\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:group-123'\n      thread_id: signal-thread\n      name: Alerts\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("SIGNAL_HTTP_URL", None);
+        with_env_var("SIGNAL_ACCOUNT", None);
+        with_env_var("SIGNAL_HOME_CHANNEL", None);
+        with_env_var("SIGNAL_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("SIGNAL_HOME_CHANNEL_NAME", None);
+        let result = handle_send(
+            &json!({
+                "target": "signal",
+                "message": "signal home hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("group:group-123"));
+        assert_eq!(parsed["thread_id"], Value::Null);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn signal_yaml_runtime_config_requires_enabled_flag() {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  signal:\n    extra:\n      http_url: http://127.0.0.1:8080\n      account: '+15550009999'\n    home_channel:\n      chat_id: 'group:group-123'\n      name: Alerts\n",
+        )
+        .unwrap();
+        assert_eq!(load_platform_enabled_from_yaml(temp.path(), "signal"), None);
+        assert!(load_signal_config_from_yaml(temp.path()).is_none());
+    }
+
+    #[test]
+    fn sends_signal_text_with_native_text_styles() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["jsonrpc"], json!("2.0"));
+            assert_eq!(payload["method"], json!("send"));
+            assert_eq!(payload["params"]["account"], json!("+15550000000"));
+            assert_eq!(payload["params"]["message"], json!("Heading\nbold italic"));
+            assert_eq!(payload["params"]["recipient"], json!(["+15551234567"]));
+            assert_eq!(
+                payload["params"]["textStyles"],
+                json!(["0:7:BOLD", "8:4:BOLD", "13:6:ITALIC"])
+            );
+            assert!(payload["params"].get("textStyle").is_none());
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000002 } }).to_string(),
+            )
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": "# Heading\n**bold** _italic_",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn retries_signal_send_after_rate_limit_feedback() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("image.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["method"], json!("send"));
+            let attachments = payload["params"]["attachments"].as_array().unwrap();
+            assert_eq!(attachments.len(), 1);
+            match index {
+                0 => (
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -5,
+                            "message": "RateLimitException: Retry after 0.01 seconds",
+                            "data": {
+                                "response": {
+                                    "results": [
+                                        { "retryAfterSeconds": 0.01 }
+                                    ]
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ),
+                1 => (
+                    200,
+                    json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000001 } }).to_string(),
+                ),
+                _ => unreachable!(),
+            }
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("signal retry\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn retries_signal_send_after_transient_http_failure() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("image.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["method"], json!("send"));
+            let attachments = payload["params"]["attachments"].as_array().unwrap();
+            assert_eq!(attachments.len(), 1);
+            match index {
+                0 => (500, "server unavailable".to_string()),
+                1 => (
+                    200,
+                    json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000001 } }).to_string(),
+                ),
+                _ => unreachable!(),
+            }
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("signal retry\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn skips_missing_signal_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["method"], json!("send"));
+            assert_eq!(payload["params"]["message"], json!("caption"));
+            assert!(payload["params"].get("attachments").is_none());
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000003 } }).to_string(),
+            )
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("caption\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Signal attachment file not found, skipping: {}",
+                missing_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn skips_oversized_signal_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("oversized.bin");
+        fs::write(&media_path, b"x").unwrap();
+        let size = SIGNAL_MAX_ATTACHMENT_SIZE + 1;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&media_path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["method"], json!("send"));
+            assert_eq!(payload["params"]["message"], json!("caption"));
+            assert!(payload["params"].get("attachments").is_none());
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000004 } }).to_string(),
+            )
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("caption\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Signal attachment too large ({} bytes), skipping: {}",
+                size,
+                media_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn returns_partial_success_when_signal_later_batch_exhausts_retries() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_paths = (0..33)
+            .map(|index| {
+                let path = temp.path().join(format!("image-{index}.png"));
+                fs::write(&path, format!("png-{index}")).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let (base_url, join) = mock_server(3, move |index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            let attachments = payload["params"]["attachments"].as_array().unwrap();
+            match index {
+                0 => {
+                    assert_eq!(attachments.len(), 32);
+                    (
+                        200,
+                        json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000000 } })
+                            .to_string(),
+                    )
+                }
+                1 | 2 => {
+                    assert_eq!(attachments.len(), 1);
+                    (
+                        200,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -5,
+                                "message": "RateLimitException: Retry after 0.01 seconds",
+                                "data": {
+                                    "response": {
+                                        "results": [
+                                            { "retryAfterSeconds": 0.01 }
+                                        ]
+                                    }
+                                }
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let message = format!(
+            "caption\n{}",
+            media_paths
+                .iter()
+                .map(|path| format!("MEDIA:{}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let result = handle_send(
+            &json!({
+                "target": "signal:group:group-123",
+                "message": message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(parsed["chat_id"], json!("group:group-123"));
+        assert_eq!(
+            parsed["warnings"],
+            json!(["Signal dropped 1 batch(es) after exhausting retries (#2)"])
+        );
+        join.join().unwrap();
+    }
+
+    #[test]
     fn sends_signal_group_media_in_batches() {
         let _guard = acquire_test_lock();
         let temp = TempDir::new().unwrap();
@@ -7034,6 +12911,281 @@ mod tests {
 
         http_join.join().unwrap();
         ws_join.join().unwrap();
+    }
+
+    #[test]
+    fn formats_slack_message_like_gateway_adapter() {
+        assert_eq!(slack_format_message("**hello**"), "*hello*");
+        assert_eq!(slack_format_message("*hello*"), "_hello_");
+        assert_eq!(slack_format_message("## **Title**"), "*Title*");
+        assert_eq!(
+            slack_format_message("[click](<https://example.com/path_(x)?a=1&b=2>)"),
+            "<https://example.com/path_(x)?a=1&b=2|click>"
+        );
+        assert_eq!(
+            slack_format_message("AT&T < 5 > 3"),
+            "AT&amp;T &lt; 5 &gt; 3"
+        );
+        assert_eq!(slack_format_message("~~gone~~"), "~gone~");
+        assert_eq!(
+            slack_format_message("Hey <@U123> <!channel>"),
+            "Hey <@U123> <!channel>"
+        );
+    }
+
+    #[test]
+    fn formats_slack_message_preserves_code_quotes_and_images() {
+        assert_eq!(
+            slack_format_message("Use `**raw**` in ```python\nx = **not bold**\n```"),
+            "Use `**raw**` in ```python\nx = **not bold**\n```"
+        );
+        assert_eq!(
+            slack_format_message("> **bold quote**\nplain"),
+            "> *bold quote*\nplain"
+        );
+        assert_eq!(
+            slack_format_message("![alt](https://img.example.com/cat.png)"),
+            "![alt](https://img.example.com/cat.png)"
+        );
+        assert_eq!(slack_format_message("a * b * c"), "a * b * c");
+    }
+
+    #[test]
+    fn sends_slack_text_with_gateway_mrkdwn_formatting() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("C12345678"));
+            assert_eq!(
+                payload["text"],
+                json!(
+                    "*Launch*\n*bold* and <https://example.com?a=1&b=2|link>\n> quote\n`**raw**`"
+                )
+            );
+            assert_eq!(payload["mrkdwn"], json!(true));
+            assert_eq!(payload["thread_ts"], json!("1710000000.000100"));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000101" }).to_string(),
+            )
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678:1710000000.000100",
+                "message": "## Launch\n**bold** and [link](https://example.com?a=1&b=2)\n> quote\n`**raw**`",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("slack"));
+        assert_eq!(parsed["chat_id"], json!("C12345678"));
+        assert_eq!(parsed["thread_id"], json!("1710000000.000100"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000101"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_slack_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer slack-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("C12345678"));
+            assert_eq!(payload["text"], json!("slack yaml hello"));
+            assert_eq!(payload["mrkdwn"], json!(true));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000201" }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  slack:\n    enabled: true\n    token: slack-token\n    home_channel:\n      chat_id: C12345678\n      name: Home\n",
+        )
+        .unwrap();
+
+        with_env_var("SLACK_BOT_TOKEN", None);
+        with_env_var("SLACK_HOME_CHANNEL", None);
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("SLACK_HOME_CHANNEL_NAME", None);
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack",
+                "message": "slack yaml hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("C12345678"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000201"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_slack_text_to_env_home_over_yaml_home_when_auth_comes_from_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer slack-token")
+            );
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("CENVHOME"));
+            assert_eq!(payload["thread_ts"], json!("1710000000.000100"));
+            assert_eq!(payload["text"], json!("slack env home"));
+            assert_eq!(payload["mrkdwn"], json!(true));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000301" }).to_string(),
+            )
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  slack:\n    enabled: true\n    token: slack-token\n    home_channel:\n      chat_id: CYAMLHOME\n      thread_id: '1710000000.000001'\n      name: YAML Home\n",
+        )
+        .unwrap();
+
+        with_env_var("SLACK_BOT_TOKEN", None);
+        with_env_var("SLACK_HOME_CHANNEL", Some("CENVHOME"));
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", Some("1710000000.000100"));
+        with_env_var("SLACK_HOME_CHANNEL_NAME", Some("Env Home"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack",
+                "message": "slack env home",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("CENVHOME"));
+        assert_eq!(parsed["thread_id"], json!("1710000000.000100"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000301"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn slack_env_token_does_not_override_explicit_yaml_disable() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  slack:\n    enabled: false\n    token: slack-token\n    home_channel:\n      chat_id: CYAMLHOME\n      name: YAML Home\n",
+        )
+        .unwrap();
+
+        with_env_var("SLACK_BOT_TOKEN", Some("env-slack-token"));
+        with_env_var("SLACK_HOME_CHANNEL", Some("CENVHOME"));
+        with_env_var("SLACK_HOME_CHANNEL_THREAD_ID", None);
+        with_env_var("SLACK_HOME_CHANNEL_NAME", Some("Env Home"));
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        let result = handle_send(
+            &json!({
+                "target": "slack",
+                "message": "should stay disabled",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["error"],
+            json!("Platform 'slack' is not configured.")
+        );
+    }
+
+    #[test]
+    fn slack_send_honors_reply_broadcast_from_config_yaml() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  slack:\n    extra:\n      reply_broadcast: true\n",
+        )
+        .unwrap();
+        assert_eq!(load_slack_reply_broadcast(temp.path()), Some(true));
+        let long_message = "A".repeat(SLACK_MAX_MESSAGE_LENGTH + 200);
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["thread_ts"], json!("1710000000.000100"));
+            match index {
+                0 => assert_eq!(payload["reply_broadcast"], json!(true)),
+                1 => assert!(payload.get("reply_broadcast").is_none()),
+                _ => unreachable!(),
+            }
+            (
+                200,
+                json!({ "ok": true, "ts": format!("1710000000.00010{}", index + 1) }).to_string(),
+            )
+        });
+
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678:1710000000.000100",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("1710000000.000100"));
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn sends_slack_long_text_in_multiple_chunks() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(SLACK_MAX_MESSAGE_LENGTH + 200);
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            let text = payload["text"].as_str().unwrap();
+            assert!(text.ends_with(if index == 0 { " (1/2)" } else { " (2/2)" }));
+            (
+                200,
+                json!({ "ok": true, "ts": format!("1710000000.00010{}", index + 1) }).to_string(),
+            )
+        });
+
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("1710000000.000102"));
+        join.join().unwrap();
     }
 
     #[test]
@@ -7235,4 +13387,1380 @@ mod tests {
         upload_join.join().unwrap();
         ws_join.join().unwrap();
     }
+    fn clear_discord_forum_cache() {
+        if let Some(cache) = DISCORD_FORUM_CACHE.get() {
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+    }
+
+
+    fn clear_signal_scheduler() {
+        if let Some(scheduler) = SIGNAL_SCHEDULER.get() {
+            let mut scheduler = scheduler.lock().unwrap_or_else(|error| error.into_inner());
+            scheduler.capacity = SIGNAL_RATE_LIMIT_BUCKET_CAPACITY;
+            scheduler.tokens = SIGNAL_RATE_LIMIT_BUCKET_CAPACITY;
+            scheduler.refill_rate = 1.0 / SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER;
+            scheduler.last_refill = std::time::Instant::now();
+        }
+        set_signal_batch_pacing_notice_threshold_override(None);
+    }
+
+
+    fn set_signal_batch_pacing_notice_threshold_override(value: Option<f64>) {
+        let override_value =
+            SIGNAL_PACING_NOTICE_THRESHOLD_OVERRIDE.get_or_init(|| Mutex::new(None));
+        *override_value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = value;
+    }
+
+
+    #[test]
+    fn chunks_telegram_media_groups_above_ten_photos() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let mut paths = Vec::new();
+        for index in 0..11 {
+            let path = temp.path().join(format!("img-{index}.png"));
+            fs::write(&path, format!("png-{index}")).unwrap();
+            paths.push(path);
+        }
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+            let expected_count = if index == 0 { 10 } else { 1 };
+            let attach_count = body.matches("attach://file").count();
+            assert_eq!(attach_count, expected_count);
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "result": [{
+                        "message_id": 100 + index
+                    }]
+                })
+                .to_string(),
+            )
+        });
+
+        let message = paths
+            .iter()
+            .map(|path| format!("MEDIA:{}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("101"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn batches_telegram_photos_even_when_mixed_with_document_media() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let first = temp.path().join("one.png");
+        let second = temp.path().join("two.png");
+        let document = temp.path().join("notes.pdf");
+        fs::write(&first, b"png-one").unwrap();
+        fs::write(&second, b"png-two").unwrap();
+        fs::write(&document, b"pdf-doc").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMediaGroup "));
+                assert!(body.contains("attach://file0"));
+                assert!(body.contains("attach://file1"));
+                assert!(body.contains("filename=\"one.png\""));
+                assert!(body.contains("filename=\"two.png\""));
+                (
+                    200,
+                    json!({
+                        "ok": true,
+                        "result": [
+                            { "message_id": 111 },
+                            { "message_id": 112 }
+                        ]
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendDocument "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"notes.pdf\""));
+                assert!(body.contains("pdf-doc"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 113 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!(
+                    "MEDIA:{}\nMEDIA:{}\nMEDIA:{}",
+                    first.display(),
+                    second.display(),
+                    document.display(),
+                ),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("113"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn falls_back_to_telegram_document_when_photo_upload_is_rejected() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("wide.png");
+        fs::write(&media_path, b"png-wide").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendPhoto "));
+                (
+                    400,
+                    json!({
+                        "ok": false,
+                        "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendDocument "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: multipart/form-data;")
+                );
+                assert!(body.contains("filename=\"wide.png\""));
+                assert!(body.contains("png-wide"));
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 114 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("114"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn falls_back_to_telegram_text_when_video_upload_is_rejected() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("clip.mp4");
+        fs::write(&media_path, b"mp4-bytes").unwrap();
+        let expected_fallback = format!("🎬 Video: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendVideo "));
+                (
+                    500,
+                    json!({
+                        "ok": false,
+                        "description": "video upload exploded"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["text"], json!(expected_fallback));
+                assert!(payload.get("parse_mode").is_none());
+                (
+                    200,
+                    json!({ "ok": true, "result": { "message_id": 115 } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765:12",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("12"));
+        assert_eq!(parsed["message_id"], json!("115"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_telegram_long_text_in_multiple_chunks() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 200);
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["parse_mode"], json!("MarkdownV2"));
+            let text = payload["text"].as_str().unwrap();
+            assert!(text.ends_with(if index == 0 {
+                " \\(1/2\\)"
+            } else {
+                " \\(2/2\\)"
+            }));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 90 + index } }).to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("91"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn skips_missing_telegram_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /bottelegram-token/sendMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["text"], json!("hello"));
+            (
+                200,
+                json!({ "ok": true, "result": { "message_id": 81 } }).to_string(),
+            )
+        });
+
+        with_env_var("TELEGRAM_BOT_TOKEN", Some("telegram-token"));
+        with_env_var("TELEGRAM_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "telegram:98765",
+                "message": format!("hello\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("81"));
+        let warnings = parsed["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0],
+            json!(format!(
+                "Media file not found, skipping: {}",
+                missing_path.display()
+            ))
+        );
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_feishu_text_via_config_yaml_home_when_env_missing() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_home"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hi from yaml"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_yaml_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            format!(
+                "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: cli_test\n      app_secret: secret_test\n      domain: {base_url}\n    home_channel:\n      chat_id: oc_home\n      name: Home\n"
+            ),
+        )
+        .unwrap();
+
+        with_env_var("FEISHU_APP_ID", None);
+        with_env_var("FEISHU_APP_SECRET", None);
+        with_env_var("FEISHU_DOMAIN", None);
+        let result = handle_send(
+            &json!({
+                "target": "feishu",
+                "message": "hi from yaml",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["chat_id"], json!("oc_home"));
+        assert_eq!(parsed["message_id"], json!("om_yaml_1"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn feishu_yaml_runtime_respects_env_domain_override() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_home"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hi from env domain"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_env_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        fs::write(
+            temp.path().join("config.yaml"),
+            "platforms:\n  feishu:\n    enabled: true\n    extra:\n      app_id: cli_test\n      app_secret: secret_test\n      domain: feishu\n    home_channel:\n      chat_id: oc_home\n      name: Home\n",
+        )
+        .unwrap();
+
+        with_env_var("FEISHU_APP_ID", None);
+        with_env_var("FEISHU_APP_SECRET", None);
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu",
+                "message": "hi from env domain",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["chat_id"], json!("oc_home"));
+        assert_eq!(parsed["message_id"], json!("om_env_1"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_feishu_thread_text_via_reply_endpoint() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/messages/om_thread/reply "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("text"));
+                assert_eq!(payload["reply_in_thread"], json!(true));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("thread hello"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_thread_reply" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_home:om_thread",
+                "message": "thread hello",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("om_thread"));
+        assert_eq!(parsed["message_id"], json!("om_thread_reply"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn builds_feishu_post_payload_for_markdown_text() {
+        let (msg_type, payload) = feishu_build_outbound_payload("可以用 **粗体** 和 *斜体*。");
+        assert_eq!(msg_type, "post");
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["zh_cn"]["content"],
+            json!([[{ "tag": "md", "text": "可以用 **粗体** 和 *斜体*。" }]])
+        );
+    }
+
+
+    #[test]
+    fn builds_feishu_post_payload_with_separate_code_block_rows() {
+        let payload = feishu_build_markdown_post_payload(
+            "确认已入库\n```json\n{\"cron\": \"list\"}\n```\n后续说明仍应保留。",
+        );
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["zh_cn"]["content"],
+            json!([
+                [{ "tag": "md", "text": "确认已入库" }],
+                [{ "tag": "md", "text": "```json\n{\"cron\": \"list\"}\n```" }],
+                [{ "tag": "md", "text": "后续说明仍应保留。" }]
+            ])
+        );
+    }
+
+
+    #[test]
+    fn falls_back_to_feishu_text_when_post_payload_is_rejected() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("post"));
+                (
+                    200,
+                    json!({
+                        "code": 230001,
+                        "msg": "content format of the post type is incorrect"
+                    })
+                    .to_string(),
+                )
+            }
+            2 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("可以用 粗体 和 斜体。"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_plain" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_home",
+                "message": "可以用 **粗体** 和 *斜体*。",
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_plain"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_feishu_long_text_in_multiple_chunks() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let long_message = "A".repeat(FEISHU_MAX_MESSAGE_LENGTH + 200);
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 | 2 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                let text = inner["text"].as_str().unwrap();
+                assert!(text.ends_with(if index == 1 { " (1/2)" } else { " (2/2)" }));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": format!("om_chunk_{index}") } })
+                        .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_long",
+                "message": long_message,
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_chunk_2"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn keeps_feishu_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hello feishu"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_text_1" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                (
+                    200,
+                    json!({ "code": 99991663, "msg": "upload disabled" }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("hello feishu\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_text_1"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: Feishu image upload failed: code=99991663 msg=upload disabled",
+                media_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn falls_back_to_feishu_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let expected_fallback = format!("🖼️ Image: {}", media_path.display());
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                (
+                    200,
+                    json!({ "code": 99991663, "msg": "upload disabled" }).to_string(),
+                )
+            }
+            2 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!(expected_fallback));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_fallback_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_fallback_1"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn skips_missing_feishu_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/im/v1/messages?receive_id_type=chat_id ")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["receive_id"], json!("oc_media"));
+                assert_eq!(payload["msg_type"], json!("text"));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["text"], json!("hello feishu"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_text_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media",
+                "message": format!("hello feishu\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("om_text_1"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_feishu_thread_image_via_reply_endpoint() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/images "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                assert!(body.contains("name=\"image_type\""));
+                assert!(body.contains("name=\"image\""));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "image_key": "img_thread_123" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/messages/om_thread/reply "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("image"));
+                assert_eq!(payload["reply_in_thread"], json!(true));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["image_key"], json!("img_thread_123"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_thread_image_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media:om_thread",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("om_thread"));
+        assert_eq!(parsed["message_id"], json!("om_thread_image_1"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_feishu_thread_file_via_reply_endpoint() {
+        let _guard = acquire_test_lock();
+        clear_feishu_cache();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("spec.pdf");
+        fs::write(&media_path, b"pdf-bytes").unwrap();
+        let (base_url, join) = mock_server(3, move |index, headers, body| match index {
+            0 => {
+                assert!(
+                    headers.starts_with("POST /open-apis/auth/v3/tenant_access_token/internal ")
+                );
+                (
+                    200,
+                    json!({ "code": 0, "tenant_access_token": "tenant-token", "expire": 7200 })
+                        .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/files "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer tenant-token")
+                );
+                assert!(body.contains("name=\"file_type\""));
+                assert!(body.contains("\r\npdf\r\n"));
+                assert!(body.contains("name=\"file_name\""));
+                assert!(body.contains("spec.pdf"));
+                assert!(body.contains("name=\"file\""));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "file_key": "file_thread_123" } }).to_string(),
+                )
+            }
+            2 => {
+                assert!(headers.starts_with("POST /open-apis/im/v1/messages/om_thread/reply "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msg_type"], json!("file"));
+                assert_eq!(payload["reply_in_thread"], json!(true));
+                let inner: Value =
+                    serde_json::from_str(payload["content"].as_str().unwrap()).unwrap();
+                assert_eq!(inner["file_key"], json!("file_thread_123"));
+                (
+                    200,
+                    json!({ "code": 0, "data": { "message_id": "om_thread_file_1" } }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+
+        with_env_var("FEISHU_APP_ID", Some("cli_test"));
+        with_env_var("FEISHU_APP_SECRET", Some("secret_test"));
+        with_env_var("FEISHU_DOMAIN", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "feishu:oc_media:om_thread",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["thread_id"], json!("om_thread"));
+        assert_eq!(parsed["message_id"], json!("om_thread_file_1"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn falls_back_to_matrix_text_when_media_file_is_missing() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.png");
+        let expected_body = format!("(file not found: {})", missing_path.display());
+        let expected_warning = format!(
+            "Matrix attachment missing, sent fallback text instead: {}",
+            missing_path.display()
+        );
+        let (base_url, join) = mock_server(1, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with(
+                    "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+                ));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.text"));
+                assert_eq!(payload["body"], json!(expected_body));
+                assert_eq!(payload["format"], json!("org.matrix.custom.html"));
+                assert_eq!(payload["formatted_body"], json!(expected_body));
+                (200, json!({ "event_id": "$event-missing" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": format!("MEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("matrix"));
+        assert_eq!(parsed["message_id"], json!("$event-missing"));
+        assert_eq!(parsed["warnings"], json!([expected_warning]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn keeps_matrix_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let expected_warning = format!(
+            "Failed to send media {}: Matrix media upload failed: HTTP 500: upload exploded",
+            media_path.display()
+        );
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with(
+                    "PUT /_matrix/client/v3/rooms/%21roomid%3Aexample.org/send/m.room.message/"
+                ));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.text"));
+                assert_eq!(payload["body"], json!("matrix hello"));
+                (200, json!({ "event_id": "$event-text" }).to_string())
+            }
+            1 => {
+                assert!(headers.starts_with("POST /_matrix/media/v3/upload?filename=proof.png "));
+                (500, "upload exploded".to_string())
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": format!("matrix hello\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("$event-text"));
+        assert_eq!(parsed["warnings"], json!([expected_warning]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn sends_matrix_audio_without_voice_flag_by_default() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("audio.ogg");
+        fs::write(&media_path, b"audio-bytes").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /_matrix/media/v3/upload?filename=audio.ogg "));
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: audio/ogg")
+                );
+                assert_eq!(body, "audio-bytes");
+                (
+                    200,
+                    json!({ "content_uri": "mxc://example.org/audio789" }).to_string(),
+                )
+            }
+            1 => {
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["msgtype"], json!("m.audio"));
+                assert_eq!(payload["body"], json!("audio.ogg"));
+                assert_eq!(payload["url"], json!("mxc://example.org/audio789"));
+                assert_eq!(payload["info"]["mimetype"], json!("audio/ogg"));
+                assert_eq!(payload["info"]["size"], json!(11));
+                assert!(payload.get("org.matrix.msc3245.voice").is_none());
+                (200, json!({ "event_id": "$event-audio" }).to_string())
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("MATRIX_ACCESS_TOKEN", Some("matrix-token"));
+        with_env_var("MATRIX_HOMESERVER", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "matrix:!roomid:example.org",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("$event-audio"));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn formats_matrix_markdown_to_html() {
+        assert_eq!(matrix_markdown_to_html("matrix hello"), "matrix hello");
+        assert_eq!(
+            matrix_markdown_to_html("## Launch\n**bold** and [link](https://example.com)"),
+            "<h2>Launch</h2>\n<strong>bold</strong> and <a href=\"https://example.com\">link</a>"
+        );
+        assert_eq!(
+            matrix_markdown_to_html("> quote\n- one\n- two"),
+            "<blockquote>quote</blockquote>\n<ul><li>one</li><li>two</li></ul>"
+        );
+        assert_eq!(
+            matrix_markdown_to_html("`code` and ~~gone~~"),
+            "<code>code</code> and <del>gone</del>"
+        );
+    }
+
+
+    #[test]
+    fn matrix_text_payload_adds_mentions_and_html_pills() {
+        let payload = matrix_text_payload("Hello @alice:example.org, please check this.");
+        assert_eq!(
+            payload["m.mentions"],
+            json!({ "user_ids": ["@alice:example.org"] })
+        );
+        assert_eq!(
+            payload["formatted_body"],
+            json!(
+                "Hello <a href=\"https://matrix.to/#/@alice:example.org\">@alice:example.org</a>, please check this."
+            )
+        );
+    }
+
+
+    #[test]
+    fn matrix_text_payload_dedupes_mentions_and_ignores_code_spans() {
+        let payload = matrix_text_payload(
+            "Ping @alice:example.org and @alice:example.org, not `@code:example.org`.",
+        );
+        assert_eq!(
+            payload["m.mentions"],
+            json!({ "user_ids": ["@alice:example.org"] })
+        );
+        let formatted = payload["formatted_body"].as_str().unwrap();
+        assert!(!formatted.contains("@code:example.org</a>"));
+        assert!(formatted.contains("@alice:example.org</a>"));
+    }
+
+
+    #[test]
+    fn sends_signal_pacing_notice_before_attachment_batch() {
+        let _guard = acquire_test_lock();
+        clear_signal_scheduler();
+        set_signal_batch_pacing_notice_threshold_override(Some(0.0));
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("image.png");
+        fs::write(&media_path, b"png-bytes").unwrap();
+        let media_path_for_assert = media_path.clone();
+        let (base_url, join) = mock_server(2, move |index, headers, body| {
+            assert!(headers.starts_with("POST /api/v1/rpc "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            match index {
+                0 => {
+                    assert_eq!(payload["method"], json!("send"));
+                    assert_eq!(payload["params"]["recipient"], json!(["+15551234567"]));
+                    assert_eq!(
+                        payload["params"]["message"],
+                        json!(
+                            "(More images coming — pausing ~0s for Signal rate limit, batch 1/1)"
+                        )
+                    );
+                    assert!(payload["params"].get("attachments").is_none());
+                }
+                1 => {
+                    assert_eq!(payload["method"], json!("send"));
+                    assert_eq!(payload["params"]["message"], json!("caption"));
+                    assert_eq!(
+                        payload["params"]["attachments"],
+                        json!([media_path_for_assert.display().to_string()])
+                    );
+                }
+                _ => unreachable!(),
+            }
+            (
+                200,
+                json!({ "jsonrpc": "2.0", "result": { "timestamp": 1710000000 + index } })
+                    .to_string(),
+            )
+        });
+
+        with_env_var("SIGNAL_HTTP_URL", Some(&base_url));
+        with_env_var("SIGNAL_ACCOUNT", Some("+15550000000"));
+        let result = handle_send(
+            &json!({
+                "target": "signal:+15551234567",
+                "message": format!("caption\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        set_signal_batch_pacing_notice_threshold_override(None);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["platform"], json!("signal"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn keeps_slack_text_success_when_media_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.txt");
+        fs::write(&media_path, b"slack-bytes").unwrap();
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /chat.postMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["channel"], json!("C12345678"));
+                assert_eq!(payload["text"], json!("hello slack"));
+                (
+                    200,
+                    json!({ "ok": true, "ts": "1710000000.000101" }).to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /files.getUploadURLExternal "));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "error": "upload_disabled"
+                    })
+                    .to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("hello slack\nMEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("1710000000.000101"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: Slack media upload init failed: upload_disabled",
+                media_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn falls_back_to_slack_text_when_media_only_upload_fails() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let media_path = temp.path().join("proof.txt");
+        fs::write(&media_path, b"slack-bytes").unwrap();
+        let expected_fallback = format!("📎 File: {}", media_path.display());
+        let (base_url, join) = mock_server(2, move |index, headers, body| match index {
+            0 => {
+                assert!(headers.starts_with("POST /files.getUploadURLExternal "));
+                (
+                    200,
+                    json!({
+                        "ok": false,
+                        "error": "upload_disabled"
+                    })
+                    .to_string(),
+                )
+            }
+            1 => {
+                assert!(headers.starts_with("POST /chat.postMessage "));
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["channel"], json!("C12345678"));
+                assert_eq!(payload["text"], json!(expected_fallback));
+                assert_eq!(payload["mrkdwn"], json!(true));
+                (
+                    200,
+                    json!({ "ok": true, "ts": "1710000000.000202" }).to_string(),
+                )
+            }
+            _ => unreachable!(),
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("MEDIA:{}", media_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true), "{parsed}");
+        assert_eq!(parsed["platform"], json!("slack"));
+        assert_eq!(parsed["message_id"], json!("1710000000.000202"));
+        assert_eq!(parsed["warnings"], json!([]));
+        join.join().unwrap();
+    }
+
+
+    #[test]
+    fn skips_missing_slack_media_with_warning_after_text_delivery() {
+        let _guard = acquire_test_lock();
+        let temp = TempDir::new().unwrap();
+        let runtime = runtime_for(&temp);
+        let missing_path = temp.path().join("missing.txt");
+        let (base_url, join) = mock_server(1, move |_index, headers, body| {
+            assert!(headers.starts_with("POST /chat.postMessage "));
+            let payload: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["channel"], json!("C12345678"));
+            assert_eq!(payload["text"], json!("hello slack"));
+            (
+                200,
+                json!({ "ok": true, "ts": "1710000000.000101" }).to_string(),
+            )
+        });
+        with_env_var("SLACK_BOT_TOKEN", Some("slack-token"));
+        with_env_var("SLACK_API_BASE_URL", Some(&base_url));
+        let result = handle_send(
+            &json!({
+                "target": "slack:C12345678",
+                "message": format!("hello slack\nMEDIA:{}", missing_path.display()),
+            }),
+            &runtime,
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], json!(true));
+        assert_eq!(parsed["message_id"], json!("1710000000.000101"));
+        assert_eq!(
+            parsed["warnings"],
+            json!([format!(
+                "Failed to send media {}: No such file or directory (os error 2)",
+                missing_path.display()
+            )])
+        );
+        join.join().unwrap();
+    }
+
+
 }
