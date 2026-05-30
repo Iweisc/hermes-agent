@@ -497,7 +497,7 @@ fn handle_native_request(
         "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
         "config.show" => handle_helper_dispatch(id, "config.show", &params, helper)?,
         "insights.get" => Some(handle_insights_get(id, &params, store)?),
-        "cron.manage" => handle_helper_dispatch(id, "cron.manage", &params, helper)?,
+        "cron.manage" => Some(handle_cron_manage(id, &params, helper)?),
         "tools.list" => forward_child_request(id, "tools.list", &params, state, child_stdin, true)?,
         "tools.show" => forward_child_request(id, "tools.show", &params, state, child_stdin, true)?,
         "toolsets.list" => {
@@ -1388,6 +1388,43 @@ fn unix_now_secs_f64() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Native `cron.manage`: map the RPC action to `hermes_core::handle_cronjob`
+/// and wrap the result. Port of the Python handler (list / add->create /
+/// remove / pause / resume), which runs entirely against ~/.hermes cron files.
+fn handle_cron_manage(
+    id: Value,
+    params: &Map<String, Value>,
+    helper: &HelperContext,
+) -> Result<Value, Box<dyn Error>> {
+    let action = params.get("action").and_then(Value::as_str).unwrap_or("list");
+    let job_id = params.get("name").and_then(Value::as_str).unwrap_or("");
+
+    let cron_args = match action {
+        "list" => json!({"action": "list"}),
+        "add" => json!({
+            "action": "create",
+            "name": job_id,
+            "schedule": params.get("schedule").and_then(Value::as_str).unwrap_or(""),
+            "prompt": params.get("prompt").and_then(Value::as_str).unwrap_or(""),
+        }),
+        "remove" | "pause" | "resume" => json!({"action": action, "job_id": job_id}),
+        other => {
+            return Ok(error_response(
+                id,
+                4016,
+                &format!("unknown cron action: {other}"),
+            ));
+        }
+    };
+
+    let runtime = ToolRuntime::new(helper.work_root.to_path_buf())
+        .with_hermes_home(&helper.hermes_home);
+    let raw = hermes_core::handle_cronjob(&cron_args, &runtime);
+    let result: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|_| json!({"error": "invalid cron response"}));
+    Ok(ok_response(id, result))
 }
 
 /// Native `insights.get`: count sessions started within the last `days` and sum
