@@ -29,6 +29,7 @@ pub mod gateway;
 pub mod gateway_display_config;
 pub mod gateway_footer;
 pub mod gateway_sticker_cache;
+pub mod gateway_whatsapp_identity;
 mod homeassistant;
 mod image_gen;
 mod kanban;
