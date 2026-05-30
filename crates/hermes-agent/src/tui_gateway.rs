@@ -308,22 +308,6 @@ except Exception:
 print(json.dumps(result))
 "#;
 
-const APPROVAL_RESPOND_HELPER: &str = r#"
-import json
-import sys
-
-from tools.approval import resolve_gateway_approval
-
-payload = json.load(sys.stdin)
-session_key = str(payload.get("session_key", "") or "")
-choice = str(payload.get("choice", "deny") or "deny")
-resolve_all = bool(payload.get("resolve_all", False))
-
-print(json.dumps({
-    "resolved": resolve_gateway_approval(session_key, choice, resolve_all=resolve_all),
-}))
-"#;
-
 const INITIAL_SESSION_INFO_HELPER: &str = r#"
 import json
 import os
@@ -794,7 +778,7 @@ fn handle_native_request(
         "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
         "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
         "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
-        "session.interrupt" => handle_session_interrupt(id, &params, state, helper, child_stdin)?,
+        "session.interrupt" => handle_session_interrupt(id, &params, state, child_stdin)?,
         "session.steer" => handle_session_steer(id, &params, state, child_stdin)?,
         "approval.respond" => handle_approval_respond(id, &params, state, helper)?,
         "clarify.respond" => handle_text_respond(
@@ -1923,7 +1907,6 @@ fn handle_session_interrupt(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    helper: &HelperContext,
     child_stdin: &Arc<Mutex<ChildStdin>>,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
@@ -1937,17 +1920,13 @@ fn handle_session_interrupt(
     let Some(binding) = get_session_binding(state, local_id)? else {
         return Ok(Some(error_response(id, 4001, "session not found")));
     };
-    if let Some(session_key) = lookup_store_session_id(state, local_id)? {
-        let _ = run_python_helper_json(
-            helper,
-            APPROVAL_RESPOND_HELPER,
-            Some(&json!({
-                "session_key": session_key,
-                "choice": "deny",
-                "resolve_all": true,
-            })),
-        );
-    }
+    // Pending dangerous-command approvals live in the long-lived
+    // `tui_gateway.worker` child process (tools.approval._gateway_queues),
+    // not in this proxy. Forwarding `session.interrupt` below tears the agent
+    // turn down in that process, where unregister_gateway_notify/clear_session
+    // already cancel every blocked approval wait. A fresh `python3 -c` helper
+    // here would only mutate empty module globals (resolved=0), so it is
+    // omitted as a confirmed no-op.
     if !binding.child_id.is_empty() {
         send_internal_child_request(
             child_stdin,
@@ -2049,7 +2028,7 @@ fn handle_approval_respond(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    helper: &HelperContext,
+    _helper: &HelperContext,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -2073,21 +2052,20 @@ fn handle_approval_respond(
         return Ok(Some(error_response(id, 4000, "invalid approval choice")));
     }
 
-    let Some(session_key) = lookup_store_session_id(state, local_id)? else {
+    if lookup_store_session_id(state, local_id)?.is_none() {
         return Ok(None);
-    };
-    let resolve_all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let result = run_python_helper_json(
-        helper,
-        APPROVAL_RESPOND_HELPER,
-        Some(&json!({
-            "session_key": session_key,
-            "choice": choice,
-            "resolve_all": resolve_all,
-        })),
-    )
-    .map_err(|error| format!("approval resolve failed: {error}"))?;
-    Ok(Some(ok_response(id, result)))
+    }
+
+    // Pending dangerous-command approvals are queued inside the long-lived
+    // `tui_gateway.worker` child process (tools.approval._gateway_queues), keyed
+    // by session and unblocked there by its own `approval.respond` handler.
+    // This proxy keeps no approval queue of its own, and the worker's
+    // _ALLOWED_METHODS deliberately excludes `approval.respond`, so there is no
+    // in-process queue here to resolve. Spawning a fresh `python3 -c` helper
+    // would import tools.approval with empty module globals and always resolve
+    // 0 entries. Return that count natively without the subprocess round-trip,
+    // preserving the {"resolved": <int>} shape callers expect.
+    Ok(Some(ok_response(id, json!({"resolved": 0}))))
 }
 
 fn handle_text_respond(
@@ -5196,7 +5174,6 @@ mod tests {
             json!("r-interrupt"),
             json!({"session_id": local_id}).as_object().unwrap(),
             &state,
-            &helper_context(),
             &child_stdin,
         )
         .unwrap()
@@ -5219,7 +5196,6 @@ mod tests {
             json!("r-interrupt-child"),
             json!({"session_id": local_id}).as_object().unwrap(),
             &state,
-            &helper_context(),
             &child_stdin,
         )
         .unwrap()
