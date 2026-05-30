@@ -132,40 +132,6 @@ finally:
 print(json.dumps({"output": buf.getvalue().rstrip()}))
 "#;
 
-const INITIAL_SESSION_INFO_HELPER: &str = r#"
-import json
-import os
-import sys
-
-result = {
-    "model": "",
-    "tools": {},
-    "skills": {},
-    "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
-    "lazy": True,
-    "version": "",
-    "release_date": "",
-}
-
-try:
-    from tui_gateway.server import _resolve_model
-
-    result["model"] = _resolve_model() or ""
-except Exception:
-    pass
-
-try:
-    from hermes_cli import __version__, __release_date__
-
-    result["version"] = __version__
-    result["release_date"] = __release_date__
-except Exception:
-    pass
-
-sys.__stdout__.write(json.dumps(result))
-sys.__stdout__.flush()
-"#;
-
 const GATEWAY_READY_HELPER: &str = r#"
 import json
 import sys
@@ -975,19 +941,8 @@ fn resolve_resume_session(
 }
 
 fn initial_session_info(helper: &HelperContext, model_override: Option<&str>) -> Value {
-    let mut info = run_python_helper_json(helper, INITIAL_SESSION_INFO_HELPER, None)
-        .ok()
-        .unwrap_or_else(|| {
-            json!({
-                "model": "",
-                "tools": {},
-                "skills": {},
-                "cwd": helper.work_root.display().to_string(),
-                "lazy": true,
-                "version": env!("CARGO_PKG_VERSION"),
-                "release_date": "",
-            })
-        });
+    let mut info =
+        hermes_core::initial_session_info(&helper.hermes_home, &helper.work_root.display().to_string());
     if let Some(model) = model_override
         .map(str::trim)
         .filter(|value| !value.is_empty())

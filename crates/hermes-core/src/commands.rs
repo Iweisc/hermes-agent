@@ -341,6 +341,76 @@ fn yaml_to_json(value: &YamlValue) -> Value {
     }
 }
 
+/// Release date reported to the TUI, mirroring `hermes_cli.__release_date__`.
+/// Kept in sync with `hermes_cli/__init__.py`.
+pub const HERMES_RELEASE_DATE: &str = "2026.4.30";
+
+/// Default model when none is configured (mirrors `_resolve_model`'s fallback).
+const DEFAULT_TUI_MODEL: &str = "anthropic/claude-sonnet-4";
+
+/// Resolve the TUI startup model. Port of `tui_gateway.server._resolve_model`:
+/// `HERMES_MODEL`/`HERMES_INFERENCE_MODEL` env, then `config.yaml` `model`
+/// (string, or `model.default` when it's a mapping), then the default.
+pub fn resolve_tui_model(hermes_home: &Path) -> String {
+    let env_model = std::env::var("HERMES_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HERMES_INFERENCE_MODEL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(model) = env_model {
+        return model;
+    }
+    if let Some(config) = read_config_mapping_yaml(hermes_home) {
+        match config.get(YamlValue::String("model".to_string())) {
+            Some(YamlValue::Mapping(model)) => {
+                if let Some(default) = model
+                    .get(YamlValue::String("default".to_string()))
+                    .and_then(YamlValue::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return default.to_string();
+                }
+            }
+            Some(YamlValue::String(model)) if !model.trim().is_empty() => {
+                return model.trim().to_string();
+            }
+            _ => {}
+        }
+    }
+    DEFAULT_TUI_MODEL.to_string()
+}
+
+fn read_config_mapping_yaml(hermes_home: &Path) -> Option<serde_yaml::Mapping> {
+    let text = std::fs::read_to_string(hermes_home.join("config.yaml")).ok()?;
+    match serde_yaml::from_str::<YamlValue>(&text).ok()? {
+        YamlValue::Mapping(mapping) => Some(mapping),
+        _ => None,
+    }
+}
+
+/// Build the initial session-info payload (port of `INITIAL_SESSION_INFO_HELPER`).
+///
+/// `cwd` mirrors the Python helper: `TERMINAL_CWD` env, else the provided
+/// working directory. `version` comes from the crate version and `release_date`
+/// from [`HERMES_RELEASE_DATE`].
+pub fn initial_session_info(hermes_home: &Path, work_dir: &str) -> Value {
+    let cwd = std::env::var("TERMINAL_CWD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| work_dir.to_string());
+    json!({
+        "model": resolve_tui_model(hermes_home),
+        "tools": {},
+        "skills": {},
+        "cwd": cwd,
+        "lazy": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "release_date": HERMES_RELEASE_DATE,
+    })
+}
+
 /// Picker commands that should NOT get a trailing space in completions.
 const PICKER_COMMANDS: &[&str] = &["model", "skin", "personality"];
 
@@ -536,6 +606,48 @@ mod tests {
         assert!(items
             .iter()
             .any(|i| i["text"].as_str() == Some("/mouse")));
+    }
+
+    #[test]
+    fn resolve_tui_model_reads_config_default() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path();
+        // No config and no env -> default. (Guard against a HERMES_MODEL set in
+        // the test environment by only asserting the config-backed paths.)
+        std::fs::write(
+            home.join("config.yaml"),
+            "model:\n  default: openai/gpt-5\n",
+        )
+        .unwrap();
+        // Env precedence is documented; here we assert the config mapping path
+        // when the env vars are absent.
+        if std::env::var_os("HERMES_MODEL").is_none()
+            && std::env::var_os("HERMES_INFERENCE_MODEL").is_none()
+        {
+            assert_eq!(resolve_tui_model(home), "openai/gpt-5");
+        }
+
+        // String form of `model`.
+        std::fs::write(home.join("config.yaml"), "model: anthropic/claude-x\n").unwrap();
+        if std::env::var_os("HERMES_MODEL").is_none()
+            && std::env::var_os("HERMES_INFERENCE_MODEL").is_none()
+        {
+            assert_eq!(resolve_tui_model(home), "anthropic/claude-x");
+        }
+    }
+
+    #[test]
+    fn initial_session_info_shape() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let info = initial_session_info(temp.path(), "/work/dir");
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(info["release_date"], HERMES_RELEASE_DATE);
+        assert_eq!(info["lazy"], true);
+        assert!(info["model"].as_str().is_some());
+        // cwd falls back to the work dir when TERMINAL_CWD is unset.
+        if std::env::var_os("TERMINAL_CWD").is_none() {
+            assert_eq!(info["cwd"], "/work/dir");
+        }
     }
 
     #[test]
