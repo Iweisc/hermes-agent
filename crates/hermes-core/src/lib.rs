@@ -26,6 +26,7 @@ pub mod env_loader;
 mod feishu;
 mod gateway_events;
 pub mod gateway;
+pub mod gateway_footer;
 mod homeassistant;
 mod image_gen;
 mod kanban;
