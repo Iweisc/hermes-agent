@@ -1021,6 +1021,22 @@ fn load_anthropic_credentials() -> Result<Option<AnthropicCredentials>, HermesEr
     }))
 }
 
+/// Return true when usable Claude Code OAuth credentials exist at
+/// `~/.claude/.credentials.json` (a valid/non-expired access token, or a
+/// refresh token). Port of the `read_claude_code_credentials` +
+/// `is_claude_code_token_valid`/`refreshToken` check in
+/// `hermes_cli.main._has_any_provider_configured`. Best-effort: any read/parse
+/// error resolves to `false`.
+pub fn claude_code_credentials_present() -> bool {
+    match load_anthropic_credentials() {
+        Ok(Some(creds)) => {
+            !anthropic_access_token_needs_refresh(creds.expires_at_ms)
+                || !creds.refresh_token.is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn anthropic_access_token_needs_refresh(expires_at_ms: i64) -> bool {
     if expires_at_ms <= 0 {
         return true;

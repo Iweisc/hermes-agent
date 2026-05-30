@@ -1437,21 +1437,20 @@ fn handle_insights_get(
 ) -> Result<Value, Box<dyn Error>> {
     let days = params.get("days").and_then(Value::as_f64).unwrap_or(30.0);
     let cutoff = unix_now_secs_f64() - days * 86400.0;
-    let sessions = match store.list_sessions(500, 0) {
+    // Use the rich-count projection (root/branch filtering + compression-tip
+    // message counts) to match the Python list_sessions_rich(limit=500) path.
+    let sessions = match store.list_sessions_rich_counts(500) {
         Ok(sessions) => sessions,
         Err(error) => return Ok(error_response(id, 5017, &error.to_string())),
     };
-    let recent: Vec<_> = sessions
+    let recent: Vec<(f64, i64)> = sessions
         .into_iter()
-        .filter(|s| s.started_at >= cutoff)
+        .filter(|(started_at, _)| *started_at >= cutoff)
         .collect();
-    let messages: i64 = recent.iter().map(|s| s.message_count).sum();
-    // Preserve integer `days` rendering when the input was an integer.
-    let days_value = if days.fract() == 0.0 {
-        json!(days as i64)
-    } else {
-        json!(days)
-    };
+    let messages: i64 = recent.iter().map(|(_, count)| *count).sum();
+    // Echo `days` verbatim from params (Python returns the client's value
+    // as-is), defaulting to integer 30 when absent.
+    let days_value = params.get("days").cloned().unwrap_or_else(|| json!(30));
     Ok(ok_response(
         id,
         json!({

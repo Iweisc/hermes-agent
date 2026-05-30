@@ -617,7 +617,18 @@ impl HermesContext {
 /// Used by the TUI gateway `setup.status` RPC. Best-effort: any error loading
 /// config/auth resolves to `false` rather than propagating.
 pub fn provider_configured(context: &HermesContext) -> bool {
+    // Whether Hermes itself has been explicitly configured (a non-empty model
+    // name). The Python default model is "", so any configured model counts.
+    // Gates the external-tool (Claude Code) credential fallback below.
+    let mut has_hermes_config = false;
+
     if let Ok(loaded) = context.load_config_document() {
+        if loaded
+            .configured_model_name()
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            has_hermes_config = true;
+        }
         if loaded.configured_model_api_key().is_some()
             || loaded.configured_model_base_url().is_some()
         {
@@ -646,6 +657,13 @@ pub fn provider_configured(context: &HermesContext) -> bool {
                 return true;
             }
         }
+    }
+
+    // Claude Code OAuth credentials only count when Hermes has been explicitly
+    // configured (mirrors the _has_hermes_config gate in the Python check) —
+    // having Claude Code installed doesn't mean the user wants Hermes to use it.
+    if has_hermes_config && auth::claude_code_credentials_present() {
+        return true;
     }
 
     false

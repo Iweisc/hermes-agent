@@ -1396,16 +1396,24 @@ pub struct PluginListing {
     pub enabled: bool,
 }
 
-/// List all discovered general plugins with their effective enabled state.
-/// Port of the `plugins.list` RPC (which enumerates the plugin manager's
-/// plugins, including disabled ones, with name/version/enabled).
+/// List ALL discovered plugins with their effective enabled state, matching the
+/// Python plugin manager's `_plugins` dict (which records every discovered
+/// manifest — including exclusive/model-provider/context-engine kinds and
+/// disabled plugins — for introspection). Port of the `plugins.list` RPC.
+///
+/// Per-kind enabled rules mirror `PluginManager.discover_plugins`:
+/// - in the config `disabled` set -> `false`
+/// - `exclusive` (memory providers) -> `false` (activated via category config)
+/// - `model-provider` -> `true` (loaded by the providers discovery path)
+/// - bundled `backend`/`platform` -> `true` (auto-load)
+/// - everything else -> enabled iff in the config `enabled` set
 pub fn plugins_list(hermes_home: &Path, cwd: &Path) -> Vec<PluginListing> {
     let enabled = load_plugin_set(hermes_home, "enabled");
     let disabled = load_plugin_set(hermes_home, "disabled");
-    discover_general_plugins(hermes_home, cwd)
+    discover_scanned_plugins(hermes_home, cwd)
         .into_iter()
         .map(|plugin| {
-            let is_enabled = is_effectively_enabled(&plugin, &enabled, &disabled);
+            let is_enabled = plugin_listing_enabled(&plugin, &enabled, &disabled);
             PluginListing {
                 name: plugin.name,
                 version: plugin.version,
@@ -1413,6 +1421,36 @@ pub fn plugins_list(hermes_home: &Path, cwd: &Path) -> Vec<PluginListing> {
             }
         })
         .collect()
+}
+
+/// Compute the `enabled` flag a plugin would have in the Python manager's
+/// `_plugins` dict (distinct from `is_effectively_enabled`, which is the
+/// runtime activation gate — exclusive plugins are *recorded* as disabled here
+/// but model-providers as enabled, matching the introspection contract).
+fn plugin_listing_enabled(
+    plugin: &DiscoveredPlugin,
+    enabled: &BTreeSet<String>,
+    disabled: &BTreeSet<String>,
+) -> bool {
+    if disabled.contains(&plugin.name) || disabled.contains(&plugin.key) {
+        return false;
+    }
+    match plugin.kind {
+        // Exclusive (memory providers) are recorded disabled by the loader.
+        PluginKind::Exclusive => false,
+        // Model providers are recorded enabled (loaded by providers discovery).
+        PluginKind::ModelProvider => true,
+        // Bundled backends/platforms auto-load.
+        PluginKind::Backend | PluginKind::Platform
+            if plugin.source == PluginSource::Bundled =>
+        {
+            true
+        }
+        // Everything else (standalone, user backends, context engines) is
+        // opt-in via plugins.enabled — Python's loop has no context-engine
+        // special case, so it falls through to this same rule.
+        _ => enabled.contains(&plugin.name) || enabled.contains(&plugin.key),
+    }
 }
 
 fn load_plugin_set(hermes_home: &Path, key: &str) -> BTreeSet<String> {
@@ -2437,6 +2475,46 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{dispatch_tool, get_tool_definitions_with_runtime};
+
+    #[test]
+    fn plugins_list_includes_all_kinds_with_python_enabled_rules() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join(".hermes");
+        let plugins = home.join("plugins");
+        let write_plugin = |name: &str, kind: &str| {
+            let dir = plugins.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("plugin.yaml"),
+                format!("name: {name}\nversion: 1.2.3\ndescription: d\nkind: {kind}\n"),
+            )
+            .unwrap();
+        };
+        write_plugin("mp", "model-provider");
+        write_plugin("mem", "exclusive");
+        write_plugin("opt-in", "standalone");
+        write_plugin("on-plugin", "standalone");
+        fs::write(
+            home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - on-plugin\n",
+        )
+        .unwrap();
+
+        let listing = plugins_list(&home, temp.path());
+        let by_name: std::collections::HashMap<&str, &PluginListing> =
+            listing.iter().map(|p| (p.name.as_str(), p)).collect();
+
+        // All kinds present (the previous discover_general_plugins filter
+        // dropped model-provider + exclusive entirely — regression guard).
+        assert!(by_name.contains_key("mp"), "model-provider must be listed");
+        assert!(by_name.contains_key("mem"), "exclusive must be listed");
+        // Per-kind enabled rules mirror the Python plugin manager.
+        assert!(by_name["mp"].enabled, "model-provider -> enabled");
+        assert!(!by_name["mem"].enabled, "exclusive -> disabled");
+        assert!(!by_name["opt-in"].enabled, "standalone not in enabled set -> disabled");
+        assert!(by_name["on-plugin"].enabled, "standalone in enabled set -> enabled");
+        assert_eq!(by_name["mp"].version, "1.2.3");
+    }
 
     #[test]
     fn attach_python_plugin_runtime_uses_static_tool_and_hook_discovery() {

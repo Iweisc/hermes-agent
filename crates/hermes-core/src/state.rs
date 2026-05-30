@@ -676,6 +676,95 @@ impl SessionStore {
             .map_err(state_err("collecting session list"))
     }
 
+    /// Session `(started_at, message_count)` rows with the same root/branch
+    /// filtering and compression-tip projection that
+    /// `hermes_state.list_sessions_rich(limit, include_children=False,
+    /// project_compression_tips=True)` applies. Used by the TUI `insights.get`
+    /// RPC so message-count aggregation matches the Python path on DBs that
+    /// contain compression chains.
+    pub fn list_sessions_rich_counts(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(f64, i64)>, HermesError> {
+        // Root sessions + branch children (parent ended with 'branched' before
+        // the child started); excludes subagent runs and compression
+        // continuations. Mirrors the default list_sessions_rich WHERE clause.
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT s.id, s.started_at, s.message_count, s.end_reason \
+                 FROM sessions s \
+                 WHERE s.parent_session_id IS NULL \
+                    OR EXISTS (SELECT 1 FROM sessions p \
+                               WHERE p.id = s.parent_session_id \
+                                 AND p.end_reason = 'branched' \
+                                 AND s.started_at >= p.ended_at) \
+                 ORDER BY s.started_at DESC LIMIT ?",
+            )
+            .map_err(state_err("preparing rich session list"))?;
+        let rows: Vec<(String, f64, i64, Option<String>)> = statement
+            .query_map(params![limit.max(0)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(state_err("listing rich sessions"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(state_err("collecting rich session list"))?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for (id, started_at, message_count, end_reason) in rows {
+            // Project compression roots forward to their tip's message_count,
+            // preserving the root's started_at for ordering/windowing.
+            if end_reason.as_deref() == Some("compression") {
+                if let Some(tip_id) = self.compression_tip(&id)? {
+                    if tip_id != id {
+                        if let Some(tip_count) = self.session_message_count(&tip_id)? {
+                            result.push((started_at, tip_count));
+                            continue;
+                        }
+                    }
+                }
+            }
+            result.push((started_at, message_count));
+        }
+        Ok(result)
+    }
+
+    /// Walk the compression-continuation chain forward and return the tip's id.
+    /// Port of `hermes_state.get_compression_tip` (bounded to 100 hops).
+    fn compression_tip(&self, session_id: &str) -> Result<Option<String>, HermesError> {
+        let mut current = session_id.to_string();
+        for _ in 0..100 {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT id FROM sessions \
+                     WHERE parent_session_id = ?1 \
+                       AND started_at >= (SELECT ended_at FROM sessions \
+                                          WHERE id = ?1 AND end_reason = 'compression') \
+                     ORDER BY started_at DESC LIMIT 1",
+                )
+                .map_err(state_err("preparing compression tip"))?;
+            let next: Option<String> = statement
+                .query_row(params![current], |row| row.get(0))
+                .ok();
+            match next {
+                Some(id) => current = id,
+                None => return Ok(Some(current)),
+            }
+        }
+        Ok(Some(current))
+    }
+
+    fn session_message_count(&self, session_id: &str) -> Result<Option<i64>, HermesError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT message_count FROM sessions WHERE id = ?")
+            .map_err(state_err("preparing message-count lookup"))?;
+        Ok(statement
+            .query_row(params![session_id], |row| row.get(0))
+            .ok())
+    }
+
     pub fn search_sessions(
         &self,
         source: Option<&str>,
