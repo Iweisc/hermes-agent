@@ -15,6 +15,8 @@ mod checkpoints;
 mod clarify;
 pub mod clipboard;
 mod code_execution;
+pub mod commands;
+mod commands_registry_data;
 pub mod config;
 mod context_engine;
 mod cronjob;
@@ -78,6 +80,10 @@ pub use config::{
 };
 pub use clipboard::{
     has_clipboard_image, image_dimensions, image_token_estimate, save_clipboard_image,
+};
+pub use commands::{
+    CommandDef, command_registry, commands_catalog, complete_slash, resolve_command,
+    resolve_command_json,
 };
 pub use context_engine::{ContextEngine, ContextEngineSessionStart};
 pub use cronjob::{

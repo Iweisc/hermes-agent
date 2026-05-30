@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Generate the native Rust command registry from hermes_cli/commands.py.
+
+This parses the COMMAND_REGISTRY list literal with the stdlib `ast` module
+(no imports of hermes_cli are executed) and emits a committed Rust data table
+at crates/hermes-core/src/commands_registry_data.rs.
+
+The registry is the single source of truth for slash commands. While the
+codebase is mid-migration the Python file remains canonical; re-run this
+generator whenever COMMAND_REGISTRY changes:
+
+    python3 scripts/gen_command_registry.py
+
+The derivation logic (resolve_command, build_description, SUBCOMMANDS, the
+slash completer) lives in hand-written Rust in commands.rs and mirrors the
+Python in hermes_cli/commands.py.
+"""
+
+from __future__ import annotations
+
+import ast
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SRC = REPO / "hermes_cli" / "commands.py"
+OUT = REPO / "crates" / "hermes-core" / "src" / "commands_registry_data.rs"
+
+
+def _str(node: ast.AST) -> str:
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        raise TypeError(f"expected string literal, got {ast.dump(node)}")
+    return node.value
+
+
+def _bool(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, bool):
+        raise TypeError(f"expected bool literal, got {ast.dump(node)}")
+    return node.value
+
+
+def _str_tuple(node: ast.AST) -> list[str]:
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        raise TypeError(f"expected tuple/list literal, got {ast.dump(node)}")
+    return [_str(elt) for elt in node.elts]
+
+
+def find_registry(tree: ast.Module) -> ast.List:
+    for stmt in tree.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == "COMMAND_REGISTRY" and isinstance(stmt.value, ast.List):
+                return stmt.value
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "COMMAND_REGISTRY"
+                    and isinstance(stmt.value, ast.List)
+                ):
+                    return stmt.value
+    raise SystemExit("could not locate COMMAND_REGISTRY list literal")
+
+
+def rust_str(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def rust_str_slice(values: list[str]) -> str:
+    if not values:
+        return "&[]"
+    inner = ", ".join(rust_str(v) for v in values)
+    return f"&[{inner}]"
+
+
+def rust_opt_str(value: str | None) -> str:
+    return "None" if value is None else f"Some({rust_str(value)})"
+
+
+def main() -> int:
+    tree = ast.parse(SRC.read_text(encoding="utf-8"), filename=str(SRC))
+    registry = find_registry(tree)
+
+    rows: list[str] = []
+    for call in registry.elts:
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+            raise SystemExit(f"unexpected registry element: {ast.dump(call)}")
+        if call.func.id != "CommandDef":
+            raise SystemExit(f"unexpected constructor: {call.func.id}")
+
+        args = call.args
+        if len(args) < 3:
+            raise SystemExit("CommandDef requires name, description, category")
+        name = _str(args[0])
+        description = _str(args[1])
+        category = _str(args[2])
+
+        aliases: list[str] = []
+        args_hint = ""
+        subcommands: list[str] = []
+        cli_only = False
+        gateway_only = False
+        gateway_config_gate: str | None = None
+
+        for kw in call.keywords:
+            if kw.arg == "aliases":
+                aliases = _str_tuple(kw.value)
+            elif kw.arg == "args_hint":
+                args_hint = _str(kw.value)
+            elif kw.arg == "subcommands":
+                subcommands = _str_tuple(kw.value)
+            elif kw.arg == "cli_only":
+                cli_only = _bool(kw.value)
+            elif kw.arg == "gateway_only":
+                gateway_only = _bool(kw.value)
+            elif kw.arg == "gateway_config_gate":
+                gateway_config_gate = _str(kw.value)
+            else:
+                raise SystemExit(f"unhandled CommandDef kwarg: {kw.arg}")
+
+        rows.append(
+            "    CommandDef {\n"
+            f"        name: {rust_str(name)},\n"
+            f"        description: {rust_str(description)},\n"
+            f"        category: {rust_str(category)},\n"
+            f"        aliases: {rust_str_slice(aliases)},\n"
+            f"        args_hint: {rust_str(args_hint)},\n"
+            f"        subcommands: {rust_str_slice(subcommands)},\n"
+            f"        cli_only: {str(cli_only).lower()},\n"
+            f"        gateway_only: {str(gateway_only).lower()},\n"
+            f"        gateway_config_gate: {rust_opt_str(gateway_config_gate)},\n"
+            "    },"
+        )
+
+    body = "\n".join(rows)
+    out = (
+        "// @generated by scripts/gen_command_registry.py from hermes_cli/commands.py\n"
+        "// Do not edit by hand. Re-run the generator when COMMAND_REGISTRY changes.\n"
+        "//\n"
+        "// The slash-command registry is the single source of truth for command\n"
+        "// names, aliases, descriptions, categories, and subcommands. Derivation\n"
+        "// logic (resolve_command, build_description, subcommands, completion)\n"
+        "// lives in commands.rs and mirrors hermes_cli/commands.py.\n\n"
+        "use super::commands::CommandDef;\n\n"
+        f"pub(super) const COMMAND_REGISTRY: &[CommandDef] = &[\n{body}\n];\n"
+    )
+    OUT.write_text(out, encoding="utf-8")
+    print(f"wrote {OUT} ({len(rows)} commands)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
