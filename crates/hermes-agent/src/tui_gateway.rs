@@ -277,28 +277,6 @@ finally:
 print(json.dumps({"output": buf.getvalue().rstrip()}))
 "#;
 
-const IMAGE_META_HELPER: &str = r#"
-import json
-import sys
-from pathlib import Path
-
-payload = json.load(sys.stdin)
-path = Path(str(payload.get("path", "") or ""))
-result = {"name": path.name} if path else {}
-try:
-    from PIL import Image
-
-    with Image.open(path) as img:
-        width, height = img.size
-    result["width"] = int(width)
-    result["height"] = int(height)
-    result["token_estimate"] = max(1, (int(width) + 511) // 512) * max(1, (int(height) + 511) // 512) * 85
-except Exception:
-    pass
-
-print(json.dumps(result))
-"#;
-
 const CLIPBOARD_PASTE_HELPER: &str = r#"
 import json
 import sys
@@ -3656,26 +3634,25 @@ fn run_python_helper_json(
     Ok(serde_json::from_str(stdout.trim())?)
 }
 
-fn image_meta(helper: &HelperContext, path: &Path) -> Map<String, Value> {
-    run_python_helper_json(
-        helper,
-        IMAGE_META_HELPER,
-        Some(&json!({"path": path.display().to_string()})),
-    )
-    .ok()
-    .and_then(|value| value.as_object().cloned())
-    .unwrap_or_else(|| {
-        let mut payload = Map::new();
-        payload.insert(
-            "name".to_string(),
-            json!(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-            ),
-        );
-        payload
-    })
+fn image_meta(_helper: &HelperContext, path: &Path) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert(
+        "name".to_string(),
+        json!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        ),
+    );
+    if let Ok((width, height)) = image::image_dimensions(path) {
+        let token_estimate = u64::from((width + 511) / 512).max(1)
+            * u64::from((height + 511) / 512).max(1)
+            * 85;
+        payload.insert("width".to_string(), json!(width));
+        payload.insert("height".to_string(), json!(height));
+        payload.insert("token_estimate".to_string(), json!(token_estimate));
+    }
+    payload
 }
 
 fn split_path_input(raw: &str) -> (String, String) {
