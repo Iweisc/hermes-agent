@@ -40,6 +40,7 @@ mod shell_hooks;
 mod skills;
 pub mod skins;
 mod skins_data;
+pub mod tui_config;
 mod spotify;
 pub mod state;
 mod terminal;

@@ -1465,6 +1465,18 @@ fn handle_config_get(
         return Ok(Some(rebind_response_id(response, id)));
     }
 
+    // Native config.get for the self-contained keys; only `provider` (which
+    // needs credential-aware enumeration) falls back to the Python helper.
+    match hermes_core::tui_config::config_get(
+        &helper.hermes_home,
+        key,
+        &helper.context.display_hermes_home(),
+    ) {
+        Ok(Some(result)) => return Ok(Some(ok_response(id, result))),
+        Err((code, message)) => return Ok(Some(error_response(id, code, &message))),
+        Ok(None) => {}
+    }
+
     let response = run_python_helper_json(helper, CONFIG_GET_HELPER, Some(&json!(params)))
         .map_err(|error| format!("config.get helper failed: {error}"))?;
     Ok(Some(rebind_response_id(response, id)))
