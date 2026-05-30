@@ -14,6 +14,26 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const GATEWAY_SERVICE_RESTART_EXIT_CODE: i32 = 75;
+
+/// Default gateway restart drain timeout (seconds). Mirrors
+/// `DEFAULT_CONFIG["agent"]["restart_drain_timeout"]` (gateway/restart.py).
+pub const DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT: f64 = 180.0;
+
+/// Parse a configured drain timeout, falling back to the shared default and
+/// clamping to >= 0. Port of `gateway.restart.parse_restart_drain_timeout`.
+pub fn parse_restart_drain_timeout(raw: Option<&serde_json::Value>) -> f64 {
+    let parsed = match raw {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.trim().parse::<f64>().ok(),
+        // null / empty string / absent -> default; non-numeric -> default.
+        _ => None,
+    };
+    match parsed {
+        Some(value) if value.is_finite() => value.max(0.0),
+        _ => DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    }
+}
+
 pub const MAX_PLATFORM_OUTPUT: usize = 4000;
 pub const TRUNCATED_VISIBLE: usize = 3800;
 pub const RESTART_NOTIFY_FILENAME: &str = ".restart_notify.json";
@@ -8052,6 +8072,23 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use tempfile::tempdir;
+
+    #[test]
+    fn parse_restart_drain_timeout_matches_python() {
+        use serde_json::json;
+        // numeric
+        assert_eq!(parse_restart_drain_timeout(Some(&json!(30))), 30.0);
+        assert_eq!(parse_restart_drain_timeout(Some(&json!(12.5))), 12.5);
+        // numeric string
+        assert_eq!(parse_restart_drain_timeout(Some(&json!("45"))), 45.0);
+        // negative clamps to 0
+        assert_eq!(parse_restart_drain_timeout(Some(&json!(-5))), 0.0);
+        // empty / null / absent / non-numeric -> default
+        assert_eq!(parse_restart_drain_timeout(Some(&json!(""))), DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT);
+        assert_eq!(parse_restart_drain_timeout(Some(&json!(null))), DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT);
+        assert_eq!(parse_restart_drain_timeout(None), DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT);
+        assert_eq!(parse_restart_drain_timeout(Some(&json!("abc"))), DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT);
+    }
 
     fn telegram() -> Platform {
         Platform::parse("telegram").unwrap()
