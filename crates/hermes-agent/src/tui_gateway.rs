@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local, Utc};
 use hermes_core::{
     DelegateExecutor, HermesContext, HermesError, MessageAppend, MessageRecord, ModelOverrides,
     SessionCreate, SessionStore, ToolRuntime,
@@ -3135,39 +3136,21 @@ fn new_background_task_id() -> String {
 
 fn current_filename_timestamp() -> String {
     let timestamp = current_timestamp_seconds();
-    run_python_filename_timestamp(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+    format_local_timestamp(timestamp, "%Y%m%d_%H%M%S")
+        .unwrap_or_else(|| format!("{timestamp:.0}"))
 }
 
 fn format_timestamp(timestamp: f64) -> String {
-    run_python_datetime_format(timestamp).unwrap_or_else(|_| format!("{timestamp:.0}"))
+    format_local_timestamp(timestamp, "%Y-%m-%d %H:%M").unwrap_or_else(|| format!("{timestamp:.0}"))
 }
 
-fn run_python_filename_timestamp(timestamp: f64) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg("from datetime import datetime; import sys; print(datetime.fromtimestamp(float(sys.argv[1])).strftime('%Y%m%d_%H%M%S'))")
-        .arg(format!("{timestamp}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err("python3 filename timestamp formatting failed".into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-}
-
-fn run_python_datetime_format(timestamp: f64) -> Result<String, Box<dyn Error>> {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg("from datetime import datetime; import sys; print(datetime.fromtimestamp(float(sys.argv[1])).strftime('%Y-%m-%d %H:%M'))")
-        .arg(format!("{timestamp}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err("python3 timestamp formatting failed".into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+/// Format a Unix timestamp (seconds) in the local timezone, matching Python's
+/// `datetime.fromtimestamp(ts).strftime(fmt)`.
+fn format_local_timestamp(timestamp: f64, fmt: &str) -> Option<String> {
+    let secs = timestamp.floor() as i64;
+    let nanos = ((timestamp - timestamp.floor()) * 1_000_000_000.0).round() as u32;
+    let utc = DateTime::<Utc>::from_timestamp(secs, nanos)?;
+    Some(utc.with_timezone(&Local).format(fmt).to_string())
 }
 
 fn set_session_cols(
