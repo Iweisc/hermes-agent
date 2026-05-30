@@ -1388,6 +1388,33 @@ pub fn discover_enabled_general_plugins(hermes_home: &Path, cwd: &Path) -> Vec<D
         .collect()
 }
 
+/// A plugin's listing entry: name, version, and effective enabled state.
+#[derive(Debug, Clone)]
+pub struct PluginListing {
+    pub name: String,
+    pub version: String,
+    pub enabled: bool,
+}
+
+/// List all discovered general plugins with their effective enabled state.
+/// Port of the `plugins.list` RPC (which enumerates the plugin manager's
+/// plugins, including disabled ones, with name/version/enabled).
+pub fn plugins_list(hermes_home: &Path, cwd: &Path) -> Vec<PluginListing> {
+    let enabled = load_plugin_set(hermes_home, "enabled");
+    let disabled = load_plugin_set(hermes_home, "disabled");
+    discover_general_plugins(hermes_home, cwd)
+        .into_iter()
+        .map(|plugin| {
+            let is_enabled = is_effectively_enabled(&plugin, &enabled, &disabled);
+            PluginListing {
+                name: plugin.name,
+                version: plugin.version,
+                enabled: is_enabled,
+            }
+        })
+        .collect()
+}
+
 fn load_plugin_set(hermes_home: &Path, key: &str) -> BTreeSet<String> {
     let config_path = hermes_home.join("config.yaml");
     let text = match fs::read_to_string(config_path) {

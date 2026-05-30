@@ -133,7 +133,8 @@ pub use plugin_runtime::{
     discover_plugin_cli_commands_from_source, discover_plugin_image_gen_providers,
     discover_scanned_plugins, discover_tool_definitions_from_source,
     dispatch_python_plugin_cli_command, dispatch_python_plugin_image_generate,
-    is_effectively_enabled, python_plugin_image_gen_available, run_python_plugin_platform_setup,
+    is_effectively_enabled, plugins_list, PluginListing, python_plugin_image_gen_available,
+    run_python_plugin_platform_setup,
 };
 pub use providers::{
     ProviderProfile, auto_provider_candidates, get_provider_profile, infer_api_mode_from_base_url,

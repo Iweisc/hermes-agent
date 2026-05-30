@@ -494,7 +494,15 @@ fn handle_native_request(
             false,
             Duration::from_secs(240),
         )?,
-        "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
+        "plugins.list" => {
+            let listings =
+                hermes_core::plugins_list(&helper.hermes_home, &helper.work_root);
+            let plugins: Vec<Value> = listings
+                .into_iter()
+                .map(|p| json!({"name": p.name, "version": p.version, "enabled": p.enabled}))
+                .collect();
+            Some(ok_response(id, json!({"plugins": plugins})))
+        }
         "config.show" => Some(ok_response(
             id,
             hermes_core::tui_config::config_show(
