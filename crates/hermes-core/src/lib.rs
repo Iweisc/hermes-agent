@@ -608,6 +608,105 @@ impl HermesContext {
     }
 }
 
+/// Return true when at least one inference provider is usable. Port of
+/// `hermes_cli.main._has_any_provider_configured` (and parity with the
+/// `hermes` crate's `has_any_chat_provider_configured`): checks configured
+/// model api_key/base_url, provider env vars (process + `.env`), the active
+/// auth provider, and non-api-key provider auth status.
+///
+/// Used by the TUI gateway `setup.status` RPC. Best-effort: any error loading
+/// config/auth resolves to `false` rather than propagating.
+pub fn provider_configured(context: &HermesContext) -> bool {
+    if let Ok(loaded) = context.load_config_document() {
+        if loaded.configured_model_api_key().is_some()
+            || loaded.configured_model_base_url().is_some()
+        {
+            return true;
+        }
+    }
+
+    for key in provider_env_keys() {
+        if env_value_for_context(context, key).is_some() {
+            return true;
+        }
+    }
+
+    if let Ok(Some(active)) = get_active_auth_provider(context.hermes_home().as_path()) {
+        if is_inference_auth_provider(&active) {
+            return true;
+        }
+    }
+
+    for profile in list_provider_profiles() {
+        if profile.auth_type == "api_key" {
+            continue;
+        }
+        if let Ok(status) = get_auth_status_summary(context.hermes_home().as_path(), profile.name) {
+            if status.configured || status.logged_in {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn provider_env_keys() -> Vec<&'static str> {
+    let mut keys = vec![
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_TOKEN",
+        "OPENAI_BASE_URL",
+    ];
+    for profile in list_provider_profiles() {
+        for key in profile.env_vars {
+            if !keys.contains(key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn is_inference_auth_provider(provider: &str) -> bool {
+    let provider = provider.trim();
+    !provider.is_empty()
+        && list_provider_profiles()
+            .iter()
+            .any(|profile| profile.name == provider)
+}
+
+fn env_value_for_context(context: &HermesContext, key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| read_env_file_value(context.env_path().as_path(), key))
+}
+
+fn read_env_file_value(path: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((entry_key, entry_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if entry_key.trim() != key {
+            continue;
+        }
+        let value = entry_value.trim().trim_matches(['"', '\'']);
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileFlag {
     value: String,

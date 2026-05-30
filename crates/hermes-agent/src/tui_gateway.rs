@@ -166,23 +166,6 @@ sys.__stdout__.write(json.dumps(response))
 sys.__stdout__.flush()
 "#;
 
-const DISPATCH_RPC_HELPER: &str = r#"
-import json
-import sys
-
-from tui_gateway.server import dispatch
-
-payload = json.load(sys.stdin)
-response = dispatch({
-    "jsonrpc": "2.0",
-    "id": "helper",
-    "method": payload.get("method", ""),
-    "params": payload.get("params", {}) or {},
-})
-sys.__stdout__.write(json.dumps(response))
-sys.__stdout__.flush()
-"#;
-
 #[derive(Debug, Clone)]
 struct HelperContext {
     context: HermesContext,
@@ -522,7 +505,10 @@ fn handle_native_request(
         }
         "session.usage" => handle_session_usage(id, &params, state)?,
         "session.status" => handle_session_status(id, &params, store, state, helper)?,
-        "setup.status" => handle_helper_dispatch(id, "setup.status", &params, helper)?,
+        "setup.status" => Some(ok_response(
+            id,
+            json!({"provider_configured": hermes_core::provider_configured(&helper.context)}),
+        )),
         "delegation.status" => {
             forward_child_request(id, "delegation.status", &params, state, child_stdin, false)?
         }
@@ -1474,21 +1460,6 @@ fn handle_insights_get(
             "messages": messages,
         }),
     ))
-}
-
-fn handle_helper_dispatch(
-    id: Value,
-    method: &str,
-    params: &Map<String, Value>,
-    helper: &HelperContext,
-) -> Result<Option<Value>, Box<dyn Error>> {
-    let response = run_python_helper_json(
-        helper,
-        DISPATCH_RPC_HELPER,
-        Some(&json!({"method": method, "params": params})),
-    )
-    .map_err(|error| format!("{method} helper failed: {error}"))?;
-    Ok(Some(rebind_response_id(response, id)))
 }
 
 fn forward_child_request(
@@ -5810,7 +5781,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_tree_helper_dispatch_uses_isolated_hermes_home() {
+    fn spawn_tree_native_save_list_load_uses_isolated_hermes_home() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -5820,11 +5791,9 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&hermes_home).unwrap();
-        let helper = helper_context_at(hermes_home.clone());
 
-        let save = handle_helper_dispatch(
-            json!("r-spawn-save"),
-            "spawn_tree.save",
+        let save = hermes_core::spawn_tree::save(
+            &hermes_home,
             json!({
                 "session_id": "rs_tui_00000001",
                 "finished_at": 1234.0,
@@ -5834,34 +5803,29 @@ mod tests {
             })
             .as_object()
             .unwrap(),
-            &helper,
+            1234.0,
         )
-        .unwrap()
-        .expect("spawn_tree.save response");
-        let path = save["result"]["path"].as_str().unwrap().to_string();
-        let listed = handle_helper_dispatch(
-            json!("r-spawn-list"),
-            "spawn_tree.list",
+        .expect("spawn_tree.save");
+        let path = save["path"].as_str().unwrap().to_string();
+
+        let listed = hermes_core::spawn_tree::list(
+            &hermes_home,
             json!({"session_id": "rs_tui_00000001", "limit": 10})
                 .as_object()
                 .unwrap(),
-            &helper,
         )
-        .unwrap()
-        .expect("spawn_tree.list response");
-        let loaded = handle_helper_dispatch(
-            json!("r-spawn-load"),
-            "spawn_tree.load",
+        .expect("spawn_tree.list");
+        let loaded = hermes_core::spawn_tree::load(
+            &hermes_home,
             json!({"path": path}).as_object().unwrap(),
-            &helper,
         )
-        .unwrap()
-        .expect("spawn_tree.load response");
+        .expect("spawn_tree.load");
 
-        assert_eq!(listed["id"], json!("r-spawn-list"));
-        assert_eq!(listed["result"]["entries"][0]["label"], json!("demo"));
-        assert_eq!(loaded["result"]["session_id"], json!("rs_tui_00000001"));
-        assert_eq!(loaded["result"]["subagents"][0]["id"], json!("sub-1"));
+        assert_eq!(listed["entries"][0]["label"], json!("demo"));
+        assert_eq!(loaded["session_id"], json!("rs_tui_00000001"));
+        assert_eq!(loaded["subagents"][0]["id"], json!("sub-1"));
+
+        let _ = fs::remove_dir_all(&hermes_home);
     }
 
     #[test]
