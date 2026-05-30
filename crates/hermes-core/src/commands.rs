@@ -341,6 +341,177 @@ fn yaml_to_json(value: &YamlValue) -> Value {
     }
 }
 
+/// Outcome of a native `command.dispatch`: a ready JSON-RPC `result` object, an
+/// error to surface, or `NotHandled` to fall back to the Python helper for the
+/// plugin/skill/queue/steer/unknown branches.
+pub enum DispatchOutcome {
+    Ok(Value),
+    Err(String),
+    NotHandled,
+}
+
+/// Handle the leading, self-contained branches of `COMMAND_DISPATCH_HELPER`:
+/// command-alias resolution and `quick_commands` (exec/alias). These are
+/// evaluated *before* the plugin-handler check in the Python helper, so native
+/// handling here preserves exact precedence — anything not a quick command
+/// returns [`DispatchOutcome::NotHandled`] and the caller defers to Python
+/// (which then checks plugin handlers, skills, queue/steer in order).
+///
+/// The exec branch runs the shell command (30s timeout) and formats output
+/// exactly like the Python: stdout and stderr joined with a newline when both
+/// are present, trimmed, capped at 4000 chars; a non-zero exit becomes an error.
+pub fn command_dispatch(hermes_home: &Path, name: &str, arg: &str) -> DispatchOutcome {
+    // name comes in without a leading slash; resolve aliases to canonical.
+    let mut name = name.trim_start_matches('/').to_string();
+    if let Some(resolved) = resolve_command(&name) {
+        name = resolved.name.to_string();
+    }
+
+    let quick = read_quick_commands(hermes_home);
+    let Some(qc) = quick.get(&name).and_then(Value::as_object) else {
+        // Not a quick command — let Python handle plugin/skill/queue/steer.
+        let _ = arg;
+        return DispatchOutcome::NotHandled;
+    };
+
+    match qc.get("type").and_then(Value::as_str) {
+        Some("exec") => {
+            let command = qc.get("command").and_then(Value::as_str).unwrap_or("");
+            run_exec_quick_command(command)
+        }
+        Some("alias") => {
+            let target = qc.get("target").and_then(Value::as_str).unwrap_or("");
+            DispatchOutcome::Ok(json!({"type": "alias", "target": target}))
+        }
+        // A quick command of an unexpected type falls through to Python, which
+        // would skip the quick-command block and continue its precedence chain.
+        _ => DispatchOutcome::NotHandled,
+    }
+}
+
+/// Run a `type: exec` quick command via the shell, faithfully reproducing the
+/// Python helper's exec branch: `subprocess.run(cmd, shell=True, timeout=30)`,
+/// output = stdout (+ "\n" if both) + stderr, trimmed and capped at 4000; a
+/// non-zero exit raises (here: returns `Err`) with the output or an exit-code
+/// message.
+fn run_exec_quick_command(command: &str) -> DispatchOutcome {
+    use std::process::{Command, Stdio};
+
+    // shell=True parity: invoke via the platform shell.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => return DispatchOutcome::Err(format!("quick command failed to start: {error}")),
+    };
+
+    // 30s timeout parity with the Python subprocess.run(..., timeout=30).
+    let output = match wait_with_timeout(child, std::time::Duration::from_secs(30)) {
+        Ok(output) => output,
+        Err(error) => return DispatchOutcome::Err(error),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let joined = join_exec_output(&stdout, &stderr);
+
+    if !output.status.success() {
+        let code = output.status.code();
+        let message = if joined.is_empty() {
+            match code {
+                Some(code) => format!("quick command failed with exit code {code}"),
+                None => "quick command failed".to_string(),
+            }
+        } else {
+            joined
+        };
+        return DispatchOutcome::Err(message);
+    }
+    DispatchOutcome::Ok(json!({"type": "exec", "output": joined}))
+}
+
+struct ExecOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Wait for a child with a timeout, reading stdout/stderr to completion.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<ExecOutput, String> {
+    use std::io::Read;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let start = Instant::now();
+    let timed_out = loop {
+        match child.try_wait().map_err(|e| format!("waiting on quick command failed: {e}"))? {
+            Some(_) => break false,
+            None if start.elapsed() >= timeout => break true,
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    if timed_out {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(|e| format!("waiting on quick command failed: {e}"))?;
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    if timed_out {
+        return Err("quick command timed out after 30 seconds".to_string());
+    }
+    Ok(ExecOutput { status, stdout, stderr })
+}
+
+/// Join exec stdout/stderr the way the Python helper does:
+/// `(stdout + "\n" if both else "") + stderr`, then `.strip()` and cap at 4000.
+fn join_exec_output(stdout: &str, stderr: &str) -> String {
+    let mut combined = String::new();
+    combined.push_str(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() {
+        combined.push('\n');
+    }
+    combined.push_str(stderr);
+    let trimmed = combined.trim();
+    trimmed.chars().take(4000).collect()
+}
+
 /// Release date reported to the TUI, mirroring `hermes_cli.__release_date__`.
 /// Kept in sync with `hermes_cli/__init__.py`.
 pub const HERMES_RELEASE_DATE: &str = "2026.4.30";
@@ -655,6 +826,60 @@ mod tests {
         // cwd falls back to the work dir when TERMINAL_CWD is unset.
         if std::env::var_os("TERMINAL_CWD").is_none() {
             assert_eq!(info["cwd"], "/work/dir");
+        }
+    }
+
+    #[test]
+    fn dispatch_quick_command_exec_alias_and_fallthrough() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("config.yaml"),
+            "quick_commands:\n  hi:\n    type: exec\n    command: \"echo hello\"\n  gp:\n    type: alias\n    target: \"git push\"\n",
+        )
+        .unwrap();
+
+        // exec quick command runs and captures stdout
+        match command_dispatch(temp.path(), "hi", "") {
+            DispatchOutcome::Ok(v) => {
+                assert_eq!(v["type"], "exec");
+                assert_eq!(v["output"], "hello");
+            }
+            DispatchOutcome::Err(e) => panic!("exec errored: {e}"),
+            DispatchOutcome::NotHandled => panic!("exec should be handled"),
+        }
+
+        // alias returns its target
+        match command_dispatch(temp.path(), "/gp", "") {
+            DispatchOutcome::Ok(v) => {
+                assert_eq!(v["type"], "alias");
+                assert_eq!(v["target"], "git push");
+            }
+            other => panic!("alias not handled: {}", matches!(other, DispatchOutcome::Ok(_))),
+        }
+
+        // a non-quick command falls through to the python helper
+        assert!(matches!(
+            command_dispatch(temp.path(), "queue", "do a thing"),
+            DispatchOutcome::NotHandled
+        ));
+        // an unknown skill/plugin name also falls through
+        assert!(matches!(
+            command_dispatch(temp.path(), "some-skill", ""),
+            DispatchOutcome::NotHandled
+        ));
+    }
+
+    #[test]
+    fn dispatch_exec_nonzero_exit_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join("config.yaml"),
+            "quick_commands:\n  fail:\n    type: exec\n    command: \"echo oops 1>&2; exit 3\"\n",
+        )
+        .unwrap();
+        match command_dispatch(temp.path(), "fail", "") {
+            DispatchOutcome::Err(message) => assert!(message.contains("oops")),
+            other => panic!("expected Err, got Ok={}", matches!(other, DispatchOutcome::Ok(_))),
         }
     }
 

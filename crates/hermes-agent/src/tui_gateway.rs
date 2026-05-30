@@ -634,13 +634,25 @@ fn handle_native_request(
                 .and_then(Value::as_str)
                 .and_then(|local_id| lookup_store_session_id(state, local_id).ok().flatten())
                 .unwrap_or_default();
-            match run_python_helper_json(
-                helper,
-                COMMAND_DISPATCH_HELPER,
-                Some(&json!({"name": name, "arg": arg, "session_key": session_key})),
-            ) {
-                Ok(result) => Some(ok_response(id, result)),
-                Err(error) => Some(error_response(id, 4018, &error.to_string())),
+            // Native: command-alias resolution + quick_commands (exec/alias),
+            // which the Python helper evaluates before the plugin/skill checks.
+            // Anything else falls through to the helper (plugin handler, skills,
+            // queue/steer) to preserve exact precedence.
+            match hermes_core::command_dispatch(&helper.hermes_home, name, arg) {
+                hermes_core::DispatchOutcome::Ok(result) => Some(ok_response(id, result)),
+                hermes_core::DispatchOutcome::Err(message) => {
+                    Some(error_response(id, 4018, &message))
+                }
+                hermes_core::DispatchOutcome::NotHandled => {
+                    match run_python_helper_json(
+                        helper,
+                        COMMAND_DISPATCH_HELPER,
+                        Some(&json!({"name": name, "arg": arg, "session_key": session_key})),
+                    ) {
+                        Ok(result) => Some(ok_response(id, result)),
+                        Err(error) => Some(error_response(id, 4018, &error.to_string())),
+                    }
+                }
             }
         }
         "slash.exec" => {
