@@ -137,6 +137,7 @@ pub use providers::{
 };
 pub use skills::load_skill_prompt_content;
 pub use skills::build_skill_invocation_message;
+pub use skills::{SkillCommand, scan_skill_commands};
 pub use state::{
     ExportedSession, MessageAppend, MessageRecord, MessageSearchRow, SearchContextMessage,
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,

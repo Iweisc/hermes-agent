@@ -113,42 +113,6 @@ print(json.dumps({
 }))
 "#;
 
-const SLASH_COMPLETION_HELPER: &str = r#"
-import json
-import sys
-
-from hermes_cli.commands import SlashCommandCompleter
-from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import to_plain_text
-
-from agent.skill_commands import get_skill_commands
-
-payload = json.load(sys.stdin)
-text = str(payload.get("text", ""))
-completer = SlashCommandCompleter(skill_commands_provider=lambda: get_skill_commands())
-doc = Document(text, len(text))
-items = [{
-    "text": c.text,
-    "display": c.display or c.text,
-    "meta": to_plain_text(c.display_meta) if c.display_meta else "",
-} for c in completer.get_completions(doc, None)][:30]
-
-text_lower = text.lower()
-for extra in [
-    {"text": "/compact", "display": "/compact", "meta": "Toggle compact display mode"},
-    {"text": "/details", "display": "/details", "meta": "Control agent detail visibility"},
-    {"text": "/logs", "display": "/logs", "meta": "Show recent gateway log lines"},
-    {"text": "/mouse", "display": "/mouse", "meta": "Toggle mouse/wheel tracking [on|off|toggle]"},
-]:
-    if extra["text"].startswith(text_lower) and not any(item["text"] == extra["text"] for item in items):
-        items.append(extra)
-
-print(json.dumps({
-    "items": items,
-    "replace_from": text.rfind(" ") + 1 if " " in text else 1,
-}))
-"#;
-
 const COMMAND_DISPATCH_HELPER: &str = r#"
 import json
 import subprocess
@@ -787,11 +751,8 @@ fn handle_native_request(
             } else if let Some(details) = details_completions(text) {
                 Some(ok_response(id, details))
             } else {
-                let result = run_python_helper_json(
-                    helper,
-                    SLASH_COMPLETION_HELPER,
-                    Some(&json!({"text": text})),
-                )?;
+                let skill_commands = scan_skill_command_pairs(helper);
+                let result = hermes_core::complete_slash(text, &skill_commands);
                 Some(ok_response(id, result))
             }
         }
@@ -3551,6 +3512,18 @@ fn next_paste_counter(state: &Arc<Mutex<ProxyState>>) -> Result<u64, Box<dyn Err
         .map_err(|_| "proxy state lock poisoned while incrementing paste counter")?;
     guard.next_paste = guard.next_paste.saturating_add(1);
     Ok(guard.next_paste)
+}
+
+/// Scan `~/.hermes/skills/` for skills exposed as slash commands, returning
+/// `(/command, description)` pairs for the native command catalog/completer.
+/// Mirrors `agent.skill_commands.scan_skill_commands`; the platform scope is
+/// taken from `HERMES_SESSION_PLATFORM`/`HERMES_PLATFORM` (resolved inside
+/// `hermes_core::scan_skill_commands`).
+fn scan_skill_command_pairs(helper: &HelperContext) -> Vec<(String, String)> {
+    hermes_core::scan_skill_commands(&helper.hermes_home, None)
+        .into_iter()
+        .map(|skill| (skill.command, skill.description))
+        .collect()
 }
 
 fn run_python_helper_json(

@@ -447,6 +447,365 @@ pub fn load_skill_prompt_content(hermes_home: &Path, name: &str) -> Result<Strin
         .map_err(|error| format!("Failed to read skill '{}': {error}", name))
 }
 
+/// A skill exposed as a slash command: `/cmd` -> name + description.
+#[derive(Debug, Clone)]
+pub struct SkillCommand {
+    pub command: String,
+    pub name: String,
+    pub description: String,
+    pub skill_md_path: PathBuf,
+    pub skill_dir: PathBuf,
+}
+
+/// Map `sys.platform`-style targets for the skill `platforms:` frontmatter.
+/// Mirrors `agent.skill_utils.PLATFORM_MAP`.
+fn platform_target(value: &str) -> String {
+    match value {
+        "macos" => "darwin".to_string(),
+        "linux" => "linux".to_string(),
+        "windows" => "win32".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Current `sys.platform` value for the host OS (the subset Python reports).
+fn current_sys_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+/// Port of `agent.skill_utils.skill_matches_platform`: a skill with no
+/// `platforms` field matches everything; otherwise the current `sys.platform`
+/// must start with one of the mapped platform targets.
+fn skill_matches_platform(frontmatter: &BTreeMap<String, YamlValue>) -> bool {
+    let Some(platforms) = frontmatter.get("platforms") else {
+        return true;
+    };
+    let entries: Vec<String> = match platforms {
+        YamlValue::Null => return true,
+        YamlValue::Sequence(seq) => {
+            if seq.is_empty() {
+                return true;
+            }
+            seq.iter().map(yaml_scalar_to_string).collect()
+        }
+        YamlValue::String(s) if s.is_empty() => return true,
+        other => vec![yaml_scalar_to_string(other)],
+    };
+    let current = current_sys_platform();
+    entries.iter().any(|platform| {
+        let normalized = platform.to_lowercase();
+        let normalized = normalized.trim();
+        current.starts_with(&platform_target(normalized))
+    })
+}
+
+fn yaml_scalar_to_string(value: &YamlValue) -> String {
+    match value {
+        YamlValue::String(s) => s.clone(),
+        YamlValue::Bool(b) => b.to_string(),
+        YamlValue::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Read `config.yaml` under `hermes_home` as a YAML mapping (best-effort).
+fn read_config_mapping(hermes_home: &Path) -> Option<serde_yaml::Mapping> {
+    let path = hermes_home.join("config.yaml");
+    let text = fs::read_to_string(path).ok()?;
+    match serde_yaml::from_str::<YamlValue>(&text).ok()? {
+        YamlValue::Mapping(mapping) => Some(mapping),
+        _ => None,
+    }
+}
+
+fn mapping_get<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn normalize_string_set(value: Option<&YamlValue>) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    match value {
+        Some(YamlValue::Sequence(seq)) => {
+            for item in seq {
+                let s = yaml_scalar_to_string(item);
+                let s = s.trim();
+                if !s.is_empty() {
+                    set.insert(s.to_string());
+                }
+            }
+        }
+        Some(YamlValue::String(s)) => {
+            let s = s.trim();
+            if !s.is_empty() {
+                set.insert(s.to_string());
+            }
+        }
+        _ => {}
+    }
+    set
+}
+
+/// Port of `agent.skill_utils.get_disabled_skill_names`. Reads
+/// `skills.disabled` (or `skills.platform_disabled.<platform>` when a platform
+/// is active) from `config.yaml`. `platform` resolves from the explicit arg
+/// then `HERMES_PLATFORM` then `HERMES_SESSION_PLATFORM`.
+fn disabled_skill_names(hermes_home: &Path, platform: Option<&str>) -> BTreeSet<String> {
+    let Some(config) = read_config_mapping(hermes_home) else {
+        return BTreeSet::new();
+    };
+    let Some(YamlValue::Mapping(skills_cfg)) = mapping_get(&config, "skills") else {
+        return BTreeSet::new();
+    };
+    let resolved_platform = platform
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HERMES_PLATFORM").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var("HERMES_SESSION_PLATFORM")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(platform) = resolved_platform {
+        if let Some(YamlValue::Mapping(platform_disabled)) =
+            mapping_get(skills_cfg, "platform_disabled")
+        {
+            if let Some(entry) = platform_disabled.get(YamlValue::String(platform)) {
+                return normalize_string_set(Some(entry));
+            }
+        }
+    }
+    normalize_string_set(mapping_get(skills_cfg, "disabled"))
+}
+
+/// Port of `agent.skill_utils.get_external_skills_dirs`. Reads
+/// `skills.external_dirs` from `config.yaml`, expands `~`/`$VAR`, resolves
+/// relative entries against `hermes_home`, drops the local skills dir,
+/// dedupes, and keeps only existing directories.
+fn external_skills_dirs(hermes_home: &Path, local_skills: &Path) -> Vec<PathBuf> {
+    let Some(config) = read_config_mapping(hermes_home) else {
+        return Vec::new();
+    };
+    let Some(YamlValue::Mapping(skills_cfg)) = mapping_get(&config, "skills") else {
+        return Vec::new();
+    };
+    let raw = match mapping_get(skills_cfg, "external_dirs") {
+        Some(YamlValue::Sequence(seq)) => seq
+            .iter()
+            .map(yaml_scalar_to_string)
+            .collect::<Vec<_>>(),
+        Some(YamlValue::String(s)) => vec![s.clone()],
+        _ => return Vec::new(),
+    };
+    let local = local_skills
+        .canonicalize()
+        .unwrap_or_else(|_| local_skills.to_path_buf());
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut result = Vec::new();
+    for entry in raw {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let expanded = expand_user_and_vars(entry);
+        let path = Path::new(&expanded);
+        let resolved = if path.is_absolute() {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            let joined = hermes_home.join(path);
+            joined.canonicalize().unwrap_or(joined)
+        };
+        if resolved == local || seen.contains(&resolved) {
+            continue;
+        }
+        if resolved.is_dir() {
+            seen.insert(resolved.clone());
+            result.push(resolved);
+        }
+    }
+    result
+}
+
+/// Expand a leading `~` and `$VAR`/`${VAR}` references using the environment.
+fn expand_user_and_vars(input: &str) -> String {
+    let mut expanded = input.to_string();
+    if expanded == "~" || expanded.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            expanded = expanded.replacen('~', &home.to_string_lossy(), 1);
+        }
+    }
+    expand_env_vars(&expanded)
+}
+
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'{' {
+                if let Some(end) = input[i + 2..].find('}') {
+                    let name = &input[i + 2..i + 2 + end];
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    i = i + 2 + end + 1;
+                    continue;
+                }
+            } else {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j > start {
+                    let name = &input[start..j];
+                    out.push_str(&std::env::var(name).unwrap_or_default());
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Description fallback used by skill-command scanning: the frontmatter
+/// `description` (untruncated) or the first non-heading body line capped at 80
+/// chars. Mirrors the inline logic in `agent.skill_commands.scan_skill_commands`
+/// (distinct from `resolved_description`, which truncates differently).
+fn skill_command_description(
+    frontmatter: &BTreeMap<String, YamlValue>,
+    body: &str,
+) -> String {
+    if let Some(description) = frontmatter
+        .get("description")
+        .and_then(YamlValue::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return description.to_string();
+    }
+    for line in body.trim().split('\n') {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            return line.chars().take(80).collect();
+        }
+    }
+    String::new()
+}
+
+/// Scan `~/.hermes/skills/` (and configured external dirs) for skills exposed
+/// as slash commands. Faithful port of `agent.skill_commands.scan_skill_commands`:
+/// platform-incompatible and disabled skills are skipped, the first occurrence
+/// of each skill name wins, and command slugs are normalized to `[a-z0-9-]`.
+pub fn scan_skill_commands(hermes_home: &Path, platform: Option<&str>) -> Vec<SkillCommand> {
+    let local_skills = hermes_home.join("skills");
+    let disabled = disabled_skill_names(hermes_home, platform);
+
+    let mut dirs_to_scan = Vec::new();
+    if local_skills.exists() {
+        dirs_to_scan.push(local_skills.clone());
+    }
+    dirs_to_scan.extend(external_skills_dirs(hermes_home, &local_skills));
+
+    let mut seen_names: BTreeSet<String> = BTreeSet::new();
+    // Preserve first-insert order while allowing later duplicate /cmd keys to
+    // overwrite the stored value, matching Python's dict semantics.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_command: BTreeMap<String, SkillCommand> = BTreeMap::new();
+
+    for scan_dir in dirs_to_scan {
+        let mut skill_files = Vec::new();
+        if collect_skill_files(&scan_dir, &mut skill_files).is_err() {
+            continue;
+        }
+        // collect_skill_files yields filesystem order; sort by path relative to
+        // the scan dir to match Python's iter_skill_index_files ordering.
+        skill_files.sort_by(|a, b| {
+            let ra = a.strip_prefix(&scan_dir).unwrap_or(a);
+            let rb = b.strip_prefix(&scan_dir).unwrap_or(b);
+            ra.cmp(rb)
+        });
+        for skill_md in skill_files {
+            if skill_md
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some(p) if EXCLUDED_SKILL_DIRS.contains(&p)))
+            {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&skill_md) else {
+                continue;
+            };
+            let (frontmatter, body) = parse_frontmatter(&content);
+            if !skill_matches_platform(&frontmatter) {
+                continue;
+            }
+            let name = frontmatter
+                .get("name")
+                .and_then(YamlValue::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    skill_md
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("skill")
+                        .to_string()
+                });
+            if seen_names.contains(&name) {
+                continue;
+            }
+            if disabled.contains(&name) {
+                continue;
+            }
+            let description = skill_command_description(&frontmatter, &body);
+            seen_names.insert(name.clone());
+            let cmd_name = normalize_skill_command_name(&name);
+            if cmd_name.is_empty() {
+                continue;
+            }
+            let command = format!("/{cmd_name}");
+            let description = if description.is_empty() {
+                format!("Invoke the {name} skill")
+            } else {
+                description
+            };
+            let skill_dir = skill_md
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| skill_md.clone());
+            if !by_command.contains_key(&command) {
+                order.push(command.clone());
+            }
+            by_command.insert(
+                command.clone(),
+                SkillCommand {
+                    command,
+                    name,
+                    description,
+                    skill_md_path: skill_md,
+                    skill_dir,
+                },
+            );
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| by_command.remove(&key))
+        .collect()
+}
+
 fn discover_skills(skills_root: &Path) -> Result<Vec<SkillEntry>, String> {
     let mut skill_files = Vec::new();
     collect_skill_files(skills_root, &mut skill_files)?;
