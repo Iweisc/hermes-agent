@@ -21,97 +21,6 @@ use url::Url;
 const DENY_SOURCES: &[&str] = &["tool"];
 const MAX_COMPLETION_ITEMS: usize = 30;
 
-const COMMANDS_CATALOG_HELPER: &str = r#"
-import json
-import sys
-
-from hermes_cli.commands import COMMAND_REGISTRY, SUBCOMMANDS, _build_description
-from hermes_cli.config import read_raw_config
-
-TUI_HIDDEN = {"new", "clear", "quit", "exit", "copy", "paste", "image", "commands", "approve", "deny", "sethome", "set-home", "update"}
-TUI_EXTRA = [
-    ("/compact", "Toggle compact display mode", "TUI"),
-    ("/logs", "Show recent gateway log lines", "TUI"),
-    ("/mouse", "Toggle mouse/wheel tracking [on|off|toggle]", "TUI"),
-]
-
-all_pairs = []
-canon = {}
-categories = []
-cat_map = {}
-cat_order = []
-
-for cmd in COMMAND_REGISTRY:
-    if cmd.name in TUI_HIDDEN or cmd.gateway_only:
-        continue
-    c = f"/{cmd.name}"
-    canon[c.lower()] = c
-    for a in cmd.aliases:
-        canon[f"/{a}".lower()] = c
-    desc = _build_description(cmd)
-    all_pairs.append([c, desc])
-    if cmd.category not in cat_map:
-        cat_map[cmd.category] = []
-        cat_order.append(cmd.category)
-    cat_map[cmd.category].append([c, desc])
-
-for name, desc, cat in TUI_EXTRA:
-    all_pairs.append([name, desc])
-    if cat not in cat_map:
-        cat_map[cat] = []
-        cat_order.append(cat)
-    cat_map[cat].append([name, desc])
-
-warning = ""
-try:
-    qcmds = (read_raw_config() or {}).get("quick_commands", {}) or {}
-    if isinstance(qcmds, dict) and qcmds:
-        bucket = "User commands"
-        if bucket not in cat_map:
-            cat_map[bucket] = []
-            cat_order.append(bucket)
-        for qname, qc in sorted(qcmds.items()):
-            if not isinstance(qc, dict):
-                continue
-            key = f"/{qname}"
-            canon[key.lower()] = key
-            qtype = qc.get("type", "")
-            if qtype == "exec":
-                default_desc = f"exec: {qc.get('command', '')}"
-            elif qtype == "alias":
-                default_desc = f"alias -> {qc.get('target', '')}"
-            else:
-                default_desc = qtype or "quick command"
-            qdesc = str(qc.get("description") or default_desc)
-            qdesc = qdesc[:120] + ("…" if len(qdesc) > 120 else "")
-            all_pairs.append([key, qdesc])
-            cat_map[bucket].append([key, qdesc])
-except Exception as e:
-    warning = f"quick_commands discovery unavailable: {e}"
-
-skill_count = 0
-try:
-    from agent.skill_commands import scan_skill_commands
-
-    for key, info in sorted(scan_skill_commands().items()):
-        desc = str(info.get("description", "Skill"))
-        all_pairs.append([key, desc[:120] + ("…" if len(desc) > 120 else "")])
-        skill_count += 1
-except Exception as e:
-    warning = f"skill discovery unavailable: {e}"
-
-for cat in cat_order:
-    categories.append({"name": cat, "pairs": cat_map[cat]})
-
-print(json.dumps({
-    "pairs": all_pairs,
-    "sub": {k: list(v) for k, v in SUBCOMMANDS.items()},
-    "canon": canon,
-    "categories": categories,
-    "skill_count": skill_count,
-    "warning": warning,
-}))
-"#;
 
 const COMMAND_DISPATCH_HELPER: &str = r#"
 import json
@@ -728,7 +637,9 @@ fn handle_native_request(
         "image.attach" => handle_image_attach(id, &params, state, helper)?,
         "input.detect_drop" => handle_input_detect_drop(id, &params, state, helper)?,
         "commands.catalog" => {
-            let result = run_python_helper_json(helper, COMMANDS_CATALOG_HELPER, None)?;
+            let quick_commands = read_quick_commands(helper);
+            let skill_commands = scan_skill_command_pairs(helper);
+            let result = hermes_core::commands_catalog(&quick_commands, &skill_commands);
             Some(ok_response(id, result))
         }
         "complete.path" => Some(ok_response(
@@ -3524,6 +3435,12 @@ fn scan_skill_command_pairs(helper: &HelperContext) -> Vec<(String, String)> {
         .into_iter()
         .map(|skill| (skill.command, skill.description))
         .collect()
+}
+
+/// Read the `quick_commands` map from `<hermes_home>/config.yaml` for the
+/// native command catalog (mirrors `read_raw_config()["quick_commands"]`).
+fn read_quick_commands(helper: &HelperContext) -> Map<String, Value> {
+    hermes_core::read_quick_commands(&helper.hermes_home)
 }
 
 fn run_python_helper_json(

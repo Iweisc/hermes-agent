@@ -82,8 +82,8 @@ pub use clipboard::{
     has_clipboard_image, image_dimensions, image_token_estimate, save_clipboard_image,
 };
 pub use commands::{
-    CommandDef, command_registry, commands_catalog, complete_slash, resolve_command,
-    resolve_command_json,
+    CommandDef, command_registry, commands_catalog, complete_slash, read_quick_commands,
+    resolve_command, resolve_command_json,
 };
 pub use context_engine::{ContextEngine, ContextEngineSessionStart};
 pub use cronjob::{

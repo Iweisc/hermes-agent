@@ -8,10 +8,12 @@
 //! `commands.catalog`, and `complete.slash`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use serde_yaml::Value as YamlValue;
 
 use crate::commands_registry_data::COMMAND_REGISTRY;
 
@@ -188,10 +190,10 @@ pub fn commands_catalog(
     let mut cat_order: Vec<String> = Vec::new();
     let mut cat_map: HashMap<String, Vec<Value>> = HashMap::new();
 
-    let mut push_cat = |cat_order: &mut Vec<String>,
-                        cat_map: &mut HashMap<String, Vec<Value>>,
-                        category: &str,
-                        pair: Value| {
+    let push_cat = |cat_order: &mut Vec<String>,
+                    cat_map: &mut HashMap<String, Vec<Value>>,
+                    category: &str,
+                    pair: Value| {
         if !cat_map.contains_key(category) {
             cat_map.insert(category.to_string(), Vec::new());
             cat_order.push(category.to_string());
@@ -287,6 +289,56 @@ pub fn commands_catalog(
         "skill_count": skill_count,
         "warning": warning,
     })
+}
+
+/// Read `quick_commands` from `<hermes_home>/config.yaml` as a JSON object
+/// (name -> spec), mirroring `read_raw_config().get("quick_commands", {})`.
+/// Returns an empty map when the file is missing/unparsable or the key absent.
+pub fn read_quick_commands(hermes_home: &Path) -> Map<String, Value> {
+    let path = hermes_home.join("config.yaml");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Map::new();
+    };
+    let Ok(YamlValue::Mapping(root)) = serde_yaml::from_str::<YamlValue>(&text) else {
+        return Map::new();
+    };
+    match root.get(YamlValue::String("quick_commands".to_string())) {
+        Some(value) => match yaml_to_json(value) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        },
+        None => Map::new(),
+    }
+}
+
+fn yaml_to_json(value: &YamlValue) -> Value {
+    match value {
+        YamlValue::Null => Value::Null,
+        YamlValue::Bool(b) => Value::Bool(*b),
+        YamlValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                json!(i)
+            } else if let Some(u) = n.as_u64() {
+                json!(u)
+            } else if let Some(f) = n.as_f64() {
+                json!(f)
+            } else {
+                Value::Null
+            }
+        }
+        YamlValue::String(s) => Value::String(s.clone()),
+        YamlValue::Sequence(seq) => Value::Array(seq.iter().map(yaml_to_json).collect()),
+        YamlValue::Mapping(mapping) => {
+            let mut object = Map::new();
+            for (key, value) in mapping {
+                if let Some(key) = key.as_str() {
+                    object.insert(key.to_string(), yaml_to_json(value));
+                }
+            }
+            Value::Object(object)
+        }
+        YamlValue::Tagged(tagged) => yaml_to_json(&tagged.value),
+    }
 }
 
 /// Picker commands that should NOT get a trailing space in completions.
@@ -484,6 +536,42 @@ mod tests {
         assert!(items
             .iter()
             .any(|i| i["text"].as_str() == Some("/mouse")));
+    }
+
+    #[test]
+    fn catalog_includes_quick_commands_and_skills() {
+        let mut quick = Map::new();
+        quick.insert(
+            "deploy".to_string(),
+            json!({"type": "exec", "command": "make deploy"}),
+        );
+        quick.insert(
+            "gp".to_string(),
+            json!({"type": "alias", "target": "git push"}),
+        );
+        let skills = vec![("/triage".to_string(), "Triage incoming issues".to_string())];
+        let cat = commands_catalog(&quick, &skills);
+
+        let pairs = cat["pairs"].as_array().unwrap();
+        let find = |name: &str| {
+            pairs
+                .iter()
+                .find(|p| p[0].as_str() == Some(name))
+                .map(|p| p[1].as_str().unwrap_or_default().to_string())
+        };
+        // exec/alias quick commands render their derived descriptions
+        assert_eq!(find("/deploy").as_deref(), Some("exec: make deploy"));
+        assert_eq!(find("/gp").as_deref(), Some("alias -> git push"));
+        // quick commands are canonicalized
+        assert_eq!(cat["canon"]["/deploy"], "/deploy");
+        // skills appear and are counted
+        assert_eq!(cat["skill_count"], 1);
+        assert_eq!(find("/triage").as_deref(), Some("Triage incoming issues"));
+        // quick commands form their own category bucket
+        let categories = cat["categories"].as_array().unwrap();
+        assert!(categories
+            .iter()
+            .any(|c| c["name"] == "User commands"));
     }
 
     #[test]

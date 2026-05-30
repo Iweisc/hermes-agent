@@ -1677,4 +1677,49 @@ Use this workflow.
         let remove_json: Value = serde_json::from_str(&remove).unwrap();
         assert_eq!(remove_json["success"], Value::Bool(true));
     }
+
+    #[test]
+    fn scan_skill_commands_normalizes_and_filters() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        // A normal skill with a frontmatter description.
+        let a = home.join("skills/group/Code Review");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(
+            a.join("SKILL.md"),
+            "---\nname: Code Review\ndescription: Review a diff\n---\n\n# body\n",
+        )
+        .unwrap();
+        // A skill with no description -> falls back to first body line (<=80).
+        let b = home.join("skills/no_desc");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(
+            b.join("SKILL.md"),
+            "---\nname: deploy_helper\n---\n\n# Heading\nHelps you deploy things\n",
+        )
+        .unwrap();
+        // A disabled skill (config.yaml skills.disabled).
+        let c = home.join("skills/secret");
+        fs::create_dir_all(&c).unwrap();
+        fs::write(c.join("SKILL.md"), "---\nname: secret\n---\n\nhidden\n").unwrap();
+        fs::write(
+            home.join("config.yaml"),
+            "skills:\n  disabled:\n    - secret\n",
+        )
+        .unwrap();
+
+        let commands = scan_skill_commands(home, None);
+        let by_cmd: std::collections::HashMap<_, _> = commands
+            .iter()
+            .map(|s| (s.command.as_str(), s))
+            .collect();
+
+        // "Code Review" -> "/code-review" (spaces -> hyphens, lowercased)
+        assert_eq!(by_cmd["/code-review"].name, "Code Review");
+        assert_eq!(by_cmd["/code-review"].description, "Review a diff");
+        // "deploy_helper" -> "/deploy-helper", body-line fallback description
+        assert_eq!(by_cmd["/deploy-helper"].description, "Helps you deploy things");
+        // disabled skill is absent
+        assert!(!by_cmd.contains_key("/secret"));
+    }
 }
