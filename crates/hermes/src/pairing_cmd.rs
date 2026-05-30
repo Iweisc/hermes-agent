@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 const CODE_TTL_SECONDS: f64 = 3600.0;
 const LOCKOUT_SECONDS: f64 = 3600.0;
 const MAX_FAILED_ATTEMPTS: i64 = 5;
+/// Unambiguous alphabet — excludes 0/O, 1/I (matches gateway/pairing.py).
+const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LENGTH: usize = 8;
+const RATE_LIMIT_SECONDS: f64 = 600.0;
+const MAX_PENDING_PER_PLATFORM: usize = 3;
 
 #[derive(Subcommand, Debug)]
 pub enum PairingCommand {
@@ -249,8 +254,10 @@ impl PairingStore {
         code: &str,
     ) -> Result<Option<ApprovedResult>, Box<dyn Error>> {
         self.cleanup_expired(platform)?;
+        // Mirror Python: code.upper().strip().
+        let code = code.trim().to_uppercase();
         let mut pending = self.load_pending(platform)?;
-        let Some(entry) = pending.remove(code) else {
+        let Some(entry) = pending.remove(&code) else {
             self.record_failed_attempt(platform)?;
             return Ok(None);
         };
@@ -384,6 +391,75 @@ impl PairingStore {
     fn save_rate_limits(&self, data: &BTreeMap<String, f64>) -> Result<(), Box<dyn Error>> {
         save_json_map(&self.rate_limit_path(), data)
     }
+
+    // ----- Gateway-runtime side (port of generate_code / is_approved) -----
+
+    /// Check if a user is approved (paired) on a platform. Port of `is_approved`.
+    fn is_approved(&self, platform: &str, user_id: &str) -> Result<bool, Box<dyn Error>> {
+        Ok(self.load_approved(platform)?.contains_key(user_id))
+    }
+
+    /// Generate a pairing code for a new user, or `None` when rate-limited,
+    /// locked out, or at the per-platform pending cap. Port of `generate_code`.
+    fn generate_code(
+        &self,
+        platform: &str,
+        user_id: &str,
+        user_name: &str,
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        self.cleanup_expired(platform)?;
+        if self.is_locked_out(platform)? {
+            return Ok(None);
+        }
+        if self.is_rate_limited(platform, user_id)? {
+            return Ok(None);
+        }
+        let mut pending = self.load_pending(platform)?;
+        if pending.len() >= MAX_PENDING_PER_PLATFORM {
+            return Ok(None);
+        }
+        let code = generate_pairing_code();
+        pending.insert(
+            code.clone(),
+            PendingEntry {
+                user_id: user_id.to_string(),
+                user_name: user_name.to_string(),
+                created_at: now_ts(),
+            },
+        );
+        self.save_pending(platform, &pending)?;
+        self.record_rate_limit(platform, user_id)?;
+        Ok(Some(code))
+    }
+
+    fn is_rate_limited(&self, platform: &str, user_id: &str) -> Result<bool, Box<dyn Error>> {
+        let limits = self.load_rate_limits()?;
+        let key = format!("{platform}:{user_id}");
+        let last = limits.get(&key).copied().unwrap_or(0.0);
+        Ok((now_ts() - last) < RATE_LIMIT_SECONDS)
+    }
+
+    fn record_rate_limit(&self, platform: &str, user_id: &str) -> Result<(), Box<dyn Error>> {
+        let mut limits = self.load_rate_limits()?;
+        limits.insert(format!("{platform}:{user_id}"), now_ts());
+        self.save_rate_limits(&limits)
+    }
+
+    fn is_locked_out(&self, platform: &str) -> Result<bool, Box<dyn Error>> {
+        let limits = self.load_rate_limits()?;
+        let lockout_until = limits.get(&format!("_lockout:{platform}")).copied().unwrap_or(0.0);
+        Ok(now_ts() < lockout_until)
+    }
+}
+
+/// Generate a cryptographically-random pairing code from the unambiguous
+/// alphabet (port of `secrets.choice(ALPHABET) for _ in range(CODE_LENGTH)`).
+fn generate_pairing_code() -> String {
+    let mut buf = [0u8; CODE_LENGTH];
+    getrandom::fill(&mut buf).expect("getrandom for pairing code");
+    buf.iter()
+        .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 fn resolve_pairing_dir(context: &HermesContext) -> PathBuf {
@@ -542,5 +618,60 @@ mod tests {
         let limits = store.load_rate_limits().unwrap();
         assert_eq!(limits.get("_failures:slack").copied().unwrap_or(-1.0), 0.0);
         assert!(limits.get("_lockout:slack").copied().unwrap_or(0.0) > now_ts());
+    }
+
+    #[test]
+    fn generate_code_then_approve_round_trip() {
+        let home = TempDir::new().unwrap();
+        let context = HermesContext::new(home.path());
+        let store = PairingStore::new(&context);
+
+        assert!(!store.is_approved("telegram", "u-1").unwrap());
+
+        let code = store
+            .generate_code("telegram", "u-1", "Alice")
+            .unwrap()
+            .expect("a code");
+        assert_eq!(code.len(), CODE_LENGTH);
+        assert!(code.chars().all(|c| ALPHABET.contains(&(c as u8))));
+
+        // Same user is now rate-limited -> no second code.
+        assert!(store.generate_code("telegram", "u-1", "Alice").unwrap().is_none());
+
+        // Approving the code (lower-cased, padded) still works via normalization.
+        let lowered = code.to_lowercase();
+        let approved = store
+            .approve_code("telegram", &format!("  {lowered}  "))
+            .unwrap()
+            .expect("approved");
+        assert_eq!(approved.user_id, "u-1");
+        assert!(store.is_approved("telegram", "u-1").unwrap());
+    }
+
+    #[test]
+    fn generate_code_respects_max_pending() {
+        let home = TempDir::new().unwrap();
+        let context = HermesContext::new(home.path());
+        let store = PairingStore::new(&context);
+        // Distinct users avoid the per-user rate limit; cap is MAX_PENDING_PER_PLATFORM.
+        for i in 0..MAX_PENDING_PER_PLATFORM {
+            assert!(store
+                .generate_code("discord", &format!("user-{i}"), "")
+                .unwrap()
+                .is_some());
+        }
+        assert!(store.generate_code("discord", "user-overflow", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn locked_out_platform_cannot_generate() {
+        let home = TempDir::new().unwrap();
+        let context = HermesContext::new(home.path());
+        let store = PairingStore::new(&context);
+        // Trip the lockout via failed approvals, then generate must return None.
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            assert!(store.approve_code("signal", "NOPE").unwrap().is_none());
+        }
+        assert!(store.generate_code("signal", "u-x", "").unwrap().is_none());
     }
 }
