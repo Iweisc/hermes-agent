@@ -3602,13 +3602,9 @@ fn python_module_installed(module: &str) -> Result<bool, Box<dyn Error>> {
     let Some(python) = setup_python_interpreter() else {
         return Ok(false);
     };
-    let status = Command::new(python)
-        .arg("-c")
-        .arg(format!(
-            "import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec({module:?}) else 1)"
-        ))
-        .status()?;
-    Ok(status.success())
+    // Native site-packages check (with subprocess fallback) instead of spawning
+    // `python -c "find_spec(...)"`. See python_bridge::python_module_installed.
+    Ok(crate::python_bridge::python_module_installed(&python, module))
 }
 
 fn install_python_package(packages: &[&str]) -> Result<bool, Box<dyn Error>> {
