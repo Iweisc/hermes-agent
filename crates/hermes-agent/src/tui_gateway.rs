@@ -496,7 +496,7 @@ fn handle_native_request(
         )?,
         "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
         "config.show" => handle_helper_dispatch(id, "config.show", &params, helper)?,
-        "insights.get" => handle_helper_dispatch(id, "insights.get", &params, helper)?,
+        "insights.get" => Some(handle_insights_get(id, &params, store)?),
         "cron.manage" => handle_helper_dispatch(id, "cron.manage", &params, helper)?,
         "tools.list" => forward_child_request(id, "tools.list", &params, state, child_stdin, true)?,
         "tools.show" => forward_child_request(id, "tools.show", &params, state, child_stdin, true)?,
@@ -1388,6 +1388,41 @@ fn unix_now_secs_f64() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Native `insights.get`: count sessions started within the last `days` and sum
+/// their message counts. Port of the Python handler (reads the session DB, which
+/// in the fresh-process helper had no live-session dependency anyway).
+fn handle_insights_get(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+) -> Result<Value, Box<dyn Error>> {
+    let days = params.get("days").and_then(Value::as_f64).unwrap_or(30.0);
+    let cutoff = unix_now_secs_f64() - days * 86400.0;
+    let sessions = match store.list_sessions(500, 0) {
+        Ok(sessions) => sessions,
+        Err(error) => return Ok(error_response(id, 5017, &error.to_string())),
+    };
+    let recent: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| s.started_at >= cutoff)
+        .collect();
+    let messages: i64 = recent.iter().map(|s| s.message_count).sum();
+    // Preserve integer `days` rendering when the input was an integer.
+    let days_value = if days.fract() == 0.0 {
+        json!(days as i64)
+    } else {
+        json!(days)
+    };
+    Ok(ok_response(
+        id,
+        json!({
+            "days": days_value,
+            "sessions": recent.len(),
+            "messages": messages,
+        }),
+    ))
 }
 
 fn handle_helper_dispatch(
