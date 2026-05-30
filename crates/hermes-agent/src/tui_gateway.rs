@@ -149,24 +149,6 @@ print(json.dumps({
 }))
 "#;
 
-const COMMAND_RESOLVE_HELPER: &str = r#"
-import json
-import sys
-
-from hermes_cli.commands import resolve_command
-
-payload = json.load(sys.stdin)
-name = str(payload.get("name", ""))
-result = resolve_command(name)
-if result is None:
-    raise SystemExit(2)
-print(json.dumps({
-    "canonical": result.name,
-    "description": result.description,
-    "category": result.category,
-}))
-"#;
-
 const COMMAND_DISPATCH_HELPER: &str = r#"
 import json
 import subprocess
@@ -818,13 +800,9 @@ fn handle_native_request(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            match run_python_helper_json(
-                helper,
-                COMMAND_RESOLVE_HELPER,
-                Some(&json!({"name": name})),
-            ) {
-                Ok(result) => Some(ok_response(id, result)),
-                Err(_) => Some(error_response(
+            match hermes_core::resolve_command_json(name) {
+                Some(result) => Some(ok_response(id, result)),
+                None => Some(error_response(
                     id,
                     4011,
                     &format!("unknown command: {name}"),
