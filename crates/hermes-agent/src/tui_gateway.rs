@@ -495,7 +495,13 @@ fn handle_native_request(
             Duration::from_secs(240),
         )?,
         "plugins.list" => handle_helper_dispatch(id, "plugins.list", &params, helper)?,
-        "config.show" => handle_helper_dispatch(id, "config.show", &params, helper)?,
+        "config.show" => Some(ok_response(
+            id,
+            hermes_core::tui_config::config_show(
+                &helper.hermes_home,
+                &helper.work_root.display().to_string(),
+            ),
+        )),
         "insights.get" => Some(handle_insights_get(id, &params, store)?),
         "cron.manage" => Some(handle_cron_manage(id, &params, helper)?),
         "tools.list" => forward_child_request(id, "tools.list", &params, state, child_stdin, true)?,

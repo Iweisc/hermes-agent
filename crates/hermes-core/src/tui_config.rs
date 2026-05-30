@@ -14,6 +14,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 
+use crate::commands::resolve_tui_model;
+
 const STATUSBAR_MODES: &[&str] = &["off", "top", "bottom"];
 const INDICATOR_STYLES: &[&str] = &["ascii", "emoji", "kaomoji", "unicode"];
 const INDICATOR_DEFAULT: &str = "kaomoji";
@@ -284,6 +286,99 @@ fn yaml_to_json(value: &YamlValue) -> Value {
         }
         YamlValue::Tagged(tagged) => yaml_to_json(&tagged.value),
     }
+}
+
+/// Port of `_cfg_max_turns`: `HERMES_TUI_MAX_TURNS` env (>0), else
+/// `agent.max_turns`, else top-level `max_turns`, else `default`.
+fn cfg_max_turns(config: &serde_yaml::Mapping, default: i64) -> i64 {
+    if let Ok(env) = std::env::var("HERMES_TUI_MAX_TURNS") {
+        if let Ok(value) = env.trim().parse::<i64>() {
+            if value > 0 {
+                return value;
+            }
+        }
+    }
+    if let Some(value) = section(config, "agent")
+        .and_then(|agent| get(agent, "max_turns"))
+        .and_then(YamlValue::as_i64)
+        .filter(|v| *v != 0)
+    {
+        return value;
+    }
+    get(config, "max_turns")
+        .and_then(YamlValue::as_i64)
+        .filter(|v| *v != 0)
+        .unwrap_or(default)
+}
+
+/// Build the `config.show` payload (port of the Python handler): a `sections`
+/// array of Model / Agent / Environment rows. `cwd` and the absolute config
+/// path are supplied by the caller (which has the live working dir).
+pub fn config_show(hermes_home: &Path, cwd: &str) -> Value {
+    let config = read_config(hermes_home);
+
+    let model = resolve_tui_model(hermes_home);
+    let api_key = std::env::var("HERMES_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| get(&config, "api_key").and_then(YamlValue::as_str).map(str::to_string))
+        .unwrap_or_default();
+    let masked = if api_key.chars().count() > 4 {
+        let tail: String = api_key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("****{tail}")
+    } else {
+        "(not set)".to_string()
+    };
+    let base_url = std::env::var("HERMES_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| get(&config, "base_url").and_then(YamlValue::as_str).map(str::to_string))
+        .unwrap_or_default();
+
+    let max_turns = cfg_max_turns(&config, 90);
+    let toolsets = match get(&config, "enabled_toolsets") {
+        Some(YamlValue::Sequence(seq)) => {
+            let names: Vec<String> = seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            if names.is_empty() { "all".to_string() } else { names.join(", ") }
+        }
+        _ => "all".to_string(),
+    };
+    let verbose = match get(&config, "verbose") {
+        Some(YamlValue::Bool(b)) => *b,
+        _ => false,
+    };
+    // Python renders Python bool repr: True/False.
+    let verbose_str = if verbose { "True" } else { "False" };
+
+    let config_file = hermes_home.join("config.yaml").display().to_string();
+
+    json!({
+        "sections": [
+            {
+                "title": "Model",
+                "rows": [
+                    ["Model", model],
+                    ["Base URL", if base_url.is_empty() { "(default)".to_string() } else { base_url }],
+                    ["API Key", masked],
+                ],
+            },
+            {
+                "title": "Agent",
+                "rows": [
+                    ["Max Turns", max_turns.to_string()],
+                    ["Toolsets", toolsets],
+                    ["Verbose", verbose_str],
+                ],
+            },
+            {
+                "title": "Environment",
+                "rows": [
+                    ["Working Dir", cwd],
+                    ["Config File", config_file],
+                ],
+            },
+        ]
+    })
 }
 
 // ===========================================================================
@@ -714,6 +809,49 @@ mod tests {
                 "{key} should defer to python helper"
             );
         }
+    }
+
+    #[test]
+    fn config_show_sections_and_masking() {
+        let temp = home_with(
+            "api_key: sk-abcdEFGH\nenabled_toolsets:\n  - core\n  - web\nverbose: true\nagent:\n  max_turns: 42\n",
+        );
+        // Avoid env interference from a real HERMES_API_KEY/model in the test env.
+        if std::env::var_os("HERMES_API_KEY").is_some()
+            || std::env::var_os("HERMES_MODEL").is_some()
+            || std::env::var_os("HERMES_TUI_MAX_TURNS").is_some()
+        {
+            return;
+        }
+        let show = config_show(temp.path(), "/tmp/work");
+        let sections = show["sections"].as_array().unwrap();
+        let model_rows = sections[0]["rows"].as_array().unwrap();
+        // API Key masked to ****last4
+        assert_eq!(model_rows[2][0], "API Key");
+        assert_eq!(model_rows[2][1], "****EFGH");
+        let agent_rows = sections[1]["rows"].as_array().unwrap();
+        assert_eq!(agent_rows[0][1], "42");
+        assert_eq!(agent_rows[1][1], "core, web");
+        assert_eq!(agent_rows[2][1], "True");
+        let env_rows = sections[2]["rows"].as_array().unwrap();
+        assert_eq!(env_rows[0][1], "/tmp/work");
+        assert!(env_rows[1][1].as_str().unwrap().ends_with("config.yaml"));
+    }
+
+    #[test]
+    fn config_show_defaults() {
+        let temp = TempDir::new().unwrap();
+        if std::env::var_os("HERMES_TUI_MAX_TURNS").is_some() {
+            return;
+        }
+        let show = config_show(temp.path(), "/w");
+        let sections = show["sections"].as_array().unwrap();
+        // default max turns 90, toolsets "all", verbose False, API key (not set)
+        assert_eq!(sections[1]["rows"][0][1], "90");
+        assert_eq!(sections[1]["rows"][1][1], "all");
+        assert_eq!(sections[1]["rows"][2][1], "False");
+        assert_eq!(sections[0]["rows"][2][1], "(not set)");
+        assert_eq!(sections[0]["rows"][1][1], "(default)");
     }
 
     #[test]
