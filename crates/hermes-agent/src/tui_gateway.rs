@@ -518,9 +518,18 @@ fn handle_native_request(
         "subagent.interrupt" => {
             forward_child_request(id, "subagent.interrupt", &params, state, child_stdin, false)?
         }
-        "spawn_tree.save" => handle_helper_dispatch(id, "spawn_tree.save", &params, helper)?,
-        "spawn_tree.list" => handle_helper_dispatch(id, "spawn_tree.list", &params, helper)?,
-        "spawn_tree.load" => handle_helper_dispatch(id, "spawn_tree.load", &params, helper)?,
+        "spawn_tree.save" => Some(spawn_tree_response(
+            id,
+            hermes_core::spawn_tree::save(&helper.hermes_home, &params, unix_now_secs_f64()),
+        )),
+        "spawn_tree.list" => Some(spawn_tree_response(
+            id,
+            hermes_core::spawn_tree::list(&helper.hermes_home, &params),
+        )),
+        "spawn_tree.load" => Some(spawn_tree_response(
+            id,
+            hermes_core::spawn_tree::load(&helper.hermes_home, &params),
+        )),
         "process.stop" => {
             forward_child_request(id, "process.stop", &params, state, child_stdin, false)?
         }
@@ -1361,6 +1370,24 @@ fn handle_browser_manage(
         Duration::from_secs(20),
     )?;
     Ok(Some(rebind_response_id(response, id)))
+}
+
+/// Wrap a native spawn-tree result (`Ok(result)` / `Err((code, message))`) in a
+/// JSON-RPC response, matching the `_ok`/`_err` envelopes the Python helper
+/// produced.
+fn spawn_tree_response(id: Value, outcome: Result<Value, (i64, String)>) -> Value {
+    match outcome {
+        Ok(result) => ok_response(id, result),
+        Err((code, message)) => error_response(id, code, &message),
+    }
+}
+
+/// Current UNIX time in fractional seconds (parity with Python `time.time()`).
+fn unix_now_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn handle_helper_dispatch(
