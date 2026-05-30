@@ -277,37 +277,6 @@ finally:
 print(json.dumps({"output": buf.getvalue().rstrip()}))
 "#;
 
-const CLIPBOARD_PASTE_HELPER: &str = r#"
-import json
-import sys
-from pathlib import Path
-
-from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
-
-payload = json.load(sys.stdin)
-path = Path(str(payload.get("path", "") or ""))
-path.parent.mkdir(parents=True, exist_ok=True)
-
-if not save_clipboard_image(path):
-    msg = "Clipboard has image but extraction failed" if has_clipboard_image() else "No image found in clipboard"
-    print(json.dumps({"attached": False, "message": msg}))
-    raise SystemExit(0)
-
-result = {"attached": True, "path": str(path), "name": path.name}
-try:
-    from PIL import Image
-
-    with Image.open(path) as img:
-        width, height = img.size
-    result["width"] = int(width)
-    result["height"] = int(height)
-    result["token_estimate"] = max(1, (int(width) + 511) // 512) * max(1, (int(height) + 511) // 512) * 85
-except Exception:
-    pass
-
-print(json.dumps(result))
-"#;
-
 const INITIAL_SESSION_INFO_HELPER: &str = r#"
 import json
 import os
@@ -2172,12 +2141,7 @@ fn handle_clipboard_paste(
         .hermes_home
         .join("images")
         .join(format!("clip_{timestamp}_{image_counter}.png"));
-    let result = run_python_helper_json(
-        helper,
-        CLIPBOARD_PASTE_HELPER,
-        Some(&json!({"path": path.display().to_string()})),
-    )
-    .map_err(|error| format!("clipboard unavailable: {error}"))?;
+    let result = clipboard_paste_result(&path);
     if result
         .get("attached")
         .and_then(Value::as_bool)
@@ -2190,6 +2154,46 @@ fn handle_clipboard_paste(
         return Ok(Some(ok_response(id, Value::Object(payload))));
     }
     Ok(Some(ok_response(id, result)))
+}
+
+/// Save the system clipboard image to `path` natively and build the response
+/// payload. Mirrors the former `CLIPBOARD_PASTE_HELPER` Python helper:
+/// `{"attached": true, "path", "name", "width", "height", "token_estimate"}`
+/// on success (width/height/token_estimate omitted if the image can't be
+/// decoded), or `{"attached": false, "message"}` when no image is found.
+fn clipboard_paste_result(path: &Path) -> Value {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if !hermes_core::save_clipboard_image(path) {
+        let message = if hermes_core::has_clipboard_image() {
+            "Clipboard has image but extraction failed"
+        } else {
+            "No image found in clipboard"
+        };
+        return json!({"attached": false, "message": message});
+    }
+
+    let mut payload = Map::new();
+    payload.insert("attached".to_string(), json!(true));
+    payload.insert("path".to_string(), json!(path.display().to_string()));
+    payload.insert(
+        "name".to_string(),
+        json!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        ),
+    );
+    if let Some((width, height)) = hermes_core::image_dimensions(path) {
+        payload.insert("width".to_string(), json!(width));
+        payload.insert("height".to_string(), json!(height));
+        payload.insert(
+            "token_estimate".to_string(),
+            json!(hermes_core::image_token_estimate(width, height)),
+        );
+    }
+    Value::Object(payload)
 }
 
 fn handle_image_attach(

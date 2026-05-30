@@ -5461,50 +5461,19 @@ fn launch_python_session_bridge_compress(
 }
 
 fn launch_python_session_bridge_clipboard_save() -> Result<PathBuf, Box<dyn Error>> {
-    let root = project_root();
-    let python = resolve_repo_python(&root, Some("HERMES_CLI_PYTHON"))
-        .ok_or("could not find a Python interpreter for clipboard compatibility command")?;
-    let output = ProcessCommand::new(&python)
-        .current_dir(&root)
-        .env("PYTHONPATH", root.display().to_string())
-        .arg("-m")
-        .arg("tui_gateway.session_bridge")
-        .arg("clipboard-save")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "clipboard bridge exited with status {}: {stderr}",
-            output.status
-        )
-        .into());
+    let hermes_home = HermesContext::detect().hermes_home();
+    let image_dir = hermes_home.join("images");
+    fs::create_dir_all(&image_dir)?;
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let image_path = image_dir.join(format!("clip_{timestamp}.png"));
+
+    if hermes_core::save_clipboard_image(&image_path) {
+        return Ok(image_path);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let response = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or("clipboard bridge returned no response")?;
-    let parsed: JsonValue = serde_json::from_str(response)?;
-    if !parsed
-        .get("ok")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false)
-    {
-        let error = parsed
-            .get("error")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("clipboard bridge failed");
-        return Err(error.to_string().into());
+    if hermes_core::has_clipboard_image() {
+        return Err("Clipboard has image but extraction failed".into());
     }
-    let path = parsed
-        .get("result")
-        .and_then(|result| result.get("path"))
-        .and_then(JsonValue::as_str)
-        .ok_or("clipboard bridge returned no path")?;
-    Ok(PathBuf::from(path))
+    Err("No image found in clipboard".into())
 }
 
 fn launch_python_chat_query(session_id: &str, query: &str) -> Result<(), Box<dyn Error>> {
@@ -7895,31 +7864,35 @@ mod tests {
     }
 
     #[test]
-    fn launch_python_session_bridge_clipboard_save_uses_bridge_module() {
+    fn clipboard_save_resolves_natively_without_python() {
+        // The clipboard save path is now native (no Python bridge). The result
+        // depends on the host clipboard, so assert only on deterministic
+        // invariants that hold regardless of clipboard contents: on success the
+        // saved image lands under <HERMES_HOME>/images, and on failure the error
+        // is one of the two known native messages — never a Python bridge error.
         let temp = tempfile::TempDir::new().unwrap();
-        let argv_log = temp.path().join("argv.log");
-        let python = temp.path().join("fake-python");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' '{{\"ok\":true,\"result\":{{\"path\":\"/tmp/fake.png\"}}}}'\n",
-            argv_log.display()
-        );
-        fs::write(&python, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&python).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&python, perms).unwrap();
+        let home = temp.path().join("home");
+        let _lock = cli_test_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("HERMES_HOME", &home);
         }
 
-        let _python_guard = test_python_override(&python);
         let result = launch_python_session_bridge_clipboard_save();
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp/fake.png"));
 
-        let logged = fs::read_to_string(&argv_log).unwrap();
-        assert!(logged.contains("-m"));
-        assert!(logged.contains("tui_gateway.session_bridge"));
-        assert!(logged.contains("clipboard-save"));
+        unsafe {
+            std::env::remove_var("HERMES_HOME");
+        }
+        match result {
+            Ok(path) => assert!(path.starts_with(home.join("images"))),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message == "Clipboard has image but extraction failed"
+                        || message == "No image found in clipboard",
+                    "unexpected clipboard error: {message}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7988,7 +7961,7 @@ mod tests {
     }
 
     #[test]
-    fn print_image_and_paste_compat_use_chat_turn_with_image_inputs() {
+    fn print_image_compat_uses_chat_turn_with_image_input() {
         let temp = tempfile::TempDir::new().unwrap();
         let home = temp.path().join("home");
         let context = HermesContext::new("/tmp").with_hermes_home_env(Some(home.clone()));
@@ -8010,7 +7983,7 @@ mod tests {
         let argv_log = temp.path().join("argv.log");
         let python = temp.path().join("fake-python");
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\nif [ \"$2\" = \"tui_gateway.session_bridge\" ]; then\n  printf '%s\\n' '{{\"ok\":true,\"result\":{{\"path\":\"/tmp/from-clipboard.png\"}}}}'\nfi\n",
+            "#!/bin/sh\nprintf '%s\\n' -- CALL -- >> \"{argv}\"\nprintf '%s\\n' \"$@\" >> \"{argv}\"\n",
             argv = argv_log.display(),
         );
         fs::write(&python, script).unwrap();
@@ -8035,28 +8008,16 @@ mod tests {
             },
         )
         .unwrap();
-        print_paste_compat(
-            &store,
-            SlashCompatArgs {
-                session: Some(session_id.to_string()),
-                args: vec![String::from("describe"), String::from("clipboard")],
-            },
-        )
-        .unwrap();
 
         let logged = fs::read_to_string(&argv_log).unwrap();
-        assert_eq!(logged.matches("CALL").count(), 3);
+        assert_eq!(logged.matches("CALL").count(), 1);
         assert!(logged.contains("chat"));
         assert!(logged.contains("--resume"));
         assert!(logged.contains(session_id));
         assert!(logged.contains("--image"));
         assert!(logged.contains("/tmp/direct.png"));
-        assert!(logged.contains("/tmp/from-clipboard.png"));
         assert!(logged.contains("--query"));
         assert!(logged.contains("inspect this"));
-        assert!(logged.contains("describe clipboard"));
-        assert!(logged.contains("tui_gateway.session_bridge"));
-        assert!(logged.contains("clipboard-save"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod auth;
 mod browser;
 mod checkpoints;
 mod clarify;
+pub mod clipboard;
 mod code_execution;
 pub mod config;
 mod context_engine;
@@ -74,6 +75,9 @@ pub use config::{
     AgentConfig, CompressionConfig, DelegationConfig, DisplayConfig, FallbackProviderConfig,
     HermesConfig, LoadedConfig, LoggingConfig, MemoryConfig, ModelOverrides, ModelRuntimeConfig,
     NetworkConfig, SecurityConfig, TerminalConfig,
+};
+pub use clipboard::{
+    has_clipboard_image, image_dimensions, image_token_estimate, save_clipboard_image,
 };
 pub use context_engine::{ContextEngine, ContextEngineSessionStart};
 pub use cronjob::{
