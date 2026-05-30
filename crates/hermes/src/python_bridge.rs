@@ -80,6 +80,12 @@ fn python_bin_name() -> &'static str {
 /// If no `site-packages` can be located (e.g. an unusual interpreter layout),
 /// it falls back to actually running the interpreter so behavior never
 /// regresses relative to the previous subprocess probe.
+///
+/// Note: unlike `python -c "import X"`, this does not see modules importable
+/// only via a custom `PYTHONPATH` when site-packages is otherwise present.
+/// These probes target optional pip-installed dependencies (mautrix, honcho,
+/// mem0, …), which always land in site-packages, so that case does not arise
+/// in practice.
 pub fn python_module_installed(python: &Path, module: &str) -> bool {
     let module = module.trim();
     if module.is_empty() {
@@ -174,11 +180,14 @@ fn site_packages_has_module(site_packages: &Path, module: &str) -> bool {
                 continue;
             }
             // Strip the trailing "-<version>.dist-info"/".egg-info" and compare
-            // the distribution name, normalizing separators.
+            // the distribution name, normalizing separators. The version is the
+            // LAST hyphen-delimited segment, so split on the final '-' — the
+            // distribution name itself may contain hyphens (e.g.
+            // "hindsight-client-1.0.0.dist-info" -> "hindsight-client").
             let stem = lower
                 .trim_end_matches(".dist-info")
                 .trim_end_matches(".egg-info");
-            let dist_name = stem.split('-').next().unwrap_or(stem);
+            let dist_name = stem.rsplit_once('-').map(|(name, _ver)| name).unwrap_or(stem);
             let dist_norm = dist_name.replace('_', "-");
             if dist_norm == normalized || dist_name == module.to_lowercase() {
                 return true;
@@ -245,12 +254,17 @@ mod tests {
         fs::write(site.join("mautrix").join("__init__.py"), b"").unwrap();
         // Single-file module
         fs::write(site.join("singlemod.py"), b"").unwrap();
-        // dist-info marker with normalized name (hindsight_client -> hindsight-client)
-        fs::create_dir_all(site.join("hindsight_client-1.2.0.dist-info")).unwrap();
+        // dist-info marker with a MULTI-DASH distribution name and no package
+        // dir (forces the dist-info branch): hindsight_client maps to the
+        // distribution "hindsight-client", filed as hindsight-client-<ver>.dist-info.
+        fs::create_dir_all(site.join("hindsight-client-1.2.0.dist-info")).unwrap();
 
         assert!(python_module_installed(&python, "mautrix"));
         assert!(python_module_installed(&python, "singlemod"));
         assert!(python_module_installed(&python, "hindsight_client"));
+        // The version is the LAST hyphen segment: must not match just the
+        // first token ("hindsight") of a multi-dash distribution name.
+        assert!(!python_module_installed(&python, "hindsight"));
         // Submodule path resolves on the top-level name.
         assert!(python_module_installed(&python, "mautrix.client"));
         // Absent package.
