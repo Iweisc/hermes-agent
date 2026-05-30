@@ -1530,6 +1530,20 @@ fn handle_config_set(
         return Ok(Some(rebind_response_id(response, id)));
     }
 
+    // Native config.set for the pure config-write keys (compact, statusbar,
+    // mouse, indicator, thinking_mode, details_mode[.section], busy, prompt).
+    // Session-coupled keys (model/fast/verbose/yolo/reasoning/personality) and
+    // skin fall through to the Python helper.
+    match hermes_core::tui_config::config_set(&helper.hermes_home, key, params.get("value").unwrap_or(&Value::Null)) {
+        hermes_core::tui_config::ConfigSetOutcome::Ok(result) => {
+            return Ok(Some(ok_response(id, result)));
+        }
+        hermes_core::tui_config::ConfigSetOutcome::Err(code, message) => {
+            return Ok(Some(error_response(id, code, &message)));
+        }
+        hermes_core::tui_config::ConfigSetOutcome::NotHandled => {}
+    }
+
     let response = run_python_helper_json(helper, CONFIG_SET_HELPER, Some(&json!(params)))
         .map_err(|error| format!("config.set helper failed: {error}"))?;
     let response = rebind_response_id(response, id);
