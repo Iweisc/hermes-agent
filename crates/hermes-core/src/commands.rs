@@ -431,6 +431,14 @@ fn completion_text(cmd_name: &str, word: &str) -> String {
 ///
 /// `skill_commands` is the scanned `/cmd -> {name, description}` map (key,
 /// description). Returns `{items, replace_from}` matching the Python helper.
+///
+/// Fidelity note: the Python completer had a final branch that listed
+/// plugin-registered slash commands via `hermes_cli.plugins.get_plugin_commands`.
+/// That is intentionally omitted here — surfacing it would require spawning the
+/// Python plugin bridge on every keystroke, which is exactly the per-keystroke
+/// `python3` spawn this port removes. Plugin slash-commands therefore don't
+/// appear in completions (the same large-surface boundary as `command.dispatch`,
+/// which remains bridged); built-in and skill commands are fully covered.
 pub fn complete_slash(text: &str, skill_commands: &[(String, String)]) -> Value {
     let mut items: Vec<Value> = Vec::new();
 
