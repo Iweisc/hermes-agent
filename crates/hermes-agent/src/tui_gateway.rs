@@ -132,22 +132,6 @@ finally:
 print(json.dumps({"output": buf.getvalue().rstrip()}))
 "#;
 
-const GATEWAY_READY_HELPER: &str = r#"
-import json
-import sys
-
-result = {"skin": {}}
-try:
-    from tui_gateway.server import resolve_skin
-
-    result["skin"] = resolve_skin()
-except Exception:
-    pass
-
-sys.__stdout__.write(json.dumps(result))
-sys.__stdout__.flush()
-"#;
-
 const CONFIG_SET_HELPER: &str = r#"
 import json
 import sys
@@ -196,16 +180,6 @@ response = dispatch({
     "params": payload.get("params", {}) or {},
 })
 sys.__stdout__.write(json.dumps(response))
-sys.__stdout__.flush()
-"#;
-
-const SKIN_PAYLOAD_HELPER: &str = r#"
-import json
-import sys
-
-from tui_gateway.server import resolve_skin
-
-sys.__stdout__.write(json.dumps(resolve_skin()))
 sys.__stdout__.flush()
 "#;
 
@@ -314,8 +288,7 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
     pipe_child_stdout(child_stdout, Arc::clone(&stdout), Arc::clone(&state));
     pipe_child_stderr(child_stderr);
 
-    let ready_payload =
-        run_python_helper_json(&helper, GATEWAY_READY_HELPER, None).unwrap_or_else(|_| json!({}));
+    let ready_payload = json!({ "skin": hermes_core::resolve_skin(&helper.hermes_home) });
     write_json(
         &stdout,
         &json!({
@@ -1549,8 +1522,7 @@ fn handle_config_set(
         .map_err(|error| format!("config.set helper failed: {error}"))?;
     let response = rebind_response_id(response, id);
     if key == "skin" && response.get("result").is_some() {
-        let skin =
-            run_python_helper_json(helper, SKIN_PAYLOAD_HELPER, None).unwrap_or_else(|_| json!({}));
+        let skin = hermes_core::resolve_skin(&helper.hermes_home);
         write_json(
             stdout,
             &json!({

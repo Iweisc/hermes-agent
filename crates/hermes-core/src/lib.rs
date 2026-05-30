@@ -38,6 +38,8 @@ mod rl;
 mod send_message;
 mod shell_hooks;
 mod skills;
+pub mod skins;
+mod skins_data;
 mod spotify;
 pub mod state;
 mod terminal;
@@ -139,6 +141,7 @@ pub use providers::{
 pub use skills::load_skill_prompt_content;
 pub use skills::build_skill_invocation_message;
 pub use skills::{SkillCommand, scan_skill_commands};
+pub use skins::{SkinConfig, load_skin, resolve_skin};
 pub use state::{
     ExportedSession, MessageAppend, MessageRecord, MessageSearchRow, SearchContextMessage,
     SessionCreate, SessionRecord, SessionSearchRow, SessionStore, SessionSummary,
