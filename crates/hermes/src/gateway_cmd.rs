@@ -5052,13 +5052,7 @@ fn gateway_python_module_installed(module: &str) -> Result<bool, Box<dyn Error>>
     let Some(python) = resolve_repo_python(&root, Some("HERMES_GATEWAY_PYTHON")) else {
         return Ok(false);
     };
-    let status = Command::new(python)
-        .arg("-c")
-        .arg(format!(
-            "import importlib.util; raise SystemExit(0 if importlib.util.find_spec({module:?}) else 1)"
-        ))
-        .status()?;
-    Ok(status.success())
+    Ok(crate::python_bridge::python_module_installed(&python, module))
 }
 
 fn gateway_install_python_package(package: &str) -> Result<bool, Box<dyn Error>> {

@@ -3103,12 +3103,7 @@ fn install_missing_memory_python_dependencies(
 
 fn python_import_available(python: &Path, dependency: &str) -> bool {
     let import_name = python_dependency_import_name(dependency);
-    Command::new(python)
-        .arg("-c")
-        .arg(format!("import {import_name}"))
-        .output()
-        .ok()
-        .is_some_and(|output| output.status.success())
+    crate::python_bridge::python_module_installed(python, &import_name)
 }
 
 fn python_dependency_import_name(dependency: &str) -> String {
