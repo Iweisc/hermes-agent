@@ -90,8 +90,7 @@ mod ag_display;
 mod ag_google_oauth;
 #[allow(dead_code)]
 mod ag_model_metadata;
-#[allow(dead_code)]
-mod ag_models_dev;
+// QUARANTINED (compile errors, see cleanup_queue): mod ag_models_dev;
 #[allow(dead_code)]
 mod ag_skill_utils;
 #[allow(dead_code)]
@@ -154,8 +153,7 @@ mod gw_qq_constants;
 mod gw_qq_crypto;
 #[allow(dead_code)]
 mod gw_signal_rate_limit;
-#[allow(dead_code)]
-mod gw_status;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_status;
 #[allow(dead_code)]
 mod gw_stream_consumer;
 #[allow(dead_code)]
@@ -221,6 +219,202 @@ mod tui_render;
 #[allow(dead_code)]
 mod tui_transport;
 // === END PORTED MODULES ===
+
+// === PORTED MODULES (wave fan-out round 2) — not yet wired to callers ===
+#[allow(dead_code)]
+mod ag_account_usage;
+// QUARANTINED (compile errors, see cleanup_queue): mod ag_codex_responses_adapter;
+// QUARANTINED (compile errors, see cleanup_queue): mod ag_context_compressor;
+#[allow(dead_code)]
+mod ag_context_references;
+// QUARANTINED (compile errors, see cleanup_queue): mod ag_copilot_acp_client;
+#[allow(dead_code)]
+mod ag_gemini_cloudcode_adapter;
+#[allow(dead_code)]
+mod ag_gemini_native_adapter;
+#[allow(dead_code)]
+mod ag_image_gen_registry;
+// QUARANTINED (depends on quarantined module): mod ag_image_routing;
+#[allow(dead_code)]
+mod ag_insights;
+#[allow(dead_code)]
+mod ag_memory_manager;
+#[allow(dead_code)]
+mod ag_skill_commands;
+#[allow(dead_code)]
+mod ag_subdirectory_hints;
+#[allow(dead_code)]
+mod ag_title_generator;
+#[allow(dead_code)]
+mod ag_transports_chat_completions;
+#[allow(dead_code)]
+mod ag_usage_pricing;
+#[allow(dead_code)]
+mod cli_browser_connect;
+#[allow(dead_code)]
+mod cli_clipboard;
+// QUARANTINED (compile errors, see cleanup_queue): mod cli_config;
+// QUARANTINED (depends on quarantined module): mod cli_env_loader;
+// QUARANTINED (compile errors, see cleanup_queue): mod cli_model_catalog;
+#[allow(dead_code)]
+mod cli_models;
+#[allow(dead_code)]
+mod cli_nous_subscription;
+// QUARANTINED (depends on quarantined module): mod cli_providers;
+#[allow(dead_code)]
+mod cli_runtime_provider;
+// QUARANTINED (compile errors, see cleanup_queue): mod cli_timeouts;
+#[allow(dead_code)]
+mod cli_voice;
+#[allow(dead_code)]
+mod cron_jobs;
+#[allow(dead_code)]
+mod cron_scheduler;
+#[allow(dead_code)]
+mod env_agent_loop;
+#[allow(dead_code)]
+mod env_agentic_opd_env;
+#[allow(dead_code)]
+mod env_hermes_base_env;
+#[allow(dead_code)]
+mod env_hermes_swe_env_hermes_swe_env;
+#[allow(dead_code)]
+mod env_tblite_tblite_env;
+#[allow(dead_code)]
+mod env_terminal_test_env_terminal_test_env;
+#[allow(dead_code)]
+mod env_terminalbench_2_terminalbench2_env;
+#[allow(dead_code)]
+mod env_tool_context;
+#[allow(dead_code)]
+mod env_web_research_env;
+#[allow(dead_code)]
+mod env_yc_bench_yc_bench_env;
+#[allow(dead_code)]
+mod gw_channel_directory;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_config;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_delivery;
+#[allow(dead_code)]
+mod gw_display_config;
+#[allow(dead_code)]
+mod gw_mirror;
+#[allow(dead_code)]
+mod gw_pairing;
+#[allow(dead_code)]
+mod gw_platforms_api_server;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_platforms_base;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_bluebubbles;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_dingtalk;
+#[allow(dead_code)]
+mod gw_platforms_discord;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_email;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_platforms_feishu;
+#[allow(dead_code)]
+mod gw_platforms_feishu_comment;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_platforms_homeassistant;
+#[allow(dead_code)]
+mod gw_platforms_matrix;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_mattermost;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_signal;
+#[allow(dead_code)]
+mod gw_platforms_slack;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_sms;
+#[allow(dead_code)]
+mod gw_platforms_telegram;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_platforms_webhook;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_wecom;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_platforms_wecom_callback;
+#[allow(dead_code)]
+mod gw_platforms_weixin;
+// QUARANTINED (depends on quarantined module): mod gw_platforms_whatsapp;
+#[allow(dead_code)]
+mod gw_platforms_yuanbao;
+#[allow(dead_code)]
+mod gw_qqbot_adapter;
+#[allow(dead_code)]
+mod gw_qqbot_constants;
+#[allow(dead_code)]
+mod gw_qqbot_crypto;
+#[allow(dead_code)]
+mod gw_qqbot_onboard;
+#[allow(dead_code)]
+mod gw_qqbot_utils;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_restart;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_run;
+#[allow(dead_code)]
+mod gw_runtime_footer;
+// QUARANTINED (compile errors, see cleanup_queue): mod gw_session;
+#[allow(dead_code)]
+mod gw_session_context;
+#[allow(dead_code)]
+mod gw_sticker_cache;
+#[allow(dead_code)]
+mod gw_whatsapp_identity;
+// QUARANTINED (compile errors, see cleanup_queue): mod mod_batch_runner;
+#[allow(dead_code)]
+mod mod_hermes_logging;
+#[allow(dead_code)]
+mod mod_hermes_state;
+// QUARANTINED (compile errors, see cleanup_queue): mod mod_hermes_time;
+// QUARANTINED (compile errors, see cleanup_queue): mod mod_mcp_serve;
+#[allow(dead_code)]
+mod mod_model_tools;
+#[allow(dead_code)]
+mod mod_run_agent;
+#[allow(dead_code)]
+mod mod_toolset_distributions;
+#[allow(dead_code)]
+mod mod_trajectory_compressor;
+#[allow(dead_code)]
+mod tool_browser_camofox_state;
+#[allow(dead_code)]
+mod tool_browser_providers_base_1;
+#[allow(dead_code)]
+mod tool_budget_config;
+#[allow(dead_code)]
+mod tool_credential_files;
+#[allow(dead_code)]
+mod tool_debug_helpers;
+#[allow(dead_code)]
+mod tool_env_passthrough;
+#[allow(dead_code)]
+mod tool_environments_base;
+#[allow(dead_code)]
+mod tool_environments_file_sync;
+#[allow(dead_code)]
+mod tool_environments_local;
+#[allow(dead_code)]
+mod tool_environments_modal_utils;
+#[allow(dead_code)]
+mod tool_file_operations;
+// QUARANTINED (compile errors, see cleanup_queue): mod tool_hook_output_spill;
+#[allow(dead_code)]
+mod tool_managed_tool_gateway;
+#[allow(dead_code)]
+mod tool_openrouter_client;
+#[allow(dead_code)]
+mod tool_skill_usage;
+// QUARANTINED (compile errors, see cleanup_queue): mod tool_skills_sync;
+#[allow(dead_code)]
+mod tool_tool_backend_helpers;
+#[allow(dead_code)]
+mod tool_tool_output_limits;
+#[allow(dead_code)]
+mod tool_tool_result_storage;
+#[allow(dead_code)]
+mod tool_url_safety;
+#[allow(dead_code)]
+mod tool_web_providers_base_1;
+#[allow(dead_code)]
+mod tool_website_policy;
+// QUARANTINED (compile errors, see cleanup_queue): mod tui_entry;
+#[allow(dead_code)]
+mod tui_event_publisher;
+#[allow(dead_code)]
+mod tui_worker;
+#[allow(dead_code)]
+mod tui_ws;
+// === END PORTED MODULES r2 ===
 
 
 pub use agent::{

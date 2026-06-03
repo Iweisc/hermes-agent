@@ -1,0 +1,245 @@
+{
+  "summary": "Port a chunk of dependency-bearing modules to Rust, written directly to disk",
+  "agentCount": 24,
+  "logs": [
+    "[stall] agent \"port:cli_gateway\" stalled (no progress) after 1003s — retrying (1/5)"
+  ],
+  "result": {
+    "count": 12,
+    "written": [
+      {
+        "py": "run_agent.py",
+        "wave": 2,
+        "mod": "mod_run_agent",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/mod_run_agent.rs",
+        "crate": "hermes-core",
+        "lines": 2710,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "repair_tool_call_arguments re-serializes JSON object keys in a DIFFERENT order than the Python original. Python uses json.dumps(parsed, separators=(',',':')) which preserves the key insertion order produced by json.loads. The Rust compact_json() uses serde_json's Value, and crates/hermes-core/Cargo.toml / root Cargo.toml pull serde_json = \"1.0.145\" WITHOUT the `preserve_order` feature, so serde_json::Map is a BTreeMap and emits object keys ALPHABETICALLY SORTED. For input like '{\"b\":1,\"a\":2}', Python returns '{\"b\":1,\"a\":2}' but Rust returns '{\"a\":2,\"b\":1}'. This affects the literal repaired-arguments string fed back to tools (and any downstream string comparison / dedup keyed on arguments). The module's own test only covers single-key objects so it does not catch this. The same sorted-key behavior applies anywhere a Value built from JSON is re-serialized in this module."
+          }
+        ]
+      },
+      {
+        "py": "cli.py",
+        "wave": 2,
+        "mod": "mod_cli",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes/src/mod_cli.rs",
+        "crate": "hermes",
+        "lines": 2357,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "Missing personalities in default config. cli.py `load_cli_config()` defaults (lines 315-330) define 15 built-in personalities: helpful, concise, technical, creative, teacher, kawaii, catgirl, pirate, shakespeare, surfer, noir, uwu, philosopher, hype. The Rust `default_cli_config()` (mod_cli.rs lines 322-328) and `default_personalities()` (lines 269-289) include ONLY the first 5 (helpful, concise, technical, creative, teacher). The 10 'fun' personalities are dropped. A user whose config file does not override agent.personalities will get a different (smaller) default set in Rust — affecting `CliConfig::personalities()` and any personality listing/resolution. Not a documented subset omission of REPL plumbing; it's a wrong default in a ported pure-data structure."
+          },
+          {
+            "severity": "major",
+            "detail": "Config env-var expansion is dropped. cli.py `load_cli_config()` runs `defaults = _expand_env_vars(defaults)` (line 455) over the ENTIRE merged config tree before bridging values to environment variables. The Rust port performs no `${VAR}`/`$VAR` expansion on config values anywhere — `expand_env_vars_in_str` exists but is used only for attachment-path resolution (line 985). Consequently `config_env_bridge()` will export literal unexpanded strings (e.g. api_key `${OPENAI_KEY}`, image names, etc.) where Python exports the expanded value. Behavioral divergence in the emitted env bridge. (Arguably delegated to hermes_cli/config.py, but the ported `load_cli_config`/`config_env_bridge` does not reproduce it.)"
+          }
+        ]
+      },
+      {
+        "py": "gateway/run.py",
+        "wave": 4,
+        "mod": "gw_run",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/gw_run.rs",
+        "crate": "hermes-core",
+        "lines": 1864,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "telegramize_command_mentions drops the negative lookbehind. The Python regex is `(?<![\\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)` — the slash must NOT be preceded by a word char, ':' or '/', which prevents rewriting slashes inside URLs/paths (e.g. `http://x/Foo`, `a/b`). The Rust at crates/hermes-core/src/gw_run.rs:1206-1240 uses plain regex `r\"/([A-Za-z0-9][A-Za-z0-9_-]*)\"` with NO lookbehind and NO preceding-char validation in the substitution loop — despite the code comment at lines 1234-1239 explicitly claiming it would 'validate the prior char at call time' / 're-implement here'. Result: on the telegram platform, command-mention rewriting fires on slashes embedded in URLs/paths/`::/` sequences that Python deliberately skips. Behavioral divergence on any help text containing URLs or paths."
+          }
+        ]
+      },
+      {
+        "py": "gateway/platforms/feishu.py",
+        "wave": 4,
+        "mod": "gw_platforms_feishu",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/gw_platforms_feishu.rs",
+        "crate": "hermes-core",
+        "lines": 4150,
+        "new_deps": [],
+        "faithful": true,
+        "blockers": [],
+        "majors": []
+      },
+      {
+        "py": "gateway/platforms/yuanbao.py",
+        "wave": 4,
+        "mod": "gw_platforms_yuanbao",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/gw_platforms_yuanbao.rs",
+        "crate": "hermes-core",
+        "lines": 3190,
+        "new_deps": [],
+        "faithful": true,
+        "blockers": [],
+        "majors": []
+      },
+      {
+        "py": "gateway/platforms/discord.py",
+        "wave": 4,
+        "mod": "gw_platforms_discord",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/gw_platforms_discord.rs",
+        "crate": "hermes-core",
+        "lines": 1827,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "document_ext_for (Rust gw_platforms_discord.rs:438) diverges from Python os.path.splitext semantics (discord.py:3933 `_, ext = os.path.splitext(att.filename); ext = ext.lower()`). Rust uses `name.rfind('.')`, which produces WRONG extensions for dotfiles/leading-dot names where Python returns empty. Verified with python3: `os.path.splitext('.bashrc')` -> ext '' ; Rust returns '.bashrc'. `os.path.splitext('..x')` -> ext '' ; Rust returns '.x'. `os.path.splitext('file.')` -> ext '.' (Python keeps '.'), Rust returns '' due to the `ext != \".\"` guard. Because Python returns '' for dotfiles it then falls through to the MIME->ext lookup (`mime_to_ext.get(content_type, '')`), whereas the Rust function returns the bogus filename-derived extension and never consults MIME. This changes which attachments are accepted as supported documents and which MIME is recorded."
+          }
+        ]
+      },
+      {
+        "py": "gateway/platforms/telegram.py",
+        "wave": 4,
+        "mod": "gw_platforms_telegram",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/gw_platforms_telegram.rs",
+        "crate": "hermes-core",
+        "lines": 1685,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "format_message step 5 (bold) regex divergence: Python uses re.sub(r'\\*\\*(.+?)\\*\\*', ...) WITHOUT re.DOTALL (telegram.py:2643), so '.' does not match newlines and a bold span crossing a line break (e.g. '**line1\\nline2**') does NOT match and is left as literal '**' (later escaped). The Rust port (gw_platforms_telegram.rs:407) uses r\"(?s)\\*\\*(.+?)\\*\\*\" with the (?s) DOTALL flag, so it matches across newlines and converts the multi-line span to '*line1\\nline2*'. Behavioral difference for any bold marker spanning a newline."
+          },
+          {
+            "severity": "major",
+            "detail": "format_message step 7 (strikethrough) regex divergence: Python uses r'~~(.+?)~~' WITHOUT DOTALL (telegram.py:2659); Rust uses r\"(?s)~~(.+?)~~\" (gw_platforms_telegram.rs:417). Multi-line '~~a\\nb~~' is left untouched by Python but converted by Rust."
+          },
+          {
+            "severity": "major",
+            "detail": "format_message step 8 (spoiler) regex divergence: Python uses r'\\|\\|(.+?)\\|\\|' WITHOUT DOTALL (telegram.py:2666); Rust uses r\"(?s)\\|\\|(.+?)\\|\\|\" (gw_platforms_telegram.rs:422). Multi-line spoiler spans are handled differently (Python leaves literal '||...||' across newlines; Rust converts it)."
+          }
+        ]
+      },
+      {
+        "py": "hermes_cli/main.py",
+        "wave": 6,
+        "mod": "cli_main",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes/src/cli_main.rs",
+        "crate": "hermes",
+        "lines": 1630,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "Wrong constant values: STEPFUN_STEP_PLAN_CN_BASE_URL / STEPFUN_STEP_PLAN_INTL_BASE_URL in crates/hermes/src/cli_main.rs:595-597 are 'https://api.stepfun.com/v1' and 'https://api.stepfun.ai/v1'. The real source (hermes_cli/auth.py:87-88) defines them as 'https://api.stepfun.com/step_plan/v1' and 'https://api.stepfun.ai/step_plan/v1' — the '/step_plan' path segment is dropped. stepfun_base_url_for_region() therefore returns a URL missing the path prefix, which would break StepFun API calls. (infer_stepfun_region only matches on host so it is unaffected.)"
+          },
+          {
+            "severity": "major",
+            "detail": "coalesce_session_name_args uses the wrong subcommand set. In Python (_coalesce_session_name_args, main.py:7932-7968) the _SUBCOMMANDS set does NOT include 'fallback', 'slack', 'kanban', 'hooks', 'curator', or 'checkpoints'. The Rust SUBCOMMANDS const (cli_main.rs:68-110), which coalesce_session_name_args() consumes, DOES include all six. Consequence: e.g. 'hermes -c slack ...' or 'hermes -r fallback' — Python coalesces the bare word as part of the session name, Rust stops collecting at it. This changes argv rewriting / session-name resolution behavior. The doc comment conflates the argparse-registered parsers with the smaller _SUBCOMMANDS set, but the coalesce logic in Python deliberately uses only the smaller set."
+          }
+        ]
+      },
+      {
+        "py": "hermes_cli/auth.py",
+        "wave": 6,
+        "mod": "cli_auth",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes/src/cli_auth.rs",
+        "crate": "hermes",
+        "lines": 5382,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "resolve_provider: missing AWS Bedrock auto-detection fallback. Python (auth.py lines 1295-1303) — after the API-key env-var loop and before raising 'no_provider_configured' — attempts `from agent.bedrock_adapter import has_aws_credentials; if has_aws_credentials(): return 'bedrock'`. The Rust resolve_provider (cli_auth.rs lines 1249-1269) ends the API-key loop and immediately returns the no_provider_configured error. A user whose only credentials are an AWS IAM role / SSO / AWS env vars will resolve to 'bedrock' in Python but get a hard 'No inference provider configured' error in Rust."
+          },
+          {
+            "severity": "major",
+            "detail": "resolve_provider unknown-provider error message drops the config-diagnostic branch. Python (auth.py lines 1251-1259) calls `_get_config_hint_for_unknown_provider(normalized)` (which runs `validate_config_structure()` and appends ERROR/WARNING lines) and appends that hint to the message when present; only when there is NO hint does it append the generic 'Check hermes model ... run hermes doctor'. The Rust port (cli_auth.rs lines 1212-1219) always emits the generic suffix and never produces the config-issue diagnostic. `_get_config_hint_for_unknown_provider` / validate_config_structure are entirely absent (grep finds no references). The error code 'invalid_provider' matches, but the user-facing message and the diagnostic behavior diverge."
+          },
+          {
+            "severity": "major",
+            "detail": "PROVIDER_REGISTRY and alias map are not extended from `providers/` plugins. Python auth.py lines 419-451 auto-extend PROVIDER_REGISTRY with any api_key provider declared under plugins/model-providers/ (plus their aliases), and lines 1232-1242 extend _PROVIDER_ALIASES from the same source. The Rust registry/provider_aliases are static-only (cli_auth.rs provider_registry() and provider_aliases()). Any plugin-registered provider or alias that resolves in Python will be treated as an unknown provider in Rust (resolve_provider raises invalid_provider; get_provider_config returns None). This silently narrows the set of resolvable providers."
+          },
+          {
+            "severity": "major",
+            "detail": "_resolve_api_key_provider_secret: copilot path does not go through copilot token validation/minting. Python (auth.py lines 541-552) for provider_id=='copilot' imports hermes_cli.copilot_auth, calls resolve_copilot_token() then get_copilot_api_token(token) (which mints/validates the actual API token), and on ValueError logs and returns ('',''). The Rust port (cli_auth.rs lines 1410-1422) just iterates the env-var chain and returns the RAW token from env (COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN) with no validation or minting. Behavior differs: Rust may return an unvalidated/raw GitHub token as the copilot api_key, and never returns the minted Copilot API token. (The Rust comment acknowledges this is deferred to the wider binary, but as a standalone port it changes the returned secret.)"
+          },
+          {
+            "severity": "major",
+            "detail": "_resolve_api_key_provider_secret credential-pool fallback ordering differs. Python (auth.py lines 561-573) uses `pool.peek()` to select the pool entry, then reads `access_token` OR `runtime_api_key`. The Rust port (cli_auth.rs lines 1433-1448) reads the credential pool array and takes `entries.first()` (index 0). load_pool/peek() applies pool selection/priority ordering, which is not guaranteed to be the first raw JSON array element; under a multi-entry pool the chosen credential can differ from Python."
+          }
+        ]
+      },
+      {
+        "py": "hermes_cli/config.py",
+        "wave": 6,
+        "mod": "cli_config",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/cli_config.rs",
+        "crate": "hermes-core",
+        "lines": 1750,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "get_compatible_custom_providers: handling of a null/empty `custom_providers:` key diverges. Python checks `if custom_providers is not None` — a YAML `custom_providers:` (which parses to None) is skipped, so the function FALLS THROUGH and still processes the `providers:` dict. Rust (crates/hermes-core/src/cli_config.rs ~line 1505-1519) matches `cp` against Sequence and uses `_ => return Vec::new()`, so a present-but-null `custom_providers` (Value::Null hits the `_` arm) causes an early `return Vec::new()`, DISCARDING all entries derived from the populated `providers:` dict. A config with an empty `custom_providers:` line plus a real `providers:` section returns the providers in Python but `[]` in Rust."
+          },
+          {
+            "severity": "major",
+            "detail": "set_config_value env-sync writes a different serialized value for booleans. Python (config.py ~line 4753) does `save_env_value(_config_to_env_sync[key], str(value))` where `value` has already been coerced to a Python bool, so `str(True)` -> \"True\" / `str(False)` -> \"False\" (capitalized) is written to .env for the TERMINAL_* keys (e.g. TERMINAL_PERSISTENT_SHELL, TERMINAL_CONTAINER_PERSISTENT, TERMINAL_DOCKER_RUN_AS_HOST_USER, TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE). Rust set_config_value uses coerce_set_value's `display` string, which is lowercase \"true\"/\"false\". So the .env value differs in case (`True` vs `true`). Downstream env parsing that is case-sensitive would behave differently."
+          },
+          {
+            "severity": "major",
+            "detail": "migrate_config is NOT ported. The entire Python migration pipeline (config.py lines ~3096-3672), covering schema version steps 3->4 (tool_progress), 4->5 (timezone), 8->9 (clear ANTHROPIC_TOKEN), 11->12 (custom_providers list -> providers dict), 12->13 (clear LLM_MODEL/OPENAI_MODEL), 13->14 (legacy stt.model), 14->15, 15->16 (tool_progress_overrides -> display.platforms), 16->17 (compression.summary_*), 20->21 (plugins opt-in grandfathering), 22->23 (curator seeding + logs/curator mkdir), plus interactive env/skill-config prompting and the final `_config_version` bump + save, has no Rust equivalent. A Rust-only path would never upgrade an on-disk config or run any of these data migrations."
+          }
+        ]
+      },
+      {
+        "py": "hermes_cli/gateway.py",
+        "wave": 6,
+        "mod": "cli_gateway",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes/src/cli_gateway.rs",
+        "crate": "hermes",
+        "lines": 4742,
+        "new_deps": [],
+        "faithful": false,
+        "blockers": [],
+        "majors": [
+          {
+            "severity": "major",
+            "detail": "Dropped systemctl failure handling / fallback paths. Python's `_run_systemctl` uses `check=True` for the consequential commands (`systemd_start` -> `start`; `systemd_stop` -> `stop`; `systemd_restart` -> `reload-or-restart`; `systemd_install` -> `daemon-reload`/`enable`), so a non-zero exit raises `CalledProcessError` which callers catch. The Rust `run_systemctl` is built on `run_capture` and NEVER inspects the exit code — it returns `Some(...)` for any spawn that succeeds. Consequences: (1) In `cmd_stop`/`cmd_restart`, Python sets `service_available=False` when the systemctl stop/restart actually fails and then falls back to `stop_profile_gateway()` / the manual restart path; Rust's `systemd_stop`/`systemd_restart` return `Ok(())` regardless of the underlying systemctl exit code, so `service_available` is always true when a unit file exists and the PID-file fallback / 'Gateway service restart failed' branch becomes effectively unreachable. (2) In `cmd_restart`, the linger-not-enabled remediation block and the `service_configured`-failure block are only reached when `systemd_restart` reports failure, which Rust can no longer signal. This changes observable behavior on a host where the systemd unit exists but the service manager rejects the start/stop/restart command."
+          },
+          {
+            "severity": "major",
+            "detail": "`launchd_start` swallows unexpected launchctl exit codes. Python runs `launchctl kickstart` with `check=True`: codes 3/113 trigger a bootstrap+kickstart retry, and ANY OTHER non-zero code re-raises (propagating an error / non-zero exit). Rust (crates/hermes/src/cli_gateway.rs ~line 3009) matches only `code==0` (no-op) and `code==3||113` (reload); the catch-all `_ => {}` arm silently ignores every other non-zero code AND still prints '✓ Service started'. A genuine kickstart failure (e.g. code 5) is reported as success in Rust but would error out in Python."
+          }
+        ]
+      },
+      {
+        "py": "hermes_cli/models.py",
+        "wave": 6,
+        "mod": "cli_models",
+        "path": "/Users/katcode/Desktop/Projects/hermes-agent/crates/hermes-core/src/cli_models.rs",
+        "crate": "hermes-core",
+        "lines": 4244,
+        "new_deps": [],
+        "faithful": true,
+        "blockers": [],
+        "majors": []
+      }
+    ]
+  }
+}

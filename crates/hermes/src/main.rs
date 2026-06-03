@@ -58,6 +58,7 @@ mod cli_profiles;
 #[allow(dead_code)]
 mod cli_vercel_auth;
 #[allow(dead_code)]
+mod tool_file_tools;
 mod tool_browser_supervisor;
 #[allow(dead_code)]
 mod tool_checkpoint_manager;
@@ -73,9 +74,138 @@ mod tool_mixture_of_agents_tool;
 mod tool_slash_confirm;
 #[allow(dead_code)]
 mod tool_todo_tool;
-#[allow(dead_code)]
-mod tool_voice_mode;
+// QUARANTINED: mod tool_voice_mode;
 // === END PORTED MODULES ===
+
+// === PORTED MODULES (wave fan-out round 2) — not yet wired to callers ===
+#[allow(dead_code)]
+mod cli_auth;
+#[allow(dead_code)]
+mod cli_auth_commands;
+#[allow(dead_code)]
+mod cli_backup;
+#[allow(dead_code)]
+mod cli_banner;
+// QUARANTINED: mod cli_callbacks;
+#[allow(dead_code)]
+mod cli_checkpoints;
+#[allow(dead_code)]
+mod cli_cli_output;
+#[allow(dead_code)]
+mod cli_commands;
+#[allow(dead_code)]
+mod cli_copilot_auth;
+// QUARANTINED: mod cli_cron;
+#[allow(dead_code)]
+mod cli_curator;
+#[allow(dead_code)]
+mod cli_curses_ui;
+// QUARANTINED: mod cli_debug;
+#[allow(dead_code)]
+mod cli_dingtalk_auth;
+#[allow(dead_code)]
+mod cli_doctor;
+#[allow(dead_code)]
+mod cli_dump;
+#[allow(dead_code)]
+mod cli_fallback_cmd;
+// QUARANTINED: mod cli_gateway;
+#[allow(dead_code)]
+mod cli_hooks;
+#[allow(dead_code)]
+mod cli_logs;
+#[allow(dead_code)]
+mod cli_main;
+#[allow(dead_code)]
+mod cli_mcp_config;
+#[allow(dead_code)]
+mod cli_memory_setup;
+#[allow(dead_code)]
+mod cli_model_switch;
+#[allow(dead_code)]
+mod cli_oneshot;
+// QUARANTINED: mod cli_pairing;
+#[allow(dead_code)]
+mod cli_plugins_cmd;
+#[allow(dead_code)]
+mod cli_pty_bridge;
+#[allow(dead_code)]
+mod cli_relaunch;
+// QUARANTINED: mod cli_skills_config;
+// QUARANTINED: mod cli_skills_hub;
+#[allow(dead_code)]
+mod cli_skin_engine;
+#[allow(dead_code)]
+mod cli_slack_cli;
+#[allow(dead_code)]
+mod cli_status;
+// QUARANTINED: mod cli_tips;
+#[allow(dead_code)]
+mod cli_uninstall;
+// QUARANTINED: mod cli_webhook;
+#[allow(dead_code)]
+mod mod_cli;
+#[allow(dead_code)]
+mod mod_rl_cli;
+// QUARANTINED: mod tool_approval;
+// QUARANTINED: mod tool_browser_camofox;
+#[allow(dead_code)]
+mod tool_browser_cdp_tool;
+#[allow(dead_code)]
+mod tool_browser_dialog_tool;
+#[allow(dead_code)]
+mod tool_browser_providers_browser_use;
+#[allow(dead_code)]
+mod tool_browser_providers_browserbase;
+#[allow(dead_code)]
+mod tool_browser_providers_firecrawl;
+// QUARANTINED: mod tool_browser_tool;
+#[allow(dead_code)]
+mod tool_clarify_tool;
+// QUARANTINED: mod tool_cronjob_tools;
+#[allow(dead_code)]
+mod tool_delegate_tool;
+#[allow(dead_code)]
+mod tool_discord_tool;
+#[allow(dead_code)]
+mod tool_environments_daytona;
+#[allow(dead_code)]
+mod tool_environments_docker;
+#[allow(dead_code)]
+mod tool_environments_managed_modal;
+// QUARANTINED: mod tool_environments_modal;
+#[allow(dead_code)]
+mod tool_environments_singularity;
+#[allow(dead_code)]
+mod tool_environments_ssh;
+// QUARANTINED: mod tool_environments_vercel_sandbox;
+#[allow(dead_code)]
+mod tool_feishu_doc_tool;
+#[allow(dead_code)]
+mod tool_feishu_drive_tool;
+// QUARANTINED: mod tool_image_generation_tool;
+// QUARANTINED: mod tool_kanban_tools;
+#[allow(dead_code)]
+mod tool_mcp_tool;
+// QUARANTINED: mod tool_memory_tool;
+// QUARANTINED: mod tool_process_registry;
+#[allow(dead_code)]
+mod tool_send_message_tool;
+// QUARANTINED: mod tool_session_search_tool;
+// QUARANTINED: mod tool_skill_manager_tool;
+#[allow(dead_code)]
+mod tool_skills_hub;
+// QUARANTINED: mod tool_skills_tool;
+// QUARANTINED: mod tool_terminal_tool;
+// QUARANTINED: mod tool_tirith_security;
+// QUARANTINED: mod tool_tts_tool;
+// QUARANTINED: mod tool_vision_tools;
+#[allow(dead_code)]
+mod tool_web_providers_searxng;
+#[allow(dead_code)]
+mod tool_web_tools;
+// QUARANTINED: mod tool_yuanbao_tools;
+// === END PORTED MODULES r2 ===
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -9154,3 +9284,6 @@ print(json.dumps(_walk(captured["parser"]), sort_keys=True))
         assert!(!inference_auth_provider(""));
     }
 }
+
+#[allow(dead_code)]
+mod tool_transcription_tools;
