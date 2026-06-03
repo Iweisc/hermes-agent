@@ -42,6 +42,41 @@ mod update_cmd;
 mod webhook;
 mod whatsapp_cmd;
 
+// === PORTED MODULES (wave fan-out) — not yet wired to callers ===
+#[allow(dead_code)]
+mod cli__parser;
+#[allow(dead_code)]
+mod cli_colors;
+#[allow(dead_code)]
+mod cli_completion;
+#[allow(dead_code)]
+mod cli_default_soul;
+#[allow(dead_code)]
+mod cli_platforms;
+#[allow(dead_code)]
+mod cli_profiles;
+#[allow(dead_code)]
+mod cli_vercel_auth;
+#[allow(dead_code)]
+mod tool_browser_supervisor;
+#[allow(dead_code)]
+mod tool_checkpoint_manager;
+#[allow(dead_code)]
+mod tool_homeassistant_tool;
+#[allow(dead_code)]
+mod tool_mcp_oauth;
+#[allow(dead_code)]
+mod tool_mcp_oauth_manager;
+#[allow(dead_code)]
+mod tool_mixture_of_agents_tool;
+#[allow(dead_code)]
+mod tool_slash_confirm;
+#[allow(dead_code)]
+mod tool_todo_tool;
+#[allow(dead_code)]
+mod tool_voice_mode;
+// === END PORTED MODULES ===
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
@@ -163,18 +198,14 @@ struct TestPythonOverrideGuard {
 #[cfg(test)]
 impl Drop for TestPythonOverrideGuard {
     fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("HERMES_CLI_PYTHON");
-        }
+        unsafe { std::env::remove_var("HERMES_CLI_PYTHON"); }
     }
 }
 
 #[cfg(test)]
 fn test_python_override(path: &Path) -> TestPythonOverrideGuard {
     let lock = cli_test_env_lock().lock().unwrap();
-    unsafe {
-        std::env::set_var("HERMES_CLI_PYTHON", path);
-    }
+    unsafe { std::env::set_var("HERMES_CLI_PYTHON", path); }
     TestPythonOverrideGuard { _lock: lock }
 }
 
@@ -7873,15 +7904,11 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let home = temp.path().join("home");
         let _lock = cli_test_env_lock().lock().unwrap();
-        unsafe {
-            std::env::set_var("HERMES_HOME", &home);
-        }
+        unsafe { std::env::set_var("HERMES_HOME", &home); }
 
         let result = launch_python_session_bridge_clipboard_save();
 
-        unsafe {
-            std::env::remove_var("HERMES_HOME");
-        }
+        unsafe { std::env::remove_var("HERMES_HOME"); }
         match result {
             Ok(path) => assert!(path.starts_with(home.join("images"))),
             Err(error) => {

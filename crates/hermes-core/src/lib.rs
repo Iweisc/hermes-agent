@@ -71,6 +71,158 @@ mod vision;
 mod web;
 mod yuanbao;
 
+// === PORTED MODULES (wave fan-out) — not yet wired to callers ===
+#[allow(dead_code)]
+mod ag_anthropic_adapter;
+#[allow(dead_code)]
+mod ag_auxiliary_client;
+#[allow(dead_code)]
+mod ag_bedrock_adapter;
+#[allow(dead_code)]
+mod ag_context_engine;
+#[allow(dead_code)]
+mod ag_credential_pool;
+#[allow(dead_code)]
+mod ag_curator_backup;
+#[allow(dead_code)]
+mod ag_display;
+#[allow(dead_code)]
+mod ag_google_oauth;
+#[allow(dead_code)]
+mod ag_model_metadata;
+#[allow(dead_code)]
+mod ag_models_dev;
+#[allow(dead_code)]
+mod ag_skill_utils;
+#[allow(dead_code)]
+mod agent_image_gen_provider;
+#[allow(dead_code)]
+mod agent_onboarding;
+#[allow(dead_code)]
+mod agent_tool_guardrails;
+#[allow(dead_code)]
+mod cli_azure_detect;
+#[allow(dead_code)]
+mod cli_codex_models;
+#[allow(dead_code)]
+mod cli_goals;
+#[allow(dead_code)]
+mod cli_kanban_db;
+#[allow(dead_code)]
+mod cli_kanban_diagnostics;
+#[allow(dead_code)]
+mod cli_model_normalize;
+#[allow(dead_code)]
+mod credential_sources;
+#[allow(dead_code)]
+mod env_deepseek_v3_1_parser;
+#[allow(dead_code)]
+mod env_deepseek_v3_parser;
+#[allow(dead_code)]
+mod env_glm45_parser;
+#[allow(dead_code)]
+mod env_glm47_parser;
+#[allow(dead_code)]
+mod env_hermes_parser;
+#[allow(dead_code)]
+mod env_kimi_k2_parser;
+#[allow(dead_code)]
+mod env_llama_parser;
+#[allow(dead_code)]
+mod env_longcat_parser;
+#[allow(dead_code)]
+mod env_mistral_parser;
+#[allow(dead_code)]
+mod env_patches;
+#[allow(dead_code)]
+mod env_qwen_parser;
+#[allow(dead_code)]
+mod env_qwen3_coder_parser;
+#[allow(dead_code)]
+mod google_code_assist;
+#[allow(dead_code)]
+mod gw__http_client_limits;
+#[allow(dead_code)]
+mod gw_feishu_comment_rules;
+#[allow(dead_code)]
+mod gw_helpers;
+#[allow(dead_code)]
+mod gw_platform_registry;
+#[allow(dead_code)]
+mod gw_qq_constants;
+#[allow(dead_code)]
+mod gw_qq_crypto;
+#[allow(dead_code)]
+mod gw_signal_rate_limit;
+#[allow(dead_code)]
+mod gw_status;
+#[allow(dead_code)]
+mod gw_stream_consumer;
+#[allow(dead_code)]
+mod gw_telegram_network;
+#[allow(dead_code)]
+mod gw_wecom_crypto;
+#[allow(dead_code)]
+mod gw_yuanbao_media;
+#[allow(dead_code)]
+mod gw_yuanbao_proto;
+#[allow(dead_code)]
+mod gw_yuanbao_sticker;
+#[allow(dead_code)]
+mod memory_provider;
+#[allow(dead_code)]
+mod mod_hermes_constants;
+#[allow(dead_code)]
+mod mod_mini_swe_runner;
+#[allow(dead_code)]
+mod mod_toolsets;
+#[allow(dead_code)]
+mod mod_utils;
+#[allow(dead_code)]
+mod nous_rate_guard;
+#[allow(dead_code)]
+mod prov_base;
+#[allow(dead_code)]
+mod rate_limit_tracker;
+#[allow(dead_code)]
+mod tool_ansi_strip;
+#[allow(dead_code)]
+mod tool_binary_extensions;
+#[allow(dead_code)]
+mod tool_browser_providers_base;
+#[allow(dead_code)]
+mod tool_file_state;
+#[allow(dead_code)]
+mod tool_fuzzy_match;
+#[allow(dead_code)]
+mod tool_interrupt;
+#[allow(dead_code)]
+mod tool_osv_check;
+#[allow(dead_code)]
+mod tool_patch_parser;
+#[allow(dead_code)]
+mod tool_path_security;
+#[allow(dead_code)]
+mod tool_registry;
+#[allow(dead_code)]
+mod tool_schema_sanitizer;
+#[allow(dead_code)]
+mod tool_skill_provenance;
+#[allow(dead_code)]
+mod tool_skills_guard;
+#[allow(dead_code)]
+mod tool_web_providers_base;
+#[allow(dead_code)]
+mod tool_xai_http;
+#[allow(dead_code)]
+mod transports;
+#[allow(dead_code)]
+mod tui_render;
+#[allow(dead_code)]
+mod tui_transport;
+// === END PORTED MODULES ===
+
+
 pub use agent::{
     AgentInterruptController, AgentInterruptPhase, AgentTurnEvent, AgentTurnOptions,
     AgentTurnResult,

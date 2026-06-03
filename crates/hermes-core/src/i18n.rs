@@ -522,15 +522,11 @@ mod tests {
         let env = Env::new();
         env.write_catalog("en", "k: \"en\"\n");
         env.write_catalog("de", "k: \"de\"\n");
-        unsafe {
-            std::env::set_var("HERMES_LANGUAGE", "de");
-        }
+        unsafe { std::env::set_var("HERMES_LANGUAGE", "de"); }
         reset_language_cache();
         assert_eq!(get_language(), "de");
         assert_eq!(t("k"), "de");
-        unsafe {
-            std::env::remove_var("HERMES_LANGUAGE");
-        }
+        unsafe { std::env::remove_var("HERMES_LANGUAGE"); }
         reset_language_cache();
         assert_eq!(get_language(), "en");
     }
