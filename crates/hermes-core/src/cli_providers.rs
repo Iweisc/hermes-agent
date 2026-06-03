@@ -1310,7 +1310,7 @@ mod tests {
     fn test_resolve_custom_provider_none() {
         let list: Vec<serde_yaml::Value> = vec![];
         assert!(resolve_custom_provider("x", Some(&list)).is_none());
-        assert!(resolve_custom_provider("x", None).is_none());
+        assert!(resolve_custom_provider::<serde_yaml::Value>("x", None).is_none());
         // Non-matching, non-bare request.
         let list2 = vec![yaml_map(&[("name", "Alpha"), ("url", "https://a.test")])];
         assert!(resolve_custom_provider("zzz", Some(&list2)).is_none());
@@ -1373,7 +1373,7 @@ mod tests {
         set_mdev(lookup);
         // Not an alias, not in overlays, but in models.dev → direct fallback.
         // Note: get_provider would already catch it; this confirms the chain.
-        let p = resolve_provider_full("some-mdev-only", None, None).unwrap();
+        let p = resolve_provider_full::<serde_yaml::Value>("some-mdev-only", None, None).unwrap();
         assert_eq!(p.name, "Some MDev");
         assert_eq!(p.source, "models.dev");
         clear_mdev();
@@ -1382,7 +1382,7 @@ mod tests {
     #[test]
     fn test_resolve_provider_full_none() {
         set_mdev(no_mdev);
-        assert!(resolve_provider_full("nope-nope", None, None).is_none());
+        assert!(resolve_provider_full::<serde_yaml::Value>("nope-nope", None, None).is_none());
         clear_mdev();
     }
 }

@@ -29,7 +29,10 @@ pub fn default_gateway_restart_drain_timeout() -> f64 {
 /// coerce it to an `f64`, mirroring Python's `float(...)`. Returns `None` if
 /// the key is missing or not coercible to a finite float.
 fn default_drain_timeout_from_config() -> Option<f64> {
-    let cfg = crate::cli_config::default_config();
+    // cli_config returns a serde_yaml::Value; bridge to serde_json::Value so the
+    // coercion helpers (written against serde_json) apply unchanged.
+    let cfg_yaml = crate::cli_config::default_config();
+    let cfg: Value = serde_json::to_value(&cfg_yaml).ok()?;
     let raw = cfg.get("agent")?.get("restart_drain_timeout")?;
     coerce_float(raw).filter(|v| v.is_finite())
 }

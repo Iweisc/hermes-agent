@@ -630,7 +630,7 @@ impl WebhookRuntime {
         let stale: Vec<String> = self
             .delivery_info_created
             .iter()
-            .filter(|(_, &t)| t < cutoff)
+            .filter(|(_, t)| **t < cutoff)
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale {

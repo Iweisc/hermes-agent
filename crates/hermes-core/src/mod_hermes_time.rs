@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{DateTime, FixedOffset, Local, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 
 // ── Config path resolution ──────────────────────────────────────────────────

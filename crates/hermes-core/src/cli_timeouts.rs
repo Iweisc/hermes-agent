@@ -143,7 +143,9 @@ pub fn resolve_timeout(
 /// the only "failure" mode we model is a non-mapping document, which the
 /// downstream helpers already treat as absent.
 fn load_config_safe() -> Option<Value> {
-    Some(crate::cli_config::load_config())
+    // cli_config::load_config returns a serde_yaml::Value; bridge to
+    // serde_json::Value (this module's `Value`) so the downstream helpers apply.
+    serde_json::to_value(crate::cli_config::load_config()).ok()
 }
 
 #[cfg(test)]

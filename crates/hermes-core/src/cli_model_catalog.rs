@@ -130,7 +130,10 @@ fn to_float_or(value: Option<&Value>, default: f64) -> f64 {
 /// Mirrors Python `_load_catalog_config`: any failure to load config yields an
 /// empty config, and a non-dict `model_catalog` is treated as empty.
 pub fn load_catalog_config() -> CatalogConfig {
-    let cfg = crate::cli_config::load_config();
+    // cli_config returns serde_yaml::Value; bridge to serde_json (this module's
+    // Value) so the object accessors below apply unchanged.
+    let cfg: Value = serde_json::to_value(crate::cli_config::load_config())
+        .unwrap_or(Value::Null);
 
     let raw: &Map<String, Value> = cfg
         .get("model_catalog")

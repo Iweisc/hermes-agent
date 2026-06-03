@@ -121,6 +121,16 @@ impl HomeAssistantConfig {
         };
         let hass_url = url.trim_end_matches('/').to_string();
 
+        // token = config.token OR env HASS_TOKEN OR "" (Python treats empty as falsy).
+        let extra_token = extra_obj
+            .and_then(|o| o.get("token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let hass_token = match extra_token {
+            Some(t) => t.to_string(),
+            None => std::env::var("HASS_TOKEN").unwrap_or_default(),
+        };
+
         let watch_domains = string_set(extra_obj, "watch_domains");
         let watch_entities = string_set(extra_obj, "watch_entities");
         let ignore_entities = string_set(extra_obj, "ignore_entities");

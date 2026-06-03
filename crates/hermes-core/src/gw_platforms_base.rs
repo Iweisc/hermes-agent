@@ -880,7 +880,7 @@ pub struct SessionSource {
 
 /// Incoming message from a platform. Normalized representation that all
 /// adapters produce. Mirrors `MessageEvent`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessageEvent {
     pub text: String,
     pub message_type: MessageType,
