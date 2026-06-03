@@ -21,6 +21,7 @@ image.workspace = true
 libc.workspace = true
 log.workspace = true
 md5.workspace = true
+pyo3 = { workspace = true, optional = true }
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
@@ -34,6 +35,16 @@ tokio.workspace = true
 tungstenite.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
+
+[features]
+# `pyhost` embeds CPython (via pyo3) so hermes can execute genuinely
+# user-authored Python in-process — user plugins, shell/python hooks, and
+# ML/synth entrypoints — without shelling out to `python3` for hermes' own
+# logic. Opt-in for now so the default `cargo build --workspace` stays free of
+# a CPython link requirement; flipped to default once CI links it cleanly.
+# Note: the code_execution tool deliberately keeps its OS-sandboxed subprocess
+# (env_clear + setsid + kill-on-timeout) and is NOT routed through pyhost.
+pyhost = ["dep:pyo3"]
 
 [dev-dependencies]
 tempfile = "3.20.0"

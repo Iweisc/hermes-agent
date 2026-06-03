@@ -39,6 +39,7 @@ mod memory;
 mod moa;
 mod plugin_runtime;
 pub mod providers;
+pub mod pyhost;
 mod rl;
 mod send_message;
 mod shell_hooks;
