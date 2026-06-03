@@ -163,8 +163,22 @@ pub fn managed_persistence_enabled() -> bool {
     cfg.get("browser")
         .and_then(|b| b.get("camofox"))
         .and_then(|c| c.get("managed_persistence"))
-        .map(value_truthy)
+        .map(yaml_value_truthy)
         .unwrap_or(false)
+}
+
+/// Python `bool(...)` semantics for a YAML config value (the type returned by
+/// [`hermes_core::cli_config::load_config`]).
+fn yaml_value_truthy(v: &serde_yaml::Value) -> bool {
+    match v {
+        serde_yaml::Value::Null => false,
+        serde_yaml::Value::Bool(b) => *b,
+        serde_yaml::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        serde_yaml::Value::String(s) => !s.is_empty(),
+        serde_yaml::Value::Sequence(a) => !a.is_empty(),
+        serde_yaml::Value::Mapping(m) => !m.is_empty(),
+        serde_yaml::Value::Tagged(t) => yaml_value_truthy(&t.value),
+    }
 }
 
 /// Python `bool(...)` semantics for a JSON value.

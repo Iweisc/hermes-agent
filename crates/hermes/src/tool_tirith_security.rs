@@ -126,6 +126,27 @@ fn env_int(key: &str, default: u64) -> u64 {
     }
 }
 
+/// Read the `security` mapping from `~/.hermes/config.yaml`.
+///
+/// Returns `Value::Null` if the file is missing, empty, unparseable, or has no
+/// `security` section — mirroring the Python `load_config()["security"]` access
+/// guarded by a try/except.
+fn load_security_section() -> serde_yaml::Value {
+    let config_path = get_hermes_home().join("config.yaml");
+    let text = match fs::read_to_string(&config_path) {
+        Ok(t) => t,
+        Err(_) => return serde_yaml::Value::Null,
+    };
+    if text.trim().is_empty() {
+        return serde_yaml::Value::Null;
+    }
+    let cfg: serde_yaml::Value = match serde_yaml::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return serde_yaml::Value::Null,
+    };
+    cfg.get("security").cloned().unwrap_or(serde_yaml::Value::Null)
+}
+
 /// Load security settings from config.yaml, with env var overrides.
 pub fn load_security_config() -> SecurityConfig {
     let default_enabled = true;
@@ -134,11 +155,12 @@ pub fn load_security_config() -> SecurityConfig {
     let default_fail_open = true;
 
     // try { from hermes_cli.config import load_config; ...security... } except {}
-    let sec: Value = std::panic::catch_unwind(|| {
-        let cfg = hermes_core::cli_config::load_config();
-        cfg.get("security").cloned().unwrap_or(Value::Null)
-    })
-    .unwrap_or(Value::Null);
+    // Read the `security` section from ~/.hermes/config.yaml directly (mirrors
+    // hermes_cli.config.load_config -> cfg["security"]). Any failure (missing
+    // file, parse error) falls through to defaults + env overrides, matching the
+    // Python try/except fallback.
+    let sec: serde_yaml::Value = std::panic::catch_unwind(load_security_section)
+        .unwrap_or(serde_yaml::Value::Null);
 
     let cfg_enabled = sec
         .get("tirith_enabled")
@@ -173,8 +195,20 @@ pub fn load_security_config() -> SecurityConfig {
 // Filesystem / PATH helpers
 // ---------------------------------------------------------------------------
 
+/// Return the Hermes home directory (default: `~/.hermes`).
+///
+/// Mirrors `hermes_constants.get_hermes_home`: honours `HERMES_HOME` when set
+/// and non-empty, otherwise falls back to `~/.hermes`.
 fn get_hermes_home() -> PathBuf {
-    hermes_core::mod_hermes_constants::get_hermes_home()
+    if let Ok(val) = std::env::var("HERMES_HOME") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".hermes")
 }
 
 fn failure_marker_path() -> PathBuf {

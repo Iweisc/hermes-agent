@@ -17,6 +17,7 @@ use hermes_core::{
     discover_platform_surfaces_from_source, discover_plugin_cli_commands_from_source,
     discover_scanned_plugins, discover_tool_definitions_from_source,
 };
+#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

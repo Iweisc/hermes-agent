@@ -1,14 +1,12 @@
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::thread;
 use std::time::Duration;
 
 use hermes_core::{HermesContext, LoadedConfig};
-use serde_json::{Value, json};
 use serde_yaml::{Mapping, Value as YamlValue};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -373,9 +371,12 @@ fn is_network_accessible(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use hmac::{Hmac, Mac};
+    use serde_json::{Value, json};
     use sha2::Sha256;
     use std::fs;
     use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
     use tempfile::TempDir;
     use tokio::sync::watch;
 

@@ -24,7 +24,7 @@
 //!
 //! Cross-references (when those modules are wired into the same crate graph):
 //! * `crate::tool_managed_tool_gateway` — gateway resolution + Nous token reading.
-//! * `crate::tool_tool_backend_helpers` — `prefers_gateway`.
+//! * `hermes_core::tool_tool_backend_helpers` — `prefers_gateway`.
 //! * `crate::tool_url_safety` — `is_safe_url`.
 //! * `crate::tool_website_policy` — `check_website_access`.
 //! * `crate::tool_interrupt` — `is_interrupted`.

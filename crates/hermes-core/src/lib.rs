@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 pub mod agent;
 mod agent_file_safety;
-mod agent_redact;
+pub mod agent_redact;
 mod agent_retry;
 mod agent_trajectory;
 mod anthropic_caching;
@@ -75,13 +75,13 @@ mod yuanbao;
 #[allow(dead_code)]
 mod ag_anthropic_adapter;
 #[allow(dead_code)]
-mod ag_auxiliary_client;
+pub mod ag_auxiliary_client;
 #[allow(dead_code)]
 mod ag_bedrock_adapter;
 #[allow(dead_code)]
 mod ag_context_engine;
 #[allow(dead_code)]
-mod ag_credential_pool;
+pub mod ag_credential_pool;
 #[allow(dead_code)]
 mod ag_curator_backup;
 #[allow(dead_code)]
@@ -93,7 +93,7 @@ mod ag_model_metadata;
 #[allow(dead_code)]
 mod ag_models_dev;
 #[allow(dead_code)]
-mod ag_skill_utils;
+pub mod ag_skill_utils;
 #[allow(dead_code)]
 mod agent_image_gen_provider;
 #[allow(dead_code)]
@@ -107,7 +107,7 @@ mod cli_codex_models;
 #[allow(dead_code)]
 mod cli_goals;
 #[allow(dead_code)]
-mod cli_kanban_db;
+pub mod cli_kanban_db;
 #[allow(dead_code)]
 mod cli_kanban_diagnostics;
 #[allow(dead_code)]
@@ -167,17 +167,17 @@ mod gw_yuanbao_media;
 #[allow(dead_code)]
 mod gw_yuanbao_proto;
 #[allow(dead_code)]
-mod gw_yuanbao_sticker;
+pub mod gw_yuanbao_sticker;
 #[allow(dead_code)]
 mod memory_provider;
 #[allow(dead_code)]
-mod mod_hermes_constants;
+pub mod mod_hermes_constants;
 #[allow(dead_code)]
 mod mod_mini_swe_runner;
 #[allow(dead_code)]
 mod mod_toolsets;
 #[allow(dead_code)]
-mod mod_utils;
+pub mod mod_utils;
 #[allow(dead_code)]
 mod nous_rate_guard;
 #[allow(dead_code)]
@@ -185,7 +185,7 @@ mod prov_base;
 #[allow(dead_code)]
 mod rate_limit_tracker;
 #[allow(dead_code)]
-mod tool_ansi_strip;
+pub mod tool_ansi_strip;
 #[allow(dead_code)]
 mod tool_binary_extensions;
 #[allow(dead_code)]
@@ -193,17 +193,17 @@ mod tool_browser_providers_base;
 #[allow(dead_code)]
 mod tool_file_state;
 #[allow(dead_code)]
-mod tool_fuzzy_match;
+pub mod tool_fuzzy_match;
 #[allow(dead_code)]
-mod tool_interrupt;
+pub mod tool_interrupt;
 #[allow(dead_code)]
 mod tool_osv_check;
 #[allow(dead_code)]
 mod tool_patch_parser;
 #[allow(dead_code)]
-mod tool_path_security;
+pub mod tool_path_security;
 #[allow(dead_code)]
-mod tool_registry;
+pub mod tool_registry;
 #[allow(dead_code)]
 mod tool_schema_sanitizer;
 #[allow(dead_code)]
@@ -213,7 +213,7 @@ mod tool_skills_guard;
 #[allow(dead_code)]
 mod tool_web_providers_base;
 #[allow(dead_code)]
-mod tool_xai_http;
+pub mod tool_xai_http;
 #[allow(dead_code)]
 mod transports;
 #[allow(dead_code)]
@@ -257,7 +257,7 @@ mod cli_browser_connect;
 #[allow(dead_code)]
 mod cli_clipboard;
 #[allow(dead_code)]
-mod cli_config;
+pub mod cli_config;
 #[allow(dead_code)]
 mod cli_env_loader;
 #[allow(dead_code)]
@@ -275,7 +275,7 @@ mod cli_timeouts;
 #[allow(dead_code)]
 mod cli_voice;
 #[allow(dead_code)]
-mod cron_jobs;
+pub mod cron_jobs;
 #[allow(dead_code)]
 mod cron_scheduler;
 #[allow(dead_code)]
@@ -308,11 +308,11 @@ mod gw_display_config;
 #[allow(dead_code)]
 mod gw_mirror;
 #[allow(dead_code)]
-mod gw_pairing;
+pub mod gw_pairing;
 #[allow(dead_code)]
 mod gw_platforms_api_server;
 #[allow(dead_code)]
-mod gw_platforms_base;
+pub mod gw_platforms_base;
 #[allow(dead_code)]
 mod gw_platforms_bluebubbles;
 #[allow(dead_code)]
@@ -368,7 +368,7 @@ mod gw_runtime_footer;
 #[allow(dead_code)]
 mod gw_session;
 #[allow(dead_code)]
-mod gw_session_context;
+pub mod gw_session_context;
 #[allow(dead_code)]
 mod gw_sticker_cache;
 #[allow(dead_code)]
@@ -377,7 +377,7 @@ mod gw_whatsapp_identity;
 #[allow(dead_code)]
 mod mod_hermes_logging;
 #[allow(dead_code)]
-mod mod_hermes_state;
+pub mod mod_hermes_state;
 #[allow(dead_code)]
 mod mod_hermes_time;
 // QUARANTINED (compile errors, see cleanup_queue): mod mod_mcp_serve;
@@ -390,7 +390,7 @@ mod mod_toolset_distributions;
 #[allow(dead_code)]
 mod mod_trajectory_compressor;
 #[allow(dead_code)]
-mod tool_browser_camofox_state;
+pub mod tool_browser_camofox_state;
 #[allow(dead_code)]
 mod tool_browser_providers_base_1;
 #[allow(dead_code)]
@@ -400,9 +400,9 @@ mod tool_credential_files;
 #[allow(dead_code)]
 mod tool_debug_helpers;
 #[allow(dead_code)]
-mod tool_env_passthrough;
+pub mod tool_env_passthrough;
 #[allow(dead_code)]
-mod tool_environments_base;
+pub mod tool_environments_base;
 #[allow(dead_code)]
 mod tool_environments_file_sync;
 #[allow(dead_code)]
@@ -413,24 +413,24 @@ mod tool_environments_modal_utils;
 mod tool_file_operations;
 // QUARANTINED (compile errors, see cleanup_queue): mod tool_hook_output_spill;
 #[allow(dead_code)]
-mod tool_managed_tool_gateway;
+pub mod tool_managed_tool_gateway;
 #[allow(dead_code)]
 mod tool_openrouter_client;
 #[allow(dead_code)]
 mod tool_skill_usage;
 // QUARANTINED (compile errors, see cleanup_queue): mod tool_skills_sync;
 #[allow(dead_code)]
-mod tool_tool_backend_helpers;
+pub mod tool_tool_backend_helpers;
 #[allow(dead_code)]
 mod tool_tool_output_limits;
 #[allow(dead_code)]
 mod tool_tool_result_storage;
 #[allow(dead_code)]
-mod tool_url_safety;
+pub mod tool_url_safety;
 #[allow(dead_code)]
 mod tool_web_providers_base_1;
 #[allow(dead_code)]
-mod tool_website_policy;
+pub mod tool_website_policy;
 // QUARANTINED (compile errors, see cleanup_queue): mod tui_entry;
 #[allow(dead_code)]
 mod tui_event_publisher;

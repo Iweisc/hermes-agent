@@ -25,16 +25,16 @@
 //! is byte-compatible with the Python tools.
 //!
 //! Sticker lookup/search and session-env resolution reuse the already-ported
-//! `crate::gw_yuanbao_sticker` and `crate::gw_session_context` modules; the
-//! `MEDIA:<path>` extraction reuses `crate::gw_platforms_base::extract_media`.
+//! `hermes_core::gw_yuanbao_sticker` and `hermes_core::gw_session_context` modules; the
+//! `MEDIA:<path>` extraction reuses `hermes_core::gw_platforms_base::extract_media`.
 
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::gw_platforms_base::extract_media;
-use crate::gw_session_context::get_session_env;
-use crate::gw_yuanbao_sticker::{
+use hermes_core::gw_platforms_base::extract_media;
+use hermes_core::gw_session_context::get_session_env;
+use hermes_core::gw_yuanbao_sticker::{
     get_random_sticker, get_sticker_by_id, get_sticker_by_name, search_stickers, Sticker,
 };
 

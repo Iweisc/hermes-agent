@@ -265,12 +265,12 @@ pub trait HubBackend {
 
     /// `SKILLS_DIR` (`~/.hermes/skills`).
     fn skills_dir(&self) -> PathBuf {
-        crate::mod_hermes_constants::get_skills_dir()
+        hermes_core::HermesContext::detect().skills_dir()
     }
 
     /// `hermes_constants.display_hermes_home()`.
     fn display_hermes_home(&self) -> String {
-        crate::mod_hermes_constants::display_hermes_home()
+        hermes_core::HermesContext::detect().display_hermes_home()
     }
 
     fn ensure_hub_dirs(&self) {}

@@ -43,8 +43,44 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use hermes_core::mod_hermes_constants::get_hermes_home;
-use hermes_core::mod_utils::atomic_replace;
+/// Resolve the home directory, mirroring `Path.home()` / `dirs.home_dir`.
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolve the Hermes home directory.
+///
+/// Local mirror of `hermes_core::mod_hermes_constants::get_hermes_home` (a
+/// private module): reads the `HERMES_HOME` env var (trimmed, non-empty) and
+/// otherwise falls back to `~/.hermes`. Resolved dynamically so profile
+/// overrides are always respected.
+fn get_hermes_home() -> PathBuf {
+    if let Ok(val) = std::env::var("HERMES_HOME") {
+        let val = val.trim();
+        if !val.is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    home_dir().join(".hermes")
+}
+
+/// Atomically move `tmp_path` onto `target`, preserving symlinks.
+///
+/// Local mirror of `hermes_core::mod_utils::atomic_replace` (a private module).
+/// When `target` is a symlink, the symlink is resolved first so the rename
+/// writes through to the real file in-place and the symlink survives.
+fn atomic_replace(tmp_path: &Path, target: &Path) -> std::io::Result<PathBuf> {
+    let is_link = fs::symlink_metadata(target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let real_path: PathBuf = if is_link {
+        fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf())
+    } else {
+        target.to_path_buf()
+    };
+    fs::rename(tmp_path, &real_path)?;
+    Ok(real_path)
+}
 
 /// Delimiter between memory entries, mirroring `ENTRY_DELIMITER` in Python.
 pub const ENTRY_DELIMITER: &str = "\n§\n";

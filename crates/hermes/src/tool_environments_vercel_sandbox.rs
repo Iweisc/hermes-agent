@@ -31,8 +31,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hermes_core::tool_environments_base as base;
-
 // ---------------------------------------------------------------------------
 // Constants (mirror the module-level Python constants)
 // ---------------------------------------------------------------------------
@@ -78,7 +76,27 @@ pub const SNAPSHOT_STORE_NAME: &str = "vercel_sandbox_snapshots.json";
 // shell quoting + file_sync shell-string helpers (mirror file_sync.py)
 // ---------------------------------------------------------------------------
 
-pub use base::shlex_quote;
+/// Shell-quote a string the way Python's `shlex.quote` does: if it's safe
+/// (matches `[A-Za-z0-9_@%+=:,./-]+` and non-empty), return as-is; otherwise
+/// wrap in single quotes, escaping embedded single quotes as `'"'"'`.
+///
+/// Inlined faithful copy of `hermes_core::tool_environments_base::shlex_quote`
+/// (the source module is not exported across crate boundaries).
+pub fn shlex_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let safe = s.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
+    });
+    if safe {
+        return s.to_string();
+    }
+    // Wrap in single quotes; replace each ' with '"'"'
+    let escaped = s.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
 
 /// Build a shell `rm -f` command for a batch of remote paths.
 ///
@@ -361,6 +379,50 @@ where
 // Snapshot store (mirror _load/_save/_get/_store/_delete snapshot helpers)
 // ---------------------------------------------------------------------------
 
+/// Load a JSON file as an object, returning `{}` on any error. Inlined faithful
+/// copy of `hermes_core::tool_environments_base::load_json_store`.
+fn load_json_store(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    if path.exists() {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&text)
+            {
+                return map;
+            }
+        }
+    }
+    serde_json::Map::new()
+}
+
+/// Write `data` as pretty-printed (2-space indent) JSON to `path`. Inlined
+/// faithful copy of `hermes_core::tool_environments_base::save_json_store`.
+fn save_json_store(
+    path: &std::path::Path,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(data.clone()))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, text)
+}
+
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Atomically read-modify-write a JSON object store under a process lock.
+/// Inlined faithful copy of `hermes_core::tool_environments_base::with_json_store`.
+fn with_json_store<F, R>(path: &std::path::Path, f: F) -> std::io::Result<R>
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> R,
+{
+    let _g = STORE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = load_json_store(path);
+    let r = f(&mut map);
+    save_json_store(path, &map)?;
+    Ok(r)
+}
+
 /// Path to the snapshot store under `hermes_home`. Mirrors
 /// `_snapshot_store_path`.
 pub fn snapshot_store_path(hermes_home: &std::path::Path) -> std::path::PathBuf {
@@ -373,7 +435,7 @@ pub fn get_snapshot_id(store_path: &std::path::Path, task_id: &str) -> Option<St
     if task_id.is_empty() {
         return None;
     }
-    let map = base::load_json_store(store_path);
+    let map = load_json_store(store_path);
     match map.get(task_id).and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => Some(s.to_string()),
         _ => None,
@@ -390,7 +452,7 @@ pub fn store_snapshot(
     if task_id.is_empty() || snapshot_id.is_empty() {
         return Ok(());
     }
-    base::with_json_store(store_path, |map| {
+    with_json_store(store_path, |map| {
         map.insert(
             task_id.to_string(),
             serde_json::Value::String(snapshot_id.to_string()),
@@ -409,7 +471,7 @@ pub fn delete_snapshot(
     if task_id.is_empty() {
         return Ok(());
     }
-    base::with_json_store(store_path, |map| {
+    with_json_store(store_path, |map| {
         let existing = map.get(task_id).cloned();
         let existing = match existing {
             None | Some(serde_json::Value::Null) => return,

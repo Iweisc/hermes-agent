@@ -40,9 +40,46 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-// Cross-refs into already-ported hermes-core modules.
-use crate::tool_tool_backend_helpers::{prefers_gateway, resolve_openai_audio_api_key};
-use crate::tool_xai_http::hermes_xai_user_agent;
+// Local equivalents of helpers that live in sibling modules as private,
+// signature-incompatible functions. Defining them here keeps this module
+// self-contained without editing shared files.
+
+/// Prefer the voice-tools key, falling back to the normal OpenAI key.
+/// Mirrors `tool_backend_helpers.resolve_openai_audio_api_key`.
+fn resolve_openai_audio_api_key() -> String {
+    let voice = std::env::var("VOICE_TOOLS_OPENAI_KEY").unwrap_or_default();
+    let chosen = if voice.is_empty() {
+        std::env::var("OPENAI_API_KEY").unwrap_or_default()
+    } else {
+        voice
+    };
+    chosen.trim().to_string()
+}
+
+/// Return True when the user opted into the Tool Gateway for this section.
+/// Mirrors `tool_backend_helpers.prefers_gateway`: reads `use_gateway`
+/// truthiness from the provided config section. Never raises.
+fn prefers_gateway(config_section: Option<&Value>) -> bool {
+    match config_section {
+        Some(section) => match obj_get(section, "use_gateway") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => {
+                matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            }
+            Some(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// Return a stable Hermes-specific `User-Agent` for xAI HTTP calls:
+/// `Hermes-Agent/<version>`. Mirrors `hermes_xai_user_agent`.
+fn hermes_xai_user_agent() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let version = if version.is_empty() { "unknown" } else { version };
+    format!("Hermes-Agent/{version}")
+}
 
 // ===========================================================================
 // Defaults

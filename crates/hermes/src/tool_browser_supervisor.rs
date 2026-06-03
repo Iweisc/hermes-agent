@@ -766,7 +766,7 @@ impl SupervisorWorker {
     }
 
     /// Top-level supervisor loop with reconnection.
-    fn run(mut self) {
+    fn run(self) {
         let mut attempt: u64 = 0;
         let mut backoff = 0.5_f64;
 

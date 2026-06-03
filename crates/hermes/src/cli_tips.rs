@@ -5,7 +5,9 @@
 //! returned a uniformly-random tip. The `exclude_recent` argument was reserved
 //! for future use and ignored, which we faithfully reproduce here.
 
-use rand::seq::SliceRandom;
+// `rand` is not a dependency of this crate, so we draw randomness from
+// `getrandom` (the same primitive used elsewhere in the CLI) and reduce it to a
+// uniform index into `TIPS`.
 
 // ---------------------------------------------------------------------------
 // Tip corpus — one-liners covering slash commands, CLI flags, config,
@@ -444,9 +446,17 @@ pub static TIPS: &[&str] = &[
 /// deduplication across sessions. This mirrors the Python signature, which
 /// accepts (and ignores) the same argument.
 pub fn get_random_tip(_exclude_recent: usize) -> &'static str {
-    let mut rng = rand::thread_rng();
-    // TIPS is never empty, so unwrap is safe.
-    TIPS.choose(&mut rng).copied().unwrap_or("")
+    if TIPS.is_empty() {
+        return "";
+    }
+    let mut buf = [0u8; 8];
+    let value = if getrandom::fill(&mut buf).is_ok() {
+        u64::from_le_bytes(buf)
+    } else {
+        0
+    };
+    let idx = (value % TIPS.len() as u64) as usize;
+    TIPS[idx]
 }
 
 #[cfg(test)]

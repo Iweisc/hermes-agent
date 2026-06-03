@@ -32,7 +32,7 @@
 //! the cleanup thread machinery) are not reproduced wholesale. Where their
 //! decision logic is self-contained it is mirrored; where it requires un-ported
 //! runtime state it is exposed as a trait/parameter so callers can wire it in.
-//! `crate::tool_tool_backend_helpers` is reused for modal-mode coercion and
+//! `hermes_core::tool_tool_backend_helpers` is reused for modal-mode coercion and
 //! backend-state resolution.
 
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use crate::tool_tool_backend_helpers::{
+use hermes_core::tool_tool_backend_helpers::{
     coerce_modal_mode, has_direct_modal_credentials, resolve_modal_backend_state,
     ModalBackendState,
 };
@@ -1303,7 +1303,7 @@ fn abspath(path: &str) -> String {
 /// Resolve direct vs managed Modal backend selection.
 ///
 /// Mirror of `_get_modal_backend_state`. Delegates to
-/// [`crate::tool_tool_backend_helpers::resolve_modal_backend_state`], supplying
+/// [`hermes_core::tool_tool_backend_helpers::resolve_modal_backend_state`], supplying
 /// the direct-credentials probe natively. `managed_ready` (Python
 /// `is_managed_tool_gateway_ready("modal")`) and `managed_nous_tools_enabled`
 /// are passed in because they consult un-ported subscription state.

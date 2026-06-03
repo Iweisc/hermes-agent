@@ -1070,7 +1070,7 @@ impl std::fmt::Display for UserSystemdUnavailableError {
 }
 impl std::error::Error for UserSystemdUnavailableError {}
 
-fn build_user_systemd_unavailable(username: &str, reason: &str, fix_hint: &str) -> UserSystemdUnavailableError {
+fn build_user_systemd_unavailable(_username: &str, reason: &str, fix_hint: &str) -> UserSystemdUnavailableError {
     let msg = format!(
         "{reason}\n  systemctl --user cannot reach the user D-Bus session in this shell.\n\n  To fix:\n{fix_hint}\n\n  Alternative: run the gateway in the foreground (stays up until\n  you exit / close the terminal):\n    hermes gateway run"
     );
@@ -4082,7 +4082,7 @@ pub fn gateway_setup() {
                     true,
                 ) {
                     let mut installed_scope: Option<String> = None;
-                    let mut did_install = false;
+                    let did_install;
                     if supports_systemd_services() {
                         let (scope, installed) = install_linux_gateway_from_setup(false);
                         installed_scope = scope;

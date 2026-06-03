@@ -25,7 +25,7 @@
 //!
 //! Cross-references (flat ported modules, referenced where available):
 //!   * `crate::agent_redact::redact_sensitive_text`
-//!   * `crate::gw_platforms_base::{extract_media, truncate_message, utf16_len}`
+//!   * `hermes_core::gw_platforms_base::{extract_media, truncate_message, utf16_len}`
 //!   * `crate::tool_interrupt::is_interrupted`
 
 use std::collections::HashMap;

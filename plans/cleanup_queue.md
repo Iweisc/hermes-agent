@@ -110,3 +110,13 @@
   - tool_tts_tool
   - tool_vision_tools
   - tool_yuanbao_tools
+
+## Cleanup phase progress (recovery)
+- Promoted 26 hermes-core modules to 'pub mod' so the hermes crate can reach them (cli_config, cron_jobs, gw_pairing, gw_session_context, mod_hermes_*, tool_* helpers, gw_platforms_base, gw_yuanbao_sticker, cli_kanban_db, etc.)
+- Fixed crate:: -> hermes_core:: refs in tool_yuanbao_tools, tool_send_message_tool, tool_terminal_tool, tool_web_tools
+- hermes crate: 28 quarantined -> 1 (only tool_environments_modal remains, needs cross-crate env-base/file_sync wiring)
+- hermes-core: 11 still quarantined (adapters w/ serde issues, gw_run/delivery/config cluster, mcp_serve, batch_runner, tui_entry, feishu, skills_sync, hook_output_spill)
+
+## Test-binary status (NOT a regression)
+- hermes-rs-cli TEST binary has pre-existing breakage (oneshot crate missing in native_api_server tests, StatusArgs.bootstrap E0027) — documented before this work. Production build (cargo build --workspace) is green.
+- Recovered modules' inline tests have minor issues (CdpSupervisor needs Debug, a couple type annotations) but are masked by the pre-existing oneshot break.

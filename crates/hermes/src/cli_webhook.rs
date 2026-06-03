@@ -12,7 +12,7 @@
 //! Native Rust port of `hermes_cli/webhook.py`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -83,11 +83,11 @@ pub struct RealEnv;
 
 impl WebhookEnv for RealEnv {
     fn hermes_home(&self) -> PathBuf {
-        hermes_core::mod_hermes_constants::get_hermes_home()
+        get_hermes_home()
     }
 
     fn display_hermes_home(&self) -> String {
-        hermes_core::mod_hermes_constants::display_hermes_home()
+        display_hermes_home()
     }
 
     fn webhook_config(&self) -> Value {
@@ -99,11 +99,66 @@ impl WebhookEnv for RealEnv {
     }
 }
 
-/// Load `platforms.webhook` from config (serde_yaml::Value), converted to a
+/// User home directory, mirroring `hermes_constants` (falls back to `.`).
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Return the Hermes home directory (default: `~/.hermes`).
+///
+/// Reads the `HERMES_HOME` env var, falls back to `~/.hermes`. Local mirror of
+/// `hermes_core::mod_hermes_constants::get_hermes_home` (a private module).
+fn get_hermes_home() -> PathBuf {
+    if let Ok(val) = std::env::var("HERMES_HOME") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    home_dir().join(".hermes")
+}
+
+/// User-friendly display string for the current HERMES_HOME (uses `~/`).
+fn display_hermes_home() -> String {
+    let home = get_hermes_home();
+    let user_home = home_dir();
+    match home.strip_prefix(&user_home) {
+        Ok(rel) => format!("~/{}", rel.to_string_lossy()),
+        Err(_) => home.to_string_lossy().into_owned(),
+    }
+}
+
+/// Atomic-replace `tmp_path` onto `target`, resolving a symlinked target first.
+///
+/// Local mirror of `hermes_core::mod_utils::atomic_replace` (a private module).
+fn atomic_replace(tmp_path: &Path, target: &Path) -> std::io::Result<PathBuf> {
+    let is_link = std::fs::symlink_metadata(target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let real_path: PathBuf = if is_link {
+        std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf())
+    } else {
+        target.to_path_buf()
+    };
+    std::fs::rename(tmp_path, &real_path)?;
+    Ok(real_path)
+}
+
+/// Load `platforms.webhook` from `~/.hermes/config.yaml`, converted to a
 /// serde_json::Value mapping. Returns `{}` (an empty object) if unavailable.
 fn get_webhook_config_real() -> Value {
-    let cfg = hermes_core::cli_config::load_config();
-    let block = hermes_core::cli_config::cfg_get(Some(&cfg), &["platforms", "webhook"], None);
+    let config_path = get_hermes_home().join("config.yaml");
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(t) => t,
+        Err(_) => return Value::Object(Map::new()),
+    };
+    let cfg: serde_yaml::Value = match serde_yaml::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Value::Object(Map::new()),
+    };
+    let block = cfg
+        .get("platforms")
+        .and_then(|p| p.get("webhook"));
     match block {
         Some(v) => yaml_to_json(v),
         None => Value::Object(Map::new()),
@@ -189,7 +244,7 @@ pub fn save_subscriptions(
     let body = serde_json::to_string_pretty(&Value::Object(subs.clone()))
         .unwrap_or_else(|_| "{}".to_string());
     std::fs::write(&tmp_path, body)?;
-    hermes_core::mod_utils::atomic_replace(&tmp_path, &path)?;
+    atomic_replace(&tmp_path, &path)?;
     Ok(())
 }
 
