@@ -549,7 +549,13 @@ fn handle_native_request(
         "config.get" => handle_config_get(id, &params, state, helper, child_stdin)?,
         "config.set" => handle_config_set(id, &params, state, helper, stdout, child_stdin)?,
         "prompt.background" => handle_prompt_background(id, &params, state, helper, stdout)?,
-        "prompt.submit" => handle_prompt_submit(id, &params, state, child_stdin)?,
+        "prompt.submit" => {
+            if native_prompt_enabled() {
+                handle_prompt_submit_native(id, &params, store, state, helper, stdout)?
+            } else {
+                handle_prompt_submit(id, &params, state, child_stdin)?
+            }
+        }
         "session.interrupt" => handle_session_interrupt(id, &params, state, child_stdin)?,
         "session.steer" => handle_session_steer(id, &params, state, child_stdin)?,
         "approval.respond" => handle_approval_respond(id, &params, state, helper)?,
@@ -1847,6 +1853,146 @@ fn handle_prompt_submit(
         Some(local_id.to_string()),
     )?;
     Ok(Some(rebind_response_id(response, id)))
+}
+
+/// True when the TUI proxy should run `prompt.submit` turns natively in Rust
+/// (via `hermes_core::spawn_chat_turn_with_events`) instead of forwarding to the
+/// Python `tui_gateway.worker` child. Opt-in while the native path is validated.
+/// Read an environment variable as a non-empty trimmed string, else `None`.
+fn env_string(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn native_prompt_enabled() -> bool {
+    std::env::var("HERMES_TUI_NATIVE_PROMPT")
+        .map(|value| {
+            let v = value.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Emit a TUI `event` notification to the frontend (the envelope the Node UI
+/// consumes), carrying a turn event's type + optional payload.
+fn emit_tui_event(
+    stdout: &Arc<Mutex<io::Stdout>>,
+    session_id: &str,
+    event_type: &str,
+    payload: Option<Value>,
+) -> Result<(), Box<dyn Error>> {
+    let mut params = json!({ "type": event_type, "session_id": session_id });
+    if let (Some(obj), Some(payload)) = (params.as_object_mut(), payload) {
+        obj.insert("payload".to_string(), payload);
+    }
+    write_json(
+        stdout,
+        &json!({ "jsonrpc": "2.0", "method": "event", "params": params }),
+    )
+}
+
+/// Native `prompt.submit`: run the agent turn in Rust and stream its events to
+/// the TUI frontend, instead of proxying to the Python worker.
+///
+/// Mirrors the proven driver in `gateway_native.rs::handle_prompt_submit`:
+/// spawn the turn, relay every emitted event as a TUI `event` notification, and
+/// reply to the original request once the turn completes.
+fn handle_prompt_submit_native(
+    id: Value,
+    params: &Map<String, Value>,
+    store: &SessionStore,
+    state: &Arc<Mutex<ProxyState>>,
+    helper: &HelperContext,
+    stdout: &Arc<Mutex<io::Stdout>>,
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let Some(local_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4006, "session_id required")));
+    };
+    let Some(store_session_id) = lookup_store_session_id(state, local_id)? else {
+        return Ok(Some(error_response(id, 4001, "session not found")));
+    };
+    let Some(text) = params
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Some(error_response(id, 4004, "text is required")));
+    };
+    let text = text.to_string();
+
+    mark_store_session_dirty(state, local_id)?;
+
+    // Load config + build a tool runtime bound to this session, matching the
+    // native gateway's setup.
+    let loaded = helper.context.load_config_document()?;
+    let overrides = ModelOverrides {
+        model: env_string("HERMES_MODEL").or_else(|| env_string("HERMES_INFERENCE_MODEL")),
+        provider: env_string("HERMES_TUI_PROVIDER")
+            .or_else(|| env_string("HERMES_INFERENCE_PROVIDER")),
+        base_url: env_string("HERMES_BASE_URL"),
+        api_key: env_string("HERMES_API_KEY"),
+        api_mode: env_string("HERMES_API_MODE"),
+    };
+    let runtime = ToolRuntime::new(helper.work_root.clone())
+        .with_hermes_home(helper.hermes_home.clone())
+        .with_current_session_id(Some(store_session_id.clone()));
+
+    let _ = store.get_session(&store_session_id)?; // surface a missing session early
+
+    let rx = hermes_core::spawn_chat_turn_with_events(
+        helper.context.clone(),
+        loaded.clone(),
+        Value::String(text),
+        runtime,
+        loaded.config.toolsets.clone(),
+        overrides,
+        Some(store_session_id.clone()),
+        hermes_core::InteractiveTurnOptions {
+            enable_client_requests: true,
+            ..hermes_core::InteractiveTurnOptions::default()
+        },
+    );
+
+    emit_tui_event(stdout, local_id, "message.start", None)?;
+
+    let mut turn = hermes_core::GatewayTurnSession::new(rx);
+    let final_result = loop {
+        match turn.poll_next() {
+            Ok(hermes_core::GatewaySessionPoll::Events { events, .. }) => {
+                for event in events {
+                    emit_tui_event(stdout, local_id, &event.event_type, event.payload)?;
+                }
+            }
+            Ok(hermes_core::GatewaySessionPoll::Final { result, events }) => {
+                for event in events {
+                    emit_tui_event(stdout, local_id, &event.event_type, event.payload)?;
+                }
+                break result;
+            }
+            Err(error) => break Err(error),
+        }
+    };
+
+    match final_result {
+        Ok(_) => Ok(Some(ok_response(id, json!({ "ok": true })))),
+        Err(error) => {
+            emit_tui_event(
+                stdout,
+                local_id,
+                "error",
+                Some(json!({ "message": error })),
+            )?;
+            Ok(Some(error_response(id, 5000, &error)))
+        }
+    }
 }
 
 fn handle_session_steer(
