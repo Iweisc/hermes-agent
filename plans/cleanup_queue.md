@@ -120,3 +120,14 @@
 ## Test-binary status (NOT a regression)
 - hermes-rs-cli TEST binary has pre-existing breakage (oneshot crate missing in native_api_server tests, StatusArgs.bootstrap E0027) — documented before this work. Production build (cargo build --workspace) is green.
 - Recovered modules' inline tests have minor issues (CdpSupervisor needs Debug, a couple type annotations) but are masked by the pre-existing oneshot break.
+
+## TUI native prompt path (DONE — first thing that actually runs in Rust)
+- HERMES_TUI_NATIVE_PROMPT=1 routes prompt.submit through hermes_core::spawn_chat_turn_with_events
+- Verified: real Anthropic API call from the Rust turn (401 w/ request_id), no Python worker in the prompt path
+- FOLLOW-UP to fully delete the Python worker from the TUI:
+  - startup still spawns python -m tui_gateway.worker unconditionally (tui_gateway.rs ~L247)
+  - still-forwarded methods to make native or stub: voice.*, tools.configure/list/show,
+    skills.reload/manage, cli.exec, shell.exec, reload.mcp/env, model.*, delegation.*,
+    agents.list, toolsets.list, process.stop, browser.manage, image.attach, rollback.*
+  - once those are native, make startup spawn lazy (only if a non-native method is hit) or remove it
+  - flip HERMES_TUI_NATIVE_PROMPT default to on after a real conversation is validated with a live key
