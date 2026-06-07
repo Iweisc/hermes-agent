@@ -21,7 +21,6 @@ use url::Url;
 const DENY_SOURCES: &[&str] = &["tool"];
 const MAX_COMPLETION_ITEMS: usize = 30;
 
-
 const COMMAND_DISPATCH_HELPER: &str = r#"
 import json
 import subprocess
@@ -216,6 +215,27 @@ struct ProxyState {
     sessions: HashMap<String, SessionBinding>,
 }
 
+enum Worker {
+    Live(ChildStdin),
+    Disabled,
+}
+
+type WorkerHandle = Arc<Mutex<Worker>>;
+
+impl Worker {
+    fn write_json_line(&mut self, value: &Value, method: &str) -> Result<(), Box<dyn Error>> {
+        match self {
+            Worker::Live(stdin) => {
+                stdin.write_all(serde_json::to_string(value)?.as_bytes())?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()?;
+                Ok(())
+            }
+            Worker::Disabled => Err(disabled_worker_error(method).into()),
+        }
+    }
+}
+
 pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
     let store = Arc::new(context.open_session_store()?);
     let stdout = Arc::new(Mutex::new(io::stdout()));
@@ -243,33 +263,36 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
         work_root,
     };
 
-    let mut child = Command::new(&python)
-        .args(["-m", "tui_gateway.worker"])
-        .current_dir(&session_cwd)
-        .env("HERMES_PYTHON_SRC_ROOT", &project_root)
-        .env("PYTHONPATH", &helper.python_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let child_stdin: WorkerHandle = if native_mode_enabled() {
+        Arc::new(Mutex::new(Worker::Disabled))
+    } else {
+        let mut child = Command::new(&python)
+            .args(["-m", "tui_gateway.worker"])
+            .current_dir(&session_cwd)
+            .env("HERMES_PYTHON_SRC_ROOT", &project_root)
+            .env("PYTHONPATH", &helper.python_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-    let child_stdin = Arc::new(Mutex::new(
-        child
+        let child_stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "failed to capture child stdin".to_string())?,
-    ));
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture child stdout".to_string())?;
-    let child_stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "failed to capture child stderr".to_string())?;
+            .ok_or_else(|| "failed to capture child stdin".to_string())?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture child stdout".to_string())?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture child stderr".to_string())?;
 
-    pipe_child_stdout(child_stdout, Arc::clone(&stdout), Arc::clone(&state));
-    pipe_child_stderr(child_stderr);
+        pipe_child_stdout(child_stdout, Arc::clone(&stdout), Arc::clone(&state));
+        pipe_child_stderr(child_stderr);
+        Arc::new(Mutex::new(Worker::Live(child_stdin)))
+    };
 
     let ready_payload = json!({ "skin": hermes_core::resolve_skin(&helper.hermes_home) });
     write_json(
@@ -304,14 +327,22 @@ pub fn run(context: HermesContext) -> Result<(), Box<dyn Error>> {
             }
         };
 
-        if let Some(response) =
-            handle_native_request(&request, &store, &state, &helper, &stdout, &child_stdin)?
-        {
-            write_json(&stdout, &response)?;
-            continue;
+        match handle_native_request(&request, &store, &state, &helper, &stdout, &child_stdin) {
+            Ok(Some(response)) => {
+                write_json(&stdout, &response)?;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                write_json(&stdout, &error_response(id, 5000, &error.to_string()))?;
+                continue;
+            }
         }
 
-        forward_request(&child_stdin, &state, &request)?;
+        if let Some(response) = forward_request(&child_stdin, &state, &request)? {
+            write_json(&stdout, &response)?;
+        }
     }
 
     Ok(())
@@ -323,7 +354,7 @@ fn handle_native_request(
     state: &Arc<Mutex<ProxyState>>,
     helper: &HelperContext,
     stdout: &Arc<Mutex<io::Stdout>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(None);
@@ -478,8 +509,7 @@ fn handle_native_request(
             Duration::from_secs(240),
         )?,
         "plugins.list" => {
-            let listings =
-                hermes_core::plugins_list(&helper.hermes_home, &helper.work_root);
+            let listings = hermes_core::plugins_list(&helper.hermes_home, &helper.work_root);
             let plugins: Vec<Value> = listings
                 .into_iter()
                 .map(|p| json!({"name": p.name, "version": p.version, "enabled": p.enabled}))
@@ -799,7 +829,7 @@ fn handle_session_close(
     params: &Map<String, Value>,
     store: &SessionStore,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -941,8 +971,10 @@ fn resolve_resume_session(
 }
 
 fn initial_session_info(helper: &HelperContext, model_override: Option<&str>) -> Value {
-    let mut info =
-        hermes_core::initial_session_info(&helper.hermes_home, &helper.work_root.display().to_string());
+    let mut info = hermes_core::initial_session_info(
+        &helper.hermes_home,
+        &helper.work_root.display().to_string(),
+    );
     if let Some(model) = model_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1083,7 +1115,7 @@ fn handle_session_undo(
     params: &Map<String, Value>,
     store: &SessionStore,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1239,7 +1271,7 @@ fn handle_session_compress(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1310,7 +1342,7 @@ fn handle_session_bound_child_request(
     method: &str,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1348,7 +1380,7 @@ fn handle_browser_manage(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let mut forwarded_params = params.clone();
     let local_session_id = params
@@ -1404,7 +1436,10 @@ fn handle_cron_manage(
     params: &Map<String, Value>,
     helper: &HelperContext,
 ) -> Result<Value, Box<dyn Error>> {
-    let action = params.get("action").and_then(Value::as_str).unwrap_or("list");
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("list");
     let job_id = params.get("name").and_then(Value::as_str).unwrap_or("");
 
     let cron_args = match action {
@@ -1425,11 +1460,11 @@ fn handle_cron_manage(
         }
     };
 
-    let runtime = ToolRuntime::new(helper.work_root.to_path_buf())
-        .with_hermes_home(&helper.hermes_home);
+    let runtime =
+        ToolRuntime::new(helper.work_root.to_path_buf()).with_hermes_home(&helper.hermes_home);
     let raw = hermes_core::handle_cronjob(&cron_args, &runtime);
-    let result: Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|_| json!({"error": "invalid cron response"}));
+    let result: Value =
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({"error": "invalid cron response"}));
     Ok(ok_response(id, result))
 }
 
@@ -1472,7 +1507,7 @@ fn forward_child_request(
     method: &str,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
     map_session_id: bool,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     forward_child_request_timeout(
@@ -1491,7 +1526,7 @@ fn forward_child_request_timeout(
     method: &str,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
     map_session_id: bool,
     timeout: Duration,
 ) -> Result<Option<Value>, Box<dyn Error>> {
@@ -1537,7 +1572,7 @@ fn handle_config_get(
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
     helper: &HelperContext,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let key = params
         .get("key")
@@ -1589,7 +1624,7 @@ fn handle_config_set(
     state: &Arc<Mutex<ProxyState>>,
     helper: &HelperContext,
     stdout: &Arc<Mutex<io::Stdout>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(key) = params
         .get("key")
@@ -1635,7 +1670,11 @@ fn handle_config_set(
     // mouse, indicator, thinking_mode, details_mode[.section], busy, prompt).
     // Session-coupled keys (model/fast/verbose/yolo/reasoning/personality) and
     // skin fall through to the Python helper.
-    match hermes_core::tui_config::config_set(&helper.hermes_home, key, params.get("value").unwrap_or(&Value::Null)) {
+    match hermes_core::tui_config::config_set(
+        &helper.hermes_home,
+        key,
+        params.get("value").unwrap_or(&Value::Null),
+    ) {
         hermes_core::tui_config::ConfigSetOutcome::Ok(result) => {
             return Ok(Some(ok_response(id, result)));
         }
@@ -1780,7 +1819,7 @@ fn handle_session_interrupt(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1818,7 +1857,7 @@ fn handle_prompt_submit(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -1866,13 +1905,37 @@ fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn native_prompt_enabled() -> bool {
-    std::env::var("HERMES_TUI_NATIVE_PROMPT")
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
         .map(|value| {
             let v = value.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "yes" || v == "on"
         })
         .unwrap_or(false)
+}
+
+fn native_mode_enabled() -> bool {
+    env_flag("HERMES_TUI_NATIVE")
+}
+
+fn native_prompt_enabled() -> bool {
+    native_mode_enabled() || env_flag("HERMES_TUI_NATIVE_PROMPT")
+}
+
+fn disabled_worker_error(method: &str) -> String {
+    let name = if method.trim().is_empty() {
+        "<unknown>"
+    } else {
+        method
+    };
+    format!("tui_gateway.worker is disabled by HERMES_TUI_NATIVE; method {name} is not native yet")
+}
+
+fn worker_disabled(worker: &WorkerHandle) -> Result<bool, Box<dyn Error>> {
+    let guard = worker
+        .lock()
+        .map_err(|_| "failed to lock worker while checking availability")?;
+    Ok(matches!(*guard, Worker::Disabled))
 }
 
 /// Emit a TUI `event` notification to the frontend (the envelope the Node UI
@@ -1984,12 +2047,7 @@ fn handle_prompt_submit_native(
     match final_result {
         Ok(_) => Ok(Some(ok_response(id, json!({ "ok": true })))),
         Err(error) => {
-            emit_tui_event(
-                stdout,
-                local_id,
-                "error",
-                Some(json!({ "message": error })),
-            )?;
+            emit_tui_event(stdout, local_id, "error", Some(json!({ "message": error })))?;
             Ok(Some(error_response(id, 5000, &error)))
         }
     }
@@ -1999,7 +2057,7 @@ fn handle_session_steer(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -2084,7 +2142,7 @@ fn handle_approval_respond(
 fn handle_text_respond(
     id: Value,
     params: &Map<String, Value>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     request_key: &str,
@@ -2128,7 +2186,7 @@ fn handle_terminal_resize(
     id: Value,
     params: &Map<String, Value>,
     state: &Arc<Mutex<ProxyState>>,
-    child_stdin: &Arc<Mutex<ChildStdin>>,
+    child_stdin: &WorkerHandle,
 ) -> Result<Option<Value>, Box<dyn Error>> {
     let Some(local_id) = params
         .get("session_id")
@@ -2416,10 +2474,22 @@ fn pipe_child_stderr(stderr: ChildStderr) {
 }
 
 fn forward_request(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     request: &Value,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<Value>, Box<dyn Error>> {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if worker_disabled(stdin)? {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        return Ok(Some(error_response(
+            id,
+            5019,
+            &disabled_worker_error(method),
+        )));
+    }
     if request.get("method").and_then(Value::as_str) == Some("prompt.submit")
         && let Some(local_sid) = request
             .get("params")
@@ -2434,10 +2504,8 @@ fn forward_request(
     let mut stdin = stdin
         .lock()
         .map_err(|_| "failed to lock child stdin for forwarding")?;
-    stdin.write_all(serde_json::to_string(&forwarded)?.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    Ok(())
+    stdin.write_json_line(&forwarded, method)?;
+    Ok(None)
 }
 
 fn write_json(sink: &Arc<Mutex<io::Stdout>>, value: &Value) -> Result<(), Box<dyn Error>> {
@@ -3140,8 +3208,7 @@ fn new_background_task_id() -> String {
 
 fn current_filename_timestamp() -> String {
     let timestamp = current_timestamp_seconds();
-    format_local_timestamp(timestamp, "%Y%m%d_%H%M%S")
-        .unwrap_or_else(|| format!("{timestamp:.0}"))
+    format_local_timestamp(timestamp, "%Y%m%d_%H%M%S").unwrap_or_else(|| format!("{timestamp:.0}"))
 }
 
 fn format_timestamp(timestamp: f64) -> String {
@@ -3228,7 +3295,7 @@ fn take_queued_images(
 }
 
 fn sync_pending_images(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     local_id: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -3251,7 +3318,7 @@ fn sync_pending_images(
 }
 
 fn ensure_child_session(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     local_id: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -3283,7 +3350,7 @@ fn ensure_child_session(
 }
 
 fn send_internal_child_request(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     params: Value,
@@ -3291,6 +3358,9 @@ fn send_internal_child_request(
     resume_target: Option<String>,
     tracked_method: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    if worker_disabled(stdin)? {
+        return Err(disabled_worker_error(method).into());
+    }
     let request_id = {
         let mut guard = state
             .lock()
@@ -3318,14 +3388,12 @@ fn send_internal_child_request(
     let mut stdin = stdin
         .lock()
         .map_err(|_| "failed to lock child stdin for internal request")?;
-    stdin.write_all(serde_json::to_string(&request)?.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
+    stdin.write_json_line(&request, method)?;
     Ok(())
 }
 
 fn send_blocking_child_request(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     params: Value,
@@ -3342,13 +3410,20 @@ fn send_blocking_child_request(
 }
 
 fn send_blocking_child_request_timeout(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &WorkerHandle,
     state: &Arc<Mutex<ProxyState>>,
     method: &str,
     params: Value,
     local_session_id: Option<String>,
     timeout: Duration,
 ) -> Result<Value, Box<dyn Error>> {
+    if worker_disabled(stdin)? {
+        return Ok(error_response(
+            Value::Null,
+            5019,
+            &disabled_worker_error(method),
+        ));
+    }
     let (response_tx, response_rx) = mpsc::channel();
     let request_id = {
         let mut guard = state
@@ -3378,9 +3453,7 @@ fn send_blocking_child_request_timeout(
         let mut stdin = stdin
             .lock()
             .map_err(|_| "failed to lock child stdin for blocking request")?;
-        stdin.write_all(serde_json::to_string(&request)?.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
+        stdin.write_json_line(&request, method)?;
     }
 
     match response_rx.recv_timeout(timeout) {
@@ -3689,9 +3762,8 @@ fn image_meta(_helper: &HelperContext, path: &Path) -> Map<String, Value> {
         ),
     );
     if let Ok((width, height)) = image::image_dimensions(path) {
-        let token_estimate = u64::from((width + 511) / 512).max(1)
-            * u64::from((height + 511) / 512).max(1)
-            * 85;
+        let token_estimate =
+            u64::from((width + 511) / 512).max(1) * u64::from((height + 511) / 512).max(1) * 85;
         payload.insert("width".to_string(), json!(width));
         payload.insert("height".to_string(), json!(height));
         payload.insert("token_estimate".to_string(), json!(token_estimate));
@@ -4890,17 +4962,17 @@ mod tests {
         SessionStore::open(path).unwrap()
     }
 
-    fn dummy_child_stdin() -> (Child, Arc<Mutex<ChildStdin>>) {
+    fn dummy_child_stdin() -> (Child, Arc<Mutex<Worker>>) {
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
-        (child, Arc::new(Mutex::new(stdin)))
+        (child, Arc::new(Mutex::new(Worker::Live(stdin))))
     }
 
-    fn dummy_child_echo() -> (Child, Arc<Mutex<ChildStdin>>, BufReader<ChildStdout>) {
+    fn dummy_child_echo() -> (Child, Arc<Mutex<Worker>>, BufReader<ChildStdout>) {
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4908,7 +4980,11 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        (child, Arc::new(Mutex::new(stdin)), BufReader::new(stdout))
+        (
+            child,
+            Arc::new(Mutex::new(Worker::Live(stdin))),
+            BufReader::new(stdout),
+        )
     }
 
     fn helper_context() -> HelperContext {
@@ -5960,11 +6036,9 @@ mod tests {
                 .unwrap(),
         )
         .expect("spawn_tree.list");
-        let loaded = hermes_core::spawn_tree::load(
-            &hermes_home,
-            json!({"path": path}).as_object().unwrap(),
-        )
-        .expect("spawn_tree.load");
+        let loaded =
+            hermes_core::spawn_tree::load(&hermes_home, json!({"path": path}).as_object().unwrap())
+                .expect("spawn_tree.load");
 
         assert_eq!(listed["entries"][0]["label"], json!("demo"));
         assert_eq!(loaded["session_id"], json!("rs_tui_00000001"));
